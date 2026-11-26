@@ -25,7 +25,11 @@ use super::*;
 /// `None`: a read in divergent code may see a write made in divergent code
 /// since the last barrier. A write in divergent code after a read there gets
 /// no barrier, as before.
-pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
+pub(crate) fn split_wave_barriers(
+    p: &Program,
+    st: &Structured,
+    unif: &HashSet<Value>,
+) -> Option<Set<(usize, usize)>> {
     /// LDS accesses since the last barrier.
     #[derive(Clone, Copy, Default, PartialEq)]
     struct Since {
@@ -56,7 +60,7 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = in_step(p, st);
+    let step = in_step(p, st, unif);
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -124,13 +128,15 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
 /// Every block each lane runs once ([`once_per_lane`]) is one; so is a loop
 /// whose count every wave computes alike, from the group's inputs,
 /// constants and scalar loads through scalar code (not from lane masks,
-/// other lanes' values or hardware state). Such a scalar is the same in
-/// every console wave of the group too.
+/// other lanes' values or hardware state), or by a first-lane read of a
+/// value every lane of the console wave holds ([`halves::lane_uniform`]
+/// `unif`), unguarded in a block every lane runs together. Such a scalar is
+/// the same in every console wave of the group too.
 ///
 /// Scalars are assumed alike until shown otherwise (a loop counter needs
 /// itself), and the regions and the scalars are narrowed together to a
 /// fixed point. With an indirect branch, the blocks each lane runs once.
-pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
+pub(crate) fn in_step(p: &Program, st: &Structured, unif: &HashSet<Value>) -> Vec<bool> {
     let Some(regions) = halves::branch_regions(st) else {
         return once_per_lane(p);
     };
@@ -202,12 +208,28 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
                     next.insert(phi.value);
                 }
             }
-            for inst in &block.insts {
-                let from = inst
-                    .reads
-                    .iter()
-                    .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from && !own(inst) {
+            for (i, inst) in block.insts.iter().enumerate() {
+                // A first-lane read of a vector every lane of the console
+                // wave holds gives both host waves the console's value, but
+                // only unguarded where every lane runs together: under a
+                // lane-dependent guard the halves read different first
+                // lanes. (`v_readlane` with a constant lane is not admitted.)
+                let first = inst.name() == "v_readfirstlane_b32"
+                    && entered
+                    && st.guards[b][i].is_none()
+                    && inst.reads.iter().all(|&(r, v)| match r {
+                        Reg::V(_) => unif.contains(&v),
+                        // The lane mask is the read's own active set: an
+                        // unguarded instruction in a `step` block runs it
+                        // with every lane active in both host waves.
+                        _ => mask(r) || scalar(r) && alike.contains(&v),
+                    });
+                let from = first
+                    || inst
+                        .reads
+                        .iter()
+                        .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
+                if from && (!own(inst) || first) {
                     next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
                 }
             }

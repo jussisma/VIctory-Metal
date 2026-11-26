@@ -1345,10 +1345,20 @@ fn wave64(words: &[u32]) -> ir::Program {
     ir::build(&code, true, 256).unwrap()
 }
 
-/// [`super::split_wave_barriers`] of a program.
+/// [`super::split_wave_barriers`] of a program, with no first-lane reads
+/// known wave-uniform.
 fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
+    barriers_at_unif(p, &std::collections::HashSet::new())
+}
+
+/// [`super::split_wave_barriers`] of a program, given the VGPR values
+/// [`super::halves::lane_uniform`] proved wave-uniform.
+fn barriers_at_unif(
+    p: &ir::Program,
+    unif: &std::collections::HashSet<crate::ir::Value>,
+) -> Option<Vec<(usize, usize)>> {
     let st = structure::structure(p).unwrap();
-    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st, unif)?.into_iter().collect();
     at.sort_unstable();
     Some(at)
 }
@@ -1466,6 +1476,8 @@ const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
 const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
 const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
 const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
+const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502; // v_readfirstlane_b32 s21, v2
 
 /// `body` in a loop on s20, ending at the compare `cmp` (`s_cbranch_scc1`
 /// back to the body's start).
@@ -1530,6 +1542,59 @@ fn lds_in_a_loop_on_a_scalar_count_syncs_inside_the_loop() {
     assert_eq!(barriers_at(&p).unwrap(), [(1, 0), (1, 1)]);
     assert_eq!(split_barriers(&w, 64, true), 2);
     assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn lds_in_a_loop_on_a_uniform_first_lane_read_syncs_inside_the_loop() {
+    // The count reads the first lane of `v0 >> 6`, one value per console
+    // wave and so the same in both host halves: the loop is `in_step`.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, V_LSHRREV_V2_6_V0, READFIRSTLANE_S21_V2],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let unif: std::collections::HashSet<_> = p.blocks[0]
+        .insts
+        .iter()
+        .filter(|i| i.name() == "v_lshrrev_b32")
+        .flat_map(|i| i.writes.iter().filter(|w| w.0 == crate::ir::Reg::V(2)))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(unif.len(), 1);
+    assert!(barriers_at(&p).is_none(), "no proof: no barrier");
+    assert_eq!(barriers_at_unif(&p, &unif).unwrap(), [(1, 0), (1, 1)]);
+    assert_eq!(split_barriers(&w, 64, true), 2);
+    assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn a_guarded_uniform_first_lane_read_is_not_admitted() {
+    // The same wave-uniform source, but read under a lane-dependent mask:
+    // each half's first active lane differs, so the scalar is not uniform.
+    let w = looped(
+        &[
+            V_LSHLREV_V1_2_V0,
+            V_LSHRREV_V2_6_V0,
+            SAVE_EXEC,
+            CMPX_V0_EQ_0,
+            READFIRSTLANE_S21_V2,
+            RESTORE_EXEC,
+        ],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let unif: std::collections::HashSet<_> = p.blocks[0]
+        .insts
+        .iter()
+        .filter(|i| i.name() == "v_lshrrev_b32")
+        .flat_map(|i| i.writes.iter().filter(|w| w.0 == crate::ir::Reg::V(2)))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(unif.len(), 1);
+    assert!(barriers_at_unif(&p, &unif).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
 }
 
 #[test]

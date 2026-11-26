@@ -764,7 +764,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if let Some(b) = split_wave_barriers(p, x.st, &halves::lane_uniform(x)) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -840,6 +840,16 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let alike = if halves {
+            halves::lane_uniform(x)
+        } else {
+            HashSet::new()
+        };
+        let step = if halves {
+            in_step(p, x.st, &alike)
+        } else {
+            Vec::new()
+        };
         Lower {
             s,
             x,
@@ -891,14 +901,10 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step,
             half_words: None,
             level: 0,
-            alike: if halves {
-                halves::lane_uniform(x)
-            } else {
-                HashSet::new()
-            },
+            alike,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
