@@ -21,6 +21,8 @@
 
 pub mod abi;
 pub mod cmdlist;
+#[cfg(all(target_os = "macos", test))]
+mod frame_e2e;
 pub mod guest_ipc;
 #[cfg(target_os = "macos")]
 pub mod ipc_host;
