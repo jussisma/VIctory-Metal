@@ -12,9 +12,14 @@
 //! - On macOS (`target_os = "macos"`), [`macos::device::DirectMetalTransport`]
 //!   provides real `MTLDevice`, `newBufferWithBytesNoCopy` unified-memory buffers,
 //!   compute dispatch, `libmetalirconverter.dylib` DXIL compilation, and [`macos::c_api`].
+//! - On macOS, [`ipc_host`] adds the loopback transport, authentication,
+//!   allocation file mapping and one-peer session around the same
+//!   [`macos::device::DirectMetalTransport::submit_batch`] entry point.
 
 pub mod abi;
 pub mod guest_ipc;
+#[cfg(target_os = "macos")]
+pub mod ipc_host;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod transport;
