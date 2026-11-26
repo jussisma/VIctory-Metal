@@ -901,6 +901,7 @@ pub struct RenderEncoder<'a> {
     pass: Option<&'a RenderPass>,
     pipeline: Option<&'a GraphicsPipeline>,
     descriptor: Option<objc::Id>,
+    command_buffer: Option<objc::Id>,
     extent: (u32, u32),
     pool: Option<AutoreleasePool>,
     cb: objc::Id,
@@ -934,6 +935,7 @@ impl<'a> RenderEncoder<'a> {
             pass: Some(pass),
             pipeline: Some(pipeline),
             descriptor: None,
+            command_buffer: None,
             extent: (pass.color.target.width, pass.color.target.height),
             pool: None,
             cb: objc::empty_id(),
@@ -942,14 +944,17 @@ impl<'a> RenderEncoder<'a> {
         })
     }
 
-    /// Prepares an encoder over a caller-built `MTLRenderPassDescriptor`.
+    /// Prepares an encoder over a caller-built `MTLRenderPassDescriptor` on an
+    /// existing, uncommitted command buffer.
     ///
     /// The descriptor must stay alive for the encoder's lifetime (for example
     /// in the caller's autorelease pool). The default viewport and scissor
     /// cover `width`x`height`; the pipeline state is set by the caller through
-    /// [`Self::set_pipeline_state`].
+    /// [`Self::set_pipeline_state`]. This is the v3 path: several encoders of
+    /// different classes share one command buffer.
     pub(crate) fn new_with_descriptor(
         transport: &'a DirectMetalTransport,
+        command_buffer: objc::Id,
         descriptor: objc::Id,
         width: u32,
         height: u32,
@@ -959,11 +964,27 @@ impl<'a> RenderEncoder<'a> {
             pass: None,
             pipeline: None,
             descriptor: Some(descriptor),
+            command_buffer: Some(command_buffer),
             extent: (width, height),
             pool: None,
             cb: objc::empty_id(),
             enc: objc::empty_id(),
             ended: false,
+        }
+    }
+
+    /// Creates the command buffer, pass descriptor and encoder if they do not
+    /// exist yet, so an empty (clear-only) pass still records its work.
+    pub(crate) fn ensure_started(&mut self) -> Result<(), MetalError> {
+        self.ensure_encoder()
+    }
+
+    /// Ends the encoder without committing the shared command buffer.
+    pub(crate) fn end_encoding(&mut self) {
+        if !self.enc.is_null() && !self.ended {
+            // SAFETY: `self.enc` is a live render encoder not yet ended.
+            unsafe { objc::msg_send_void_0(self.enc, objc::sel(c"endEncoding")) };
+            self.ended = true;
         }
     }
 
@@ -1327,10 +1348,16 @@ impl<'a> RenderEncoder<'a> {
             return Ok(());
         }
         let pool = AutoreleasePool::new();
-        // SAFETY: `queue` is a valid `MTLCommandQueue`; the returned command
-        // buffer is autoreleased and stays alive for `pool`'s lifetime.
-        let cb =
-            unsafe { objc::msg_send_id_0(self.transport.queue_raw(), objc::sel(c"commandBuffer")) };
+        let cb = match self.command_buffer {
+            Some(command_buffer) => command_buffer,
+            None => {
+                // SAFETY: `queue` is a valid `MTLCommandQueue`; the returned
+                // command buffer is autoreleased and stays alive for `pool`.
+                unsafe {
+                    objc::msg_send_id_0(self.transport.queue_raw(), objc::sel(c"commandBuffer"))
+                }
+            }
+        };
         if cb.is_null() {
             return Err(MetalError::InternalError(
                 "MTLCommandQueue.commandBuffer returned null".to_string(),
@@ -1870,22 +1897,21 @@ impl DirectMetalTransport {
                 MTL_TEXTURE_USAGE_SHADER_READ,
             );
         }
-        // SAFETY: `device` is a valid `MTLDevice`, `buffer` is a live shared
-        // buffer with `len` bytes, and the descriptor requests a nonzero
-        // `bytes_per_row`.
+        // SAFETY: `buffer` is a live shared buffer with `len` bytes and the
+        // descriptor requests a nonzero `bytes_per_row`; the selector is
+        // `MTLBuffer`'s buffer-backed texture factory.
         let texture_raw = unsafe {
             msg_send_texture_from_buffer(
-                self.device_raw(),
+                buffer.as_raw(),
                 objc::sel(c"newTextureWithDescriptor:offset:bytesPerRow:"),
                 descriptor,
-                buffer.as_raw(),
                 0,
                 bytes_per_row,
             )
         };
         let texture = ObjcObject::from_retained(texture_raw).ok_or_else(|| {
             MetalError::InternalError(
-                "MTLDevice.newTextureWithDescriptor:offset:bytesPerRow: returned null".to_string(),
+                "MTLBuffer.newTextureWithDescriptor:offset:bytesPerRow: returned null".to_string(),
             )
         })?;
 
@@ -2316,20 +2342,18 @@ unsafe fn msg_send_void_u32(target: objc::Id, s: objc::Sel, value: u32) {
 }
 
 unsafe fn msg_send_texture_from_buffer(
-    device: objc::Id,
+    buffer: objc::Id,
     s: objc::Sel,
     descriptor: objc::Id,
-    buffer: objc::Id,
     offset: usize,
     bytes_per_row: usize,
 ) -> objc::Id {
-    type Fn =
-        unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, objc::Id, usize, usize) -> objc::Id;
-    // SAFETY: Caller supplies a valid `MTLDevice`, a texture descriptor and a
-    // live `MTLBuffer` with at least `offset + rows * bytes_per_row` bytes.
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, usize) -> objc::Id;
+    // SAFETY: Caller supplies a live `MTLBuffer` with at least
+    // `offset + rows * bytes_per_row` bytes and a matching texture descriptor.
     let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
     // SAFETY: `f` matches the selector's documented argument layout.
-    unsafe { f(device, s, descriptor, buffer, offset, bytes_per_row) }
+    unsafe { f(buffer, s, descriptor, offset, bytes_per_row) }
 }
 
 unsafe fn msg_send_draw_primitives_instanced(

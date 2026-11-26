@@ -3,8 +3,9 @@
 //! Used both by native macOS callers (Phase 2, Wine-free) and behind `c_api`
 //! for Phase 1 Wine unixlib bridges. Zero Wine or Windows code lives here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
+use std::ops::Range;
 use std::sync::Mutex;
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
@@ -12,11 +13,25 @@ use crate::macos::irconverter;
 use crate::macos::msc::{self, MscUavDispatch};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::render::{
-    GraphicsPipeline, IndexType, LoadAction, PixelFormat, PrimitiveType, RenderAttachment,
-    RenderEncoder, RenderPass, RenderTarget,
+    GraphicsPipeline, IndexType, LoadAction, MTL_BARRIER_SCOPE_BUFFERS, MTL_BARRIER_SCOPE_TEXTURES,
+    PixelFormat, PrimitiveType, RawColorAttachment, RawDepthAttachment, RenderAttachment,
+    RenderEncoder, RenderPass, RenderTarget, ScissorRect as RenderScissorRect, SegmentKind,
+    StoreAction, Viewport as RenderViewport, build_mrt_render_pass_descriptor,
+    plan_encoder_segments, texture_info,
 };
+use crate::macos::texture::VmTextureId;
 use crate::transport::{MetalError, MetalTransport};
 use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
+use crate::wire_v3::{
+    BeginRenderPass, CommandV3, DescriptorKind, IndexFormat, LoadOp, PrimitiveTopology, StoreOp,
+    SubmissionV3,
+};
+
+/// How many executed list identities the v3 entry point remembers.
+///
+/// Mirrors [`crate::cmdlist::ListLedger`]: one identity executes at most once,
+/// and the history is bounded so a long session cannot grow without limit.
+const V3_EXECUTED_LIST_CAPACITY: usize = 256;
 
 const APPLE_SILICON_NOCOPY_PAGE_SIZE: usize = 16 * 1024;
 /// `MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared | MTLResourceHazardTrackingModeDefault`.
@@ -84,6 +99,30 @@ pub(crate) struct DeviceState {
     /// Lazily created 64x64 RGBA8 host render target for graphics batches.
     host_target: Option<RenderTarget>,
     pub(crate) textures: HashMap<u64, ObjcObject>,
+    /// Swapchain surfaces handed to v3 `Present`, keyed by wire surface handle.
+    pub(crate) surfaces: HashMap<u64, ObjcObject>,
+    /// v3 list identities already executed or executing.
+    executed_lists: HashSet<(u64, u32)>,
+    executed_list_order: VecDeque<(u64, u32)>,
+}
+
+impl DeviceState {
+    /// Records a v3 list identity as executed, evicting the oldest entry.
+    fn mark_list_executed(&mut self, list_id: u64, list_generation: u32) {
+        let identity = (list_id, list_generation);
+        if self.executed_lists.insert(identity) {
+            self.executed_list_order.push_back(identity);
+        }
+        while self.executed_list_order.len() > V3_EXECUTED_LIST_CAPACITY {
+            if let Some(oldest) = self.executed_list_order.pop_front() {
+                self.executed_lists.remove(&oldest);
+            }
+        }
+    }
+
+    fn list_was_executed(&self, list_id: u64, list_generation: u32) -> bool {
+        self.executed_lists.contains(&(list_id, list_generation))
+    }
 }
 
 impl DeviceState {
@@ -264,12 +303,14 @@ fn read_back_render_target(
 ) -> Result<Vec<u8>, MetalError> {
     let width = target.width() as usize;
     let height = target.height() as usize;
-    let bytes_per_row = width
-        .checked_mul(4)
-        .ok_or(MetalError::InvalidArg("render target row length overflows usize"))?;
+    let bytes_per_row = width.checked_mul(4).ok_or(MetalError::InvalidArg(
+        "render target row length overflows usize",
+    ))?;
     let len = bytes_per_row
         .checked_mul(height)
-        .ok_or(MetalError::InvalidArg("render target byte length overflows usize"))?;
+        .ok_or(MetalError::InvalidArg(
+            "render target byte length overflows usize",
+        ))?;
 
     let _pool = AutoreleasePool::new();
     // SAFETY: `device_raw()` is a valid `MTLDevice`; storage mode `0` is
@@ -280,8 +321,7 @@ fn read_back_render_target(
     })?;
     // SAFETY: `queue_raw()` is a valid `MTLCommandQueue`; the command buffer is
     // autoreleased and lives for this pool.
-    let cb =
-        unsafe { objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer")) };
+    let cb = unsafe { objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer")) };
     if cb.is_null() {
         return Err(MetalError::InternalError(
             "readback command buffer is null".to_string(),
@@ -412,7 +452,8 @@ impl DirectMetalTransport {
         let device = objc::create_system_default_device().ok_or(MetalError::DeviceUnavailable)?;
 
         // SAFETY: `device` is a valid `MTLDevice` and `newCommandQueue` returns a retained queue.
-        let queue_raw = unsafe { objc::msg_send_id_0(device.as_raw(), objc::sel(c"newCommandQueue")) };
+        let queue_raw =
+            unsafe { objc::msg_send_id_0(device.as_raw(), objc::sel(c"newCommandQueue")) };
         let queue = ObjcObject::from_retained(queue_raw).ok_or_else(|| {
             MetalError::InternalError("MTLDevice.newCommandQueue returned null".to_string())
         })?;
@@ -430,6 +471,9 @@ impl DirectMetalTransport {
                 render_pipelines: HashMap::new(),
                 host_target: None,
                 textures: HashMap::new(),
+                surfaces: HashMap::new(),
+                executed_lists: HashSet::new(),
+                executed_list_order: VecDeque::new(),
             }),
         })
     }
@@ -463,8 +507,9 @@ impl DirectMetalTransport {
         entry: &str,
     ) -> Result<VmPipelineId, MetalError> {
         let _pool = AutoreleasePool::new();
-        let entry_ns = objc::nsstring(entry)
-            .ok_or(MetalError::InvalidArg("entry name string allocation failed"))?;
+        let entry_ns = objc::nsstring(entry).ok_or(MetalError::InvalidArg(
+            "entry name string allocation failed",
+        ))?;
 
         // SAFETY: `lib` is a valid `MTLLibrary` and `entry_ns` is a retained `NSString`.
         let fn_raw = unsafe {
@@ -522,6 +567,22 @@ impl DirectMetalTransport {
     ) -> Result<VmPipelineId, MetalError> {
         let pipeline =
             GraphicsPipeline::compile(self, msl, vertex_entry, fragment_entry, format, None)?;
+        let mut state = self.lock_state()?;
+        let id = state.alloc_id();
+        state.render_pipelines.insert(id, pipeline);
+        Ok(VmPipelineId(id))
+    }
+
+    /// Registers an already-compiled graphics pipeline state.
+    ///
+    /// This is the MRT/depth counterpart of [`Self::register_graphics_pipeline`]:
+    /// the caller compiles with [`GraphicsPipeline::compile_mrt`] so several
+    /// colour formats and a depth format are part of the pipeline, then hands
+    /// the state to the same table a v3 `SetGraphicsPipeline` resolves.
+    pub fn register_graphics_pipeline_state(
+        &self,
+        pipeline: GraphicsPipeline,
+    ) -> Result<VmPipelineId, MetalError> {
         let mut state = self.lock_state()?;
         let id = state.alloc_id();
         state.render_pipelines.insert(id, pipeline);
@@ -622,7 +683,10 @@ impl DirectMetalTransport {
         for command in &submission.commands {
             match command {
                 Command::SetPipeline(set_pipeline) => {
-                    if !state.render_pipelines.contains_key(&set_pipeline.pipeline_id) {
+                    if !state
+                        .render_pipelines
+                        .contains_key(&set_pipeline.pipeline_id)
+                    {
                         return Ok(reply(ReplyStatus::UnknownHandle));
                     }
                     if current_pipeline != Some(set_pipeline.pipeline_id) {
@@ -653,8 +717,7 @@ impl DirectMetalTransport {
                             "a descriptor table requires a preceding SetPipeline",
                         ));
                     };
-                    let Some(resolved) =
-                        resolve_bindings(&state, allocations, &table.bindings)
+                    let Some(resolved) = resolve_bindings(&state, allocations, &table.bindings)
                     else {
                         return Ok(reply(ReplyStatus::UnknownHandle));
                     };
@@ -700,9 +763,7 @@ impl DirectMetalTransport {
                         .checked_add(
                             u64::from(draw.index_count)
                                 .checked_mul(GRAPHICS_INDEX_SIZE as u64)
-                                .ok_or(MetalError::InvalidArg(
-                                    "index count overflows u64",
-                                ))?,
+                                .ok_or(MetalError::InvalidArg("index count overflows u64"))?,
                         )
                         .ok_or(MetalError::InvalidArg("indexed draw range overflows u64"))?;
                     if index_window > draw.bindings[0].length {
@@ -713,9 +774,13 @@ impl DirectMetalTransport {
                     let start_byte = usize::try_from(start_byte).map_err(|_| {
                         MetalError::InvalidArg("start_index byte offset overflows usize")
                     })?;
-                    let index_offset = resolved[0].1.checked_add(start_byte).ok_or(
-                        MetalError::InvalidArg("indexed draw index offset overflows usize"),
-                    )?;
+                    let index_offset =
+                        resolved[0]
+                            .1
+                            .checked_add(start_byte)
+                            .ok_or(MetalError::InvalidArg(
+                                "indexed draw index offset overflows usize",
+                            ))?;
 
                     let vertex_bindings: Vec<BoundVertex> = resolved[1..]
                         .iter()
@@ -797,9 +862,7 @@ impl DirectMetalTransport {
                 .render_pipelines
                 .get(&segment.pipeline_id)
                 .ok_or_else(|| {
-                    MetalError::InternalError(
-                        "validated graphics pipeline disappeared".to_string(),
-                    )
+                    MetalError::InternalError("validated graphics pipeline disappeared".to_string())
                 })?;
             let attachment = RenderAttachment::color(retain_render_target(target)?);
             let attachment = if first_segment {
@@ -971,10 +1034,7 @@ impl DirectMetalTransport {
                 }
                 Command::DrawIndexed(draw) => {
                     has_graphics = true;
-                    if draw.pipeline_id == 0
-                        || draw.index_count == 0
-                        || draw.instance_count == 0
-                    {
+                    if draw.pipeline_id == 0 || draw.index_count == 0 || draw.instance_count == 0 {
                         return Err(MetalError::InvalidArg(
                             "indexed draw pipeline, index and instance counts must be nonzero",
                         ));
@@ -1000,9 +1060,7 @@ impl DirectMetalTransport {
                         ));
                     }
                     if draw.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
-                        return Err(MetalError::InvalidArg(
-                            "draw exceeds wire binding limit",
-                        ));
+                        return Err(MetalError::InvalidArg("draw exceeds wire binding limit"));
                     }
                     if draw.instance_count != 1 || draw.start_instance != 0 {
                         return Err(MetalError::NotSupported(
@@ -1490,6 +1548,1604 @@ impl DirectMetalTransport {
     }
 }
 
+/// Diagnostic encoder inventory for one version 3 submission.
+///
+/// The counts are observed while encoding, so a test can assert that a mixed
+/// command stream really produced one command buffer and one encoder per
+/// contiguous segment instead of trusting documentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncoderStats {
+    /// Command buffers created for the submission (0 for an empty plan, else 1).
+    pub command_buffers: u32,
+    /// `MTLComputeCommandEncoder`s opened.
+    pub compute_encoders: u32,
+    /// `MTLRenderCommandEncoder`s opened.
+    pub render_encoders: u32,
+    /// `MTLBlitCommandEncoder`s opened.
+    pub blit_encoders: u32,
+    /// Explicit `ResourceBarrier` commands executed.
+    pub barriers: u32,
+}
+
+/// Why preparing a v3 submission stopped before any command buffer existed.
+enum PrepareAbort {
+    /// A referenced pipeline, allocation, generation or surface is unknown.
+    UnknownHandle,
+    /// The stream is structurally invalid or uses an unsupported feature.
+    Error(MetalError),
+}
+
+impl From<MetalError> for PrepareAbort {
+    fn from(error: MetalError) -> Self {
+        Self::Error(error)
+    }
+}
+
+/// Thread grid of one prepared compute dispatch.
+enum PreparedGrid {
+    OneD {
+        threads: usize,
+        threads_per_group: usize,
+    },
+    ThreeD {
+        group_counts: MTLSize,
+        threads_per_group: MTLSize,
+    },
+}
+
+/// One resolved v3 compute dispatch.
+struct PreparedV3Dispatch {
+    pipeline: objc::Id,
+    grid: PreparedGrid,
+    bindings: Vec<BoundRange>,
+}
+
+/// One validated compute-segment command.
+enum PreparedComputeOp {
+    Pipeline(objc::Id),
+    Bytes { slot: usize, bytes: Vec<u8> },
+    Bind(Vec<BoundRange>),
+    Dispatch(PreparedV3Dispatch),
+    Barrier,
+}
+
+/// One validated render-segment command.
+enum PreparedRenderOp {
+    Pipeline {
+        state: objc::Id,
+        depth_state: Option<objc::Id>,
+    },
+    Viewport(RenderViewport),
+    Scissor(RenderScissorRect),
+    VertexBuffers(Vec<BoundVertex>),
+    VertexBytes {
+        slot: usize,
+        bytes: Vec<u8>,
+    },
+    Barrier,
+    Draw {
+        primitive: PrimitiveType,
+        vertex_start: usize,
+        vertex_count: usize,
+        instance_count: usize,
+        base_instance: usize,
+    },
+    DrawIndexed {
+        primitive: PrimitiveType,
+        index_count: usize,
+        index_type: IndexType,
+        index_buffer: objc::Id,
+        index_offset: usize,
+        base_vertex: isize,
+        instance_count: usize,
+        base_instance: usize,
+    },
+}
+
+/// One validated blit-segment command.
+enum PreparedBlitOp {
+    CopyBuffer {
+        src: objc::Id,
+        src_offset: usize,
+        dst: objc::Id,
+        dst_offset: usize,
+        length: usize,
+    },
+    CopyTexture {
+        src: objc::Id,
+        src_slice: usize,
+        src_level: usize,
+        dst: objc::Id,
+        dst_slice: usize,
+        dst_level: usize,
+        width: usize,
+        height: usize,
+        depth: usize,
+    },
+    /// A barrier between copies; the blit encoder boundary is the fence.
+    Barrier,
+}
+
+/// One prepared encoder segment. Descriptors and raw handles were resolved
+/// against the registry snapshot before the command buffer existed.
+enum PreparedSegment {
+    Compute(Vec<PreparedComputeOp>),
+    Render {
+        descriptor: objc::Id,
+        width: u32,
+        height: u32,
+        ops: Vec<PreparedRenderOp>,
+    },
+    Blit(Vec<PreparedBlitOp>),
+}
+
+fn to_usize(value: u64) -> Result<usize, MetalError> {
+    usize::try_from(value).map_err(|_| MetalError::InvalidArg("byte offset exceeds host usize"))
+}
+
+fn map_load_op(load: LoadOp) -> LoadAction {
+    match load {
+        LoadOp::Load => LoadAction::Load,
+        LoadOp::Clear => LoadAction::Clear,
+        LoadOp::DontCare => LoadAction::DontCare,
+    }
+}
+
+fn map_store_op(store: StoreOp) -> StoreAction {
+    match store {
+        StoreOp::Store => StoreAction::Store,
+        StoreOp::DontCare => StoreAction::DontCare,
+    }
+}
+
+fn map_topology(topology: PrimitiveTopology) -> PrimitiveType {
+    match topology {
+        PrimitiveTopology::PointList => PrimitiveType::Point,
+        PrimitiveTopology::LineList => PrimitiveType::Line,
+        PrimitiveTopology::LineStrip => PrimitiveType::LineStrip,
+        PrimitiveTopology::TriangleList => PrimitiveType::Triangle,
+        PrimitiveTopology::TriangleStrip => PrimitiveType::TriangleStrip,
+    }
+}
+
+fn map_index_format(format: IndexFormat) -> IndexType {
+    match format {
+        IndexFormat::Uint16 => IndexType::Uint16,
+        IndexFormat::Uint32 => IndexType::Uint32,
+    }
+}
+
+fn index_stride(index_type: IndexType) -> u64 {
+    match index_type {
+        IndexType::Uint16 => 2,
+        IndexType::Uint32 => 4,
+    }
+}
+
+/// Resolves one wire buffer range against `allocations` and the registry.
+///
+/// Returns the raw `MTLBuffer`, the byte offset and the declared range length.
+/// `None` means an unknown handle, zero field or an out-of-bounds range, which
+/// the caller reports as `UnknownHandle` exactly like [`Self::submit_batch`].
+fn resolve_buffer_range(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    allocation_id: u64,
+    generation: u32,
+    offset: u64,
+    length: u64,
+) -> Option<(objc::Id, usize, u64)> {
+    if allocation_id == 0
+        || generation == 0
+        || length == 0
+        || length > wire::MAX_RESOURCE_LEN
+        || !offset.is_multiple_of(MTL_BUFFER_OFFSET_ALIGNMENT)
+    {
+        return None;
+    }
+    let registered_id = *allocations.get(&(allocation_id, generation))?;
+    let registered = state.buffers.get(&registered_id.0)?;
+    let end = offset.checked_add(length)?;
+    if end > registered.len as u64 {
+        return None;
+    }
+    Some((
+        registered.buffer.as_raw(),
+        usize::try_from(offset).ok()?,
+        length,
+    ))
+}
+
+/// Resolves one texture handle and reads its geometry.
+fn resolve_texture(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    allocation_id: u64,
+    generation: u32,
+) -> Option<(objc::Id, crate::macos::render::TextureInfo)> {
+    if allocation_id == 0 || generation == 0 {
+        return None;
+    }
+    let registered_id = *allocations.get(&(allocation_id, generation))?;
+    let texture = state.textures.get(&registered_id.0)?;
+    let info = texture_info(texture.as_raw()).ok()?;
+    Some((texture.as_raw(), info))
+}
+
+/// Resolves a wire binding list to consecutive slots starting at `start_slot`.
+fn resolve_binding_slots(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    bindings: &[wire::BufferBinding],
+    start_slot: usize,
+) -> Result<Vec<BoundRange>, PrepareAbort> {
+    let mut resolved = Vec::with_capacity(bindings.len());
+    for (index, binding) in bindings.iter().enumerate() {
+        let (buffer, offset, _length) = resolve_buffer_range(
+            state,
+            allocations,
+            binding.allocation_id,
+            binding.generation,
+            binding.offset,
+            binding.length,
+        )
+        .ok_or(PrepareAbort::UnknownHandle)?;
+        let slot = start_slot
+            .checked_add(index)
+            .ok_or(MetalError::InvalidArg("buffer slot overflows usize"))?;
+        resolved.push((buffer, offset, slot));
+    }
+    Ok(resolved)
+}
+
+fn validate_viewport(
+    viewport: &crate::wire_v3::Viewport,
+    width: u32,
+    height: u32,
+) -> Result<RenderViewport, MetalError> {
+    if !(viewport.x.is_finite()
+        && viewport.y.is_finite()
+        && viewport.width.is_finite()
+        && viewport.height.is_finite()
+        && viewport.near.is_finite()
+        && viewport.far.is_finite())
+    {
+        return Err(MetalError::InvalidArg("viewport values must be finite"));
+    }
+    if viewport.x < 0.0 || viewport.y < 0.0 {
+        return Err(MetalError::InvalidArg(
+            "viewport origin must not be negative",
+        ));
+    }
+    if viewport.width <= 0.0 || viewport.height <= 0.0 {
+        return Err(MetalError::InvalidArg(
+            "viewport width and height must be positive",
+        ));
+    }
+    if viewport.x + viewport.width > f64::from(width)
+        || viewport.y + viewport.height > f64::from(height)
+    {
+        return Err(MetalError::InvalidArg(
+            "viewport exceeds the render pass attachment extent",
+        ));
+    }
+    Ok(RenderViewport {
+        origin_x: viewport.x,
+        origin_y: viewport.y,
+        width: viewport.width,
+        height: viewport.height,
+        znear: viewport.near,
+        zfar: viewport.far,
+    })
+}
+
+fn validate_scissor(
+    scissor: &crate::wire_v3::ScissorRect,
+    width: u32,
+    height: u32,
+) -> Result<RenderScissorRect, MetalError> {
+    if scissor.width == 0 || scissor.height == 0 {
+        return Err(MetalError::InvalidArg(
+            "scissor width and height must be nonzero",
+        ));
+    }
+    let end_x = scissor
+        .x
+        .checked_add(scissor.width)
+        .ok_or(MetalError::InvalidArg("scissor X extent overflows u32"))?;
+    let end_y = scissor
+        .y
+        .checked_add(scissor.height)
+        .ok_or(MetalError::InvalidArg("scissor Y extent overflows u32"))?;
+    if end_x > width || end_y > height {
+        return Err(MetalError::InvalidArg(
+            "scissor exceeds the render pass attachment extent",
+        ));
+    }
+    Ok(RenderScissorRect {
+        x: scissor.x,
+        y: scissor.y,
+        width: scissor.width,
+        height: scissor.height,
+    })
+}
+
+/// Validates and prepares a compute segment.
+fn prepare_compute_segment(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: &[CommandV3],
+    range: Range<usize>,
+) -> Result<Vec<PreparedComputeOp>, PrepareAbort> {
+    let mut ops = Vec::new();
+    for index in range {
+        match &commands[index] {
+            CommandV3::SetComputePipeline(pipeline) => {
+                let pso = state
+                    .pipelines
+                    .get(&pipeline.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedComputeOp::Pipeline(pso.as_raw()));
+            }
+            CommandV3::SetPipeline(pipeline) => {
+                let pso = state
+                    .pipelines
+                    .get(&pipeline.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedComputeOp::Pipeline(pso.as_raw()));
+            }
+            CommandV3::Dispatch1d(dispatch) => {
+                if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
+                    return Err(
+                        MetalError::InvalidArg("dispatch exceeds wire binding limit").into(),
+                    );
+                }
+                let pso = state
+                    .pipelines
+                    .get(&dispatch.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let threads_per_group = dispatch.threads_per_group as usize;
+                if threads_per_group as u64 > pipeline_thread_limit(pso) {
+                    return Err(MetalError::InvalidArg(
+                        "dispatch threads_per_group exceeds pipeline threadgroup maximum",
+                    )
+                    .into());
+                }
+                ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
+                    pipeline: pso.as_raw(),
+                    grid: PreparedGrid::OneD {
+                        threads: dispatch.threads as usize,
+                        threads_per_group,
+                    },
+                    bindings: resolve_binding_slots(state, allocations, &dispatch.bindings, 0)?,
+                }));
+            }
+            CommandV3::Dispatch3d(dispatch) => {
+                if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
+                    return Err(
+                        MetalError::InvalidArg("dispatch exceeds wire binding limit").into(),
+                    );
+                }
+                let pso = state
+                    .pipelines
+                    .get(&dispatch.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let local_threads =
+                    dispatch
+                        .checked_threads_per_group()
+                        .ok_or(MetalError::InvalidArg(
+                            "3D dispatch local thread product overflows u64",
+                        ))?;
+                if local_threads > pipeline_thread_limit(pso) {
+                    return Err(MetalError::InvalidArg(
+                        "3D dispatch threadgroup exceeds pipeline threadgroup maximum",
+                    )
+                    .into());
+                }
+                ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
+                    pipeline: pso.as_raw(),
+                    grid: PreparedGrid::ThreeD {
+                        group_counts: MTLSize {
+                            width: dispatch.group_counts[0] as usize,
+                            height: dispatch.group_counts[1] as usize,
+                            depth: dispatch.group_counts[2] as usize,
+                        },
+                        threads_per_group: MTLSize {
+                            width: dispatch.threads_per_group[0] as usize,
+                            height: dispatch.threads_per_group[1] as usize,
+                            depth: dispatch.threads_per_group[2] as usize,
+                        },
+                    },
+                    bindings: resolve_binding_slots(state, allocations, &dispatch.bindings, 0)?,
+                }));
+            }
+            CommandV3::DispatchMesh(_) => {
+                // No mesh pipeline can be registered on this transport, so a
+                // mesh dispatch never has validated work to run. Refuse it
+                // loudly instead of silently skipping the command.
+                return Err(MetalError::NotSupported(
+                    "mesh-shader pipelines are not registered; DispatchMesh is refused",
+                )
+                .into());
+            }
+            CommandV3::SetRootConstants(constants) => {
+                if constants.bytes.is_empty()
+                    || constants.bytes.len() > crate::wire_v3::MAX_ROOT_CONSTANT_BYTES_V3
+                {
+                    return Err(
+                        MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
+                    );
+                }
+                ops.push(PreparedComputeOp::Bytes {
+                    slot: usize::from(constants.slot),
+                    bytes: constants.bytes.clone(),
+                });
+            }
+            CommandV3::SetDescriptorTable(table) => {
+                if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
+                {
+                    return Err(
+                        MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
+                    );
+                }
+                if table.kind == DescriptorKind::Sampler {
+                    return Err(MetalError::NotSupported(
+                        "sampler descriptor tables are not bound by the native compute path",
+                    )
+                    .into());
+                }
+                ops.push(PreparedComputeOp::Bind(resolve_binding_slots(
+                    state,
+                    allocations,
+                    &table.bindings,
+                    usize::from(table.base_register),
+                )?));
+            }
+            CommandV3::SetRootBufferView(view) => {
+                let (buffer, offset, _length) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    view.allocation_id,
+                    view.generation,
+                    view.offset,
+                    view.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedComputeOp::Bind(vec![(
+                    buffer,
+                    offset,
+                    usize::from(view.slot),
+                )]));
+            }
+            CommandV3::ResourceBarrier(barrier) => {
+                if resolve_barrier_entries(state, allocations, &barrier.entries).is_none() {
+                    return Err(PrepareAbort::UnknownHandle);
+                }
+                ops.push(PreparedComputeOp::Barrier);
+            }
+            _ => {
+                return Err(
+                    MetalError::InvalidArg("command is not valid in a compute segment").into(),
+                );
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Validates and prepares one render segment, including its pass descriptor.
+fn prepare_render_segment(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: &[CommandV3],
+    range: Range<usize>,
+    pass: &BeginRenderPass,
+) -> Result<(objc::Id, u32, u32, Vec<PreparedRenderOp>), PrepareAbort> {
+    let mut colors = Vec::with_capacity(pass.colors.len());
+    let mut color_formats = Vec::with_capacity(pass.colors.len());
+    let mut extent: Option<(u32, u32)> = None;
+    for color in &pass.colors {
+        let (texture, info) =
+            resolve_texture(state, allocations, color.allocation_id, color.generation)
+                .ok_or(PrepareAbort::UnknownHandle)?;
+        if !info.format.is_color() {
+            return Err(MetalError::InvalidArg(
+                "colour attachment must be BGRA8Unorm or RGBA8Unorm",
+            )
+            .into());
+        }
+        if u32::from(color.mip_level) >= info.mip_levels || u32::from(color.slice) >= info.slices {
+            return Err(MetalError::InvalidArg(
+                "colour attachment mip level or slice is out of range",
+            )
+            .into());
+        }
+        match extent {
+            Some(existing) if existing != (info.width, info.height) => {
+                return Err(MetalError::InvalidArg(
+                    "all render pass attachments must share one extent",
+                )
+                .into());
+            }
+            Some(_) => {}
+            None => extent = Some((info.width, info.height)),
+        }
+        color_formats.push(info.format);
+        colors.push(RawColorAttachment {
+            texture,
+            load: map_load_op(color.load),
+            store: map_store_op(color.store),
+            clear_color: color.clear_color,
+            level: usize::from(color.mip_level),
+            slice: usize::from(color.slice),
+        });
+    }
+    let (width, height) = extent.ok_or(MetalError::InvalidArg(
+        "render pass needs at least one colour attachment",
+    ))?;
+
+    let mut depth_format = None;
+    let depth = match &pass.depth_stencil {
+        Some(depth) => {
+            let (texture, info) =
+                resolve_texture(state, allocations, depth.allocation_id, depth.generation)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+            if !info.format.is_depth() {
+                return Err(MetalError::InvalidArg(
+                    "depth attachment must be Depth32Float or Depth32Float_Stencil8",
+                )
+                .into());
+            }
+            if (info.width, info.height) != (width, height) {
+                return Err(MetalError::InvalidArg(
+                    "depth attachment size must match the colour attachments",
+                )
+                .into());
+            }
+            if u32::from(depth.mip_level) >= info.mip_levels
+                || u32::from(depth.slice) >= info.slices
+            {
+                return Err(MetalError::InvalidArg(
+                    "depth attachment mip level or slice is out of range",
+                )
+                .into());
+            }
+            depth_format = Some(info.format);
+            Some(RawDepthAttachment {
+                texture,
+                has_stencil: info.format.has_stencil(),
+                depth_load: map_load_op(depth.depth_load),
+                depth_store: map_store_op(depth.depth_store),
+                clear_depth: f64::from(depth.clear_depth),
+                stencil_load: map_load_op(depth.stencil_load),
+                stencil_store: map_store_op(depth.stencil_store),
+                clear_stencil: depth.clear_stencil,
+                level: usize::from(depth.mip_level),
+                slice: usize::from(depth.slice),
+            })
+        }
+        None => None,
+    };
+
+    let descriptor = build_mrt_render_pass_descriptor(&colors, depth.as_ref())?;
+
+    let mut ops = Vec::new();
+    let mut current_pipeline = false;
+    let mut index_binding: Option<(objc::Id, usize, IndexType, u64)> = None;
+    let mut topology = PrimitiveType::Triangle;
+    for index in range {
+        match &commands[index] {
+            CommandV3::BeginRenderPass(_) | CommandV3::EndRenderPass => continue,
+            CommandV3::SetGraphicsPipeline(pipeline) => {
+                let graphics = state
+                    .render_pipelines
+                    .get(&pipeline.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if graphics.color_formats() != color_formats.as_slice() {
+                    return Err(MetalError::InvalidArg(
+                        "graphics pipeline colour formats do not match the render pass",
+                    )
+                    .into());
+                }
+                if graphics.depth_format() != depth_format {
+                    return Err(MetalError::InvalidArg(
+                        "graphics pipeline depth format does not match the render pass",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::Pipeline {
+                    state: graphics.state_raw(),
+                    depth_state: graphics.depth_state_raw(),
+                });
+                current_pipeline = true;
+            }
+            CommandV3::SetPipeline(pipeline) => {
+                let graphics = state
+                    .render_pipelines
+                    .get(&pipeline.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if graphics.color_formats() != color_formats.as_slice() {
+                    return Err(MetalError::InvalidArg(
+                        "graphics pipeline colour formats do not match the render pass",
+                    )
+                    .into());
+                }
+                if graphics.depth_format() != depth_format {
+                    return Err(MetalError::InvalidArg(
+                        "graphics pipeline depth format does not match the render pass",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::Pipeline {
+                    state: graphics.state_raw(),
+                    depth_state: graphics.depth_state_raw(),
+                });
+                current_pipeline = true;
+            }
+            CommandV3::SetMeshPipeline(_) => {
+                return Err(MetalError::NotSupported(
+                    "mesh-shader pipelines are not registered; SetMeshPipeline is refused",
+                )
+                .into());
+            }
+            CommandV3::SetViewport(viewport) => {
+                ops.push(PreparedRenderOp::Viewport(validate_viewport(
+                    viewport, width, height,
+                )?));
+            }
+            CommandV3::SetScissor(scissor) => {
+                ops.push(PreparedRenderOp::Scissor(validate_scissor(
+                    scissor, width, height,
+                )?));
+            }
+            CommandV3::SetPrimitiveTopology(wire_topology) => {
+                topology = map_topology(*wire_topology);
+            }
+            CommandV3::SetVertexBuffers(set) => {
+                if set.buffers.is_empty() || set.buffers.len() > crate::wire_v3::MAX_VERTEX_BUFFERS
+                {
+                    return Err(
+                        MetalError::InvalidArg("vertex buffer set needs 1..=16 buffers").into(),
+                    );
+                }
+                for buffer in &set.buffers {
+                    if buffer.stride == 0 {
+                        return Err(
+                            MetalError::InvalidArg("vertex buffer stride must be nonzero").into(),
+                        );
+                    }
+                }
+                let bindings = set
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, buffer)| {
+                        let (raw, byte_offset, _length) = resolve_buffer_range(
+                            state,
+                            allocations,
+                            buffer.allocation_id,
+                            buffer.generation,
+                            buffer.offset,
+                            buffer.length,
+                        )
+                        .ok_or(PrepareAbort::UnknownHandle)?;
+                        let slot = usize::from(set.start_slot)
+                            .checked_add(offset)
+                            .ok_or(MetalError::InvalidArg("vertex buffer slot overflows usize"))?;
+                        Ok((raw, byte_offset, slot))
+                    })
+                    .collect::<Result<Vec<_>, PrepareAbort>>()?;
+                ops.push(PreparedRenderOp::VertexBuffers(bindings));
+            }
+            CommandV3::SetIndexBuffer(binding) => {
+                let (buffer, offset, length) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    binding.allocation_id,
+                    binding.generation,
+                    binding.offset,
+                    binding.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let index_type = map_index_format(binding.format);
+                if !offset.is_multiple_of(index_stride(index_type) as usize) {
+                    return Err(MetalError::InvalidArg(
+                        "index buffer offset is not aligned to the index type",
+                    )
+                    .into());
+                }
+                // The binding is captured by each indexed draw; no encoder
+                // call happens until a draw uses it.
+                index_binding = Some((buffer, offset, index_type, length));
+            }
+            CommandV3::SetRootConstants(constants) => {
+                if constants.bytes.is_empty()
+                    || constants.bytes.len() > crate::wire_v3::MAX_ROOT_CONSTANT_BYTES_V3
+                {
+                    return Err(
+                        MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
+                    );
+                }
+                ops.push(PreparedRenderOp::VertexBytes {
+                    slot: usize::from(constants.slot),
+                    bytes: constants.bytes.clone(),
+                });
+            }
+            CommandV3::SetDescriptorTable(table) => {
+                if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
+                {
+                    return Err(
+                        MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
+                    );
+                }
+                if table.kind == DescriptorKind::Sampler {
+                    return Err(MetalError::NotSupported(
+                        "sampler descriptor tables are not bound by the native graphics path",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::VertexBuffers(resolve_binding_slots(
+                    state,
+                    allocations,
+                    &table.bindings,
+                    usize::from(table.base_register),
+                )?));
+            }
+            CommandV3::SetRootBufferView(view) => {
+                let (buffer, offset, _length) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    view.allocation_id,
+                    view.generation,
+                    view.offset,
+                    view.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedRenderOp::VertexBuffers(vec![(
+                    buffer,
+                    offset,
+                    usize::from(view.slot),
+                )]));
+            }
+            CommandV3::ResourceBarrier(barrier) => {
+                if resolve_barrier_entries(state, allocations, &barrier.entries).is_none() {
+                    return Err(PrepareAbort::UnknownHandle);
+                }
+                ops.push(PreparedRenderOp::Barrier);
+            }
+            CommandV3::Draw(draw) => {
+                if !current_pipeline {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                if draw.vertex_count == 0 || draw.instance_count == 0 {
+                    return Err(MetalError::InvalidArg(
+                        "draw vertex and instance counts must be nonzero",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::Draw {
+                    primitive: topology,
+                    vertex_start: draw.start_vertex as usize,
+                    vertex_count: draw.vertex_count as usize,
+                    instance_count: draw.instance_count as usize,
+                    base_instance: draw.start_instance as usize,
+                });
+            }
+            CommandV3::DrawInstanced(draw) => {
+                if !current_pipeline {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                if draw.vertex_count_per_instance == 0 || draw.instance_count == 0 {
+                    return Err(MetalError::InvalidArg(
+                        "draw vertex and instance counts must be nonzero",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::Draw {
+                    primitive: topology,
+                    vertex_start: draw.start_vertex as usize,
+                    vertex_count: draw.vertex_count_per_instance as usize,
+                    instance_count: draw.instance_count as usize,
+                    base_instance: draw.start_instance as usize,
+                });
+            }
+            CommandV3::DrawIndexed(draw) => {
+                let (buffer, offset, index_type, index_count) =
+                    prepare_indexed_draw(&index_binding, draw.index_count, draw.start_index)?;
+                if !current_pipeline {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                if draw.instance_count == 0 {
+                    return Err(
+                        MetalError::InvalidArg("draw instance count must be nonzero").into(),
+                    );
+                }
+                ops.push(PreparedRenderOp::DrawIndexed {
+                    primitive: topology,
+                    index_count,
+                    index_type,
+                    index_buffer: buffer,
+                    index_offset: offset,
+                    base_vertex: draw.base_vertex as isize,
+                    instance_count: draw.instance_count as usize,
+                    base_instance: draw.start_instance as usize,
+                });
+            }
+            CommandV3::DrawIndexedInstanced(draw) => {
+                let (buffer, offset, index_type, index_count) = prepare_indexed_draw(
+                    &index_binding,
+                    draw.index_count_per_instance,
+                    draw.start_index,
+                )?;
+                if !current_pipeline {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                if draw.instance_count == 0 {
+                    return Err(
+                        MetalError::InvalidArg("draw instance count must be nonzero").into(),
+                    );
+                }
+                ops.push(PreparedRenderOp::DrawIndexed {
+                    primitive: topology,
+                    index_count,
+                    index_type,
+                    index_buffer: buffer,
+                    index_offset: offset,
+                    base_vertex: draw.base_vertex as isize,
+                    instance_count: draw.instance_count as usize,
+                    base_instance: draw.start_instance as usize,
+                });
+            }
+            _ => {
+                return Err(
+                    MetalError::InvalidArg("command is not valid in a render segment").into(),
+                );
+            }
+        }
+    }
+    Ok((descriptor, width, height, ops))
+}
+
+/// Resolves the index window of an indexed draw against the bound index buffer.
+fn prepare_indexed_draw(
+    index_binding: &Option<(objc::Id, usize, IndexType, u64)>,
+    index_count: u32,
+    start_index: u32,
+) -> Result<(objc::Id, usize, IndexType, usize), PrepareAbort> {
+    if index_count == 0 {
+        return Err(MetalError::InvalidArg("draw index count must be nonzero").into());
+    }
+    let Some((buffer, base_offset, index_type, length)) = *index_binding else {
+        return Err(
+            MetalError::InvalidArg("indexed draw requires a preceding SetIndexBuffer").into(),
+        );
+    };
+    let stride = index_stride(index_type);
+    let start_byte = u64::from(start_index)
+        .checked_mul(stride)
+        .ok_or(MetalError::InvalidArg("start_index overflows u64"))?;
+    let window = start_byte
+        .checked_add(
+            u64::from(index_count)
+                .checked_mul(stride)
+                .ok_or(MetalError::InvalidArg("index count overflows u64"))?,
+        )
+        .ok_or(MetalError::InvalidArg("indexed draw range overflows u64"))?;
+    if window > length {
+        return Err(
+            MetalError::InvalidArg("indexed draw range exceeds the index binding length").into(),
+        );
+    }
+    let offset = base_offset
+        .checked_add(to_usize(start_byte)?)
+        .ok_or(MetalError::InvalidArg(
+            "indexed draw index offset overflows usize",
+        ))?;
+    Ok((buffer, offset, index_type, index_count as usize))
+}
+
+/// Validates and prepares a blit segment.
+fn prepare_blit_segment(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: &[CommandV3],
+    range: Range<usize>,
+) -> Result<Vec<PreparedBlitOp>, PrepareAbort> {
+    let mut ops = Vec::new();
+    for index in range {
+        match &commands[index] {
+            CommandV3::CopyBuffer(copy) => {
+                if copy.length == 0 || !copy.length.is_multiple_of(4) {
+                    return Err(MetalError::InvalidArg(
+                        "buffer copy length must be nonzero and 4-byte aligned",
+                    )
+                    .into());
+                }
+                let (src, src_offset, _) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    copy.src_allocation_id,
+                    copy.src_generation,
+                    copy.src_offset,
+                    copy.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let (dst, dst_offset, _) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    copy.dst_allocation_id,
+                    copy.dst_generation,
+                    copy.dst_offset,
+                    copy.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedBlitOp::CopyBuffer {
+                    src,
+                    src_offset,
+                    dst,
+                    dst_offset,
+                    length: to_usize(copy.length)?,
+                });
+            }
+            CommandV3::CopyTexture(copy) => {
+                if copy.width == 0 || copy.height == 0 || copy.depth == 0 {
+                    return Err(MetalError::InvalidArg(
+                        "texture copy width, height and depth must be nonzero",
+                    )
+                    .into());
+                }
+                let (src, src_info) = resolve_texture(
+                    state,
+                    allocations,
+                    copy.src_allocation_id,
+                    copy.src_generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let (dst, dst_info) = resolve_texture(
+                    state,
+                    allocations,
+                    copy.dst_allocation_id,
+                    copy.dst_generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                if src_info.format != dst_info.format {
+                    return Err(MetalError::InvalidArg(
+                        "texture copy source and destination formats must match",
+                    )
+                    .into());
+                }
+                if u32::from(copy.src_mip) >= src_info.mip_levels
+                    || u32::from(copy.src_slice) >= src_info.slices
+                    || u32::from(copy.dst_mip) >= dst_info.mip_levels
+                    || u32::from(copy.dst_slice) >= dst_info.slices
+                {
+                    return Err(MetalError::InvalidArg(
+                        "texture copy mip level or slice is out of range",
+                    )
+                    .into());
+                }
+                if copy.width > src_info.width
+                    || copy.height > src_info.height
+                    || copy.width > dst_info.width
+                    || copy.height > dst_info.height
+                {
+                    return Err(MetalError::InvalidArg(
+                        "texture copy extent exceeds a texture dimension",
+                    )
+                    .into());
+                }
+                ops.push(PreparedBlitOp::CopyTexture {
+                    src,
+                    src_slice: usize::from(copy.src_slice),
+                    src_level: usize::from(copy.src_mip),
+                    dst,
+                    dst_slice: usize::from(copy.dst_slice),
+                    dst_level: usize::from(copy.dst_mip),
+                    width: copy.width as usize,
+                    height: copy.height as usize,
+                    depth: copy.depth as usize,
+                });
+            }
+            CommandV3::ResourceBarrier(barrier) => {
+                if resolve_barrier_entries(state, allocations, &barrier.entries).is_none() {
+                    return Err(PrepareAbort::UnknownHandle);
+                }
+                ops.push(PreparedBlitOp::Barrier);
+            }
+            _ => {
+                return Err(
+                    MetalError::InvalidArg("command is not valid in a blit segment").into(),
+                );
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Validates every handle and bound and builds the executable segment plan.
+fn prepare_v3(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: &[CommandV3],
+    plan: &[crate::macos::render::Segment],
+) -> Result<Vec<PreparedSegment>, PrepareAbort> {
+    let passes: Vec<&BeginRenderPass> = commands
+        .iter()
+        .filter_map(|command| match command {
+            CommandV3::BeginRenderPass(pass) => Some(pass),
+            _ => None,
+        })
+        .collect();
+    let mut prepared = Vec::with_capacity(plan.len());
+    for segment in plan {
+        match &segment.kind {
+            SegmentKind::Compute(range) => prepared.push(PreparedSegment::Compute(
+                prepare_compute_segment(state, allocations, commands, range.clone())?,
+            )),
+            SegmentKind::Render { pass_index, range } => {
+                let pass = passes.get(*pass_index).ok_or(MetalError::InternalError(
+                    "render segment names a missing BeginRenderPass".to_string(),
+                ))?;
+                let (descriptor, width, height, ops) =
+                    prepare_render_segment(state, allocations, commands, range.clone(), pass)?;
+                prepared.push(PreparedSegment::Render {
+                    descriptor,
+                    width,
+                    height,
+                    ops,
+                });
+            }
+            SegmentKind::Blit(range) => prepared.push(PreparedSegment::Blit(prepare_blit_segment(
+                state,
+                allocations,
+                commands,
+                range.clone(),
+            )?)),
+        }
+    }
+    Ok(prepared)
+}
+
+impl DirectMetalTransport {
+    /// Registers a render-target texture as an attachment allocation.
+    ///
+    /// The returned handle can be named by a v3 `BeginRenderPass` colour or
+    /// depth attachment through an `(allocation_id, generation)` entry in the
+    /// submission's allocation snapshot.
+    pub fn register_render_target(&self, target: &RenderTarget) -> Result<VmTextureId, MetalError> {
+        let texture = target.clone_objc()?;
+        let mut state = self.lock_state()?;
+        let id = state.alloc_id();
+        state.textures.insert(id, texture);
+        Ok(VmTextureId(id))
+    }
+
+    /// Registers the texture of an IOSurface-backed image as a v3 present sink.
+    ///
+    /// `Present` only checks that the handle names a registered surface; the
+    /// caller has already rendered into the same texture through a render pass,
+    /// so no copy happens on the present path.
+    pub fn register_present_surface(
+        &self,
+        surface_id: u64,
+        target: &RenderTarget,
+    ) -> Result<(), MetalError> {
+        if surface_id == 0 {
+            return Err(MetalError::InvalidArg(
+                "present surface handle must be nonzero",
+            ));
+        }
+        let texture = target.clone_objc()?;
+        let mut state = self.lock_state()?;
+        state.surfaces.insert(surface_id, texture);
+        Ok(())
+    }
+
+    /// Executes one version 3 submission on a single `MTLCommandBuffer`.
+    ///
+    /// See [`Self::submit_v3_with_stats`] for the full contract. This wrapper
+    /// discards the diagnostic encoder inventory.
+    pub fn submit_v3(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+    ) -> Result<Reply, MetalError> {
+        self.submit_v3_with_stats(submission, allocations)
+            .map(|(reply, _stats)| reply)
+    }
+
+    /// Executes one version 3 submission and reports its encoder inventory.
+    ///
+    /// # Contract
+    ///
+    /// * The command stream is first planned by
+    ///   [`crate::macos::render::plan_encoder_segments`], so illegal orderings
+    ///   are explicit errors before anything is resolved.
+    /// * Every pipeline, buffer, texture and surface handle, every bound range
+    ///   and every attachment extent/level/slice is validated against the live
+    ///   registry *before* the command buffer is created. An unknown handle
+    ///   returns [`ReplyStatus::UnknownHandle`] with no GPU work.
+    /// * Consecutive dispatches share one `MTLComputeCommandEncoder`,
+    ///   consecutive copies share one `MTLBlitCommandEncoder`, and each render
+    ///   pass gets one `MTLRenderCommandEncoder`; all of them live on one
+    ///   `MTLCommandBuffer`.
+    /// * `memoryBarrier` is emitted only for an explicit `ResourceBarrier`
+    ///   command, never per dispatch. A barrier between blit copies is realized
+    ///   by the blit encoder boundary, because `MTLBlitCommandEncoder` has no
+    ///   barrier API.
+    /// * A list identity executes at most once: a replay returns
+    ///   [`ReplyStatus::AlreadyExecuted`] with no GPU work, mirroring
+    ///   [`crate::cmdlist::ListLedger`]. A validation refusal does not consume
+    ///   the identity, so the caller may retry a corrected submission.
+    /// * `DispatchMesh` and `SetMeshPipeline` return
+    ///   [`MetalError::NotSupported`] because no mesh pipeline can be
+    ///   registered on this transport; nothing is silently skipped.
+    pub fn submit_v3_with_stats(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+    ) -> Result<(Reply, EncoderStats), MetalError> {
+        if submission.sequence == 0 {
+            return Err(MetalError::InvalidArg(
+                "submission sequence must be nonzero",
+            ));
+        }
+        if submission.commands.len() > crate::wire_v3::MAX_COMMANDS_V3 {
+            return Err(MetalError::InvalidArg(
+                "submission exceeds the v3 command limit",
+            ));
+        }
+        if let Some(list) = submission.list
+            && (list.list_id == 0 || list.list_generation == 0)
+        {
+            return Err(MetalError::InvalidArg(
+                "list identity fields must be nonzero",
+            ));
+        }
+        let reply = |status| Reply {
+            sequence: submission.sequence,
+            status,
+        };
+        let plan = plan_encoder_segments(&submission.commands)?;
+        let _pool = AutoreleasePool::new();
+        let mut state = self.lock_state()?;
+        let list_key = submission
+            .list
+            .map(|list| (list.list_id, list.list_generation));
+        if let Some((list_id, generation)) = list_key
+            && state.list_was_executed(list_id, generation)
+        {
+            return Ok((reply(ReplyStatus::AlreadyExecuted), EncoderStats::default()));
+        }
+        for command in &submission.commands {
+            if let CommandV3::Present(present) = command
+                && !state.surfaces.contains_key(&present.surface_id)
+            {
+                return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
+            }
+        }
+
+        let prepared = match prepare_v3(&state, allocations, &submission.commands, &plan) {
+            Ok(prepared) => prepared,
+            Err(PrepareAbort::UnknownHandle) => {
+                return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
+            }
+            Err(PrepareAbort::Error(error)) => return Err(error),
+        };
+
+        let mut stats = EncoderStats::default();
+        if prepared.is_empty() {
+            if let Some((list_id, generation)) = list_key {
+                state.mark_list_executed(list_id, generation);
+            }
+            return Ok((reply(ReplyStatus::Ok), stats));
+        }
+
+        let completed = self.encode_v3_segments(&prepared, &mut stats)?;
+        if let Some((list_id, generation)) = list_key {
+            state.mark_list_executed(list_id, generation);
+        }
+        Ok((
+            reply(if completed {
+                ReplyStatus::Ok
+            } else {
+                ReplyStatus::ExecutionFailed
+            }),
+            stats,
+        ))
+    }
+
+    /// Encodes prepared segments onto one command buffer and waits for it.
+    ///
+    /// Returns whether the command buffer completed successfully.
+    fn encode_v3_segments(
+        &self,
+        segments: &[PreparedSegment],
+        stats: &mut EncoderStats,
+    ) -> Result<bool, MetalError> {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: `queue_raw()` is a valid `MTLCommandQueue`; the command buffer
+        // is autoreleased and stays alive for this pool.
+        let cb = unsafe { objc::msg_send_id_0(self.queue_raw(), objc::sel(c"commandBuffer")) };
+        if cb.is_null() {
+            return Err(MetalError::InternalError(
+                "MTLCommandQueue.commandBuffer returned null".to_string(),
+            ));
+        }
+        stats.command_buffers = 1;
+
+        for segment in segments {
+            match segment {
+                PreparedSegment::Compute(ops) => {
+                    // SAFETY: `cb` is a live uncommitted command buffer.
+                    let enc =
+                        unsafe { objc::msg_send_id_0(cb, objc::sel(c"computeCommandEncoder")) };
+                    if enc.is_null() {
+                        return Err(MetalError::InternalError(
+                            "MTLCommandBuffer.computeCommandEncoder returned null".to_string(),
+                        ));
+                    }
+                    stats.compute_encoders += 1;
+                    for op in ops {
+                        match op {
+                            PreparedComputeOp::Pipeline(pipeline) => unsafe {
+                                objc::msg_send_void_1(
+                                    enc,
+                                    objc::sel(c"setComputePipelineState:"),
+                                    *pipeline,
+                                );
+                            },
+                            PreparedComputeOp::Bytes { slot, bytes } => unsafe {
+                                msg_send_set_bytes(enc, bytes.as_ptr(), bytes.len(), *slot);
+                            },
+                            PreparedComputeOp::Bind(bindings) => {
+                                for (buffer, offset, slot) in bindings {
+                                    // SAFETY: registry-held buffer, validated range.
+                                    unsafe {
+                                        objc::msg_send_set_buffer(enc, *buffer, *offset, *slot);
+                                    }
+                                }
+                            }
+                            PreparedComputeOp::Dispatch(dispatch) => {
+                                // SAFETY: `enc`, the pipeline and every buffer
+                                // are live for this encoder scope; ranges were
+                                // bounds-checked and the grid fits the pipeline.
+                                unsafe {
+                                    objc::msg_send_void_1(
+                                        enc,
+                                        objc::sel(c"setComputePipelineState:"),
+                                        dispatch.pipeline,
+                                    );
+                                    for (buffer, offset, slot) in &dispatch.bindings {
+                                        objc::msg_send_set_buffer(enc, *buffer, *offset, *slot);
+                                    }
+                                    match &dispatch.grid {
+                                        PreparedGrid::OneD {
+                                            threads,
+                                            threads_per_group,
+                                        } => objc::msg_send_dispatch_threads(
+                                            enc,
+                                            MTLSize {
+                                                width: *threads,
+                                                height: 1,
+                                                depth: 1,
+                                            },
+                                            MTLSize {
+                                                width: *threads_per_group,
+                                                height: 1,
+                                                depth: 1,
+                                            },
+                                        ),
+                                        PreparedGrid::ThreeD {
+                                            group_counts,
+                                            threads_per_group,
+                                        } => objc::msg_send_dispatch_threadgroups(
+                                            enc,
+                                            *group_counts,
+                                            *threads_per_group,
+                                        ),
+                                    }
+                                }
+                            }
+                            PreparedComputeOp::Barrier => {
+                                // SAFETY: `enc` is a live compute encoder, and
+                                // the scope covers every resource class.
+                                unsafe {
+                                    msg_send_void_usize(
+                                        enc,
+                                        objc::sel(c"memoryBarrierWithScope:"),
+                                        MTL_BARRIER_SCOPE_BUFFERS | MTL_BARRIER_SCOPE_TEXTURES,
+                                    );
+                                }
+                                stats.barriers += 1;
+                            }
+                        }
+                    }
+                    // SAFETY: `enc` is a live compute encoder awaiting its end.
+                    unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
+                }
+                PreparedSegment::Render {
+                    descriptor,
+                    width,
+                    height,
+                    ops,
+                } => {
+                    let mut encoder =
+                        RenderEncoder::new_with_descriptor(self, cb, *descriptor, *width, *height);
+                    encoder.ensure_started()?;
+                    stats.render_encoders += 1;
+                    for op in ops {
+                        match op {
+                            PreparedRenderOp::Pipeline { state, depth_state } => {
+                                encoder.set_pipeline_state(*state, *depth_state)?;
+                            }
+                            PreparedRenderOp::Viewport(viewport) => {
+                                encoder.set_viewport(*viewport)?;
+                            }
+                            PreparedRenderOp::Scissor(scissor) => {
+                                encoder.set_scissor_rect(*scissor)?;
+                            }
+                            PreparedRenderOp::VertexBuffers(bindings) => {
+                                for (buffer, offset, slot) in bindings {
+                                    // SAFETY: registry-held buffer, validated range.
+                                    unsafe {
+                                        encoder.set_vertex_buffer(*buffer, *offset, *slot)?;
+                                    }
+                                }
+                            }
+                            PreparedRenderOp::VertexBytes { slot, bytes } => {
+                                encoder.set_vertex_bytes(bytes, *slot)?;
+                            }
+                            PreparedRenderOp::Barrier => {
+                                encoder.memory_barrier(MTL_BARRIER_SCOPE_BUFFERS)?;
+                                stats.barriers += 1;
+                            }
+                            PreparedRenderOp::Draw {
+                                primitive,
+                                vertex_start,
+                                vertex_count,
+                                instance_count,
+                                base_instance,
+                            } => {
+                                encoder.draw_primitives_instanced(
+                                    *primitive,
+                                    *vertex_start,
+                                    *vertex_count,
+                                    *instance_count,
+                                    *base_instance,
+                                )?;
+                            }
+                            PreparedRenderOp::DrawIndexed {
+                                primitive,
+                                index_count,
+                                index_type,
+                                index_buffer,
+                                index_offset,
+                                base_vertex,
+                                instance_count,
+                                base_instance,
+                            } => {
+                                // SAFETY: index buffer is registry-held for the
+                                // whole synchronous submission and the index
+                                // window was validated.
+                                unsafe {
+                                    encoder.draw_indexed_primitives_instanced(
+                                        *primitive,
+                                        *index_count,
+                                        *index_type,
+                                        *index_buffer,
+                                        *index_offset,
+                                        *instance_count,
+                                        *base_vertex,
+                                        *base_instance,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    encoder.end_encoding();
+                }
+                PreparedSegment::Blit(ops) => {
+                    // SAFETY: `cb` is a live uncommitted command buffer.
+                    let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"blitCommandEncoder")) };
+                    if enc.is_null() {
+                        return Err(MetalError::InternalError(
+                            "MTLCommandBuffer.blitCommandEncoder returned null".to_string(),
+                        ));
+                    }
+                    stats.blit_encoders += 1;
+                    for op in ops {
+                        match op {
+                            PreparedBlitOp::CopyBuffer {
+                                src,
+                                src_offset,
+                                dst,
+                                dst_offset,
+                                length,
+                            } => {
+                                // SAFETY: both buffers are registry-held for the
+                                // synchronous submission and both ranges fit.
+                                unsafe {
+                                    msg_send_copy_buffer(
+                                        enc,
+                                        *src,
+                                        *src_offset,
+                                        *dst,
+                                        *dst_offset,
+                                        *length,
+                                    );
+                                }
+                            }
+                            PreparedBlitOp::CopyTexture {
+                                src,
+                                src_slice,
+                                src_level,
+                                dst,
+                                dst_slice,
+                                dst_level,
+                                width,
+                                height,
+                                depth,
+                            } => {
+                                // SAFETY: both textures are registry-held and
+                                // every mip/slice/extent was validated.
+                                unsafe {
+                                    msg_send_copy_texture(
+                                        enc,
+                                        *src,
+                                        *src_slice,
+                                        *src_level,
+                                        HostOrigin { x: 0, y: 0, z: 0 },
+                                        MTLSize {
+                                            width: *width,
+                                            height: *height,
+                                            depth: *depth,
+                                        },
+                                        *dst,
+                                        *dst_slice,
+                                        *dst_level,
+                                        HostOrigin { x: 0, y: 0, z: 0 },
+                                    );
+                                }
+                            }
+                            PreparedBlitOp::Barrier => {
+                                // The blit encoder has no barrier API; the
+                                // encoder boundary is the fence.
+                                stats.barriers += 1;
+                            }
+                        }
+                    }
+                    // SAFETY: `enc` is a live blit encoder awaiting its end.
+                    unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
+                }
+            }
+        }
+
+        // SAFETY: `cb` has every encoder closed.
+        unsafe {
+            objc::msg_send_void_0(cb, objc::sel(c"commit"));
+            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
+        }
+        // SAFETY: `cb` completed via `waitUntilCompleted`.
+        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        Ok(status == MTL_COMMAND_BUFFER_STATUS_COMPLETED)
+    }
+}
+
+/// `-[MTLComputeCommandEncoder setBytes:length:atIndex:]`.
+unsafe fn msg_send_set_bytes(enc: objc::Id, bytes: *const u8, len: usize, index: usize) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, *const c_void, usize, usize);
+    // SAFETY: Caller supplies a live compute encoder and `bytes` valid for
+    // `len` bytes during the call; Metal copies the payload immediately.
+    let f: Fn = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe {
+        f(
+            enc,
+            objc::sel(c"setBytes:length:atIndex:"),
+            bytes.cast(),
+            len,
+            index,
+        )
+    }
+}
+
+/// `-[MTLBlitCommandEncoder copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:]`.
+unsafe fn msg_send_copy_buffer(
+    enc: objc::Id,
+    src: objc::Id,
+    src_offset: usize,
+    dst: objc::Id,
+    dst_offset: usize,
+    size: usize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, objc::Id, usize, usize);
+    // SAFETY: Caller supplies a live blit encoder and two live buffers whose
+    // ranges were validated against the registry.
+    let f: Fn = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe {
+        f(
+            enc,
+            objc::sel(c"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+            src,
+            src_offset,
+            dst,
+            dst_offset,
+            size,
+        )
+    }
+}
+
+/// `-[MTLBlitCommandEncoder copyFromTexture:...toTexture:...]` for 2D slices.
+#[allow(clippy::too_many_arguments)]
+unsafe fn msg_send_copy_texture(
+    enc: objc::Id,
+    src: objc::Id,
+    src_slice: usize,
+    src_level: usize,
+    src_origin: HostOrigin,
+    src_size: MTLSize,
+    dst: objc::Id,
+    dst_slice: usize,
+    dst_level: usize,
+    dst_origin: HostOrigin,
+) {
+    type Fn = unsafe extern "C" fn(
+        objc::Id,
+        objc::Sel,
+        objc::Id,
+        usize,
+        usize,
+        HostOrigin,
+        MTLSize,
+        objc::Id,
+        usize,
+        usize,
+        HostOrigin,
+    );
+    // SAFETY: Caller supplies a live blit encoder and two live textures whose
+    // formats, mips, slices and extents were validated.
+    let f: Fn = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe {
+        f(
+            enc,
+            objc::sel(c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
+            src,
+            src_slice,
+            src_level,
+            src_origin,
+            src_size,
+            dst,
+            dst_slice,
+            dst_level,
+            dst_origin,
+        )
+    }
+}
+
+/// Sends a selector taking one `NSUInteger` and returning `void`.
+unsafe fn msg_send_void_usize(target: objc::Id, s: objc::Sel, value: usize) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize);
+    // SAFETY: Caller supplies a valid receiver/selector and an `NSUInteger`.
+    let f: Fn = unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe { f(target, s, value) }
+}
+
 impl MetalTransport for DirectMetalTransport {
     fn device_info(&self) -> Result<VmDeviceInfo, MetalError> {
         Ok(self.info)
@@ -1499,7 +3155,8 @@ impl MetalTransport for DirectMetalTransport {
         if ptr.is_null() || len == 0 {
             return Err(MetalError::InvalidArg("buffer pointer is null or len == 0"));
         }
-        let page_size = usize::try_from(self.info.page_size).unwrap_or(APPLE_SILICON_NOCOPY_PAGE_SIZE);
+        let page_size =
+            usize::try_from(self.info.page_size).unwrap_or(APPLE_SILICON_NOCOPY_PAGE_SIZE);
         let addr = ptr as usize;
         if !addr.is_multiple_of(page_size) || !len.is_multiple_of(page_size) {
             return Err(MetalError::AlignmentError {
@@ -1552,8 +3209,9 @@ impl MetalTransport for DirectMetalTransport {
             return Err(MetalError::InvalidArg("MSL source or entry point is empty"));
         }
         let _pool = AutoreleasePool::new();
-        let src_ns = objc::nsstring(source)
-            .ok_or(MetalError::InvalidArg("MSL source string allocation failed"))?;
+        let src_ns = objc::nsstring(source).ok_or(MetalError::InvalidArg(
+            "MSL source string allocation failed",
+        ))?;
 
         let mut ns_err = objc::empty_id();
         // SAFETY: `device` is a valid `MTLDevice`; `src_ns` is an immutable `NSString`; `options` is nil.
@@ -1646,11 +3304,7 @@ impl MetalTransport for DirectMetalTransport {
 
         // SAFETY: `enc` and `pso` are valid Metal objects for the active encoder scope.
         unsafe {
-            objc::msg_send_void_1(
-                enc,
-                objc::sel(c"setComputePipelineState:"),
-                pso.as_raw(),
-            );
+            objc::msg_send_void_1(enc, objc::sel(c"setComputePipelineState:"), pso.as_raw());
             for (slot, buf_raw) in bound.iter().enumerate() {
                 objc::msg_send_set_buffer(enc, *buf_raw, 0, slot);
             }
@@ -1715,8 +3369,9 @@ fn query_device_info(device: &ObjcObject) -> VmDeviceInfo {
     info.max_threads_per_threadgroup = u32::try_from(max_threads.width).unwrap_or(u32::MAX);
 
     // SAFETY: `[device recommendedMaxWorkingSetSize]` returns `uint64_t`.
-    info.recommended_max_working_set_size =
-        unsafe { objc::msg_send_u64_0(device.as_raw(), objc::sel(c"recommendedMaxWorkingSetSize")) };
+    info.recommended_max_working_set_size = unsafe {
+        objc::msg_send_u64_0(device.as_raw(), objc::sel(c"recommendedMaxWorkingSetSize"))
+    };
 
     let host_page = objc::host_page_size();
     let nocopy_page = if info.has_unified_memory != 0 {
@@ -1738,8 +3393,10 @@ mod tests {
     use std::process::Command as ProcessCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::DirectMetalTransport;
+    use super::{DirectMetalTransport, EncoderStats, read_back_render_target};
+    use crate::abi::VmBufferId;
     use crate::macos::msc::{MscUavDispatch, MscUavLayout};
+    use crate::macos::objc;
     use crate::macos::render::PixelFormat;
     use crate::transport::{MetalError, MetalTransport};
     use crate::wire::{
@@ -2038,9 +3695,8 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
 
             // SAFETY: `raw` is freshly allocated and writable for
             // `HOST_PAGE_BYTES` bytes; the slice does not outlive `page`.
-            let bytes = unsafe {
-                std::slice::from_raw_parts_mut(raw.cast::<u8>(), HOST_PAGE_BYTES)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(raw.cast::<u8>(), HOST_PAGE_BYTES) };
             bytes.fill(0);
             for (index, value) in [0u32, 1, 2].iter().enumerate() {
                 let at = HOST_INDEX_OFFSET + index * 4;
@@ -2139,9 +3795,9 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
         allocations.insert((1u64, 1u32), buffer);
 
         let submission = host_graphics_submission(pipeline.0);
-        let frame = wire::encode_submission(&submission).expect("graphics submission should encode");
-        let decoded =
-            wire::decode_submission(&frame).expect("graphics submission should decode");
+        let frame =
+            wire::encode_submission(&submission).expect("graphics submission should encode");
+        let decoded = wire::decode_submission(&frame).expect("graphics submission should decode");
         assert_eq!(decoded, submission);
 
         let reply = transport
@@ -2371,5 +4027,774 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
             MscUavLayout::DEFAULT.argument_buffer_index(),
             MscUavLayout::DEFAULT.address_offset()
         );
+    }
+    // ---- ADR-006: one command buffer, contiguous encoder segments ----------
+
+    use crate::macos::present::SurfaceImage;
+    use crate::macos::render::{GraphicsPipeline, RenderTarget};
+    use crate::wire_v3::{
+        BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture,
+        DepthStencilAttachment, DrawIndexedInstanced, DrawIndexedState, DrawInstanced, DrawState,
+        IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
+        RootConstantsV3, ScissorRect as WireScissor, StoreOp, SubmissionV3, VertexBuffer,
+        VertexBufferSet, Viewport as WireViewport,
+    };
+
+    const V3_EDGE: u32 = 64;
+    const V3_PIXELS: usize = (V3_EDGE * V3_EDGE) as usize;
+    const V3_RED: [u8; 4] = [0, 0, 255, 255];
+    const V3_GREEN: [u8; 4] = [0, 255, 0, 255];
+    const V3_BLUE: [u8; 4] = [255, 0, 0, 255];
+    const V3_WHITE: [u8; 4] = [255, 255, 255, 255];
+    const V3_CYAN: [u8; 4] = [255, 255, 0, 255];
+    const V3_MAGENTA: [u8; 4] = [255, 0, 255, 255];
+    const V3_YELLOW: [u8; 4] = [0, 255, 255, 255];
+    const V3_PAGE_BYTES: usize = 16 * 1024;
+    const V3_INDEX_PAGE_U16_AT: usize = 0;
+    const V3_INDEX_PAGE_U32_AT: usize = 16;
+    const V3_VERTEX_A_AT: usize = 32;
+    const V3_VERTEX_B_AT: usize = 80;
+    const V3_VERTEX_C_AT: usize = 128;
+    /// Three `float4` positions (16-byte stride, matching MSL `float4`).
+    const V3_VERTEX_BYTES: usize = 3 * 16;
+
+    /// 16 KiB-aligned host page used by `register_zerocopy`.
+    struct V3Page {
+        ptr: *mut c_void,
+        len: usize,
+    }
+
+    impl V3Page {
+        fn new(len: usize) -> Self {
+            unsafe extern "C" {
+                fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+            }
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation.
+            let rc = unsafe { posix_memalign(&mut raw, 16 * 1024, len) };
+            assert_eq!(rc, 0, "posix_memalign failed");
+            assert!(!raw.is_null());
+            // SAFETY: `raw` is a fresh allocation of `len` writable bytes.
+            unsafe { std::ptr::write_bytes(raw.cast::<u8>(), 0, len) };
+            Self { ptr: raw, len }
+        }
+
+        fn raw(&self) -> *mut u8 {
+            self.ptr.cast()
+        }
+
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            // SAFETY: `self.ptr` is a live allocation of `self.len` bytes.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.len) }
+        }
+
+        fn words(&self) -> &[u32] {
+            // SAFETY: The allocation is 16 KiB-aligned and `self.len` is a
+            // multiple of 4 for every caller.
+            unsafe { std::slice::from_raw_parts(self.ptr.cast::<u32>(), self.len / 4) }
+        }
+    }
+
+    impl Drop for V3Page {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn free(ptr: *mut c_void);
+            }
+            // SAFETY: `self.ptr` came from `posix_memalign` and is no longer
+            // registered with the transport when this guard drops.
+            unsafe { free(self.ptr) };
+        }
+    }
+
+    /// Retains an IOSurface-backed texture as an owning `RenderTarget`.
+    fn retained_surface_target(image: &SurfaceImage) -> RenderTarget {
+        // SAFETY: `texture_raw` is a live retained `MTLTexture` owned by `image`;
+        // `retain` adds a reference that `RenderTarget` takes ownership of.
+        let raw = unsafe { objc::msg_send_id_0(image.texture_raw(), objc::sel(c"retain")) };
+        assert!(!raw.is_null(), "surface texture retain returned nil");
+        // SAFETY: `raw` is the +1 reference created above.
+        unsafe { RenderTarget::from_retained_raw(raw) }.expect("surface texture should wrap")
+    }
+
+    fn v3_color_attachment(allocation_id: u64, load: LoadOp) -> ColorAttachment {
+        ColorAttachment {
+            allocation_id,
+            generation: 1,
+            mip_level: 0,
+            slice: 0,
+            load,
+            store: StoreOp::Store,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    fn v3_float4(values: [f32; 4]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    /// ADR-006 hardware proof: one submission mixes compute, two MRT render
+    /// passes with depth and scissor, texture and buffer blits, an explicit
+    /// barrier, a checksum compute over the first target's pixels and a present.
+    #[test]
+    fn v3_mixed_segments_one_command_buffer_mrt_depth_scissor_and_checksum() {
+        const V3_MSL: &str = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            struct VOut {
+                float4 position [[position]];
+                float4 color0 [[flat]];
+                float4 color1 [[flat]];
+            };
+
+            vertex VOut vm_v3_vertex(uint vid [[vertex_id]],
+                                     constant float4 *positions [[buffer(0)]],
+                                     constant float4 &color0 [[buffer(1)]],
+                                     constant float4 &color1 [[buffer(2)]]) {
+                VOut out;
+                out.position = positions[vid];
+                out.color0 = color0;
+                out.color1 = color1;
+                return out;
+            }
+
+            struct MrtOut {
+                float4 color0 [[color(0)]];
+                float4 color1 [[color(1)]];
+            };
+
+            fragment MrtOut vm_v3_fragment_mrt(VOut in [[stage_in]]) {
+                MrtOut out;
+                out.color0 = in.color0;
+                out.color1 = in.color1;
+                return out;
+            }
+
+            fragment float4 vm_v3_fragment_single(VOut in [[stage_in]]) {
+                return in.color0;
+            }
+
+            kernel void vm_v3_fill(device uint *data [[buffer(0)]],
+                                   uint tid [[thread_position_in_grid]]) {
+                data[tid] = tid + 1u;
+            }
+
+            kernel void vm_v3_checksum(device const uint *src [[buffer(0)]],
+                                       device uint *out [[buffer(1)]],
+                                       uint tid [[thread_position_in_grid]]) {
+                if (tid == 0u) {
+                    uint sum = 0u;
+                    for (uint i = 0u; i < 4096u; ++i) {
+                        sum += src[i];
+                    }
+                    out[0] = sum;
+                }
+            }
+        "#;
+
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let mut image0 = SurfaceImage::create(&transport, V3_EDGE, V3_EDGE)
+            .expect("first IOSurface target should be created");
+        let mut image1 = SurfaceImage::create(&transport, V3_EDGE, V3_EDGE)
+            .expect("second IOSurface target should be created");
+        let target0 = retained_surface_target(&image0);
+        let target1 = retained_surface_target(&image1);
+        let depth = transport
+            .create_render_target_2d(V3_EDGE, V3_EDGE, PixelFormat::Depth32Float)
+            .expect("depth target should be created");
+        let staging = transport
+            .create_shared_texture_2d(V3_EDGE, V3_EDGE, PixelFormat::Bgra8Unorm)
+            .expect("shared staging texture should be created");
+        assert_eq!(staging.bytes_per_row, V3_EDGE as usize * 4);
+        assert_eq!(staging.len, V3_PAGE_BYTES);
+
+        let t0 = transport
+            .register_render_target(&target0)
+            .expect("first target should register");
+        let t1 = transport
+            .register_render_target(&target1)
+            .expect("second target should register");
+        let depth_id = transport
+            .register_render_target(&depth)
+            .expect("depth target should register");
+        transport
+            .register_present_surface(u64::from(image1.surface_id()), &target1)
+            .expect("present surface should register");
+
+        // One page holds both index widths and all three vertex sets.
+        let mut geometry = V3Page::new(V3_PAGE_BYTES);
+        let bytes = geometry.bytes_mut();
+        let u16_indices: [u16; 3] = [0, 1, 2];
+        for (index, value) in u16_indices.iter().enumerate() {
+            let at = V3_INDEX_PAGE_U16_AT + index * 2;
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        let u32_indices: [u32; 3] = [0, 1, 2];
+        for (index, value) in u32_indices.iter().enumerate() {
+            let at = V3_INDEX_PAGE_U32_AT + index * 4;
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // A: full-screen triangle at z=0.9. B: centre triangle at z=0.1.
+        // C: full-screen triangle at z=0.95, drawn last and rejected by depth.
+        let vertices: [(&[f32; 12], usize); 3] = [
+            (
+                &[
+                    -1.0f32, -1.0, 0.9, 1.0, 3.0, -1.0, 0.9, 1.0, -1.0, 3.0, 0.9, 1.0,
+                ],
+                V3_VERTEX_A_AT,
+            ),
+            (
+                &[
+                    -0.5f32, -0.5, 0.1, 1.0, 0.5, -0.5, 0.1, 1.0, 0.0, 0.5, 0.1, 1.0,
+                ],
+                V3_VERTEX_B_AT,
+            ),
+            (
+                &[
+                    -1.0f32, -1.0, 0.95, 1.0, 3.0, -1.0, 0.95, 1.0, -1.0, 3.0, 0.95, 1.0,
+                ],
+                V3_VERTEX_C_AT,
+            ),
+        ];
+        for (positions, at) in vertices {
+            for (index, value) in positions.iter().enumerate() {
+                let offset = at + index * 4;
+                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let geometry_id = unsafe { transport.register_zerocopy(geometry.raw(), V3_PAGE_BYTES) }
+            .expect("geometry page should register");
+
+        let data = V3Page::new(V3_PAGE_BYTES);
+        let data_id = unsafe { transport.register_zerocopy(data.raw(), V3_PAGE_BYTES) }
+            .expect("stage-one buffer should register");
+        let copy_dst = V3Page::new(V3_PAGE_BYTES);
+        let copy_dst_id = unsafe { transport.register_zerocopy(copy_dst.raw(), V3_PAGE_BYTES) }
+            .expect("copy destination buffer should register");
+        let checksum = V3Page::new(V3_PAGE_BYTES);
+        let checksum_id = unsafe { transport.register_zerocopy(checksum.raw(), V3_PAGE_BYTES) }
+            .expect("checksum buffer should register");
+
+        let fill_pipeline = transport
+            .compile_msl(V3_MSL, "vm_v3_fill")
+            .expect("fill kernel should compile");
+        let checksum_pipeline = transport
+            .compile_msl(V3_MSL, "vm_v3_checksum")
+            .expect("checksum kernel should compile");
+        let mrt_pipeline = GraphicsPipeline::compile_mrt(
+            &transport,
+            V3_MSL,
+            "vm_v3_vertex",
+            "vm_v3_fragment_mrt",
+            &[PixelFormat::Bgra8Unorm, PixelFormat::Bgra8Unorm],
+            Some(PixelFormat::Depth32Float),
+        )
+        .expect("MRT pipeline with depth should compile");
+        let single_pipeline = GraphicsPipeline::compile_mrt(
+            &transport,
+            V3_MSL,
+            "vm_v3_vertex",
+            "vm_v3_fragment_single",
+            &[PixelFormat::Bgra8Unorm],
+            None,
+        )
+        .expect("single-target pipeline should compile");
+        let mrt_id = transport
+            .register_graphics_pipeline_state(mrt_pipeline)
+            .expect("MRT pipeline should register");
+        let single_id = transport
+            .register_graphics_pipeline_state(single_pipeline)
+            .expect("single-target pipeline should register");
+        assert_ne!(mrt_id.0, 0);
+        assert_ne!(single_id.0, 0);
+
+        let vertex = |offset: usize| VertexBuffer {
+            allocation_id: 8,
+            generation: 1,
+            offset: offset as u64,
+            stride: 16,
+            length: V3_VERTEX_BYTES as u64,
+        };
+        let viewport = WireViewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(V3_EDGE),
+            height: f64::from(V3_EDGE),
+            near: 0.0,
+            far: 1.0,
+        };
+        let full_scissor = WireScissor {
+            x: 0,
+            y: 0,
+            width: V3_EDGE,
+            height: V3_EDGE,
+        };
+        let half_scissor = WireScissor {
+            x: 0,
+            y: 0,
+            width: V3_EDGE / 2,
+            height: V3_EDGE,
+        };
+        let u16_index = IndexBufferBinding {
+            allocation_id: 8,
+            generation: 1,
+            offset: V3_INDEX_PAGE_U16_AT as u64,
+            length: 6,
+            format: IndexFormat::Uint16,
+        };
+        let u32_index = IndexBufferBinding {
+            allocation_id: 8,
+            generation: 1,
+            offset: V3_INDEX_PAGE_U32_AT as u64,
+            length: 12,
+            format: IndexFormat::Uint32,
+        };
+        let constants = |slot: u16, color: [f32; 4]| {
+            CommandV3::SetRootConstants(RootConstantsV3 {
+                slot,
+                bytes: v3_float4(color),
+            })
+        };
+
+        let mut commands = Vec::new();
+        commands.push(CommandV3::Dispatch1d(wire::Dispatch1d {
+            pipeline_id: fill_pipeline.0,
+            threads: 4096,
+            threads_per_group: 64,
+            bindings: vec![wire::BufferBinding {
+                allocation_id: 5,
+                generation: 1,
+                offset: 0,
+                length: V3_PAGE_BYTES as u64,
+            }],
+        }));
+        commands.push(CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![
+                v3_color_attachment(1, LoadOp::Clear),
+                v3_color_attachment(2, LoadOp::Clear),
+            ],
+            depth_stencil: Some(DepthStencilAttachment {
+                allocation_id: 3,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                depth_load: LoadOp::Clear,
+                depth_store: StoreOp::Store,
+                clear_depth: 1.0,
+                stencil_load: LoadOp::DontCare,
+                stencil_store: StoreOp::DontCare,
+                clear_stencil: 0,
+            }),
+        }));
+        commands.push(CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: mrt_id.0,
+        }));
+        commands.push(CommandV3::SetViewport(viewport));
+        commands.push(CommandV3::SetScissor(full_scissor));
+        commands.push(CommandV3::SetPrimitiveTopology(
+            PrimitiveTopology::TriangleList,
+        ));
+        commands.push(CommandV3::SetVertexBuffers(VertexBufferSet {
+            start_slot: 0,
+            buffers: vec![vertex(V3_VERTEX_A_AT)],
+        }));
+        commands.push(CommandV3::SetIndexBuffer(u16_index));
+        commands.push(constants(1, [1.0, 0.0, 0.0, 1.0]));
+        commands.push(constants(2, [0.0, 1.0, 1.0, 1.0]));
+        commands.push(CommandV3::DrawIndexed(DrawIndexedState {
+            index_count: 3,
+            instance_count: 1,
+            start_index: 0,
+            base_vertex: 0,
+            start_instance: 0,
+        }));
+        commands.push(CommandV3::SetVertexBuffers(VertexBufferSet {
+            start_slot: 0,
+            buffers: vec![vertex(V3_VERTEX_B_AT)],
+        }));
+        commands.push(constants(1, [0.0, 1.0, 0.0, 1.0]));
+        commands.push(constants(2, [1.0, 0.0, 1.0, 1.0]));
+        commands.push(CommandV3::DrawInstanced(DrawInstanced {
+            vertex_count_per_instance: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }));
+        commands.push(CommandV3::SetVertexBuffers(VertexBufferSet {
+            start_slot: 0,
+            buffers: vec![vertex(V3_VERTEX_C_AT)],
+        }));
+        commands.push(CommandV3::SetIndexBuffer(u32_index));
+        commands.push(constants(1, [0.0, 0.0, 1.0, 1.0]));
+        commands.push(constants(2, [1.0, 1.0, 1.0, 1.0]));
+        commands.push(CommandV3::DrawIndexedInstanced(DrawIndexedInstanced {
+            index_count_per_instance: 3,
+            instance_count: 1,
+            start_index: 0,
+            base_vertex: 0,
+            start_instance: 0,
+        }));
+        commands.push(CommandV3::EndRenderPass);
+        commands.push(CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![v3_color_attachment(1, LoadOp::Load)],
+            depth_stencil: None,
+        }));
+        commands.push(CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: single_id.0,
+        }));
+        commands.push(CommandV3::SetViewport(viewport));
+        commands.push(CommandV3::SetScissor(half_scissor));
+        commands.push(CommandV3::SetVertexBuffers(VertexBufferSet {
+            start_slot: 0,
+            buffers: vec![vertex(V3_VERTEX_C_AT)],
+        }));
+        commands.push(constants(1, [1.0, 1.0, 0.0, 1.0]));
+        commands.push(constants(2, [1.0, 1.0, 0.0, 1.0]));
+        commands.push(CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }));
+        commands.push(CommandV3::EndRenderPass);
+        commands.push(CommandV3::CopyTexture(CopyTexture {
+            src_allocation_id: 1,
+            src_generation: 1,
+            src_mip: 0,
+            src_slice: 0,
+            dst_allocation_id: 4,
+            dst_generation: 1,
+            dst_mip: 0,
+            dst_slice: 0,
+            width: V3_EDGE,
+            height: V3_EDGE,
+            depth: 1,
+        }));
+        commands.push(CommandV3::CopyBuffer(CopyBuffer {
+            src_allocation_id: 5,
+            src_generation: 1,
+            src_offset: 0,
+            dst_allocation_id: 6,
+            dst_generation: 1,
+            dst_offset: 0,
+            length: V3_PAGE_BYTES as u64,
+        }));
+        commands.push(CommandV3::ResourceBarrier(wire::ResourceBarrier {
+            entries: vec![wire::BarrierEntry {
+                allocation_id: 4,
+                generation: 1,
+                offset: 0,
+                length: V3_PAGE_BYTES as u64,
+                before_state: 0,
+                after_state: 1,
+            }],
+        }));
+        commands.push(CommandV3::Dispatch1d(wire::Dispatch1d {
+            pipeline_id: checksum_pipeline.0,
+            threads: 1,
+            threads_per_group: 1,
+            bindings: vec![
+                wire::BufferBinding {
+                    allocation_id: 4,
+                    generation: 1,
+                    offset: 0,
+                    length: V3_PAGE_BYTES as u64,
+                },
+                wire::BufferBinding {
+                    allocation_id: 7,
+                    generation: 1,
+                    offset: 0,
+                    length: 16,
+                },
+            ],
+        }));
+        commands.push(CommandV3::Present(Present {
+            surface_id: u64::from(image1.surface_id()),
+            sync_interval: 1,
+        }));
+
+        let mut allocations = HashMap::new();
+        allocations.insert((1u64, 1u32), VmBufferId(t0.0));
+        allocations.insert((2u64, 1u32), VmBufferId(t1.0));
+        allocations.insert((3u64, 1u32), VmBufferId(depth_id.0));
+        allocations.insert((4u64, 1u32), staging.buffer_id);
+        allocations.insert((5u64, 1u32), data_id);
+        allocations.insert((6u64, 1u32), copy_dst_id);
+        allocations.insert((7u64, 1u32), checksum_id);
+        allocations.insert((8u64, 1u32), geometry_id);
+
+        let submission = SubmissionV3 {
+            sequence: 41,
+            list: Some(wire::ListIdentity {
+                list_id: 5,
+                list_generation: 1,
+            }),
+            commands,
+        };
+
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&submission, &allocations)
+            .expect("v3 submission should execute");
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 41,
+                status: ReplyStatus::Ok,
+            }
+        );
+        assert_eq!(
+            stats,
+            EncoderStats {
+                command_buffers: 1,
+                compute_encoders: 2,
+                render_encoders: 2,
+                blit_encoders: 1,
+                barriers: 1,
+            },
+            "ADR-006 segmentation must be observable"
+        );
+
+        // Stage one wrote exactly 4096 dwords; the CopyBuffer duplicated them.
+        for (index, &value) in data.words().iter().enumerate() {
+            assert_eq!(value, index as u32 + 1, "fill mismatch at dword {index}");
+        }
+        assert_eq!(
+            copy_dst.words(),
+            data.words(),
+            "CopyBuffer must duplicate the fill stage on the same command buffer"
+        );
+
+        let rows0 =
+            read_back_render_target(&transport, &target0).expect("first target should read back");
+        let rows1 =
+            read_back_render_target(&transport, &target1).expect("second target should read back");
+        assert_eq!(rows0.len(), V3_PIXELS * 4);
+        assert_eq!(rows1.len(), V3_PIXELS * 4);
+        let pixels0: Vec<[u8; 4]> = rows0
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect();
+        let pixels1: Vec<[u8; 4]> = rows1
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect();
+        let at = |x: u32, y: u32| (y * V3_EDGE + x) as usize;
+
+        // Pass two's scissored full-screen triangle covers the left half only.
+        for y in 0..V3_EDGE {
+            for x in 0..V3_EDGE / 2 {
+                assert_eq!(
+                    pixels0[at(x, y)],
+                    V3_YELLOW,
+                    "target 0 ({x},{y}) should be the scissored yellow quad"
+                );
+            }
+        }
+        assert_eq!(pixels0[at(63, 0)], V3_RED, "right half keeps pass one");
+        assert_eq!(
+            pixels0[at(32, 32)],
+            V3_GREEN,
+            "the nearer centre triangle must win the depth test"
+        );
+        assert_eq!(pixels0[at(60, 60)], V3_RED);
+        assert_eq!(
+            pixels1[at(0, 0)],
+            V3_CYAN,
+            "second target kept its own colour"
+        );
+        assert_eq!(pixels1[at(63, 63)], V3_CYAN);
+        assert_eq!(
+            pixels1[at(32, 32)],
+            V3_MAGENTA,
+            "the second target's centre colour differs from the first target's"
+        );
+        for (pixels, label) in [(&pixels0, "target 0"), (&pixels1, "target 1")] {
+            assert!(
+                !pixels
+                    .iter()
+                    .any(|pixel| *pixel == V3_BLUE || *pixel == V3_WHITE),
+                "{label} must not contain the depth-rejected far draw"
+            );
+        }
+
+        let cpu_checksum = rows0.as_chunks::<4>().0.iter().fold(0u32, |sum, pixel| {
+            sum.wrapping_add(u32::from_le_bytes(*pixel))
+        });
+        assert_eq!(
+            checksum.words()[0],
+            cpu_checksum,
+            "compute must read the copied attachment pixels and checksum them"
+        );
+
+        // The list identity is one-shot: a replay is refused with no GPU work.
+        let (replay, replay_stats) = transport
+            .submit_v3_with_stats(&submission, &allocations)
+            .expect("a replayed list should still return a reply");
+        assert_eq!(replay.status, ReplyStatus::AlreadyExecuted);
+        assert_eq!(replay_stats, EncoderStats::default());
+
+        let device = transport.device_info().expect("device_info should succeed");
+        eprintln!(
+            "v3 mixed segments: device={}, surface0={}, surface1={}, pixels={V3_PIXELS}, \
+             stats={stats:?}, checksum=0x{cpu_checksum:08x}",
+            device.name_str(),
+            image0.surface_id(),
+            image1.surface_id()
+        );
+
+        assert_eq!(image0.frame_index(), None);
+        assert_eq!(image1.frame_index(), None);
+        let _ = (&mut image0, &mut image1);
+    }
+
+    #[test]
+    fn v3_illegal_ordering_is_rejected_before_any_command_buffer() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let submission = SubmissionV3 {
+            sequence: 3,
+            list: None,
+            commands: vec![
+                CommandV3::BeginRenderPass(BeginRenderPass {
+                    colors: vec![v3_color_attachment(1, LoadOp::Clear)],
+                    depth_stencil: None,
+                }),
+                CommandV3::Dispatch1d(wire::Dispatch1d {
+                    pipeline_id: 1,
+                    threads: 1,
+                    threads_per_group: 1,
+                    bindings: Vec::new(),
+                }),
+            ],
+        };
+        let error = transport
+            .submit_v3(&submission, &HashMap::new())
+            .expect_err("compute inside a pass must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("open render pass")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn v3_unknown_pipeline_returns_unknown_handle_without_encoders() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let submission = SubmissionV3 {
+            sequence: 4,
+            list: None,
+            commands: vec![
+                CommandV3::BeginRenderPass(BeginRenderPass {
+                    colors: vec![v3_color_attachment(1, LoadOp::Clear)],
+                    depth_stencil: None,
+                }),
+                CommandV3::SetGraphicsPipeline(PipelineRef {
+                    pipeline_id: 999_999,
+                }),
+                CommandV3::Draw(DrawState {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    start_vertex: 0,
+                    start_instance: 0,
+                }),
+                CommandV3::EndRenderPass,
+            ],
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&submission, &HashMap::new())
+            .expect("an unknown pipeline should still return a reply");
+        assert_eq!(reply.status, ReplyStatus::UnknownHandle);
+        assert_eq!(
+            stats,
+            EncoderStats::default(),
+            "a refused submission must not create a command buffer"
+        );
+    }
+
+    #[test]
+    fn v3_mesh_dispatch_is_refused_explicitly() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let submission = SubmissionV3 {
+            sequence: 5,
+            list: None,
+            commands: vec![CommandV3::DispatchMesh(wire::DispatchMesh {
+                pipeline_id: 1,
+                group_counts: [1, 1, 1],
+                bindings: Vec::new(),
+            })],
+        };
+        let error = transport
+            .submit_v3(&submission, &HashMap::new())
+            .expect_err("mesh dispatches must be refused, never skipped");
+        assert!(
+            matches!(error, MetalError::NotSupported(message) if message.contains("mesh")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn v3_present_requires_a_registered_surface() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let submission = SubmissionV3 {
+            sequence: 6,
+            list: None,
+            commands: vec![CommandV3::Present(Present {
+                surface_id: 123_456,
+                sync_interval: 1,
+            })],
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&submission, &HashMap::new())
+            .expect("an unknown surface should return a reply");
+        assert_eq!(reply.status, ReplyStatus::UnknownHandle);
+        assert_eq!(stats, EncoderStats::default());
+    }
+
+    #[test]
+    fn v3_validation_refusal_releases_the_list_identity() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let list = Some(wire::ListIdentity {
+            list_id: 77,
+            list_generation: 2,
+        });
+        let refused = SubmissionV3 {
+            sequence: 1,
+            list,
+            commands: vec![CommandV3::Dispatch1d(wire::Dispatch1d {
+                pipeline_id: 999_999,
+                threads: 1,
+                threads_per_group: 1,
+                bindings: Vec::new(),
+            })],
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&refused, &HashMap::new())
+            .expect("an unknown pipeline should return a reply");
+        assert_eq!(reply.status, ReplyStatus::UnknownHandle);
+        assert_eq!(stats.command_buffers, 0);
+
+        // ADR-007: a validation refusal releases the claim, so the same list
+        // identity can be submitted again once corrected.
+        let empty = SubmissionV3 {
+            sequence: 2,
+            list,
+            commands: Vec::new(),
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&empty, &HashMap::new())
+            .expect("the retried list identity should be accepted");
+        assert_eq!(reply.status, ReplyStatus::Ok);
+        assert_eq!(stats.command_buffers, 0);
+
+        // After successful execution the identity is consumed.
+        let (reply, _) = transport
+            .submit_v3_with_stats(&empty, &HashMap::new())
+            .expect("a replay should return a reply");
+        assert_eq!(reply.status, ReplyStatus::AlreadyExecuted);
     }
 }
