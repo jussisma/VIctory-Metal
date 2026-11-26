@@ -28,8 +28,8 @@ use std::ops::Range;
 
 use crate::abi::VmBufferId;
 use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
-use crate::macos::texture::VmTextureId;
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
+use crate::macos::texture::VmTextureId;
 use crate::transport::MetalError;
 use crate::wire_v3::{CommandV3, MAX_COLOR_ATTACHMENTS};
 
@@ -385,8 +385,9 @@ impl RenderTarget {
         // SAFETY: `self.texture` is a live retained `MTLTexture`; `retain`
         // returns that same object with an additional +1 reference.
         let raw = unsafe { objc::msg_send_id_0(self.texture.as_raw(), objc::sel(c"retain")) };
-        ObjcObject::from_retained(raw)
-            .ok_or(MetalError::InternalError("MTLTexture retain returned null".to_string()))
+        ObjcObject::from_retained(raw).ok_or(MetalError::InternalError(
+            "MTLTexture retain returned null".to_string(),
+        ))
     }
 }
 
@@ -978,11 +979,7 @@ impl<'a> RenderEncoder<'a> {
         unsafe {
             objc::msg_send_void_1(self.enc, objc::sel(c"setRenderPipelineState:"), state);
             if let Some(depth_state) = depth_state {
-                objc::msg_send_void_1(
-                    self.enc,
-                    objc::sel(c"setDepthStencilState:"),
-                    depth_state,
-                );
+                objc::msg_send_void_1(self.enc, objc::sel(c"setDepthStencilState:"), depth_state);
             }
         }
         Ok(())
@@ -1594,8 +1591,9 @@ pub(crate) fn build_mrt_render_pass_descriptor(
     for (index, attachment) in colors.iter().enumerate() {
         // SAFETY: `attachments` is the colour attachment array and `index` is
         // below the declared 1..=8 limit.
-        let raw =
-            unsafe { msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index) };
+        let raw = unsafe {
+            msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index)
+        };
         if raw.is_null() {
             return Err(MetalError::InternalError(
                 "colour attachment descriptor is nil".to_string(),
@@ -1613,8 +1611,16 @@ pub(crate) fn build_mrt_render_pass_descriptor(
             objc::msg_send_void_1(raw, objc::sel(c"setTexture:"), attachment.texture);
             msg_send_void_usize(raw, objc::sel(c"setLevel:"), attachment.level);
             msg_send_void_usize(raw, objc::sel(c"setSlice:"), attachment.slice);
-            msg_send_void_usize(raw, objc::sel(c"setLoadAction:"), attachment.load.mtl_value());
-            msg_send_void_usize(raw, objc::sel(c"setStoreAction:"), attachment.store.mtl_value());
+            msg_send_void_usize(
+                raw,
+                objc::sel(c"setLoadAction:"),
+                attachment.load.mtl_value(),
+            );
+            msg_send_void_usize(
+                raw,
+                objc::sel(c"setStoreAction:"),
+                attachment.store.mtl_value(),
+            );
             msg_send_void_clear_color(raw, objc::sel(c"setClearColor:"), clear);
         }
     }
@@ -1661,11 +1667,7 @@ pub(crate) fn build_mrt_render_pass_descriptor(
             // SAFETY: `stencil_attachment` is a live stencil attachment
             // descriptor and `clear_stencil` is a `uint32_t` value.
             unsafe {
-                objc::msg_send_void_1(
-                    stencil_attachment,
-                    objc::sel(c"setTexture:"),
-                    depth.texture,
-                );
+                objc::msg_send_void_1(stencil_attachment, objc::sel(c"setTexture:"), depth.texture);
                 msg_send_void_usize(stencil_attachment, objc::sel(c"setLevel:"), depth.level);
                 msg_send_void_usize(stencil_attachment, objc::sel(c"setSlice:"), depth.slice);
                 msg_send_void_usize(
@@ -1837,7 +1839,9 @@ impl DirectMetalTransport {
         let row_bytes = usize::try_from(width)
             .ok()
             .and_then(|width| width.checked_mul(format.bytes_per_texel() as usize))
-            .ok_or(MetalError::InvalidArg("shared texture row length overflows"))?;
+            .ok_or(MetalError::InvalidArg(
+                "shared texture row length overflows",
+            ))?;
         let bytes_per_row = row_bytes.next_multiple_of(256);
         let len = bytes_per_row
             .checked_mul(height as usize)
@@ -1887,13 +1891,7 @@ impl DirectMetalTransport {
 
         let mut state = self.lock_state()?;
         let id = state.alloc_id();
-        state.buffers.insert(
-            id,
-            RegisteredBuffer {
-                buffer,
-                len,
-            },
-        );
+        state.buffers.insert(id, RegisteredBuffer { buffer, len });
         state.textures.insert(id, texture);
         Ok(SharedTexture2d {
             texture_id: VmTextureId(id),
@@ -1991,9 +1989,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
         match command {
             CommandV3::Dispatch1d(dispatch) => {
                 if pass_open.is_some() {
-                    return Err(plan_error(
-                        "compute dispatch inside an open render pass",
-                    ));
+                    return Err(plan_error("compute dispatch inside an open render pass"));
                 }
                 if dispatch.pipeline_id == 0
                     || dispatch.threads == 0
@@ -2021,9 +2017,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             }
             CommandV3::Dispatch3d(dispatch) => {
                 if pass_open.is_some() {
-                    return Err(plan_error(
-                        "compute dispatch inside an open render pass",
-                    ));
+                    return Err(plan_error("compute dispatch inside an open render pass"));
                 }
                 if dispatch.pipeline_id == 0
                     || dispatch.group_counts.contains(&0)
@@ -2052,9 +2046,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             }
             CommandV3::DispatchMesh(mesh) => {
                 if pass_open.is_some() {
-                    return Err(plan_error(
-                        "mesh dispatch inside an open render pass",
-                    ));
+                    return Err(plan_error("mesh dispatch inside an open render pass"));
                 }
                 if mesh.pipeline_id == 0 || mesh.group_counts.contains(&0) {
                     return Err(plan_error(
@@ -2132,9 +2124,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     ));
                 }
                 if pass.colors.is_empty() || pass.colors.len() > MAX_COLOR_ATTACHMENTS {
-                    return Err(plan_error(
-                        "render pass needs 1..=8 colour attachments",
-                    ));
+                    return Err(plan_error("render pass needs 1..=8 colour attachments"));
                 }
                 for color in &pass.colors {
                     if color.allocation_id == 0 || color.generation == 0 {
@@ -2182,13 +2172,10 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error("draw outside a render pass"));
                 }
                 if !graphics_pipeline_selected {
-                    return Err(plan_error(
-                        "draw requires a preceding SetGraphicsPipeline",
-                    ));
+                    return Err(plan_error("draw requires a preceding SetGraphicsPipeline"));
                 }
                 if let Some((WorkKind::Render, segment_index)) = current {
-                    if let SegmentKind::Render { range, .. } =
-                        &mut segments[segment_index].kind
+                    if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind
                         && range.end < index + 1
                     {
                         range.end = index + 1;
@@ -2237,9 +2224,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error("compute pipeline handle must be nonzero"));
                 }
                 if pass_open.is_some() {
-                    return Err(plan_error(
-                        "compute pipeline inside an open render pass",
-                    ));
+                    return Err(plan_error("compute pipeline inside an open render pass"));
                 }
             }
             CommandV3::ResourceBarrier(barrier) => {
@@ -2338,7 +2323,8 @@ unsafe fn msg_send_texture_from_buffer(
     offset: usize,
     bytes_per_row: usize,
 ) -> objc::Id {
-    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, objc::Id, usize, usize) -> objc::Id;
+    type Fn =
+        unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, objc::Id, usize, usize) -> objc::Id;
     // SAFETY: Caller supplies a valid `MTLDevice`, a texture descriptor and a
     // live `MTLBuffer` with at least `offset + rows * bytes_per_row` bytes.
     let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
@@ -2355,8 +2341,7 @@ unsafe fn msg_send_draw_primitives_instanced(
     instance_count: usize,
     base_instance: usize,
 ) {
-    type Fn =
-        unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, usize, usize);
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, usize, usize);
     // SAFETY: Caller supplies a valid render encoder and nonzero counts.
     let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
     // SAFETY: `f` matches the selector's documented argument layout.
@@ -2972,5 +2957,388 @@ mod tests {
             "render depth pass: device={}, depth_clear=1.0, pixels={PIXEL_COUNT}",
             device.name_str()
         );
+    }
+    // ---- plan_encoder_segments (pure CPU, no Metal objects) ----------------
+
+    use crate::wire::{BarrierEntry, Dispatch1d, ResourceBarrier};
+    use crate::wire_v3::{
+        BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture, DrawIndexedState,
+        DrawState, LoadOp, PipelineRef, Present, ScissorRect as WireScissor, StoreOp,
+        Viewport as WireViewport,
+    };
+
+    fn segment_dispatch(pipeline_id: u64) -> CommandV3 {
+        CommandV3::Dispatch1d(Dispatch1d {
+            pipeline_id,
+            threads: 64,
+            threads_per_group: 64,
+            bindings: Vec::new(),
+        })
+    }
+
+    fn segment_begin() -> CommandV3 {
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![ColorAttachment {
+                allocation_id: 1,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            }],
+            depth_stencil: None,
+        })
+    }
+
+    fn segment_begin_with_colors(count: usize) -> CommandV3 {
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: (0..count)
+                .map(|_| ColorAttachment {
+                    allocation_id: 1,
+                    generation: 1,
+                    mip_level: 0,
+                    slice: 0,
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                    clear_color: [0.0; 4],
+                })
+                .collect(),
+            depth_stencil: None,
+        })
+    }
+
+    fn segment_pipeline() -> CommandV3 {
+        CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id: 7 })
+    }
+
+    fn segment_viewport() -> CommandV3 {
+        CommandV3::SetViewport(WireViewport {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 64.0,
+            near: 0.0,
+            far: 1.0,
+        })
+    }
+
+    fn segment_scissor() -> CommandV3 {
+        CommandV3::SetScissor(WireScissor {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        })
+    }
+
+    fn segment_draw() -> CommandV3 {
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        })
+    }
+
+    fn segment_draw_indexed() -> CommandV3 {
+        CommandV3::DrawIndexed(DrawIndexedState {
+            index_count: 3,
+            instance_count: 1,
+            start_index: 0,
+            base_vertex: 0,
+            start_instance: 0,
+        })
+    }
+
+    fn segment_copy_buffer() -> CommandV3 {
+        CommandV3::CopyBuffer(CopyBuffer {
+            src_allocation_id: 1,
+            src_generation: 1,
+            src_offset: 0,
+            dst_allocation_id: 2,
+            dst_generation: 1,
+            dst_offset: 0,
+            length: 16,
+        })
+    }
+
+    fn segment_copy_texture() -> CommandV3 {
+        CommandV3::CopyTexture(CopyTexture {
+            src_allocation_id: 1,
+            src_generation: 1,
+            src_mip: 0,
+            src_slice: 0,
+            dst_allocation_id: 2,
+            dst_generation: 1,
+            dst_mip: 0,
+            dst_slice: 0,
+            width: 64,
+            height: 64,
+            depth: 1,
+        })
+    }
+
+    fn segment_barrier() -> CommandV3 {
+        CommandV3::ResourceBarrier(ResourceBarrier {
+            entries: vec![BarrierEntry {
+                allocation_id: 1,
+                generation: 1,
+                offset: 0,
+                length: 16,
+                before_state: 0,
+                after_state: 1,
+            }],
+        })
+    }
+
+    fn segment_present() -> CommandV3 {
+        CommandV3::Present(Present {
+            surface_id: 1,
+            sync_interval: 1,
+        })
+    }
+
+    #[test]
+    fn segment_plan_coalesces_consecutive_dispatches_into_one_compute_segment() {
+        let plan = plan_encoder_segments(&[
+            segment_dispatch(1),
+            segment_dispatch(2),
+            segment_dispatch(3),
+        ])
+        .expect("three dispatches should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..3)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_keeps_consecutive_dispatches_with_barrier_in_one_segment() {
+        let plan =
+            plan_encoder_segments(&[segment_dispatch(1), segment_barrier(), segment_dispatch(2)])
+                .expect("a barrier between dispatches should keep one compute segment");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..3)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_coalesces_copies_into_one_blit_segment() {
+        let plan = plan_encoder_segments(&[segment_copy_buffer(), segment_copy_texture()])
+            .expect("two copies should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Blit(0..2)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_uses_one_render_segment_per_pass_and_covers_its_commands() {
+        let plan = plan_encoder_segments(&[
+            segment_pipeline(),
+            segment_begin(),
+            segment_viewport(),
+            segment_scissor(),
+            segment_draw(),
+            segment_draw_indexed(),
+            CommandV3::EndRenderPass,
+            segment_begin(),
+            segment_draw(),
+            CommandV3::EndRenderPass,
+        ])
+        .expect("two passes with draws should plan");
+
+        assert_eq!(plan.len(), 2, "one render segment per pass: {plan:?}");
+        assert_eq!(
+            plan[0],
+            Segment {
+                kind: SegmentKind::Render {
+                    pass_index: 0,
+                    range: 0..6,
+                }
+            },
+            "the first pass owns its pipeline state, both draws and excludes End"
+        );
+        assert_eq!(
+            plan[1],
+            Segment {
+                kind: SegmentKind::Render {
+                    pass_index: 1,
+                    range: 7..9,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn segment_plan_splits_segments_on_encoder_class_changes() {
+        let plan = plan_encoder_segments(&[
+            segment_dispatch(1),
+            segment_copy_buffer(),
+            segment_pipeline(),
+            segment_begin(),
+            segment_draw(),
+            CommandV3::EndRenderPass,
+            segment_copy_texture(),
+            segment_dispatch(2),
+        ])
+        .expect("mixed encoder classes should plan");
+
+        assert_eq!(plan.len(), 5, "expected five segments: {plan:?}");
+        assert_eq!(
+            plan[0],
+            Segment {
+                kind: SegmentKind::Compute(0..1)
+            }
+        );
+        assert_eq!(
+            plan[1],
+            Segment {
+                kind: SegmentKind::Blit(1..2)
+            }
+        );
+        assert!(matches!(
+            plan[2].kind,
+            SegmentKind::Render { pass_index: 0, .. }
+        ));
+        assert_eq!(
+            plan[3],
+            Segment {
+                kind: SegmentKind::Blit(6..7)
+            }
+        );
+        assert_eq!(
+            plan[4],
+            Segment {
+                kind: SegmentKind::Compute(7..8)
+            }
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_empty_command_list_with_no_segments() {
+        assert!(
+            plan_encoder_segments(&[])
+                .expect("empty stream is legal")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_dispatch_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_dispatch(1),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("compute inside a pass must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("open render pass")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_copy_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_copy_buffer(),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("copy inside a pass must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_present_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_present()])
+            .expect_err("present inside a pass must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_end_without_begin() {
+        let error = plan_encoder_segments(&[CommandV3::EndRenderPass])
+            .expect_err("EndRenderPass without Begin must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("without an open render pass")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_draw_without_a_graphics_pipeline() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_draw()])
+            .expect_err("draw without a pipeline must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("SetGraphicsPipeline")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_second_begin_before_end() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_begin()])
+            .expect_err("a second Begin must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("already open")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_commands_after_present() {
+        let error = plan_encoder_segments(&[segment_present(), segment_dispatch(1)])
+            .expect_err("work after Present must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("after Present")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_accepts_present_as_the_last_command() {
+        let plan = plan_encoder_segments(&[segment_dispatch(1), segment_present()])
+            .expect("a terminal Present should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..1)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_an_unclosed_pass() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_pipeline(), segment_draw()])
+            .expect_err("an unclosed pass must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("never ended")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_more_than_eight_color_attachments() {
+        let error =
+            plan_encoder_segments(&[segment_begin_with_colors(9), CommandV3::EndRenderPass])
+                .expect_err("nine color attachments must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_zero_color_attachments() {
+        let error =
+            plan_encoder_segments(&[segment_begin_with_colors(0), CommandV3::EndRenderPass])
+                .expect_err("an empty MRT must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
     }
 }

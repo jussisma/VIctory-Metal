@@ -228,13 +228,7 @@ pub(crate) unsafe fn msg_send_id_err(target: Id, s: Sel, a0: Id, err: *mut Id) -
     }
 }
 
-pub(crate) unsafe fn msg_send_id_3_err(
-    target: Id,
-    s: Sel,
-    a0: Id,
-    a1: Id,
-    err: *mut Id,
-) -> Id {
+pub(crate) unsafe fn msg_send_id_3_err(target: Id, s: Sel, a0: Id, a1: Id, err: *mut Id) -> Id {
     type Fn = unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id;
     // SAFETY: Caller supplies valid receiver, selector, 2 pointer args, and `NSError **` out pointer.
     unsafe {
