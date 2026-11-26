@@ -140,18 +140,74 @@ pub(crate) enum C {
     TwinToDepthBytes,
     TwinToTwin,
     TwinToTwinBytes,
+    /// Guard accounting (see `crate::watch::guard_snapshot`): faults resolved
+    /// while the thread already held the guard lock (`watch::open_under_lock`;
+    /// its normal faults are `GuardFaults`), bytes newly made read-only, and
+    /// microseconds the guard lock was held.
+    GuardFaultsHeld,
+    GuardedBytes,
+    GuardHoldUs,
+    /// Runs of pages `watch::protect_noting` left unguarded.
+    WithheldRegions,
 }
-const COUNTERS: usize = C::TwinToTwinBytes as usize + 1;
-static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+const COUNTERS: usize = C::WithheldRegions as usize + 1;
+
+/// An atomic counter that stops at `u64::MAX` instead of wrapping. A long
+/// run can therefore never turn a large total small, and never into zero.
+pub(crate) struct Counter(AtomicU64);
+
+impl Counter {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Adds `n`, saturating: concurrent adders stop at `u64::MAX` too.
+    pub(crate) fn add(&self, n: u64) {
+        let mut current = self.0.load(Relaxed);
+        loop {
+            let next = current.saturating_add(n);
+            if next == current {
+                return;
+            }
+            match self.0.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub(crate) fn load(&self) -> u64 {
+        self.0.load(Relaxed)
+    }
+
+    /// Takes the count, leaving zero (a reset that returns what it cleared).
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, Relaxed)
+    }
+
+    /// Puts a count in (tests only: to reach the maximum without billions of
+    /// increments).
+    #[cfg(test)]
+    pub(crate) fn set(&self, value: u64) {
+        self.0.store(value, Relaxed);
+    }
+}
+
+static COUNT: [Counter; COUNTERS] = [const { Counter::new() }; COUNTERS];
+
+/// The counter behind `c`, for snapshots and resets that name one counter.
+pub(crate) fn counter(c: C) -> &'static Counter {
+    &COUNT[c as usize]
+}
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+    COUNT[c as usize].add(n);
 }
 
 /// A counter's count so far, for the tests.
 #[cfg(test)]
 pub(crate) fn count(c: C) -> u64 {
-    COUNT[c as usize].load(Relaxed)
+    COUNT[c as usize].load()
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -315,10 +371,11 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    // The guard counters are taken first, so this line reports them and the
+    // generic swap below cannot race a second take of the same counter.
+    let guard = crate::watch::guard_snapshot();
+    crate::watch::guard_reset();
+    let c: Vec<f64> = COUNT.iter().map(|a| a.take() as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -356,7 +413,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
         ms(c[C::FallbackUs as usize]),
-        c[C::GuardFaults as usize],
+        c[C::GuardFaults as usize] + guard.faults as f64 / frames,
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
@@ -410,6 +467,17 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  guard accounting per frame: {:.0} faults the guard resolved ({:.1} while its lock was \
+         held, ownership assumed), {:.1} MB made read-only in {:.0} protect runs, {:.1} ms holding \
+         the guard lock, {:.0} regions withheld from guarding",
+        c[C::GuardFaults as usize] + guard.faults as f64 / frames,
+        guard.faults as f64 / frames,
+        mb(guard.guarded_bytes as f64) / frames,
+        c[C::ProtectCalls as usize],
+        ms(guard.hold_us as f64) / frames,
+        guard.withheld_regions as f64 / frames,
+    );
     if crate::watch::guard_bench_enabled() {
         let reports = crate::watch::guard_wait_report();
         let waits: u64 = reports.iter().map(|r| r.waits).sum();
@@ -818,7 +886,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
 
 #[cfg(test)]
 mod alloc_tests {
-    use super::{BIG, C, COUNT, CountingAlloc, Relaxed};
+    use super::{BIG, C, COUNT, CountingAlloc};
     use std::alloc::{GlobalAlloc, Layout};
 
     /// Blocks, bytes made, freed and resized ([`BIG`] blocks only).
@@ -831,7 +899,7 @@ mod alloc_tests {
             C::BigResized,
             C::BigResizedBytes,
         ]
-        .map(|c| COUNT[c as usize].load(Relaxed))
+        .map(|c| COUNT[c as usize].load())
     }
 
     /// A block Wine's heap maps on its own is counted when made, resized

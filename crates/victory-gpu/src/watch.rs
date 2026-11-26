@@ -311,7 +311,17 @@ fn open_under_lock(page: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     // SAFETY: a block of this process; fails harmlessly if it is gone.
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    let guarded = unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    // A fault this thread can resolve without waiting for its own lock: one
+    // per call (a second write finds the block open, so it does not fault
+    // again). Only when the block was really opened: otherwise nothing was
+    // resolved. Other faults are `C::GuardFaults`, in the handler below.
+    #[cfg(feature = "diagnostics")]
+    if guarded != 0 {
+        crate::copystat::add(crate::copystat::C::GuardFaultsHeld, 1);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = guarded;
     if OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
         OPENED.store(true, Release);
     } else {
@@ -393,6 +403,24 @@ impl std::ops::DerefMut for Held {
 static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 16];
 
+/// Adds `n` to `a`, stopping at `u64::MAX` instead of wrapping: a long run
+/// must not make a line's hold total small (diagnostics only).
+#[cfg(feature = "diagnostics")]
+fn add_saturating(a: &AtomicU64, n: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut current = a.load(Relaxed);
+    loop {
+        let next = current.saturating_add(n);
+        if next == current {
+            return;
+        }
+        match a.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 impl Drop for Held {
     fn drop(&mut self) {
         drop(self.guard.take());
@@ -400,13 +428,15 @@ impl Drop for Held {
         #[cfg(feature = "diagnostics")]
         {
             use std::sync::atomic::Ordering::Relaxed;
-            let us = self.since.elapsed().as_micros() as u64;
+            let us = u64::try_from(self.since.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // Every hold, whether or not a per-line slot is free for it.
+            crate::copystat::add(crate::copystat::C::GuardHoldUs, us);
             let line = u64::from(self.line);
             if let Some(slot) = HELD
                 .iter()
                 .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
             {
-                slot[1].fetch_add(us, Relaxed);
+                add_saturating(&slot[1], us);
                 slot[2].fetch_max(us, Relaxed);
             }
         }
@@ -425,6 +455,46 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out
+}
+
+/// What the guard did since the last [`guard_reset`] (diagnostics): faults
+/// it resolved while its lock was already held, bytes it newly made
+/// read-only, microseconds it held the lock, and runs of pages it left
+/// unguarded. The fields are counts, not references: increments after a
+/// snapshot do not change it.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuardSnapshot {
+    pub(crate) faults: u64,
+    pub(crate) guarded_bytes: u64,
+    pub(crate) hold_us: u64,
+    pub(crate) withheld_regions: u64,
+}
+
+/// The guard counters' current values, a copy.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_snapshot() -> GuardSnapshot {
+    use crate::copystat::{C, counter};
+    GuardSnapshot {
+        faults: counter(C::GuardFaultsHeld).load(),
+        guarded_bytes: counter(C::GuardedBytes).load(),
+        hold_us: counter(C::GuardHoldUs).load(),
+        withheld_regions: counter(C::WithheldRegions).load(),
+    }
+}
+
+/// Takes every guard counter, so the next line starts from zero.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_reset() {
+    use crate::copystat::{C, counter};
+    for c in [
+        C::GuardFaultsHeld,
+        C::GuardedBytes,
+        C::GuardHoldUs,
+        C::WithheldRegions,
+    ] {
+        let _ = counter(c).take();
+    }
 }
 
 /// Per-thread slots for the guard wait benchmark: enough for the submitting
@@ -962,7 +1032,15 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
-        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
+        let guarded =
+            unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 };
+        // Only a protection change that happened guarded those bytes: a run
+        // that failed and was retried page by page counts each page once.
+        #[cfg(feature = "diagnostics")]
+        if guarded {
+            crate::copystat::add(crate::copystat::C::GuardedBytes, ((to - from) * PAGE) as u64);
+        }
+        guarded
     };
     let unmapped = |page: usize| {
         // SAFETY: plain data filled in by the query.
@@ -972,8 +1050,24 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         n == 0 || info.State != MEM_COMMIT
     };
     let mut taken = Vec::with_capacity(pages.len());
+    // Pages asked for and left unguarded (not the runtime's, being written
+    // by a path the guards do not see, or as yet unopenable), in page
+    // numbers: counted as runs below, with what was actually withheld.
+    #[cfg(feature = "diagnostics")]
+    let mut withheld: Vec<usize> = Vec::new();
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    let pages: Vec<usize> = pages
+        .iter()
+        .copied()
+        .filter(|&p| {
+            let idle = !busy(p);
+            #[cfg(feature = "diagnostics")]
+            if !idle {
+                withheld.push(p);
+            }
+            idle
+        })
+        .collect();
     // Only the runtime's GPU memory is guarded. A tracked range can start
     // in free or reserved memory and run on into the host's own pages: in
     // #50 that guarded the process heap's header, and a thread holding the
@@ -991,7 +1085,14 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
             }
-            allowed.region(p).map(|end| (p, end))
+            match allowed.region(p) {
+                Some(end) => Some((p, end)),
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    withheld.push(p);
+                    None
+                }
+            }
         })
         .unzip();
     let mut i = 0;
@@ -1024,8 +1125,21 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             } else if unmapped(page) {
                 taken.push(page);
                 unmapped_pages.push(page);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                withheld.push(page);
             }
         }
+    }
+    // A run of withheld pages is one region: consecutive page numbers, so
+    // the runtime's one foreign allocation counts once however many pages
+    // of it were asked about.
+    #[cfg(feature = "diagnostics")]
+    if !withheld.is_empty() {
+        withheld.sort_unstable();
+        withheld.dedup();
+        let runs = withheld.windows(2).filter(|pair| pair[1] != pair[0] + 1).count() as u64 + 1;
+        crate::copystat::add(crate::copystat::C::WithheldRegions, runs);
     }
     taken
 }
@@ -1382,6 +1496,107 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The saturating counter's arithmetic: monotonic increments, a reset
+    /// that takes, and no wrap at `u64::MAX`. Local counters, so no other
+    /// test's guard activity can race them.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn guard_counters_increment_saturate_and_reset() {
+        let c = crate::copystat::Counter::new();
+        assert_eq!(c.load(), 0);
+        c.add(1);
+        assert_eq!(c.load(), 1);
+        c.add(7);
+        assert_eq!(c.load(), 8, "monotonic");
+        c.add(u64::MAX - 8);
+        assert_eq!(c.load(), u64::MAX);
+        c.add(1);
+        assert_eq!(c.load(), u64::MAX, "saturates, does not wrap");
+        c.add(u64::MAX);
+        assert_eq!(c.load(), u64::MAX);
+        assert_eq!(c.take(), u64::MAX);
+        assert_eq!(c.load(), 0, "reset");
+        assert_eq!(c.take(), 0, "reset is idempotent");
+        c.add(3);
+        assert_eq!(c.take(), 3, "counts again from zero");
+    }
+
+    /// A snapshot holds numbers, not the counters: increments after it do
+    /// not change it.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_guard_snapshot_is_a_copy() {
+        let snapshot = guard_snapshot();
+        let before = (
+            snapshot.faults,
+            snapshot.guarded_bytes,
+            snapshot.hold_us,
+            snapshot.withheld_regions,
+        );
+        for c in [
+            crate::copystat::C::GuardFaultsHeld,
+            crate::copystat::C::GuardedBytes,
+            crate::copystat::C::GuardHoldUs,
+            crate::copystat::C::WithheldRegions,
+        ] {
+            crate::copystat::counter(c).add(1);
+        }
+        let after = (
+            snapshot.faults,
+            snapshot.guarded_bytes,
+            snapshot.hold_us,
+            snapshot.withheld_regions,
+        );
+        assert_eq!(before, after, "later increments do not change a snapshot");
+    }
+
+    /// `guard_reset` takes all four guard counters. Run in a child process,
+    /// where this test is the only one running: no other test's faults or
+    /// protections can touch the counters while it sets and reads them (as
+    /// the foreign-window test isolates its address space).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn guard_reset_takes_every_guard_counter() {
+        use crate::copystat::{C, counter};
+        const CHILD: &str = "VICTORY_TEST_GUARD_RESET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "watch::tests::guard_reset_takes_every_guard_counter";
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("run the guard reset test in a child");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "guard reset child {}: {stdout}{}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        for c in [C::GuardFaultsHeld, C::GuardedBytes, C::GuardHoldUs, C::WithheldRegions] {
+            counter(c).set(17);
+        }
+        let before = guard_snapshot();
+        assert_eq!(
+            (before.faults, before.guarded_bytes, before.hold_us, before.withheld_regions),
+            (17, 17, 17, 17)
+        );
+        guard_reset();
+        let after = guard_snapshot();
+        assert_eq!(
+            (after.faults, after.guarded_bytes, after.hold_us, after.withheld_regions),
+            (0, 0, 0, 0),
+            "guard reset takes every guard counter"
+        );
+        assert_eq!(
+            (before.faults, before.guarded_bytes, before.hold_us, before.withheld_regions),
+            (17, 17, 17, 17),
+            "the snapshot is a copy"
+        );
+    }
 
     #[test]
     fn a_fault_under_the_guard_lock_does_not_hang() {
