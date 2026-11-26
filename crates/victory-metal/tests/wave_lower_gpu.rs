@@ -986,6 +986,106 @@ fn literal_mask_read() -> Vec<u32> {
     w
 }
 
+// ----- the LDS, reduction, first-lane and lane-read buckets -------------
+
+/// VOP2 opcodes of the integer reductions (see `emit::wave::Op`).
+const V_ADD_U32: u32 = 0x25;
+const V_MIN_U32: u32 = 0x13;
+const V_MAX_U32: u32 = 0x14;
+const V_AND_B32: u32 = 0x1b;
+const V_OR_B32: u32 = 0x1c;
+const V_XOR_B32: u32 = 0x1d;
+/// `v_mov_b32 v3, v0`: the thread id as the reduction's input.
+const V_MOV_V3_V0: u32 = 0x7E06_0300;
+/// `v_add_nc_u32 v3, 1, v0`: 1..64, whose exclusive or is 64.
+const V_ADD_V3_1_V0: u32 = 0x4A06_0081;
+/// `v_xor_b32 v3, 42, v0`.
+const V_XOR_V3_42_V0: u32 = 0x3A06_00AA;
+/// `v_not_b32 v3, v0`.
+const V_NOT_V3_V0: u32 = 0x7E06_6F00;
+
+/// Four passes writing each lane's running sum to LDS and adding the sum of
+/// the lane 32 away (the other half): the barrier each pass needs before its
+/// read, and one before the next pass's write.
+fn lds_in_a_loop() -> Vec<u32> {
+    let body = [
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+    ];
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0005,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ]);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_8414,                          // s_cmp_lt_u32 s20, 4
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the write)
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`lds_in_a_loop`]: each pass, a lane's sum and
+/// that of the lane 32 away both become their total.
+fn console_lds_in_a_loop() -> Vec<u32> {
+    let mut sum: Vec<u32> = (0..64).collect();
+    for _ in 0..4 {
+        sum = (0..64).map(|l| sum[l] + sum[l ^ 32]).collect();
+    }
+    sum
+}
+
+/// `v_readfirstlane_b32` of the thread id (a per-lane value): the console's
+/// first lane is 0, in the lower half.
+fn first_lane_of_the_thread_id() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (console lanes)
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0x7E04_020C, // v_mov_b32 v2, s12
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// `v_readlane_b32 s12, v3, s13` of a value every lane holds (`v3` = 1, the
+/// lane in `s13` = 33): every lane already holds it, so no exchange.
+fn lane_read_of_a_uniform_value() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (console lanes)
+        0x7E06_0281, // v_mov_b32 v3, 1
+        0xBE8D_03FF,
+        33, // s_mov_b32 s13, 33
+        0xD760_000C,
+        0x0001_1B03, // v_readlane_b32 s12, v3, s13
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// The CPU lowering must emit DXIL for every fixture (no translation refusal).
 #[test]
 fn lowered_wave_fixtures_emit_dxil() {
@@ -1004,6 +1104,15 @@ fn lowered_wave_fixtures_emit_dxil() {
         ("mask_after_loop", mask_after_a_per_wave_loop(), 128, 0),
         ("live_mask", live_mask_read(), 64, 0),
         ("literal_mask", literal_mask_read(), 64, 0),
+        ("lds_in_a_loop", lds_in_a_loop(), 64, 256),
+        ("sum_u32", reduction(V_ADD_U32, 0x80, V_MOV_V3_V0), 64, 0),
+        ("min_u32", reduction(V_MIN_U32, 0xC1, V_XOR_V3_42_V0), 64, 0),
+        ("max_u32", reduction(V_MAX_U32, 0x80, V_XOR_V3_42_V0), 64, 0),
+        ("or_u32", reduction(V_OR_B32, 0x80, V_MOV_V3_V0), 64, 0),
+        ("and_u32", reduction(V_AND_B32, 0xC1, V_NOT_V3_V0), 64, 0),
+        ("xor_u32", reduction(V_XOR_B32, 0x80, V_ADD_V3_1_V0), 64, 0),
+        ("first_lane_tid", first_lane_of_the_thread_id(), 64, 0),
+        ("lane_read_uniform", lane_read_of_a_uniform_value(), 64, 0),
     ] {
         let dxil = lowered_dxil(&words, threads, lds, lds > 0);
         assert!(dxil.len() > 4, "{name}: no DXIL");
@@ -1115,6 +1224,173 @@ fn lowered_wave_patterns_run_like_the_console_on_metal() {
     assert_lanes(
         "literal mask",
         &run(&literal_mask_read(), threads, 0, false),
+        &want,
+        1,
+    );
+}
+
+/// The LDS bucket: a group that is one console wave64, whose LDS the console
+/// orders by lockstep, gets a group barrier where each host half reads what
+/// the other wrote — once in one block, twice in a loop — and every lane of
+/// the console threadgroup reads the console's dword.
+#[test]
+#[ignore = "hardware: run once on an exclusive GPU with --ignored --test-threads=1"]
+fn lds_barriers_run_like_the_console_on_metal() {
+    let _ = converter().expect("IRConverter worker and library");
+
+    // One barrier between the write and the read of the other half: a lane
+    // reads the count the lane 32 away wrote (`v_mbcnt`, at most 32).
+    let threads = 64;
+    let want: Vec<u32> = (0..threads).map(|l| (l ^ 32).min(32)).collect();
+    assert_lanes(
+        "lds",
+        &run(&lds_across_halves(), threads, 256, true),
+        &want,
+        1,
+    );
+
+    // Two barriers inside the loop: before each pass's read, and before the
+    // next pass's write, four passes deep.
+    let want = console_lds_in_a_loop();
+    assert_lanes(
+        "lds in a loop",
+        &run(&lds_in_a_loop(), threads, 256, true),
+        &want,
+        1,
+    );
+}
+
+/// The reduction bucket: whole-wave sums, min and max, the bit operations
+/// and the prefix sum, each taken over both 32-lane halves through the
+/// group-shared exchange, give every lane the console wave64's result.
+#[test]
+#[ignore = "hardware: run once on an exclusive GPU with --ignored --test-threads=1"]
+fn reductions_across_halves_run_like_the_console_on_metal() {
+    let _ = converter().expect("IRConverter worker and library");
+    let threads = 64;
+
+    // An unsigned sum of the thread id.
+    let want: Vec<u32> = (0..threads)
+        .map(|l| console_reduction(threads, l, |a, b| a + b, |t| t))
+        .collect();
+    assert_lanes(
+        "sum",
+        &run(&reduction(V_ADD_U32, 0x80, V_MOV_V3_V0), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // The console's own f32 sum of the converted thread id.
+    let want: Vec<u32> = (0..threads)
+        .map(|l| (console_reduction(threads, l, |a, b| a + b, |t| t) as f32).to_bits())
+        .collect();
+    assert_lanes(
+        "sum f32",
+        &run(&reduction(V_ADD_F32, 0x80, 0x7E06_0D00), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // Unsigned min and max of the thread id xor 42, in both halves' lanes.
+    for (name, op, ident, f) in [
+        ("min_u32", V_MIN_U32, 0xC1, u32::min as fn(u32, u32) -> u32),
+        ("max_u32", V_MAX_U32, 0x80, u32::max as fn(u32, u32) -> u32),
+    ] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| console_reduction(threads, l, f, |t| t ^ 42))
+            .collect();
+        assert_lanes(
+            name,
+            &run(&reduction(op, ident, V_XOR_V3_42_V0), threads, 0, false),
+            &want,
+            1,
+        );
+    }
+
+    // The bit operations: or of 0..63, and of their complement, xor of 1..64.
+    for (name, op, ident, input, f) in [
+        ("or", V_OR_B32, 0x80, V_MOV_V3_V0, (|a, b| a | b) as fn(u32, u32) -> u32),
+        ("and", V_AND_B32, 0xC1, V_NOT_V3_V0, |a, b| a & b),
+        ("xor", V_XOR_B32, 0x80, V_ADD_V3_1_V0, |a, b| a ^ b),
+    ] {
+        let input_fn = |t: u32| match name {
+            "and" => !t,
+            "xor" => t + 1,
+            _ => t,
+        };
+        let want: Vec<u32> = (0..threads)
+            .map(|l| console_reduction(threads, l, f, input_fn))
+            .collect();
+        assert_lanes(
+            name,
+            &run(&reduction(op, ident, input), threads, 0, false),
+            &want,
+            1,
+        );
+    }
+
+    // The exclusive prefix sum of the thread id: the upper half adds the
+    // lower half's total before its own.
+    let want: Vec<u32> = (0..threads)
+        .map(|l| {
+            let (wave, k) = (l & !63, l & 63);
+            wave * k + k.saturating_sub(1) * k / 2
+        })
+        .collect();
+    assert_lanes(
+        "prefix",
+        &run(&exclusive_prefix(), threads, 0, false),
+        &want,
+        1,
+    );
+}
+
+/// The first-lane and lane-read bucket: a value every lane holds needs no
+/// exchange, a per-lane one goes through the halves' exchange, and a lane
+/// read of a constant console lane, of a wave-uniform value or of each
+/// lane's own index gives every lane the console's dword.
+#[test]
+#[ignore = "hardware: run once on an exclusive GPU with --ignored --test-threads=1"]
+fn first_lane_and_lane_reads_across_halves_run_like_the_console_on_metal() {
+    let _ = converter().expect("IRConverter worker and library");
+
+    // One value per console wave (`v0 >> 6`), the same in both its halves:
+    // each half keeps its own first lane (no exchange), then its `v_mbcnt`.
+    let threads = 128;
+    let want: Vec<u32> = (0..threads).flat_map(|l| [l >> 6, l & 63]).collect();
+    assert_lanes(
+        "first lane alike",
+        &run(&first_lane_alike(), threads, 0, false),
+        &want,
+        2,
+    );
+
+    // A per-lane value: the lower half's first lane, exchanged, is 0.
+    let threads = 64;
+    let want = vec![0u32; threads as usize];
+    assert_lanes(
+        "first lane",
+        &run(&first_lane_of_the_thread_id(), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // Constant console lanes 40 and 33, both in the other half for every
+    // lane of the lower one.
+    let want: Vec<u32> = (0..threads).flat_map(|_| [40, 33]).collect();
+    assert_lanes(
+        "lane reads",
+        &run(&lane_reads(40, 33), threads, 0, false),
+        &want,
+        2,
+    );
+
+    // A value every lane holds, read at a lane in the other half: kept as
+    // it is, no exchange.
+    let want = vec![1u32; threads as usize];
+    assert_lanes(
+        "lane read of a uniform value",
+        &run(&lane_read_of_a_uniform_value(), threads, 0, false),
         &want,
         1,
     );

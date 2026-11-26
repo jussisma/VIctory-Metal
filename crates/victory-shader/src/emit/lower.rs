@@ -7540,8 +7540,25 @@ impl<'a> Lower<'a> {
                     // This lane already holds what any lane would read.
                     return int(self, a);
                 }
+                // The exchange passes one dword per half: every lane must ask
+                // for the same console lane (a constant, a scalar, or a value
+                // proved wave-uniform), or the halves would exchange the value
+                // of whichever lane stored last. A per-lane index (`v_mbcnt`,
+                // another half's lane) keeps refusing.
+                let lane_alike = match v.src.get(1) {
+                    Some(&Operand::Vector { reg, .. }) => inst
+                        .read(Reg::V(reg))
+                        .is_some_and(|x| self.alike.contains(&x)),
+                    // A scalar is one value for the group, unless a waterfall
+                    // loop read this lane's own dword into it.
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst
+                        .read(Reg::S(code))
+                        .is_none_or(|x| !self.waterfall_reads.contains(&x)),
+                    Some(&Operand::Const(_) | &Operand::Literal(_)) => true,
+                    _ => false,
+                };
                 if self.halves && !self.one_host_wave() {
-                    if !self.across_here() {
+                    if !self.across_here() || !lane_alike {
                         return Err(
                             "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
                         );

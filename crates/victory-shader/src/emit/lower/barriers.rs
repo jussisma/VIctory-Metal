@@ -159,8 +159,12 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
 /// "Unguarded" is about EXEC divergence (`Structured::guards`): a scalar
 /// branch on alike values does not diverge EXEC, so the instruction has no
 /// guard and its block stays [`in_step`]; one on a value that may differ
-/// between host waves drops the block from `step`. A guard left by a
-/// lane-dependent branch is therefore still refused with the reason it had.
+/// between host waves drops the block from `step`. An EXEC narrowing with no
+/// branch is the same question: a guard over scalars already proved alike
+/// (an `s_cselect` of a uniform compare, say) enters or skips in both halves
+/// together and is admitted; one over a lane mask, a per-lane value or a
+/// scalar not shown alike is not. A guard left by a lane-dependent branch is
+/// therefore still refused with the reason it had.
 pub(super) fn in_step_one_wave(
     p: &Program,
     st: &Structured,
@@ -246,6 +250,20 @@ fn in_step_impl(
                 }
             }
             for (i, inst) in block.insts.iter().enumerate() {
+                // A guard (an EXEC narrowing without a branch) under which
+                // every lane still enters or none does: its condition is over
+                // scalars already proved alike, so both host halves run the
+                // instruction or neither does. A guard over a lane mask, a
+                // per-lane value or a scalar not shown alike is not: the
+                // halves execute it different numbers of times. Only the
+                // scalar destinations of such reads are admitted below; a
+                // mask read as data is a ballot's business, not this proof's.
+                let guard_alike = st.guards[b][i].is_none_or(|g| {
+                    st.bools
+                        .support(g)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)))
+                });
                 // A first-lane read of a vector every lane of the console
                 // wave holds gives both host waves the console's value, but
                 // only where every lane runs together: under a lane-dependent
@@ -257,7 +275,7 @@ fn in_step_impl(
                 let first = wave_unif.is_some_and(|unif| {
                     inst.name() == "v_readfirstlane_b32"
                         && entered
-                        && st.guards[b][i].is_none()
+                        && guard_alike
                         && inst.reads.iter().all(|&(r, v)| match r {
                             Reg::V(_) => unif.contains(&v),
                             // The lane mask is the read's own active set: an
@@ -277,10 +295,7 @@ fn in_step_impl(
                 // The source may come from a lane: a constant lane reads the
                 // one console lane by itself.
                 let lane_read = wave_unif.is_some_and(|unif| {
-                    if inst.name() != "v_readlane_b32"
-                        || !entered
-                        || st.guards[b][i].is_some()
-                    {
+                    if inst.name() != "v_readlane_b32" || !entered || !guard_alike {
                         return false;
                     }
                     let Fields::Valu(v) = &inst.fields else {

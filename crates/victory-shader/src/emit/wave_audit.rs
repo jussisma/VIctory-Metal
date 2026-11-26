@@ -58,9 +58,10 @@
 //!   lane mask read as data whose write **and** read blocks are not `step`:
 //!   the read in a block every lane runs after reconvergence is admitted, the
 //!   read inside the per-lane region is not;
-//! * a first-lane read of a value that differs between the halves (`v0`, a
-//!   lane-dependent mask) even in a `step` block, because each half would read
-//!   its own first lane;
+//! * a first-lane or lane read of a per-lane value in a block every lane of
+//!   both halves does not run together (a per-lane branch, a loop on a count
+//!   the halves need not share): each half would read its own first lane, and
+//!   no barrier can pass one between them;
 //! * LDS of a one-wave group with no barrier that can go where a lane reads
 //!   another's write (a divergent write/read, or a loop no `step` proof
 //!   covers);
@@ -73,11 +74,15 @@
 //! 1. Lane-mask reads (56) and reductions/first-lanes/lane reads (23): the
 //!    `in_step_one_wave` wave-uniform loop proof. Widening it to guards on
 //!    alike scalars admits more `step` loops without weakening the
-//!    lane-dependent guard refusal.
+//!    lane-dependent guard refusal. (Done for the masks in `WAVE64-LANE-MASK`;
+//!    the guard rule itself is `barriers::in_step_impl`'s `guard_alike`, and
+//!    the reductions, first-lane and lane reads use it too — see "Buckets
+//!    2-5" below.)
 //! 2. LDS in one-wave 33-64 groups (30): the same `step` proof feeds
 //!    `split_wave_barriers`; no separate lowering change.
 //! 3. A lane read of a provably wave-uniform VGPR needs no exchange at all:
-//!    every lane already holds the value it would read.
+//!    every lane already holds the value it would read. (Done:
+//!    `Lower::read_lane`'s `source_uniform` and the first-lane arm.)
 //!
 //! These are the bounded changes this task makes; the unrelated buckets 7-8
 //! are left for their own tasks.
@@ -123,3 +128,48 @@
 //! not claimed: the CPU table (`lower/halves.rs`, `lane_mask_tests`) and the
 //! Metal proof (`victory-metal/tests/wave_lower_gpu.rs`) cover each shape
 //! above.
+//!
+//! # Buckets 2-5: LDS, reductions, first-lane and lane reads (53 of 111)
+//!
+//! The other four wave64-on-a-32-lane-host buckets (30 + 12 + 8 + 3) are
+//! admitted the same way the masks are: only in a block `barriers::in_step`
+//! proves every lane of the group runs, or — for a group that is one console
+//! wave — `barriers::in_step_one_wave` proves every lane of both host halves
+//! runs, the same number of times. A group barrier, or the two group-shared
+//! dwords an exchange writes and reads, can go nowhere else. What each bucket
+//! admits, and what keeps its reason:
+//!
+//! | # | census | admitted now | still refused, reason unchanged |
+//! |---|-------:|--------------|--------------------------------|
+//! | 2 | 30 | LDS of a one-wave 33-64 group: a group barrier (`dx.op.barrier` with `mem_flags::mem_threadgroup`, mode 9) before every read of what another lane may have written and every write over what another lane may yet read, in `step` blocks, plus one at the end of such a block where the code after it reads or overwrites LDS (`barriers::split_wave_barriers`) | a read of what another lane may have written in a block neither proof covers (the call returns `None`, `Lower::halves_lds` says `LDS one console wave64 shares without barriers, on a host of 32-lane waves`): a per-lane branch, or a loop whose count is per-lane or per-console-wave |
+//! | 3 | 12 | `WaveActiveSum`/`Min`/`Max`/`BitOr`/`BitAnd`/`BitXor`/`WavePrefixSum` over both halves: each host half's own operation, the 2-dword exchange, a barrier, then the combine (`Lower::reduce_across`: `+`, `|`, `&`, `^`, `min`/`max` unsigned or signed, `min`/`max` f32; a prefix adds the lower half's total in the upper one) | a reduction in a per-lane block or a loop on a count the halves need not share, an f16 (`Shape::Half`) reduction, and a mesh shader's: `a wave reduction over both 32-lane halves (wave64 on a 32-lane host)` |
+//! | 4 | 8 | a first-lane read of a wave-uniform value (`halves::lane_uniform`) with no exchange (every lane already holds it); of any other value at a `step` block as the lower half's first lane, exchanged (`Lower::first_lane_across`) | a first-lane read of a per-lane value where no such block exists: `halves::FIRST_ACROSS` |
+//! | 5 | 3 | a lane read of a wave-uniform value with no exchange; of a constant console lane or of a lane index that is one value for the whole group (a scalar, or a VGPR `halves::lane_uniform` proved) through the per-half read and exchange (`Lower::read_lane_across`), at a `step` block | a lane read of a per-lane value or at a per-lane lane index (one dword per half cannot name 32 lanes) outside such a block: `a lane read that may cross 32-lane halves (wave64 on a 32-lane host)` |
+//!
+//! ## The one-wave loop guard
+//!
+//! The proof above turns on `Structured::guards`: an instruction run under an
+//! EXEC narrowing is alike in both halves only if every lane enters or none
+//! does. That used to mean no guard at all. It now means a guard whose
+//! condition is over scalars already proved alike (`barriers::in_step_impl`'s
+//! `guard_alike`): an `s_cselect_b64` of a uniform compare narrowing EXEC, say,
+//! enters in both halves together, so a first-lane read of a wave-uniform
+//! value, or a lane read into a scalar, under it is still one value for the
+//! console wave — and a loop on that scalar still runs as many times in each
+//! half, so its LDS and its reductions get their barriers. A guard over a lane
+//! mask, a per-lane value or a scalar not shown alike leaves the block out of
+//! the proof, and everything in it keeps refusing with the reason it had.
+//! (`in_step_impl` keeps the guard out of the *mask-as-data* proof entirely:
+//! a ballot is `Lower::mask_dword`'s business, not this one's.)
+//!
+//! ## What the census cannot say
+//!
+//! The counts are of title shaders, not of the shapes inside them, and the
+//! shaders and the log are not committed: this table records which shapes each
+//! bucket's change admits, not how many of the 30/12/8/3 fall in them. The 30
+//! are exactly the shaders where `split_wave_barriers` returned `None` (a read
+//! in a block the one-wave proof did not cover); which of those were loops on
+//! a guard this task now proves is not claimable here. The CPU table
+//! (`lower/halves.rs`, `cross_half_tests`) and the Metal proof
+//! (`victory-metal/tests/wave_lower_gpu.rs`, the LDS, reduction and
+//! first-lane tests) cover each shape above, admitted and refused.
