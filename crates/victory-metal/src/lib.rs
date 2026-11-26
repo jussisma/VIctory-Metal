@@ -5,6 +5,8 @@
 //! - [`abi`] defines stable `#[repr(C)]` status codes, handles, and device info.
 //! - [`transport`] defines [`MetalTransport`], implemented in-process on macOS
 //!   without any Wine, D3D12, or Windows dependencies.
+//! - [`wire`] defines the versioned little-endian submission protocol shared
+//!   between the Win64 Wine client and the ARM64 host process.
 //! - On macOS (`target_os = "macos"`), [`macos::device::DirectMetalTransport`]
 //!   provides real `MTLDevice`, `newBufferWithBytesNoCopy` unified-memory buffers,
 //!   compute dispatch, `libmetalirconverter.dylib` DXIL compilation, and [`macos::c_api`].
@@ -13,6 +15,7 @@ pub mod abi;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod transport;
+pub mod wire;
 
 pub use abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmLibraryId, VmPipelineId, VmStatus};
 #[cfg(target_os = "macos")]
