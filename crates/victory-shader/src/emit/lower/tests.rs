@@ -1489,6 +1489,8 @@ const S_MOV_S22_0: u32 = 0xBE96_0380; // s_mov_b32 s22, 0
 const S_CMP_LT_S22_4: u32 = 0xBF0A_8416; // s_cmp_lt_u32 s22, 4
 const READLANE_S21_V0_40: [u32; 2] = [0xD760_0015, 0x0001_5100]; // v_readlane_b32 s21, v0, 40
 const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+const V_MOV_V2_V0: u32 = 0x7E04_0300; // v_mov_b32 v2, v0
+const READLANE_S12_V2_40: [u32; 2] = [0xD760_000C, 0x0001_5102]; // v_readlane_b32 s12, v2, 40
 const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
 const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502;
 const V_MOV_V2_1: u32 = 0x7E04_0281; // v_mov_b32 v2, 1 // v_readfirstlane_b32 s21, v2
@@ -1671,6 +1673,45 @@ fn a_lane_dependent_guard_still_refuses_a_wave_constant_lane_count() {
     let p = wave64(&w);
     assert!(barriers_at_unif(&p, &std::collections::HashSet::new()).is_none());
     assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+#[test]
+fn a_wave_uniform_readlane_needs_no_half_exchange() {
+    // The read names console lane 40, in the other half, so it used to need
+    // an exchange and was refused where none can go (a per-lane branch). Its
+    // source is 1 in every lane, so the lane read is just that value: no
+    // exchange, no refusal. A lane-varying source still crosses and refuses.
+    let run = |source: u32| {
+        try_lowered(
+            &[
+                source,
+                SAVE_EXEC,
+                CMPX_V0_EQ_0,
+                0xBF88_0005, // s_cbranch_execz +5 (skip the read)
+                READLANE_S12_V2_40[0],
+                READLANE_S12_V2_40[1],
+                0xBF06_800C, // s_cmp_eq_u32 s12, 0
+                0xBF85_0001, // s_cbranch_scc1 +1
+                0xBF80_0000, // s_nop 0
+                RESTORE_EXEC,
+                S_ENDPGM,
+            ],
+            64,
+            true,
+            true,
+        )
+    };
+    let l = run(V_MOV_V2_1).expect("a wave-uniform source needs no exchange");
+    assert_eq!(l.wave_size, Some(32));
+    let neg = run(V_MOV_V2_V0);
+    let why = neg
+        .err()
+        .expect("a lane-varying source still crosses")
+        .to_string();
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
 }
 
 
