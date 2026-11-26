@@ -7,17 +7,24 @@
 //!   without any Wine, D3D12, or Windows dependencies.
 //! - [`wire`] defines the versioned little-endian submission protocol shared
 //!   between the Win64 Wine client and the ARM64 host process.
+//! - [`guest_ipc`] is the synchronous Win64 guest client for the local
+//!   loopback transport that carries hello, registration and wire frames.
 //! - On macOS (`target_os = "macos"`), [`macos::device::DirectMetalTransport`]
 //!   provides real `MTLDevice`, `newBufferWithBytesNoCopy` unified-memory buffers,
 //!   compute dispatch, `libmetalirconverter.dylib` DXIL compilation, and [`macos::c_api`].
 
 pub mod abi;
+pub mod guest_ipc;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod transport;
 pub mod wire;
 
 pub use abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmLibraryId, VmPipelineId, VmStatus};
+pub use guest_ipc::{
+    GuestIpcClient, GuestIpcError, MAX_FRAME_PAYLOAD as GUEST_IPC_MAX_FRAME_PAYLOAD,
+    RegisteredAllocation,
+};
 #[cfg(target_os = "macos")]
 pub use macos::device::DirectMetalTransport;
 pub use transport::{MetalError, MetalTransport};
