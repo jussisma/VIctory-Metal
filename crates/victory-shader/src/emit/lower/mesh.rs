@@ -9,8 +9,9 @@ pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
 
 /// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
 /// least one channel read in `keep`, trimming unread leading and trailing
-/// channels. System values (`kind != 0`) stay untouched. Then packs each
-/// register row's elements (see [`pack_rows`]).
+/// channels. System values (`kind != 0`) stay untouched. Element order is
+/// preserved: callers that need Metal's aligned layout call [`pack_rows`]
+/// explicitly (mesh outputs only).
 pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     elements.retain_mut(|e| {
         if e.kind != 0 {
@@ -31,7 +32,6 @@ pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs
         e.cols = last - first + 1;
         true
     });
-    pack_rows(elements);
 }
 
 /// One element's size as Metal lays a mesh output out: 4 bytes per declared

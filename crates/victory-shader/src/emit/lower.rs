@@ -27,7 +27,7 @@ mod halves;
 mod mesh;
 use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
-use mesh::prune_signature;
+use mesh::{pack_rows, prune_signature};
 
 type Why = &'static str;
 
@@ -692,6 +692,9 @@ impl<'a> Lower<'a> {
                 prune_signature(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
                 prune_signature(&mut s.outputs, keep);
+                // Only mesh outputs pay for Metal's aligned layout; pixel
+                // inputs and primitives keep their pruned declaration order.
+                pack_rows(&mut s.outputs);
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
