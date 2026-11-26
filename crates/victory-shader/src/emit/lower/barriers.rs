@@ -150,9 +150,11 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
 /// values [`halves::lane_uniform`] proved the same in every lane of the
 /// console wave. A first-lane read of one, unguarded where every lane runs
 /// together, gives both of its host halves the console's value, so a loop on
-/// it runs as many times in each. Only the console wave's uniformity is
-/// needed here because the group is that one wave; a group of several waves
-/// must use [`in_step`], where such a read is not alike.
+/// it runs as many times in each. So does a lane read into a scalar: every
+/// lane of the console wave asks for the same console lane, or reads a value
+/// every lane holds. Only the console wave's uniformity is needed here
+/// because the group is that one wave; a group of several waves must use
+/// [`in_step`], where such a read is not alike.
 pub(super) fn in_step_one_wave(
     p: &Program,
     st: &Structured,
@@ -257,12 +259,54 @@ fn in_step_impl(
                             _ => mask(r) || scalar(r) && alike.contains(&v),
                         })
                 });
+                // A lane read into a scalar is one value for the whole
+                // console wave: all its lanes ask for the same console lane
+                // (a constant one, or one the host waves compute alike), or
+                // the source is a value every lane of the console wave holds,
+                // so whichever lane each half reads is the same. Unguarded,
+                // where every lane runs together, it is alike in both host
+                // halves of a one-wave group; a group of several waves has one
+                // such value per wave. The source may come from a lane: a
+                // constant lane reads the one console lane by itself.
+                let lane_read = wave_unif.is_some_and(|unif| {
+                    if inst.name() != "v_readlane_b32"
+                        || !entered
+                        || st.guards[b][i].is_some()
+                    {
+                        return false;
+                    }
+                    let Fields::Valu(v) = &inst.fields else {
+                        return false;
+                    };
+                    let source_uniform = match v.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => {
+                            inst.read(Reg::V(reg)).is_some_and(|x| unif.contains(&x))
+                        }
+                        _ => false,
+                    };
+                    let lane_uniform = match v.src.get(1) {
+                        Some(&op) => match crate::resource::lane_of(op) {
+                            // A constant console lane: every lane reads it.
+                            Some(_) => true,
+                            // A lane shown the same in every host wave.
+                            None => match op {
+                                Operand::Scalar { code, .. } if code != NULL => inst
+                                    .read(Reg::S(code))
+                                    .is_some_and(|x| scalar(Reg::S(code)) && alike.contains(&x)),
+                                _ => false,
+                            },
+                        },
+                        None => false,
+                    };
+                    source_uniform || lane_uniform
+                });
                 let from = first
+                    || lane_read
                     || inst
                         .reads
                         .iter()
                         .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from && (!own(inst) || first) {
+                if from && (!own(inst) || first || lane_read) {
                     next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
                 }
             }
