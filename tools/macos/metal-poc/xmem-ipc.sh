@@ -1,7 +1,17 @@
 #!/bin/sh
 # End-to-end synthetic launcher: real Win64 Wine XMem file-backed physical
-# pages + the real guest IPC client -> the native ARM64 Metal host, whose two
-# ordered dispatches write straight into the guest alias.
+# pages + the real guest IPC client -> the native ARM64 Metal host.
+#
+# Two independent host sessions run in sequence, each serving exactly one
+# Wine guest test (the worker serves one peer and exits):
+#
+# 1. bootstrap: the host compiles one MSL kernel; the guest submits two
+#    ordered dispatches of it and reads the result through the real alias.
+# 2. pipeline: Apple's offline Metal toolchain compiles a synthetic kernel to
+#    `{ticket}.metallib` in the share directory; the guest registers it over
+#    IPC by ticket and entry name only, dispatches the returned native id
+#    after the bootstrap kernel, and verifies that a ticket without a backing
+#    file is rejected without dispatching.
 #
 # Usage: tools/macos/metal-poc/xmem-ipc.sh
 #
@@ -36,6 +46,12 @@ SECRET="$WORK/secret.hex"
 HOST_LOG="$WORK/host.stdout"
 HOST_ERR="$WORK/host.stderr"
 HOST_PID=""
+PORT=""
+PIPELINE=""
+# The ticket is the only name of the offline library that crosses the wire.
+METALLIB_TICKET=1
+METALLIB_ENTRY=vm_ipc_metallib_scale
+SHARE_METALLIB="$(printf '%s/%016x.metallib' "$SHARE" "$METALLIB_TICKET")"
 
 cleanup() {
     if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
@@ -64,76 +80,132 @@ winpath() {
     printf 'Z:%s' "$(printf '%s' "$1" | tr '/' '\\')"
 }
 
+# The offline compiler artifact is a real launcher input: the guest never
+# sends a path, so the ticket-named file must exist before registration.
+echo "Compiling the synthetic precompiled kernel..."
+METAL="$(xcrun -f metal 2>/dev/null || true)"
+METALLIB_TOOL="$(xcrun -f metallib 2>/dev/null || true)"
+if [ -z "$METAL" ] || [ ! -x "$METAL" ] || [ -z "$METALLIB_TOOL" ] || [ ! -x "$METALLIB_TOOL" ]; then
+    echo "FAIL: the offline Apple Metal toolchain (metal/metallib) is unavailable" >&2
+    exit 1
+fi
+cat >"$WORK/pipeline.metal" <<'EOF'
+#include <metal_stdlib>
+using namespace metal;
+
+// Selected by name over IPC: x -> 5x + 3.
+kernel void vm_ipc_metallib_scale(device uint *data [[buffer(0)]],
+                                  uint tid [[thread_position_in_grid]]) {
+    data[tid] = data[tid] * 5u + 3u;
+}
+
+// Never selected: a wrong-entry lookup would produce x + 1 instead.
+kernel void vm_ipc_metallib_unused(device uint *data [[buffer(0)]],
+                                   uint tid [[thread_position_in_grid]]) {
+    data[tid] = data[tid] + 1u;
+}
+EOF
+"$METAL" -c "$WORK/pipeline.metal" -o "$WORK/pipeline.air"
+"$METALLIB_TOOL" "$WORK/pipeline.air" -o "$SHARE_METALLIB"
+[ -s "$SHARE_METALLIB" ] || { echo "FAIL: $SHARE_METALLIB is empty" >&2; exit 1; }
+echo "Offline metallib: ticket=$METALLIB_TICKET entry=$METALLIB_ENTRY bytes=$(wc -c <"$SHARE_METALLIB" | tr -d ' ')"
+
 echo "Building the native ARM64 host worker..."
 cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
 WORKER="$ROOT/target/aarch64-apple-darwin/debug/metal-worker"
 [ -x "$WORKER" ] || { echo "FAIL: $WORKER is missing" >&2; exit 1; }
 
-echo "Starting the native host (private share $SHARE)..."
-"$WORKER" \
-    --secret-file "$SECRET" \
-    --share-dir "$SHARE" \
-    --port 0 \
-    --bootstrap-compute \
-    --io-timeout-secs 120 \
-    --accept-timeout-secs 180 \
-    >"$HOST_LOG" 2>"$HOST_ERR" &
-HOST_PID=$!
+# Starts the single-peer host and waits for its published port and pipeline.
+start_host() {
+    : >"$HOST_LOG"
+    : >"$HOST_ERR"
+    "$WORKER" \
+        --secret-file "$SECRET" \
+        --share-dir "$SHARE" \
+        --port 0 \
+        --bootstrap-compute \
+        --io-timeout-secs 120 \
+        --accept-timeout-secs 180 \
+        >"$HOST_LOG" 2>"$HOST_ERR" &
+    HOST_PID=$!
 
-ready=0
-for _ in $(seq 1 600); do
-    if grep -q '^VICTORY_IPC_READY=1$' "$HOST_LOG" 2>/dev/null; then
-        ready=1
-        break
+    ready=0
+    for _ in $(seq 1 600); do
+        if grep -q '^VICTORY_IPC_READY=1$' "$HOST_LOG" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        if ! kill -0 "$HOST_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$ready" -ne 1 ]; then
+        echo "FAIL: the native host did not become ready" >&2
+        cat "$HOST_LOG" "$HOST_ERR" >&2 || true
+        exit 1
     fi
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-        break
-    fi
-    sleep 0.2
-done
-if [ "$ready" -ne 1 ]; then
-    echo "FAIL: the native host did not become ready" >&2
-    cat "$HOST_LOG" "$HOST_ERR" >&2 || true
-    exit 1
-fi
 
-PORT="$(sed -n 's/^VICTORY_IPC_PORT=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
-PIPELINE="$(sed -n 's/^VICTORY_PIPELINE_ID=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
-[ -n "$PORT" ] || { echo "FAIL: no host port was published" >&2; exit 1; }
-[ -n "$PIPELINE" ] || { echo "FAIL: no bootstrap pipeline was published" >&2; exit 1; }
+    PORT="$(sed -n 's/^VICTORY_IPC_PORT=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
+    PIPELINE="$(sed -n 's/^VICTORY_PIPELINE_ID=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
+    [ -n "$PORT" ] || { echo "FAIL: no host port was published" >&2; exit 1; }
+    [ -n "$PIPELINE" ] || { echo "FAIL: no bootstrap pipeline was published" >&2; exit 1; }
 
-echo "Host ready: port=$PORT pipeline=$PIPELINE share=$(winpath "$SHARE")"
-echo "Running the Wine guest test..."
-
-export WINEPREFIX="$WORK/wineprefix"
-export VICTORY_METAL_SHARE_DIR="$(winpath "$SHARE")"
-export VICTORY_IPC_PORT="$PORT"
-export VICTORY_IPC_PIPELINE_ID="$PIPELINE"
-export VICTORY_IPC_SECRET_FILE="$(winpath "$SECRET")"
-
-test_rc=0
-"$ROOT/tools/macos/test-wine.sh" --locked -p victory-hle --lib xmem::e2e \
-    -- --test-threads=1 --nocapture || test_rc=$?
-
-host_rc=0
-wait "$HOST_PID" || host_rc=$?
-HOST_PID=""
-
-if [ "$test_rc" -ne 0 ]; then
-    echo "FAIL: the Wine guest test exited with $test_rc" >&2
-    cat "$HOST_ERR" >&2 || true
-    exit 1
-fi
-if [ "$host_rc" -ne 0 ]; then
-    echo "FAIL: the native host exited with $host_rc" >&2
-    cat "$HOST_ERR" >&2 || true
-    exit 1
-fi
-grep -q 'session complete submissions=2 allocations=1' "$HOST_ERR" || {
-    echo "FAIL: unexpected native host summary" >&2
-    cat "$HOST_ERR" >&2 || true
-    exit 1
+    export WINEPREFIX="$WORK/wineprefix"
+    export VICTORY_METAL_SHARE_DIR="$(winpath "$SHARE")"
+    export VICTORY_IPC_PORT="$PORT"
+    export VICTORY_IPC_PIPELINE_ID="$PIPELINE"
+    export VICTORY_IPC_SECRET_FILE="$(winpath "$SECRET")"
 }
-cat "$HOST_ERR"
 
-echo "PASS xmem-ipc wine-guest=1 guest-alias=1 ordered-dispatches=2 pipeline=$PIPELINE"
+# Stops the host that served the case and checks its summary.
+finish_host() {
+    expected_submissions=$1
+    host_rc=0
+    wait "$HOST_PID" || host_rc=$?
+    HOST_PID=""
+    if [ "$host_rc" -ne 0 ]; then
+        echo "FAIL: the native host exited with $host_rc" >&2
+        cat "$HOST_ERR" >&2 || true
+        exit 1
+    fi
+    grep -q "session complete submissions=$expected_submissions allocations=1" "$HOST_ERR" || {
+        echo "FAIL: unexpected native host summary" >&2
+        cat "$HOST_ERR" >&2 || true
+        exit 1
+    }
+    cat "$HOST_ERR"
+}
+
+# Runs one guest test against the currently started host.
+run_guest() {
+    filter=$1
+    echo "Running the Wine guest test $filter..."
+    test_rc=0
+    "$ROOT/tools/macos/test-wine.sh" --locked -p victory-hle --lib "$filter" \
+        -- --test-threads=1 --nocapture || test_rc=$?
+    if [ "$test_rc" -ne 0 ]; then
+        echo "FAIL: the Wine guest test exited with $test_rc" >&2
+        cat "$HOST_ERR" >&2 || true
+        exit 1
+    fi
+}
+
+# Case 1: the existing bootstrap pipeline path, unchanged.
+start_host
+echo "Host ready (bootstrap): port=$PORT pipeline=$PIPELINE share=$(winpath "$SHARE")"
+unset VICTORY_IPC_PIPELINE_TICKET VICTORY_IPC_PIPELINE_ENTRY 2>/dev/null || true
+run_guest xmem::e2e::two_ordered_host_dispatches_write_the_real_guest_alias
+finish_host 2
+BOOTSTRAP_PIPELINE="$PIPELINE"
+
+# Case 2: offline-compiled pipeline registration over the same transport.
+start_host
+echo "Host ready (pipeline): port=$PORT pipeline=$PIPELINE share=$(winpath "$SHARE")"
+export VICTORY_IPC_PIPELINE_TICKET="$METALLIB_TICKET"
+export VICTORY_IPC_PIPELINE_ENTRY="$METALLIB_ENTRY"
+run_guest xmem::e2e::registered_metallib_pipeline_dispatches_and_rejection_stays_inert
+finish_host 2
+
+echo "PASS xmem-ipc wine-guest=1 guest-alias=1 ordered-dispatches=2 pipeline=$BOOTSTRAP_PIPELINE"
+echo "PASS xmem-ipc-pipeline wine-guest=1 offline-metallib=1 ticket=$METALLIB_TICKET entry=$METALLIB_ENTRY rejected-ticket=1"
