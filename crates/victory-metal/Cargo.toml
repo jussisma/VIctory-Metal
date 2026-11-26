@@ -15,6 +15,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+blake3.workspace = true
 
 [lints]
 workspace = true
