@@ -555,6 +555,85 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
     })
 }
 
+/// A mesh output signature before and after the linked packer's whole-signature
+/// ordering, as the runtime counts it. Produced by [`mesh_output_layout`] for
+/// callers that must prove a pair fits without an `MTLDevice` (the hardware
+/// integration test in `victory-metal`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshOutputLayout {
+    pub vertices: u32,
+    pub primitives: u32,
+    /// 4 bytes per declared, register-bearing component, before packing.
+    pub packed_before: u32,
+    /// Metal's aligned layout, before packing.
+    pub aligned_before: u32,
+    /// The same two counts for the packed signature.
+    pub packed_after: u32,
+    pub aligned_after: u32,
+    /// The packed vertex outputs: `(register row, col, cols, kind)`.
+    pub rows_after: Vec<(u32, u8, u8, u8)>,
+}
+
+/// The mesh output footprint a translated mesh container declares, and the
+/// footprint the linked packer's within-row ordering, row permutation and
+/// wide-row splitting reach. `None` for a non-mesh or non-`DXBC` container.
+///
+/// This is the CPU-side half of the hardware proof: it shows a pair whose
+/// aligned layout is over [`METAL_MESH_OUTPUT_BYTES`] fits after packing.
+pub fn mesh_output_layout(dxil: &[u8]) -> Result<Option<MeshOutputLayout>, ShaderError> {
+    let Some((vertices, primitives)) = mesh_pack::declared_mesh_counts(dxil)? else {
+        return Ok(None);
+    };
+    let c = Container::parse(dxil)?;
+    let read = |fourcc| match c.part(fourcc) {
+        Some(part) => signature(part.data),
+        None => Ok(Vec::new()),
+    };
+    let before = read(FourCC::OSG1)?;
+    let prims = read(FourCC::PSG1)?;
+    let packed = |outputs: &[container::SigElement], prims: &[container::SigElement]| -> u32 {
+        let components = |els: &[container::SigElement]| -> u32 {
+            els.iter()
+                .filter(|e| e.row.is_some())
+                .map(|e| u32::from(e.cols))
+                .sum()
+        };
+        4 * (components(outputs) * vertices + components(prims) * primitives)
+    };
+    let packed_before = packed(&before, &prims);
+    let aligned_before = vertices
+        .saturating_mul(mesh_pack::vertex_aligned(&before))
+        .saturating_add(primitives.saturating_mul(mesh_pack::primitive_aligned(&prims)));
+
+    let mut after = before.clone();
+    mesh_pack::split_wide_rows(&mut after);
+    mesh_pack::pack_within_rows(&mut after);
+    if let Some(order) = mesh_pack::row_order(&after) {
+        for e in &mut after {
+            if let Some(emitted) = e.row.and_then(|row| order.get(&row).copied()) {
+                e.row = Some(emitted);
+            }
+        }
+        after.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+    }
+    let packed_after = packed(&after, &prims);
+    let aligned_after = vertices
+        .saturating_mul(mesh_pack::vertex_aligned(&after))
+        .saturating_add(primitives.saturating_mul(mesh_pack::primitive_aligned(&prims)));
+    Ok(Some(MeshOutputLayout {
+        vertices,
+        primitives,
+        packed_before,
+        aligned_before,
+        packed_after,
+        aligned_after,
+        rows_after: after
+            .iter()
+            .filter_map(|e| e.row.map(|row| (row, e.col, e.cols, e.kind)))
+            .collect(),
+    }))
+}
+
 struct Prepared<'a> {
     c: Container<'a>,
     native: NativeProgram,
@@ -676,12 +755,11 @@ pub fn translate_linked(
     };
     let emit_mesh = |reads: &lower::KeptOutputs| {
         let linked = emit_pruned(&ms_in, options, Some(reads))?;
-        let bytes = mesh_outputs(&linked.dxil)
-            .ok_or(ShaderError::Malformed(
-                "linked shader has no mesh output declaration",
-            ))?
-            .bytes();
-        if bytes > METAL_MESH_OUTPUT_BYTES {
+        // The runtime refuses on the larger of the packed footprint and Metal's
+        // aligned layout (`mesh_output_bytes`), not only the packed count: a
+        // signature the packed count puts under 32 KiB can still overrun the
+        // limit through per-element padding (#172, the title's refused pairs).
+        if !mesh_pack::fits_mesh_output_budget(&linked.dxil)? {
             return Err(ShaderError::Unsupported {
                 offset: 0,
                 what: "mesh outputs required by the next stage exceed 32 KiB",
@@ -2268,6 +2346,48 @@ mod tests {
             v
         };
         assert_eq!(fields(&before), fields(&after));
+    }
+
+    /// Regression for the 19 title pairs refused after linking (#172): the
+    /// packed count fits but Metal's aligned layout does not, so the linked
+    /// path must refuse on the aligned end, not the packed one. 17 rows of 3
+    /// components plus the position declare 55 components at 144 vertices:
+    /// 31,680 B packed (under 32 KiB), but every 12-byte element after the
+    /// 16-byte position lands on a 12-byte boundary and the first pads 8 bytes,
+    /// 228 B per vertex and 32,832 B total. No within-row or whole-row order
+    /// can remove that pad (all rows are the same width), so it stays refused.
+    #[test]
+    fn linked_mesh_budget_uses_metal_aligned_layout() {
+        let rows: Vec<&[u8]> = vec![&[3u8][..]; 17];
+        let (bytes, native) = shaped_mesh_parts(144, 32, &rows, 0).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit(
+            &c,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+        )
+        .unwrap();
+        let packed = mesh_pack::packed_mesh_bytes(&ms.dxil).unwrap();
+        let aligned = mesh_pack::aligned_mesh_bytes(&ms.dxil).unwrap().unwrap();
+        assert_eq!(packed, 55 * 4 * 144);
+        assert!(packed <= METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(aligned, 228 * 144);
+        assert!(aligned > METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(
+            mesh_pack::mesh_output_bytes(&ms.dxil).unwrap(),
+            Some(aligned)
+        );
+        // The linked path checks the larger count, so this pair is refused
+        // with the existing explicit error instead of emitting a signature the
+        // host drops.
+        assert!(!mesh_pack::fits_mesh_output_budget(&ms.dxil).unwrap());
     }
 
     /// Whole-register row order: a mesh whose 128 vertices declare 64

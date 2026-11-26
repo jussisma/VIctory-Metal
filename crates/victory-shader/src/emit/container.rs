@@ -506,6 +506,57 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
+    /// After the mesh packer reorders elements inside a register row and
+    /// renumbers rows, `OSG1` must describe the packed elements themselves:
+    /// every record's mask stays inside its four-channel row and the
+    /// `(register, mask, kind)` multiset is exactly the packed signature's.
+    /// A writer that reused a pre-packing row width would fail here.
+    #[test]
+    fn osg1_rows_describe_the_packed_signature() {
+        use crate::emit::mesh_pack;
+        let el = |name: &str, kind: u8, row: u32, col: u8, cols: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: if cols >= 8 { u8::MAX } else { (1u8 << cols) - 1 },
+            half: false,
+        };
+        let mut els = vec![el("SV_Position", 3, 0, 0, 4)];
+        els.extend((1..=6).map(|r| el("TEXCOORD", 0, r, 0, 4)));
+        // A mixed row and a wide element: both are what a stale width misses.
+        els.push(el("TEXCOORD", 0, 7, 0, 1));
+        els.push(el("TEXCOORD", 0, 7, 1, 3));
+        els.push(el("TEXCOORD", 0, 8, 0, 8));
+        mesh_pack::split_wide_rows(&mut els);
+        mesh_pack::pack_within_rows(&mut els);
+
+        let part = signature(&els, false);
+        let count = u32::from_le_bytes(part[0..4].try_into().unwrap()) as usize;
+        let base = u32::from_le_bytes(part[4..8].try_into().unwrap()) as usize;
+        assert_eq!(count, els.len());
+        let mut emitted = Vec::new();
+        for i in 0..count {
+            let at = base + 32 * i;
+            let kind = u32::from_le_bytes(part[at + 12..at + 16].try_into().unwrap());
+            let row = u32::from_le_bytes(part[at + 20..at + 24].try_into().unwrap());
+            let mask = part[at + 24];
+            assert_eq!(mask & !0xF, 0, "a row mask outside its four channels");
+            emitted.push((kind, row, mask));
+        }
+        let mut expected: Vec<(u32, u32, u8)> = els
+            .iter()
+            .filter_map(|e| e.row.map(|r| (e.system_value(), r, e.mask())))
+            .collect();
+        emitted.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(emitted, expected);
+    }
+
     #[test]
     fn md5_core_matches_the_standard() {
         // Standard MD5 of "abc" with standard padding, through md5_block.
