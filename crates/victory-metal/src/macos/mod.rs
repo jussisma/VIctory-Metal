@@ -6,6 +6,7 @@ pub mod cache;
 pub mod device;
 pub mod irconverter;
 pub mod msc;
+pub mod mesh;
 pub(crate) mod objc;
 pub mod present;
 pub mod render;
