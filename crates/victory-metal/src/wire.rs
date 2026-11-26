@@ -674,6 +674,41 @@ pub enum WireError {
     TrailingBytes,
     /// The frame does not fit the 32-bit payload length field.
     FrameTooLarge,
+    /// A render pass carried no color attachments.
+    ZeroColorAttachments,
+    /// A render pass has more than `MAX_COLOR_ATTACHMENTS` (8) color
+    /// attachments.
+    TooManyColorAttachments(usize),
+    /// A render pass has more than one depth/stencil attachment.
+    TooManyDepthAttachments(usize),
+    /// A vertex-buffer set bound no buffers.
+    ZeroVertexBuffers,
+    /// A vertex-buffer set bound more than `MAX_VERTEX_BUFFERS` (16) buffers.
+    TooManyVertexBuffers(usize),
+    /// An enumeration word carried a code this protocol version does not
+    /// define.
+    InvalidEnumCode {
+        /// Name of the enumeration field that carried the code.
+        field: &'static str,
+        /// The undefined wire code.
+        code: u16,
+    },
+    /// A `Present` command carried a sync interval other than 0 or 1.
+    UnsupportedSyncInterval(u32),
+    /// A version 3 submission contains more than `MAX_COMMANDS_V3` (1024)
+    /// commands.
+    TooManyCommandsV3(usize),
+    /// A version 3 barrier command contains more than `MAX_BARRIERS_V3` (32)
+    /// entries.
+    TooManyBarriersV3(usize),
+    /// A version 3 descriptor table contains more than
+    /// `MAX_DESCRIPTOR_BINDINGS_V3` (32) bindings.
+    TooManyDescriptorBindingsV3(usize),
+    /// A field documented as a nonzero extent or stride was zero.
+    ZeroExtent {
+        /// Name of the zero extent or stride field.
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for WireError {
@@ -740,6 +775,35 @@ impl fmt::Display for WireError {
             Self::LengthMismatch => write!(f, "payload length does not match field widths"),
             Self::TrailingBytes => write!(f, "trailing bytes after frame payload"),
             Self::FrameTooLarge => write!(f, "frame payload exceeds 32-bit length field"),
+            Self::ZeroColorAttachments => {
+                write!(f, "render pass must have at least one color attachment")
+            }
+            Self::TooManyColorAttachments(count) => {
+                write!(f, "{count} color attachments exceeds limit 8")
+            }
+            Self::TooManyDepthAttachments(count) => {
+                write!(f, "{count} depth attachments exceeds limit 1")
+            }
+            Self::ZeroVertexBuffers => write!(f, "vertex-buffer set must not be empty"),
+            Self::TooManyVertexBuffers(count) => {
+                write!(f, "{count} vertex buffers exceeds limit 16")
+            }
+            Self::InvalidEnumCode { field, code } => {
+                write!(f, "undefined {field} code {code}")
+            }
+            Self::UnsupportedSyncInterval(interval) => {
+                write!(f, "unsupported present sync interval {interval}")
+            }
+            Self::TooManyCommandsV3(count) => {
+                write!(f, "{count} commands exceeds version 3 limit 1024")
+            }
+            Self::TooManyBarriersV3(count) => {
+                write!(f, "{count} barrier entries exceeds version 3 limit 32")
+            }
+            Self::TooManyDescriptorBindingsV3(count) => {
+                write!(f, "{count} descriptor bindings exceeds version 3 limit 32")
+            }
+            Self::ZeroExtent { field } => write!(f, "{field} must be nonzero"),
         }
     }
 }
