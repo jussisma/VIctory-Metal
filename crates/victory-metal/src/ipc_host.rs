@@ -98,11 +98,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::abi::{VmBufferId, VmPipelineId};
+use crate::cmdlist::{ListLedger, RingError};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::device::DirectMetalTransport;
 use crate::transport::MetalError;
 use crate::wire::{
-    self, BufferBinding, Command, Reply, ReplyStatus, Submission, WireError,
+    self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
 };
 
 /// Maximum payload length accepted by the transport envelope.
@@ -491,6 +492,7 @@ pub struct IpcHost<E: BatchExecutor> {
     last_pipeline_ticket: u64,
     next_sequence: u32,
     submissions: u64,
+    ledger: ListLedger,
 }
 
 impl<E: BatchExecutor> IpcHost<E> {
@@ -524,6 +526,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             last_pipeline_ticket: 0,
             next_sequence: 1,
             submissions: 0,
+            ledger: ListLedger::new(),
         })
     }
 
@@ -646,40 +649,14 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn submit(&mut self, stream: &mut TcpStream, payload: &[u8]) -> Result<(), HostError> {
-        let submission = wire::decode_submission(payload)?;
+        let (submission, list) = wire::decode_submission_with_list(payload)?;
         if submission.sequence != self.next_sequence {
             return Err(HostError::Protocol(
                 "submission sequence is not the next expected value",
             ));
         }
 
-        let allocations: HashMap<(u64, u32), VmBufferId> = self
-            .allocations
-            .iter()
-            .map(|(&id, allocation)| ((id, BASE_GENERATION), allocation.buffer_id))
-            .collect();
-
-        // Metal was registered with the page-rounded mapping length. Enforce
-        // the exact logical file length here so a binding cannot reach the
-        // zero-filled tail of the final page.
-        let status = if submission
-            .commands
-            .iter()
-            .all(|command| self.bindings_within_logical_lengths(command))
-        {
-            match self.executor.submit_batch(&submission, &allocations) {
-                Ok(reply) => reply,
-                Err(_) => Reply {
-                    sequence: submission.sequence,
-                    status: ReplyStatus::ExecutionFailed,
-                },
-            }
-        } else {
-            Reply {
-                sequence: submission.sequence,
-                status: ReplyStatus::UnknownHandle,
-            }
-        };
+        let status = self.execute_or_refuse(&submission, list);
 
         let encoded = wire::encode_reply(&status)?;
         write_frame(stream, KIND_SUBMISSION, &encoded)?;
@@ -689,6 +666,72 @@ impl<E: BatchExecutor> IpcHost<E> {
             .ok_or(HostError::Protocol("submission sequence exhausted"))?;
         self.submissions += 1;
         Ok(())
+    }
+
+    /// Executes one submission, enforcing exactly-once for list-bound batches.
+    ///
+    /// Host-side binding validation (`UnknownHandle`) runs before the ledger
+    /// claim is taken, so a refused batch never consumes a claim. That is the
+    /// observable equivalent of claiming and then releasing: no GPU work runs
+    /// and the same list may be retried with corrected bindings once it passes
+    /// validation. [`ListLedger`] has no separate abort, so only a claim that
+    /// reached execution is retained; it is retired with `complete` on success
+    /// and deliberately left in flight after an uncertain execution failure so
+    /// the list is never executed twice.
+    ///
+    /// A replay of an executed list is refused with
+    /// [`ReplyStatus::AlreadyExecuted`] and performs no GPU work. A submission
+    /// without a list identity keeps the legacy execute-every-time behaviour.
+    fn execute_or_refuse(&self, submission: &Submission, list: Option<ListIdentity>) -> Reply {
+        let response = |status| Reply {
+            sequence: submission.sequence,
+            status,
+        };
+
+        if !self.submission_bindings_valid(submission) {
+            return response(ReplyStatus::UnknownHandle);
+        }
+
+        let Some(identity) = list else {
+            return self.execute_submission(submission);
+        };
+
+        match self.ledger.begin(identity, submission.sequence) {
+            Ok(()) => {
+                let reply = self.execute_submission(submission);
+                if reply.status == ReplyStatus::Ok {
+                    self.ledger.complete(identity, submission.sequence);
+                }
+                reply
+            }
+            Err(RingError::AlreadyExecuted) => response(ReplyStatus::AlreadyExecuted),
+            // The ledger refused a claim for another reason (for example its
+            // in-flight cap). No work ran and no claim is held.
+            Err(_) => response(ReplyStatus::ExecutionFailed),
+        }
+    }
+
+    fn submission_bindings_valid(&self, submission: &Submission) -> bool {
+        submission
+            .commands
+            .iter()
+            .all(|command| self.bindings_within_logical_lengths(command))
+    }
+
+    fn execute_submission(&self, submission: &Submission) -> Reply {
+        let allocations: HashMap<(u64, u32), VmBufferId> = self
+            .allocations
+            .iter()
+            .map(|(&id, allocation)| ((id, BASE_GENERATION), allocation.buffer_id))
+            .collect();
+
+        match self.executor.submit_batch(submission, &allocations) {
+            Ok(reply) => reply,
+            Err(_) => Reply {
+                sequence: submission.sequence,
+                status: ReplyStatus::ExecutionFailed,
+            },
+        }
     }
 
     fn bindings_within_logical_lengths(&self, command: &Command) -> bool {
@@ -864,6 +907,11 @@ mod tests {
         submissions: Vec<Submission>,
         pipelines: Vec<(Vec<u8>, String)>,
         write_marker: Option<u8>,
+        /// When set, `submit_batch` writes the execution ordinal into the first
+        /// byte of every bound allocation, making re-execution observable in
+        /// the shared mapping.
+        exec_writes: bool,
+        executions: u64,
     }
 
     struct StubExecutor {
@@ -922,9 +970,39 @@ mod tests {
         fn submit_batch(
             &self,
             submission: &Submission,
-            _allocations: &HashMap<(u64, u32), VmBufferId>,
+            allocations: &HashMap<(u64, u32), VmBufferId>,
         ) -> Result<Reply, MetalError> {
-            self.state().submissions.push(submission.clone());
+            let mut state = self.state();
+            state.submissions.push(submission.clone());
+            if state.exec_writes {
+                state.executions += 1;
+                let ordinal = u8::try_from(state.executions).unwrap_or(u8::MAX);
+                for command in &submission.commands {
+                    let bindings = match command {
+                        Command::Dispatch1d(dispatch) => &dispatch.bindings,
+                        Command::Dispatch3d(dispatch) => &dispatch.bindings,
+                        _ => continue,
+                    };
+                    for binding in bindings {
+                        let Some(buffer) = allocations
+                            .get(&(binding.allocation_id, binding.generation))
+                        else {
+                            continue;
+                        };
+                        let Some((ptr, len)) = state.live.get(&buffer.0) else {
+                            continue;
+                        };
+                        let Ok(offset) = usize::try_from(binding.offset) else {
+                            continue;
+                        };
+                        if offset < *len {
+                            // SAFETY: the host owns a live mapping of `len`
+                            // bytes at `ptr` and retains it until unregister.
+                            unsafe { (*ptr as *mut u8).add(offset).write(ordinal) };
+                        }
+                    }
+                }
+            }
             Ok(Reply {
                 sequence: submission.sequence,
                 status: ReplyStatus::Ok,
@@ -1074,6 +1152,29 @@ mod tests {
             offset: 0,
             length,
         }
+    }
+
+    fn list_identity(list_id: u64, list_generation: u32) -> ListIdentity {
+        ListIdentity {
+            list_id,
+            list_generation,
+        }
+    }
+
+    /// Sends one submission frame and returns the decoded kind-3 reply.
+    fn roundtrip_submission(
+        client: &mut TcpStream,
+        submission: &Submission,
+        list: Option<ListIdentity>,
+    ) -> Reply {
+        let encoded = wire::encode_submission_with_list(submission, list)
+            .expect("encode list submission");
+        write_frame(client, KIND_SUBMISSION, &encoded).expect("send submission");
+        let (kind, payload) = read_frame(client)
+            .expect("read submission reply")
+            .expect("submission reply frame");
+        assert_eq!(kind, KIND_SUBMISSION);
+        wire::decode_reply(&payload).expect("decode submission reply")
     }
 
     fn host(dir: &TestDir, executor: StubExecutor) -> IpcHost<StubExecutor> {
@@ -1358,6 +1459,207 @@ mod tests {
         let state = host.executor.state();
         assert_eq!(state.submissions.len(), 1, "rejected batch reached GPU");
         assert_eq!(state.submissions[0].sequence, 2);
+    }
+
+    #[test]
+    fn replayed_list_is_refused_and_leaves_buffer_bytes_unchanged() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let executor = StubExecutor::new(4096);
+        executor.state().exec_writes = true;
+        let server = start(host(&dir, executor));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        let identity = list_identity(10, 1);
+        let first = submission(1, full_binding(BYTES as u64));
+        let reply = roundtrip_submission(&mut client, &first, Some(identity));
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+        let after_first = dir.read_allocation(ALLOCATION_ID);
+        assert_eq!(after_first[0], 1, "first execution wrote ordinal 1");
+        assert!(after_first[1..].iter().all(|&byte| byte == 0));
+
+        // Same list identity, later sequence: the host must refuse the replay
+        // and perform no GPU work at all.
+        let replay = submission(2, full_binding(BYTES as u64));
+        let reply = roundtrip_submission(&mut client, &replay, Some(identity));
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::AlreadyExecuted,
+            }
+        );
+        let after_replay = dir.read_allocation(ALLOCATION_ID);
+        assert_eq!(
+            after_replay, after_first,
+            "replay rewrote the GPU-visible buffer"
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        let summary = result.expect("session succeeds");
+        assert_eq!(
+            summary,
+            SessionSummary {
+                submissions: 2,
+                allocations: 1,
+                bytes_mapped: BYTES as u64,
+            }
+        );
+        assert_eq!(host.next_sequence, 3, "one sequence per submission");
+        let state = host.executor.state();
+        assert_eq!(state.submissions, vec![first], "replay reached the executor");
+        assert_eq!(state.executions, 1, "replay executed GPU work");
+    }
+
+    #[test]
+    fn validation_refusal_leaves_the_list_retryable() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let executor = StubExecutor::new(4096);
+        executor.state().exec_writes = true;
+        let server = start(host(&dir, executor));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        let identity = list_identity(11, 1);
+        // A stale allocation generation is refused before any claim is taken.
+        let stale = submission(
+            1,
+            BufferBinding {
+                allocation_id: ALLOCATION_ID,
+                generation: BASE_GENERATION + 1,
+                offset: 0,
+                length: BYTES as u64,
+            },
+        );
+        let reply = roundtrip_submission(&mut client, &stale, Some(identity));
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::UnknownHandle,
+            }
+        );
+
+        // The same list identity with the corrected generation is not blocked
+        // by a leftover in-flight claim.
+        let corrected = submission(2, full_binding(BYTES as u64));
+        let reply = roundtrip_submission(&mut client, &corrected, Some(identity));
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::Ok,
+            }
+        );
+        let backed = dir.read_allocation(ALLOCATION_ID);
+        assert_eq!(backed[0], 1, "corrected retry never executed");
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(host.next_sequence, 3, "one sequence per submission");
+        let state = host.executor.state();
+        assert_eq!(state.submissions.len(), 1, "refused list reached the executor");
+        assert_eq!(state.submissions[0].sequence, 2);
+        assert_eq!(state.executions, 1);
+    }
+
+    #[test]
+    fn identity_free_submissions_keep_legacy_execute_every_time() {
+        // Documented legacy behaviour: a submission without a list identity is
+        // executed on every frame. Exactly-once applies only to lists.
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let executor = StubExecutor::new(4096);
+        executor.state().exec_writes = true;
+        let server = start(host(&dir, executor));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        for sequence in 1..=2 {
+            let request = submission(sequence, full_binding(BYTES as u64));
+            let reply = roundtrip_submission(&mut client, &request, None);
+            assert_eq!(
+                reply,
+                Reply {
+                    sequence,
+                    status: ReplyStatus::Ok,
+                }
+            );
+        }
+        let backed = dir.read_allocation(ALLOCATION_ID);
+        assert_eq!(backed[0], 2, "legacy submission must execute twice");
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(host.next_sequence, 3, "one sequence per submission");
+        assert_eq!(host.executor.state().submissions.len(), 2);
+        assert_eq!(host.executor.state().executions, 2);
+    }
+
+    #[test]
+    fn session_sequence_advances_once_per_submission_in_every_case() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        let list_a = list_identity(21, 1);
+        let list_b = list_identity(22, 1);
+        let cases = [
+            (1, Some(list_a), full_binding(BYTES as u64), ReplyStatus::Ok),
+            (
+                2,
+                Some(list_a),
+                full_binding(BYTES as u64),
+                ReplyStatus::AlreadyExecuted,
+            ),
+            (
+                3,
+                Some(list_b),
+                BufferBinding {
+                    allocation_id: ALLOCATION_ID,
+                    generation: BASE_GENERATION + 1,
+                    offset: 0,
+                    length: BYTES as u64,
+                },
+                ReplyStatus::UnknownHandle,
+            ),
+            (4, Some(list_b), full_binding(BYTES as u64), ReplyStatus::Ok),
+            (5, None, full_binding(BYTES as u64), ReplyStatus::Ok),
+        ];
+        for (sequence, identity, binding, status) in cases {
+            let reply = roundtrip_submission(&mut client, &submission(sequence, binding), identity);
+            assert_eq!(reply, Reply { sequence, status }, "sequence {sequence}");
+        }
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(host.next_sequence, 6, "exactly one sequence per submission");
     }
 
     #[test]
