@@ -68,11 +68,50 @@ const SURFACE_ROW_ALIGNMENT: usize = 64;
 /// Apple's maximum 2D texture edge.
 const MAX_SURFACE_DIMENSION: u32 = 16_384;
 
+/// Frame pacing requested for one presented frame.
+///
+/// This mirrors the guest's present sync interval: `0` is immediate and `1` is
+/// vertical sync. The headless presenter validates and forwards the value; a
+/// windowed host maps it onto its drawable presentation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncInterval {
+    /// Present immediately (sync interval `0`).
+    #[default]
+    Immediate,
+    /// Present on vertical sync (sync interval `1`).
+    Vsync,
+}
+
+impl SyncInterval {
+    /// Validates a wire sync interval.
+    ///
+    /// Only `0` and `1` are supported; any other value is an explicit
+    /// [`PresentError::UnsupportedSyncInterval`].
+    pub fn from_wire(value: u32) -> Result<Self, PresentError> {
+        match value {
+            0 => Ok(Self::Immediate),
+            1 => Ok(Self::Vsync),
+            other => Err(PresentError::UnsupportedSyncInterval {
+                sync_interval: other,
+            }),
+        }
+    }
+
+    /// The wire representation (`0` or `1`).
+    pub const fn as_wire(self) -> u32 {
+        match self {
+            Self::Immediate => 0,
+            Self::Vsync => 1,
+        }
+    }
+}
+
 /// A presented frame, as seen by a [`PresentSink`].
 ///
 /// Carries identity and pacing only: the surface's `IOSurfaceID`, the
-/// monotonic frame index and the host timestamp. It deliberately carries no
-/// pixel bytes, so a sink cannot accidentally introduce a readback.
+/// monotonic frame index, the host timestamp and the requested sync interval.
+/// It deliberately carries no pixel bytes, so a sink cannot accidentally
+/// introduce a readback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentedFrame {
     /// `IOSurfaceGetID` of the surface that holds this frame.
@@ -81,6 +120,8 @@ pub struct PresentedFrame {
     pub frame_index: u64,
     /// Nanoseconds since the [`PresentPath`] was created (monotonic clock).
     pub timestamp_ns: u64,
+    /// Pacing the guest requested for this frame.
+    pub sync_interval: SyncInterval,
 }
 
 /// A sink that accepts finished surfaces.
@@ -234,6 +275,14 @@ pub enum PresentError {
     /// Clear colour had a non-finite or out-of-range component.
     #[error("clear colour components must be finite and within 0.0..=1.0")]
     InvalidClearColor,
+    /// The present named a sync interval other than immediate or vsync.
+    #[error(
+        "unsupported present sync interval {sync_interval}; only 0 (immediate) and 1 (vsync) are supported"
+    )]
+    UnsupportedSyncInterval {
+        /// Requested sync interval.
+        sync_interval: u32,
+    },
     /// The sink refused the frame; the frame was not accepted.
     #[error("present sink refused frame {frame_index}: {reason}")]
     SinkRefused {
@@ -440,6 +489,21 @@ impl<'a> PresentPath<'a> {
         clear: ClearColor,
         sink: &mut dyn PresentSink,
     ) -> Result<(), PresentError> {
+        self.present_with_interval(image, clear, SyncInterval::Immediate, sink)
+    }
+
+    /// Like [`Self::present`], carrying the guest's requested sync interval.
+    ///
+    /// The interval is validated and forwarded to the sink on the
+    /// [`PresentedFrame`]; it never changes how the surface is rendered or
+    /// read, so this path stays readback-free.
+    pub fn present_with_interval(
+        &mut self,
+        image: &mut SurfaceImage,
+        clear: ClearColor,
+        sync_interval: SyncInterval,
+        sink: &mut dyn PresentSink,
+    ) -> Result<(), PresentError> {
         if let Some(inflight) = self.in_flight {
             return Err(PresentError::FrameInFlight {
                 frame_index: inflight.frame_index,
@@ -464,6 +528,7 @@ impl<'a> PresentPath<'a> {
             surface_id: image.surface_id,
             frame_index,
             timestamp_ns,
+            sync_interval,
         };
         self.in_flight = Some(frame);
         if let Err(error) = sink.present(frame) {
@@ -492,6 +557,19 @@ impl<'a> PresentPath<'a> {
         image: &mut SurfaceImage,
         sink: &mut dyn PresentSink,
     ) -> Result<(), PresentError> {
+        self.present_drawn_with_interval(image, SyncInterval::Immediate, sink)
+    }
+
+    /// Like [`Self::present_drawn`], carrying the guest's sync interval.
+    ///
+    /// The interval is forwarded on the [`PresentedFrame`] and does not touch
+    /// the surface's pixels.
+    pub fn present_drawn_with_interval(
+        &mut self,
+        image: &mut SurfaceImage,
+        sync_interval: SyncInterval,
+        sink: &mut dyn PresentSink,
+    ) -> Result<(), PresentError> {
         if let Some(inflight) = self.in_flight {
             return Err(PresentError::FrameInFlight {
                 frame_index: inflight.frame_index,
@@ -515,6 +593,7 @@ impl<'a> PresentPath<'a> {
             surface_id: image.surface_id,
             frame_index,
             timestamp_ns,
+            sync_interval,
         };
         self.in_flight = Some(frame);
         if let Err(error) = sink.present(frame) {
@@ -1166,6 +1245,140 @@ mod tests {
             sink.frames()[0].frame_index, 1,
             "a refused frame consumes its index, so indexes stay monotonic"
         );
+    }
+
+    #[test]
+    fn two_surfaces_present_distinct_frames_with_interval_and_refusal_discipline() {
+        use crate::transport::MetalTransport;
+
+        let transport = open_transport();
+        let mut path = PresentPath::new(&transport);
+        let mut sink = RecordingSink::new();
+        let mut first = create_surface(&transport, 40, 24);
+        let mut second = create_surface(&transport, 40, 24);
+
+        // Frame 0: immediate pace, rendered into the first surface.
+        path.present_with_interval(
+            &mut first,
+            ClearColor::OPAQUE_RED,
+            SyncInterval::Immediate,
+            &mut sink,
+        )
+        .expect("frame 0 should reach the sink");
+        let in_flight = path.in_flight().expect("frame 0 must be in flight");
+        assert_eq!(in_flight.frame_index, 0);
+        assert_eq!(in_flight.surface_id, first.surface_id());
+        assert_eq!(in_flight.sync_interval, SyncInterval::Immediate);
+        let first_rows = assert_solid(&first, ClearColor::OPAQUE_RED, "frame 0");
+
+        // Exactly one frame may be in flight: the second surface is refused
+        // before it is encoded, so its contents stay untouched.
+        let error = path
+            .present_with_interval(
+                &mut second,
+                ClearColor::OPAQUE_GREEN,
+                SyncInterval::Vsync,
+                &mut sink,
+            )
+            .expect_err("a second present must be refused while a frame is in flight");
+        assert_eq!(
+            error,
+            PresentError::FrameInFlight {
+                frame_index: 0,
+                surface_id: first.surface_id(),
+            }
+        );
+        assert_eq!(second.frame_index(), None, "refused frame must not render");
+        assert_eq!(
+            sink.frames().len(),
+            1,
+            "sink must not see the refused frame"
+        );
+        assert_eq!(
+            assert_solid(&first, ClearColor::OPAQUE_RED, "frame 0 after refusal"),
+            first_rows,
+            "the in-flight surface must not change"
+        );
+
+        path.finish_present().expect("frame 0 should finish");
+
+        // Frame 1: vsync pace, rendered into the second surface.
+        path.present_with_interval(
+            &mut second,
+            ClearColor::OPAQUE_GREEN,
+            SyncInterval::Vsync,
+            &mut sink,
+        )
+        .expect("frame 1 should reach the sink");
+        let in_flight = path.in_flight().expect("frame 1 must be in flight");
+        assert_eq!(in_flight.frame_index, 1);
+        assert_eq!(in_flight.surface_id, second.surface_id());
+        assert_eq!(in_flight.sync_interval, SyncInterval::Vsync);
+        let second_rows = assert_solid(&second, ClearColor::OPAQUE_GREEN, "frame 1");
+        assert_ne!(
+            first_rows, second_rows,
+            "the two frames must carry distinct clear colours"
+        );
+        path.finish_present().expect("frame 1 should finish");
+
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame_index, 0);
+        assert_eq!(frames[1].frame_index, 1);
+        assert_eq!(frames[0].surface_id, first.surface_id());
+        assert_eq!(frames[1].surface_id, second.surface_id());
+        assert_eq!(frames[0].sync_interval, SyncInterval::Immediate);
+        assert_eq!(frames[1].sync_interval, SyncInterval::Vsync);
+
+        // A refused sink is an explicit error; the rendered frame is not
+        // dropped from the surface even though the sink took no ownership.
+        sink.refuse_next_frame();
+        let error = path
+            .present_with_interval(
+                &mut first,
+                ClearColor::OPAQUE_BLUE,
+                SyncInterval::Vsync,
+                &mut sink,
+            )
+            .expect_err("a refusing sink must surface an explicit error");
+        assert!(
+            matches!(error, PresentError::SinkRefused { frame_index: 2, .. }),
+            "unexpected refusal error: {error:?}"
+        );
+        assert_eq!(path.in_flight(), None, "refusal must clear in-flight state");
+        assert_eq!(sink.frames().len(), 2, "refused frame must not be recorded");
+        assert_solid(&first, ClearColor::OPAQUE_BLUE, "refused frame render");
+
+        // The refused frame consumed its index; presentation continues at 3.
+        path.present_with_interval(
+            &mut first,
+            ClearColor::OPAQUE_BLUE,
+            SyncInterval::Vsync,
+            &mut sink,
+        )
+        .expect("present after refusal should succeed");
+        assert_eq!(sink.frames()[2].frame_index, 3);
+        path.finish_present().expect("frame 3 should finish");
+
+        let device = transport.device_info().expect("device_info should succeed");
+        eprintln!(
+            "native present interval/refusal gate: device={}, surfaces=[{},{}], frames=[0,1], \
+             intervals=[immediate,vsync], refused_frame_index=2",
+            device.name_str(),
+            first.surface_id(),
+            second.surface_id()
+        );
+    }
+
+    #[test]
+    fn unsupported_sync_interval_is_rejected_explicitly() {
+        assert_eq!(
+            SyncInterval::from_wire(2),
+            Err(PresentError::UnsupportedSyncInterval { sync_interval: 2 })
+        );
+        assert_eq!(SyncInterval::from_wire(0), Ok(SyncInterval::Immediate));
+        assert_eq!(SyncInterval::from_wire(1), Ok(SyncInterval::Vsync));
+        assert_eq!(SyncInterval::Vsync.as_wire(), 1);
     }
 
     #[test]
