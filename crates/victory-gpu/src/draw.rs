@@ -4233,6 +4233,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,
+                bvh_no_hit: false,
             },
         )
         .unwrap();

@@ -416,6 +416,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         bias_as_gradients: false,
         narrow_waves: false,
         host_wave32: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower");

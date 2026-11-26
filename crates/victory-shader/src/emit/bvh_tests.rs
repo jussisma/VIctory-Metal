@@ -943,3 +943,14 @@ fn box32_nodes_across_a_page_boundary_equal_the_reference() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// With `bvh_no_hit` enabled, a raytrace shader misses immediately without
+/// enabling BVH title-memory reads (compare `bvh_no_hit = false` on the same
+/// descriptor-based ray input).
+#[test]
+fn a_bvh_test_with_no_hit_reads_nothing() {
+    for wide in [false, true] {
+        assert!(build_with(wide, false, false).memory);
+        assert!(!build_with(wide, false, true).memory);
+    }
+}

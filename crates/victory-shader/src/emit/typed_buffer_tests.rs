@@ -116,6 +116,7 @@ fn lowered() -> lower::Lowered {
         bias_as_gradients: false,
         narrow_waves: false,
         host_wave32: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower")

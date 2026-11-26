@@ -461,6 +461,10 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// When the acceleration-structure builder does not run (`VICTORY_BVH_NO_HIT=1`),
+    /// BVH intersection instructions answer miss immediately without reading
+    /// unbuilt title memory.
+    pub bvh_no_hit: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -841,6 +845,7 @@ fn emit_pruned(
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
+        bvh_no_hit: options.bvh_no_hit,
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving

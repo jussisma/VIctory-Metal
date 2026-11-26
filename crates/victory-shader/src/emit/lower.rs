@@ -152,6 +152,8 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// See [`Options::bvh_no_hit`](super::Options).
+    pub bvh_no_hit: bool,
 }
 
 enum Stop {
@@ -698,7 +700,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
-            || insts().any(|i| i.name().starts_with("image_bvh"));
+            || (!x.bvh_no_hit && insts().any(|i| i.name().starts_with("image_bvh")));
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();

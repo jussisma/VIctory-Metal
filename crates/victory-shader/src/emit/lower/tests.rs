@@ -82,6 +82,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .map(|_| ())
@@ -139,6 +140,7 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
 }
@@ -423,6 +425,7 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .unwrap();
@@ -1391,6 +1394,7 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         bias_as_gradients: false,
         narrow_waves,
         host_wave32: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower")
@@ -1632,6 +1636,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             bias_as_gradients: false,
             narrow_waves: false,
             host_wave32: false,
+            bvh_no_hit: false,
             view_marks: false,
         })
         .unwrap();
@@ -1730,6 +1735,7 @@ fn lower_ps_for_early_z(
         bias_as_gradients: false,
         narrow_waves: false,
         host_wave32: false,
+        bvh_no_hit: false,
         view_marks,
     })
     .expect("lower")
@@ -1910,4 +1916,78 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
     let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
     assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+}
+
+#[test]
+fn bvh_no_hit_skips_memory_and_lowers() {
+    // Build a valid shifted BVH descriptor in s[12:15] from root s[0:1],
+    // initialize v2..=v13 to 0, run image_bvh64_intersect_ray, store v20 to LDS.
+    let mut w = vec![
+        0x8000_0000 | (0x21 << 23) | (12 << 16) | ((128 + 8) << 8), // s_lshr_b64 s[12:13], s[0:1], 8
+        0x8000_0000 | (0x10 << 23) | (13 << 16) | (255 << 8) | 13,  // s_or_b32 s13, s13, 0x80000000
+        0x8000_0000,
+        0xBE80_0000 | (14 << 16) | (0x03 << 8) | 193, // s_mov_b32 s14, -1
+        0xBE80_0000 | (15 << 16) | (0x03 << 8) | 255, // s_mov_b32 s15, flags
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    ];
+    w.extend((2u32..=13).map(|r| 0x7E00_0280 | (r << 17)));
+    let rest = 20 << 8 | (12 >> 2) << 16;
+    w.extend([
+        0xF19C_9F07,
+        rest | 2,
+        0x0504_030D,
+        0x0908_0706,
+        0x000C_0B0A,
+        0xD834_0000,
+        0x0000_1400, // ds_write_b32 v0, v20
+        S_ENDPGM,
+    ]);
+    let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 24,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, 24).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let run = |bvh_no_hit| {
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            host_wave32: false,
+            bvh_no_hit,
+            view_marks: false,
+        })
+        .expect("bvh lowering succeeds")
+    };
+    assert!(run(false).memory);
+    assert!(!run(true).memory);
 }

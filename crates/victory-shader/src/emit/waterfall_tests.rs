@@ -75,6 +75,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower");

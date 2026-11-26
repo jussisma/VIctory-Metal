@@ -127,6 +127,22 @@ impl Lower<'_> {
         };
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        if self.x.bvh_no_hit {
+            // No structures built: a box enters no child (`INVALID`) and any
+            // other node misses (`[+inf, 1.0, 0.0, 0.0]`), reading nothing.
+            let _ = (node_hi, &ray);
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, node, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(INVALID);
+            let miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0];
+            for (k, bits) in miss.into_iter().enumerate() {
+                let m = self.s.m.i32(bits);
+                let r = self.s.m.select(c, is_box, none, m);
+                self.write(inst, Reg::V(out + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let i64t = self.s.m.int(64);
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.
         let not7 = self.s.m.i32(!7);
