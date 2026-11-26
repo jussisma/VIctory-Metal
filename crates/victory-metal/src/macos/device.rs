@@ -11,15 +11,49 @@ use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
 use crate::macos::irconverter;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::transport::{MetalError, MetalTransport};
+use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
 
 const APPLE_SILICON_NOCOPY_PAGE_SIZE: usize = 16 * 1024;
 /// `MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared | MTLResourceHazardTrackingModeDefault`.
 const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
+/// Conservative byte alignment for a bound range offset.
+///
+/// `setBuffer:offset:atIndex:` accepts 4-byte-aligned offsets for general
+/// buffers. Shader-declared types may require stricter natural alignment (for
+/// example 16 bytes for a `float4`), which the host cannot infer from the wire
+/// frame. This entry point therefore enforces the 4-byte ABI minimum and leaves
+/// stricter shader-specific alignment to Metal's runtime validation; application
+/// layouts should place every typed declaration on its natural alignment.
+const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
+
+/// Maps wire allocation IDs and generations to live registered Metal buffers.
+///
+/// The resolver owns no GPU state: [`DirectMetalTransport`] keeps every mapped
+/// buffer alive through synchronous completion. Returning `None` for a stale or
+/// unknown generation rejects the whole batch before any GPU work starts.
+/// Implementations should be a pure lookup and must not call back into the
+/// transport, because resolution runs while the device state lock is held.
+pub trait AllocationResolver {
+    /// Resolves `allocation_id` at `generation` to a registered buffer handle.
+    fn resolve(&self, allocation_id: u64, generation: u32) -> Option<VmBufferId>;
+}
+
+impl AllocationResolver for HashMap<(u64, u32), VmBufferId> {
+    fn resolve(&self, allocation_id: u64, generation: u32) -> Option<VmBufferId> {
+        self.get(&(allocation_id, generation)).copied()
+    }
+}
+
+struct RegisteredBuffer {
+    buffer: ObjcObject,
+    /// Byte length reported to Metal at registration time.
+    len: usize,
+}
 
 struct DeviceState {
     next_id: u64,
-    buffers: HashMap<u64, ObjcObject>,
+    buffers: HashMap<u64, RegisteredBuffer>,
     pipelines: HashMap<u64, ObjcObject>,
 }
 
@@ -110,6 +144,183 @@ impl DirectMetalTransport {
         state.pipelines.insert(id, pso);
         Ok(VmPipelineId(id))
     }
+
+    /// Executes a decoded version-1 submission as one ordered native batch.
+    ///
+    /// # Contract
+    ///
+    /// * Every command is fully resolved against `resolver`, the pipeline table
+    ///   and the registered buffer table before any command buffer exists. An
+    ///   unknown pipeline, allocation, stale generation or out-of-range binding
+    ///   returns [`ReplyStatus::UnknownHandle`] and performs no GPU work.
+    /// * A binding range must satisfy `offset % 4 == 0` and
+    ///   `offset + length <= registered_length`. `length` is a lifetime/validity
+    ///   claim for the registered range, not a shader index bound: host kernels
+    ///   are trusted, and Metal validates shader-specific alignment at dispatch.
+    /// * One `MTLCommandBuffer` holds one compute encoder per command, so Metal's
+    ///   hazard tracking orders the dispatches while keeping the batch atomic.
+    /// * The state lock is held through synchronous completion, so a registered
+    ///   buffer cannot be unregistered while the GPU reads or writes it.
+    /// * The returned reply echoes the submission sequence. A GPU fault after
+    ///   commit returns [`ReplyStatus::ExecutionFailed`].
+    ///
+    /// Limits from [`crate::wire`] are re-checked here so a programmatically
+    /// constructed [`Submission`] cannot bypass the decoder bounds.
+    pub fn submit_batch(
+        &self,
+        submission: &Submission,
+        resolver: &dyn AllocationResolver,
+    ) -> Result<Reply, MetalError> {
+        if submission.sequence == 0 {
+            return Err(MetalError::InvalidArg(
+                "submission sequence must be nonzero",
+            ));
+        }
+        if submission.commands.len() > wire::MAX_COMMANDS {
+            return Err(MetalError::InvalidArg(
+                "submission exceeds wire command limit",
+            ));
+        }
+        for command in &submission.commands {
+            match command {
+                Command::Dispatch1d(dispatch) => {
+                    if dispatch.pipeline_id == 0
+                        || dispatch.threads == 0
+                        || dispatch.threads_per_group == 0
+                    {
+                        return Err(MetalError::InvalidArg(
+                            "dispatch handle and thread counts must be nonzero",
+                        ));
+                    }
+                    if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
+                        return Err(MetalError::InvalidArg(
+                            "dispatch exceeds wire binding limit",
+                        ));
+                    }
+                }
+            }
+        }
+
+        let reply = |status| Reply {
+            sequence: submission.sequence,
+            status,
+        };
+        if submission.commands.is_empty() {
+            return Ok(reply(ReplyStatus::Ok));
+        }
+
+        let _pool = AutoreleasePool::new();
+        // Hold the state lock through synchronous completion so registered
+        // buffers and pipelines cannot be released while the GPU uses them.
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MetalError::InternalError("Metal state mutex poisoned".to_string()))?;
+
+        // Resolve and validate everything before creating or committing a command
+        // buffer. This is what makes a stale generation a no-op on GPU memory.
+        let mut prepared = Vec::with_capacity(submission.commands.len());
+        for command in &submission.commands {
+            let Command::Dispatch1d(dispatch) = command;
+            let Some(pso) = state.pipelines.get(&dispatch.pipeline_id) else {
+                return Ok(reply(ReplyStatus::UnknownHandle));
+            };
+
+            let mut bindings = Vec::with_capacity(dispatch.bindings.len());
+            for (slot, binding) in dispatch.bindings.iter().enumerate() {
+                if binding.length == 0
+                    || binding.length > wire::MAX_RESOURCE_LEN
+                    || !binding.offset.is_multiple_of(MTL_BUFFER_OFFSET_ALIGNMENT)
+                {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                }
+                let Some(registered_id) =
+                    resolver.resolve(binding.allocation_id, binding.generation)
+                else {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                };
+                let Some(registered) = state.buffers.get(&registered_id.0) else {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                };
+                let Some(end) = binding.checked_end() else {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                };
+                let (Ok(offset), Ok(end)) = (usize::try_from(binding.offset), usize::try_from(end))
+                else {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                };
+                if end > registered.len {
+                    return Ok(reply(ReplyStatus::UnknownHandle));
+                }
+                bindings.push((registered.buffer.as_raw(), offset, slot));
+            }
+
+            // Match the legacy single-dispatch API: clamp the threadgroup width
+            // to the pipeline's hardware maximum instead of failing the batch.
+            // SAFETY: `pso` is a valid `MTLComputePipelineState`.
+            let max_threads = unsafe {
+                objc::msg_send_usize_0(pso.as_raw(), objc::sel(c"maxTotalThreadsPerThreadgroup"))
+            }
+            .max(1);
+            let threads_per_group = (dispatch.threads_per_group as usize).min(max_threads);
+            prepared.push((pso.as_raw(), dispatch.threads, threads_per_group, bindings));
+        }
+
+        // SAFETY: `self.queue` is a valid `MTLCommandQueue`; the returned command
+        // buffer is autoreleased and stays alive for this pool's lifetime.
+        let cb = unsafe { objc::msg_send_id_0(self.queue.as_raw(), objc::sel(c"commandBuffer")) };
+        if cb.is_null() {
+            return Err(MetalError::InternalError(
+                "MTLCommandQueue.commandBuffer returned null".to_string(),
+            ));
+        }
+
+        for (pso, threads, threads_per_group, bindings) in &prepared {
+            // SAFETY: `cb` is a valid uncommitted `MTLCommandBuffer`.
+            let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"computeCommandEncoder")) };
+            if enc.is_null() {
+                return Err(MetalError::InternalError(
+                    "MTLCommandBuffer.computeCommandEncoder returned null".to_string(),
+                ));
+            }
+            // SAFETY: `enc` and every prepared pipeline/buffer are valid Metal
+            // objects for the active encoder scope, and offsets were validated.
+            unsafe {
+                objc::msg_send_void_1(enc, objc::sel(c"setComputePipelineState:"), *pso);
+                for (buf_raw, offset, slot) in bindings {
+                    objc::msg_send_set_buffer(enc, *buf_raw, *offset, *slot);
+                }
+                objc::msg_send_dispatch_threads(
+                    enc,
+                    MTLSize {
+                        width: *threads as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: *threads_per_group,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                objc::msg_send_void_0(enc, objc::sel(c"endEncoding"));
+            }
+        }
+
+        // SAFETY: `cb` is a valid command buffer with every encoder closed.
+        unsafe {
+            objc::msg_send_void_0(cb, objc::sel(c"commit"));
+            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
+        }
+
+        // SAFETY: `cb` has completed via `waitUntilCompleted`.
+        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            return Ok(reply(ReplyStatus::ExecutionFailed));
+        }
+
+        Ok(reply(ReplyStatus::Ok))
+    }
 }
 
 impl MetalTransport for DirectMetalTransport {
@@ -152,7 +363,9 @@ impl MetalTransport for DirectMetalTransport {
             .lock()
             .map_err(|_| MetalError::InternalError("Metal state mutex poisoned".to_string()))?;
         let id = state.alloc_id();
-        state.buffers.insert(id, buf);
+        state
+            .buffers
+            .insert(id, RegisteredBuffer { buffer: buf, len });
         Ok(VmBufferId(id))
     }
 
@@ -239,7 +452,7 @@ impl MetalTransport for DirectMetalTransport {
                 .buffers
                 .get(&buf_id.0)
                 .ok_or_else(|| MetalError::NotFound(format!("buffer {}", buf_id.0)))?;
-            bound.push(buf.as_raw());
+            bound.push(buf.buffer.as_raw());
         }
 
         // SAFETY: `pso` is a valid `MTLComputePipelineState`.
