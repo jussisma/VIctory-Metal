@@ -332,8 +332,29 @@ struct Held {
 
 #[track_caller]
 fn guards() -> Held {
+    guards_inner(false)
+}
+
+/// The guard lock for a submitting thread refreshing a copy ([`Tracked::take`]):
+/// with `VICTORY_GUARD_BENCH` set, the wait for it is sampled for this thread
+/// ([`guard_wait_report`]). Other takers (faults, writes, mappings) are not
+/// counted: they are not submitting threads.
+#[track_caller]
+fn guards_submitting() -> Held {
+    guards_inner(true)
+}
+
+#[track_caller]
+fn guards_inner(bench: bool) -> Held {
     use std::sync::atomic::Ordering::AcqRel;
+    // Only the acquisition, not the work under it: what a refresh waits for
+    // when another thread holds the guard lock. Sampling starts before the
+    // lock call, so it includes the fast path and a contended wake-up.
+    let started = (bench && guard_bench_enabled()).then(std::time::Instant::now);
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(started) = started {
+        record_guard_wait(started.elapsed());
+    }
     HOLDING.with(|h| h.set(true));
     let mut held = Held {
         guard: Some(guard),
@@ -403,6 +424,130 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
         .map(|s| (s[0].load(Relaxed), s[1].swap(0, Relaxed) as f64 / 1e3, s[2].swap(0, Relaxed) as f64 / 1e3))
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out
+}
+
+/// Per-thread slots for the guard wait benchmark: enough for the submitting
+/// threads of a frame and its faulting writers. A slot outlives its thread
+/// (its counts stay for the next report).
+const WAIT_SLOTS: usize = 16;
+/// Buckets by ceiling log2 of the wait in microseconds: 0, 1, 2, 4, 8, ...
+/// (32 covers 2^31 us, about 36 minutes).
+const WAIT_BUCKETS: usize = 32;
+/// Per slot: waits, sum of microseconds, longest wait, then the buckets.
+/// No allocation: a fault can record here while holding the guard lock.
+static WAITS: [[AtomicU64; WAIT_BUCKETS + 3]; WAIT_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; WAIT_BUCKETS + 3] }; WAIT_SLOTS];
+static NEXT_WAIT_SLOT: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's slot in [`WAITS`] (`usize::MAX` before it records).
+    static WAIT_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Whether the guard wait benchmark is on: `VICTORY_GUARD_BENCH=1` (any value
+/// but `0`, like the other switches). Off, a take pays one environment lookup
+/// on its first guard acquisition and a branch on each later one; no counter
+/// is written and no log line changes.
+pub(crate) fn guard_bench_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| crate::switch::on("VICTORY_GUARD_BENCH"));
+    #[cfg(test)]
+    if FORCE_GUARD_BENCH.load(Ordering::Relaxed) {
+        return true;
+    }
+    *ON
+}
+
+#[cfg(test)]
+static FORCE_GUARD_BENCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the benchmark on for the tests (they cannot rely on the variable
+/// being set before the first take). The normal suite does not call it.
+#[cfg(test)]
+pub(crate) fn force_guard_bench() {
+    FORCE_GUARD_BENCH.store(true, Ordering::Relaxed);
+}
+
+/// This thread's slot in [`WAITS`], the next for a new thread.
+fn wait_slot() -> usize {
+    WAIT_SLOT.with(|slot| {
+        let mut at = slot.get();
+        if at == usize::MAX {
+            at = NEXT_WAIT_SLOT.fetch_add(1, Ordering::Relaxed) as usize % WAIT_SLOTS;
+            slot.set(at);
+        }
+        at
+    })
+}
+
+/// Adds one guard acquisition's wait: a bounded per-thread histogram, so a
+/// report has percentiles without keeping a sample per take.
+fn record_guard_wait(elapsed: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let us = elapsed.as_micros() as u64;
+    let slot = &WAITS[wait_slot()];
+    slot[0].fetch_add(1, Relaxed);
+    slot[1].fetch_add(us, Relaxed);
+    slot[2].fetch_max(us, Relaxed);
+    let bucket = if us == 0 { 0 } else { (64 - us.leading_zeros() as usize).min(WAIT_BUCKETS - 1) };
+    slot[3 + bucket].fetch_add(1, Relaxed);
+}
+
+/// One submitting thread's guard waits since the last report ([`WAITS`]).
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Debug)]
+pub(crate) struct GuardWaitReport {
+    /// The thread's slot (a new thread takes the next; slots are reused).
+    pub(crate) slot: usize,
+    /// Acquisitions sampled and their total, longest and (histogram upper
+    /// bounds of the) 50th and 99th percentile.
+    pub(crate) waits: u64,
+    pub(crate) sum_us: u64,
+    pub(crate) max_us: u64,
+    pub(crate) p50_us: u64,
+    pub(crate) p99_us: u64,
+}
+
+/// Takes every thread's guard wait samples, one report per slot with any:
+/// the per-submitting-thread form of the cumulative `GuardWaitUs` counter.
+/// (The counter sums all threads and still includes the tracker lock; this
+/// samples only the guard lock acquisition.)
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn guard_wait_report() -> Vec<GuardWaitReport> {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// The upper bound a bucket stands for, in microseconds.
+    fn upper(bucket: usize) -> u64 {
+        if bucket == 0 { 0 } else { 1 << (bucket - 1) }
+    }
+    let mut out = Vec::new();
+    for (slot, s) in WAITS.iter().enumerate() {
+        let waits = s[0].swap(0, Relaxed);
+        let sum_us = s[1].swap(0, Relaxed);
+        let max_us = s[2].swap(0, Relaxed);
+        let buckets: [u64; WAIT_BUCKETS] = std::array::from_fn(|i| s[3 + i].swap(0, Relaxed));
+        if waits == 0 {
+            continue;
+        }
+        let percentile = |p: u64| {
+            let at = (waits * p).div_ceil(100).max(1);
+            let mut seen = 0;
+            for (bucket, &n) in buckets.iter().enumerate() {
+                seen += n;
+                if seen >= at {
+                    return upper(bucket);
+                }
+            }
+            max_us
+        };
+        out.push(GuardWaitReport {
+            slot,
+            waits,
+            sum_us,
+            max_us,
+            p50_us: percentile(50),
+            p99_us: percentile(99),
+        });
+    }
     out
 }
 
@@ -652,7 +797,7 @@ impl Tracked {
         // between marks them changed again; the copy, made after, has it.
         #[cfg(feature = "diagnostics")]
         let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
+        let mut g = guards_submitting();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(waited);
@@ -1982,5 +2127,206 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Copies the runs a take returned into `copy`, the host image of the
+    /// tracked range that starts at `base`.
+    fn copy_runs(base: usize, runs: &[(usize, usize)], copy: &mut [u8]) {
+        for &(a, b) in runs {
+            let off = a - base;
+            assert!(
+                crate::host::read_into(a as *const u8, &mut copy[off..off + (b - a)]),
+                "read {a:#x}+{:#x}",
+                b - a
+            );
+        }
+    }
+
+    /// Writers fault guarded pages through either of two mappings of the
+    /// same pages while submitting threads refresh (take: guard, copy) the
+    /// first, as a frame's copies do. Once they stop, the refreshed image
+    /// holds each writer's last word: a write the guards lost would leave
+    /// the word before it (or the base pattern) there, and the next take
+    /// would find nothing.
+    #[test]
+    fn aliased_guard_faults_do_not_lose_a_write() {
+        const WRITERS: usize = 4;
+        const REFRESHERS: usize = 2;
+        const REFRESHES: usize = 250;
+        let pages = 2;
+        let len = pages * PAGE;
+        let (a, b) = twin_views(pages);
+        let t = track(a, len, true).expect("views are tracked");
+        // A known image, taken once: every word starts at a value that is
+        // not any writer's, so a stale word is visible.
+        let base = 0x1111_0000_0000_0000u64;
+        // SAFETY: our view, written before it is guarded by the take below.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(a as *mut u8, len);
+            for (i, word) in bytes.chunks_exact_mut(8).enumerate() {
+                word.copy_from_slice(&(base | i as u64).to_le_bytes());
+            }
+        }
+        let mut copy = vec![0u8; len];
+        let (runs, zero) = t.take_split(a, a + len);
+        assert!(zero.is_empty(), "mapped pages");
+        copy_runs(a, &runs, &mut copy);
+        assert_eq!(u64::from_le_bytes(copy[..8].try_into().unwrap()), base, "the copy starts as taken");
+        // Each writer owns a word: two on each page, so a take guards both
+        // pages and aliases while the writers fault them.
+        let slot = |w: usize| ((w / 2) * PAGE) + (w % 2) * 64;
+        let value = |w: usize, i: u64| ((w as u64 + 1) << 40) | i;
+        let barrier = std::sync::Barrier::new(WRITERS + REFRESHERS + 1);
+        // Writers run until every refresh has finished, so the takes that
+        // contend are the ones with a changed page to guard; `last` is the
+        // word each ends on (stored after it is written, before the join).
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let last: Vec<AtomicU64> = (0..WRITERS).map(|_| AtomicU64::new(0)).collect();
+        std::thread::scope(|scope| {
+            for (w, last) in last.iter().enumerate() {
+                let (barrier, stop) = (&barrier, &stop);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) && i < 100_000_000 {
+                        // Through both mappings, as a title's pool view and
+                        // tiled heap both show the pages.
+                        let at = if i % 2 == 0 { a } else { b } + slot(w);
+                        // SAFETY: a word of our views; a guarded page faults
+                        // into the handler, which marks it changed.
+                        unsafe { (at as *mut u64).write_volatile(value(w, i)) };
+                        last.store(i, Ordering::Relaxed);
+                        i += 1;
+                    }
+                });
+            }
+            let mut running = Vec::with_capacity(REFRESHERS);
+            for _ in 0..REFRESHERS {
+                let (barrier, t, a) = (&barrier, &t, a);
+                running.push(scope.spawn(move || {
+                    let mut copy = vec![0u8; len];
+                    barrier.wait();
+                    for _ in 0..REFRESHES {
+                        let (runs, zero) = t.take_split(a, a + len);
+                        assert!(zero.is_empty(), "mapped pages");
+                        copy_runs(a, &runs, &mut copy);
+                    }
+                }));
+            }
+            barrier.wait();
+            for refresher in running {
+                refresher.join().expect("a refresh thread");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // Everything is quiet: one refresh must now hold every last write.
+        let (runs, zero) = t.take_split(a, a + len);
+        assert!(zero.is_empty(), "mapped pages");
+        copy_runs(a, &runs, &mut copy);
+        for (w, last) in last.iter().enumerate() {
+            let i = last.load(Ordering::Relaxed);
+            let at = slot(w);
+            let got = u64::from_le_bytes(copy[at..at + 8].try_into().unwrap());
+            assert_eq!(got, value(w, i), "writer {w}'s last write is in the refreshed copy");
+            // The title memory holds it too, through the other mapping.
+            let mut title = [0u8; 8];
+            assert!(crate::host::read_into((b + at) as *const u8, &mut title));
+            assert_eq!(u64::from_le_bytes(title), value(w, i), "writer {w}'s last write is in title memory");
+        }
+        assert!(t.take(a, a + len).is_empty(), "nothing written is left unguarded");
+        drop(t);
+    }
+
+    /// Opt-in wall-time benchmark for the contended take: refresh threads
+    /// copy while writers fault the same aliased pages, then it prints each
+    /// submitting thread's guard waits (the `VICTORY_GUARD_BENCH` histogram)
+    /// and its refresh latency. Not part of the suite: it is a measurement.
+    #[test]
+    #[ignore = "opt-in measurement: run under Wine CPU with --ignored --nocapture --test-threads=1"]
+    fn guard_wait_benchmark_reports_each_submitting_thread() {
+        const WRITERS: usize = 4;
+        const REFRESHERS: usize = 3;
+        const REFRESHES: usize = 1200;
+        force_guard_bench();
+        let pages = 2;
+        let len = pages * PAGE;
+        let (a, b) = twin_views(pages);
+        let t = track(a, len, true).expect("views are tracked");
+        t.take(a, a + len);
+        let _ = guard_wait_report(); // drop what the initial take saw
+        let slot = |w: usize| ((w / 2) * PAGE) + (w % 2) * 64;
+        let barrier = std::sync::Barrier::new(WRITERS + REFRESHERS + 1);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let latency: Vec<std::sync::Mutex<Vec<u64>>> =
+            (0..REFRESHERS).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        std::thread::scope(|scope| {
+            for w in 0..WRITERS {
+                let (barrier, stop) = (&barrier, &stop);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) && i < 100_000_000 {
+                        let at = if i % 2 == 0 { a } else { b } + slot(w);
+                        // A kernel write's route (`writing`) marks the pages a
+                        // guard would not see, keeping the takes contended;
+                        // it opens them for this write and marks them again
+                        // when it ends.
+                        let write = writing(at, 8);
+                        // SAFETY: a word of our views, open while `write` lives.
+                        unsafe { (at as *mut u64).write_volatile(((w as u64 + 1) << 40) | i as u64) };
+                        drop(write);
+                        i += 1;
+                    }
+                });
+            }
+            let mut running = Vec::with_capacity(REFRESHERS);
+            for latency in &latency {
+                let (barrier, t, a) = (&barrier, &t, a);
+                running.push(scope.spawn(move || {
+                    let mut copy = vec![0u8; len];
+                    barrier.wait();
+                    for _ in 0..REFRESHES {
+                        let started = std::time::Instant::now();
+                        let (runs, _) = t.take_split(a, a + len);
+                        copy_runs(a, &runs, &mut copy);
+                        latency.lock().unwrap_or_else(|e| e.into_inner()).push(started.elapsed().as_micros() as u64);
+                    }
+                }));
+            }
+            barrier.wait();
+            for refresher in running {
+                refresher.join().expect("a refresh thread");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        let report = guard_wait_report();
+        let waits: u64 = report.iter().map(|r| r.waits).sum();
+        assert!(waits > 0, "the benchmark recorded no guard acquisition");
+        println!("guard waits per submitting thread (VICTORY_GUARD_BENCH histogram):");
+        for r in &report {
+            println!(
+                "  slot {}: {} waits, {:.1} ms total, p50 {} us, p99 {} us, max {} us",
+                r.slot,
+                r.waits,
+                r.sum_us as f64 / 1e3,
+                r.p50_us,
+                r.p99_us,
+                r.max_us
+            );
+        }
+        let percentile = |sorted: &[u64], p: usize| sorted.get((sorted.len() - 1) * p / 100).copied().unwrap_or(0);
+        println!("refresh latency per submitting thread (take and copy):");
+        for (r, latency) in latency.iter().enumerate() {
+            let mut times = latency.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            times.sort_unstable();
+            println!(
+                "  thread {r}: {} refreshes, p50 {} us, p99 {} us, max {} us",
+                times.len(),
+                percentile(&times, 50),
+                percentile(&times, 99),
+                times.last().copied().unwrap_or(0)
+            );
+        }
+        drop(t);
     }
 }
