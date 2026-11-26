@@ -261,6 +261,7 @@ mod deltas;
 mod rect;
 pub use container::sign as sign_container;
 pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
+pub use mesh_pack::{MeshPackProof, MeshPruneReason, MeshRowProof, mesh_pack_proof};
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
@@ -679,7 +680,7 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
 
 /// Arbitrary (`kind == 0`) input channels read by an emitted pixel shader,
 /// keyed by `(UPPERCASE_NAME, semantic_index)` -> 4-bit absolute channel mask.
-fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+pub(crate) fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
     let c = Container::parse(dxil)?;
     let Some(part) = c.part(FourCC::ISG1) else {
         return Ok(lower::KeptOutputs::new());

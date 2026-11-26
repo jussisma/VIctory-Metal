@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use victory_shader::emit::mesh_output_layout;
-use victory_shader::emit::{emit, METAL_MESH_OUTPUT_BYTES};
+use victory_shader::emit::{emit, mesh_pack_proof, METAL_MESH_OUTPUT_BYTES};
 use victory_shader::native::{
     MeshIo, NativeProgram, PsInput, StageIo, Usage, VsOutput,
 };
@@ -333,6 +333,45 @@ fn paired_mesh_pixel_above_32k_fits_after_packing() {
             "row {row} declares {col}+{cols} channels"
         );
     }
+
+    // The linked-pair proof: the same declared footprint, then dead-export
+    // pruning and channel compaction against this pixel stage. The pixel
+    // fixture reads only `TEXCOORD0.x`, so just the position and that row are
+    // carried; the other 31 arbitrary rows are provably unobservable.
+    let proof = mesh_pack_proof(&mesh, Some(&pixel))
+        .expect("the mesh container parses")
+        .expect("a mesh output declaration");
+    eprintln!(
+        "CPU proof: declared {declared} B aligned / {packed} B packed -> {aligned} B aligned / \
+         {after} B packed, {kept} rows kept, {pruned} pruned, fits {fits}",
+        declared = proof.declared_aligned,
+        packed = proof.declared_packed,
+        aligned = proof.aligned_after,
+        after = proof.packed_after,
+        kept = proof.retained.len(),
+        pruned = proof.pruned.len(),
+        fits = proof.fits,
+    );
+    assert_eq!(proof.declared_aligned, 33_280);
+    assert!(proof.linkage_proven, "the pixel stage is identified");
+    assert!(proof.fits, "the linked pair fits after pruning: {proof:?}");
+    assert!(proof.aligned_after <= METAL_MESH_OUTPUT_BYTES);
+    assert!(proof.packed_after <= METAL_MESH_OUTPUT_BYTES);
+    // PSV0/OSG1 identity: the position and the read semantic survive, the
+    // pixel's read mask is preserved, and every declared row is accounted for.
+    assert!(proof.retained.iter().any(|r| r.kind == 3));
+    let kept = proof
+        .retained
+        .iter()
+        .find(|r| r.kind == 0 && r.index == 0)
+        .expect("TEXCOORD0 is retained");
+    assert_eq!(kept.read, 0b0001, "the pixel input's read mask");
+    assert_eq!(
+        proof.retained.len() + proof.pruned.len(),
+        layout.rows_after.len(),
+        "every declared row is accounted for"
+    );
+    assert!(proof.pruned.iter().any(|r| r.index == 1));
 
     // Both stages through IRConverter, when a Rosetta worker is configured.
     match converter_outcome(&mesh, &pixel) {
