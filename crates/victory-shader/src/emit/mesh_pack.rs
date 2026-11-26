@@ -104,6 +104,36 @@ fn primitive_bytes(elements: &[(u32, u8)]) -> u32 {
     )
 }
 
+/// Metal's aligned bytes for one vertex's outputs, from typed elements.
+pub(crate) fn vertex_aligned(elements: &[SigElement]) -> u32 {
+    let distances: u32 = elements
+        .iter()
+        .filter(|e| matches!(e.kind, 6 | 7))
+        .map(|e| u32::from(e.cols))
+        .sum();
+    fold(
+        std::iter::repeat_n(4u32, distances as usize)
+            .chain([16])
+            .chain(
+                elements
+                    .iter()
+                    .filter(|e| e.kind != 3)
+                    .map(element_bytes),
+            ),
+        0,
+    )
+}
+
+/// Metal's aligned bytes for one primitive's outputs, from typed elements.
+pub(crate) fn primitive_aligned(elements: &[SigElement]) -> u32 {
+    fold(elements.iter().map(element_bytes), 0)
+}
+
+/// The declared `(vertices, primitives)` of a mesh container, from `PSV0`.
+pub(crate) fn declared_mesh_counts(dxil: &[u8]) -> Result<Option<(u32, u32)>, ShaderError> {
+    mesh_counts(dxil)
+}
+
 /// The declared maxima and whether the container is a mesh shader, from
 /// `PSV0`'s runtime info.
 fn mesh_counts(dxil: &[u8]) -> Result<Option<(u32, u32)>, ShaderError> {

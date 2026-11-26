@@ -555,6 +555,85 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
     })
 }
 
+/// A mesh output signature before and after the linked packer's whole-signature
+/// ordering, as the runtime counts it. Produced by [`mesh_output_layout`] for
+/// callers that must prove a pair fits without an `MTLDevice` (the hardware
+/// integration test in `victory-metal`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshOutputLayout {
+    pub vertices: u32,
+    pub primitives: u32,
+    /// 4 bytes per declared, register-bearing component, before packing.
+    pub packed_before: u32,
+    /// Metal's aligned layout, before packing.
+    pub aligned_before: u32,
+    /// The same two counts for the packed signature.
+    pub packed_after: u32,
+    pub aligned_after: u32,
+    /// The packed vertex outputs: `(register row, col, cols, kind)`.
+    pub rows_after: Vec<(u32, u8, u8, u8)>,
+}
+
+/// The mesh output footprint a translated mesh container declares, and the
+/// footprint the linked packer's within-row ordering, row permutation and
+/// wide-row splitting reach. `None` for a non-mesh or non-`DXBC` container.
+///
+/// This is the CPU-side half of the hardware proof: it shows a pair whose
+/// aligned layout is over [`METAL_MESH_OUTPUT_BYTES`] fits after packing.
+pub fn mesh_output_layout(dxil: &[u8]) -> Result<Option<MeshOutputLayout>, ShaderError> {
+    let Some((vertices, primitives)) = mesh_pack::declared_mesh_counts(dxil)? else {
+        return Ok(None);
+    };
+    let c = Container::parse(dxil)?;
+    let read = |fourcc| match c.part(fourcc) {
+        Some(part) => signature(part.data),
+        None => Ok(Vec::new()),
+    };
+    let before = read(FourCC::OSG1)?;
+    let prims = read(FourCC::PSG1)?;
+    let packed = |outputs: &[container::SigElement], prims: &[container::SigElement]| -> u32 {
+        let components = |els: &[container::SigElement]| -> u32 {
+            els.iter()
+                .filter(|e| e.row.is_some())
+                .map(|e| u32::from(e.cols))
+                .sum()
+        };
+        4 * (components(outputs) * vertices + components(prims) * primitives)
+    };
+    let packed_before = packed(&before, &prims);
+    let aligned_before = vertices
+        .saturating_mul(mesh_pack::vertex_aligned(&before))
+        .saturating_add(primitives.saturating_mul(mesh_pack::primitive_aligned(&prims)));
+
+    let mut after = before.clone();
+    mesh_pack::split_wide_rows(&mut after);
+    mesh_pack::pack_within_rows(&mut after);
+    if let Some(order) = mesh_pack::row_order(&after) {
+        for e in &mut after {
+            if let Some(emitted) = e.row.and_then(|row| order.get(&row).copied()) {
+                e.row = Some(emitted);
+            }
+        }
+        after.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+    }
+    let packed_after = packed(&after, &prims);
+    let aligned_after = vertices
+        .saturating_mul(mesh_pack::vertex_aligned(&after))
+        .saturating_add(primitives.saturating_mul(mesh_pack::primitive_aligned(&prims)));
+    Ok(Some(MeshOutputLayout {
+        vertices,
+        primitives,
+        packed_before,
+        aligned_before,
+        packed_after,
+        aligned_after,
+        rows_after: after
+            .iter()
+            .filter_map(|e| e.row.map(|row| (row, e.col, e.cols, e.kind)))
+            .collect(),
+    }))
+}
+
 struct Prepared<'a> {
     c: Container<'a>,
     native: NativeProgram,
