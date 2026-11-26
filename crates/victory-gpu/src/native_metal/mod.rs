@@ -9,6 +9,8 @@
 //! starts: an unimplemented opcode returns an explicit error (ADR-008).
 
 pub mod bindings;
+pub mod client;
 pub mod present;
 pub mod producer;
 pub mod queue;
+pub mod telemetry;

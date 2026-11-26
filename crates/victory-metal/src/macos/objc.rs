@@ -201,6 +201,17 @@ pub(crate) unsafe fn nserror_message(err: Id) -> String {
         .into_owned()
 }
 
+/// Raw `objc_msgSend` entry point for selectors whose ABI is not covered by a
+/// typed helper above.
+///
+/// Callers transmute the returned pointer to the exact `unsafe extern "C" fn`
+/// signature they need and keep that signature private to their module (see
+/// `macos::indirect`, `macos::blit` and `macos::residency`). This keeps the
+/// shared FFI surface stable while new Metal entry points are added.
+pub(crate) fn msg_send_entry() -> unsafe extern "C" fn() {
+    objc_msgSend
+}
+
 pub(crate) unsafe fn msg_send_id_0(target: Id, s: Sel) -> Id {
     type Fn = unsafe extern "C" fn(Id, Sel) -> Id;
     // SAFETY: Caller supplies a valid Objective-C receiver, selector, and matching return ABI.

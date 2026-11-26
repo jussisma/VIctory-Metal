@@ -21,6 +21,8 @@
 
 pub mod abi;
 pub mod cmdlist;
+pub mod compiler_pool;
+pub mod fence_page;
 #[cfg(all(target_os = "macos", test))]
 mod frame_e2e;
 pub mod guest_ipc;
