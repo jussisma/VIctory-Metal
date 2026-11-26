@@ -113,6 +113,10 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Exchanges the halves made ([`Lower::exchange_halves`]): masks, lane
+    /// reads and reductions that crossed them.
+    #[cfg(test)]
+    pub half_exchanges: u32,
     /// Whether the module sets DXIL `ForceEarlyDepthStencil`.
     #[cfg(test)]
     pub early_depth_stencil: bool,
@@ -347,6 +351,9 @@ struct Lower<'a> {
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
+    /// Exchanges made between the halves, for tests.
+    #[cfg(test)]
+    half_exchanges: u32,
     /// The DXIL block the instruction being lowered starts in: every lane
     /// running its IR block runs it (no guard of the instruction's own).
     level: usize,
@@ -387,6 +394,18 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
+    /// Masks structure keeps out of `masks` (`other`): the high dword of the
+    /// wave64 register pair, by the low dword, so a 64-bit read of one finds
+    /// both numbers ([`Lower::mask_dword`]).
+    other_highs: Map<Value, Value>,
+    /// [`Lower::mask_number`] is rebuilding a mask from its scalar write: a
+    /// ballot it needs for an operand has to go where the write's operands
+    /// are, so the read site must not be used ([`Lower::mask_dword`]).
+    mask_number_depth: u32,
+    /// [`Lower::fill_phis`] is resolving phis: no read-site ballot, which
+    /// would be placed in the block being lowered last, not where the phi's
+    /// incoming value belongs.
+    in_fill_phis: bool,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -514,6 +533,42 @@ enum MaskData {
     /// a value for uniformity, `WaveActiveAllEqual`): lane numbers stay the
     /// console's, so the first lane and the count below a lane are refused.
     None,
+}
+
+/// The high dword of the wave64 register pair whose low dword is `lo`, for a
+/// value whose write is known: an input, a phi or an instruction write.
+fn pair_high_of(
+    p: &Program,
+    phi_at: &Map<Value, (usize, usize)>,
+    def_block: &Map<Value, usize>,
+    lo: Value,
+) -> Option<Value> {
+    if !p.wave64 {
+        return None;
+    }
+    let pick = |reg: Reg| match reg {
+        Reg::S(c) => Some(Reg::S(c + 1)),
+        _ => None,
+    };
+    if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
+        let h = pick(reg)?;
+        return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
+    }
+    if let Some(&(b, i)) = phi_at.get(&lo) {
+        let h = pick(p.blocks[b].phis[i].reg)?;
+        return p.blocks[b]
+            .phis
+            .iter()
+            .find(|q| q.reg == h)
+            .map(|q| q.value);
+    }
+    let b = *def_block.get(&lo)?;
+    let inst = p.blocks[b]
+        .insts
+        .iter()
+        .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+    let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+    inst.write(pick(reg)?)
 }
 
 /// What a value holding a lane mask read as a number stops with.
@@ -688,6 +743,26 @@ impl<'a> Lower<'a> {
                 phi_at.insert(phi.value, (b, i));
             }
         }
+        let def_block: Map<Value, usize> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| {
+                block
+                    .insts
+                    .iter()
+                    .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
+                    .chain(block.phis.iter().map(move |phi| (phi.value, b)))
+            })
+            .collect();
+        // The high dword of the masks structure keeps out of `masks`, so a
+        // 64-bit read of one is its number in both words.
+        let other_highs: Map<Value, Value> = x
+            .st
+            .other
+            .keys()
+            .filter_map(|&lo| pair_high_of(p, &phi_at, &def_block, lo).map(|hi| (hi, lo)))
+            .collect();
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
@@ -936,6 +1011,8 @@ impl<'a> Lower<'a> {
             relabelled: None,
             step,
             half_words: None,
+            #[cfg(test)]
+            half_exchanges: 0,
             level: 0,
             alike,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -954,18 +1031,10 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: Map::default(),
             balloting: Set::default(),
-            def_block: p
-                .blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(b, block)| {
-                    block
-                        .insts
-                        .iter()
-                        .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
-                        .chain(block.phis.iter().map(move |phi| (phi.value, b)))
-                })
-                .collect(),
+            def_block,
+            other_highs,
+            mask_number_depth: 0,
+            in_fill_phis: false,
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
@@ -1605,6 +1674,13 @@ impl<'a> Lower<'a> {
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                    // A mask joined by a phi whose every incoming value is a
+                    // mask (not a register the compiler also holds data in) is
+                    // one number for the wave: a ballot of its per-lane bits at
+                    // the join ([`Lower::mask_dword`]), where every lane
+                    // arrives, gives it. Kept out of `data_phis`, whose i32 phi
+                    // would select whole mask numbers per lane.
+                    _ if self.pure_mask_phi(phi.value) => Val::Missing("a lane mask"),
                     _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
                     Reg::Scc => {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
@@ -1657,7 +1733,10 @@ impl<'a> Lower<'a> {
             self.level = self.cur;
             self.exit(b)?;
         }
-        self.fill_phis()?;
+        self.in_fill_phis = true;
+        let phis = self.fill_phis();
+        self.in_fill_phis = false;
+        phis?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1747,6 +1826,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            half_exchanges: self.half_exchanges,
             #[cfg(test)]
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             #[cfg(test)]
@@ -2028,8 +2109,25 @@ impl<'a> Lower<'a> {
         if let Some(val @ (Val::I32(_) | Val::Bit(_))) = found {
             return Ok(val);
         }
-        if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
-            return self.mask_dword(v).map(Val::I32);
+        // Masks structure tracks as numbers of their own (`other`: literals,
+        // uniform selects, copies) are read as data too, when the value is the
+        // console's (compute, or a wave64 host); see [`Lower::mask_dword`].
+        // Where that cannot rebuild the number, the value keeps the reason it
+        // already had, so unchanged refusals keep their wording.
+        let other_mask = self.mask_data == MaskData::Console
+            && (self.x.st.other.contains_key(&v) || self.other_highs.contains_key(&v));
+        if self.mask_ok
+            && (self.x.st.masks.contains_key(&v)
+                || self.x.st.highs.contains_key(&v)
+                || other_mask)
+        {
+            let r = self.mask_dword(v);
+            if let Some(Val::Missing(why)) = found
+                && r.is_err()
+            {
+                return Err(why);
+            }
+            return r.map(Val::I32);
         }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
@@ -2206,35 +2304,111 @@ impl<'a> Lower<'a> {
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
-    /// taken in the block that writes the mask (see [`MaskData`]).
+    /// taken at a block every lane of the group runs the same number of times
+    /// (see [`MaskData`]), and passed between the halves where the host has
+    /// two ([`Lower::ballot_across_halves`]).
+    ///
+    /// A mask whose bit is a literal ([`Lower::literal_mask`]) is one value in
+    /// every lane: it is read with no ballot and no exchange. A mask structure
+    /// keeps out of `masks` (`other`: a constant, a uniform select, a copy or
+    /// a complement) is rebuilt from the scalar operation that wrote it
+    /// ([`Lower::mask_number`]); one it cannot follow keeps [`LANE_MASK`].
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
-            None => (v, false),
+            None => match self.other_highs.get(&v) {
+                Some(&lo) => (lo, true),
+                None => (v, false),
+            },
         };
-        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
-            let xy = self.mask_number(lo)?;
+        let tracked = self.x.st.masks.get(&lo).copied();
+        let Some(m) = tracked else {
+            // No `masks` entry: structure keeps this mask's number in `other`.
+            // Rebuild it from the scalar write, which reads the ballot any mask
+            // operand needs. An unreadable one keeps the old refusal.
+            let &own = self.x.st.other.get(&lo).ok_or(LANE_MASK)?;
+            if let Some((x, y)) = self.literal_mask(own) {
+                let xy = (self.s.m.i32(x), self.s.m.i32(y));
+                self.ballots.insert(lo, xy);
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
+            if let Some(&xy) = self.ballots.get(&lo) {
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
+            self.mask_number_depth += 1;
+            let xy = self.mask_number(lo);
+            self.mask_number_depth -= 1;
+            let xy = xy.map_err(|_| LANE_MASK)?;
+            self.ballots.insert(lo, xy);
+            return Ok(if high { xy.1 } else { xy.0 });
+        };
+        // A literal mask is the same number in every lane, its two dwords the
+        // literal's own: no ballot and no exchange, wherever it was written.
+        // `Bool::TRUE` is every lane of a full console wave (a group that is a
+        // multiple of 64), so its two dwords are all-ones; a partial wave's
+        // live mask is not 64 bits and goes through the ballot instead.
+        if let Some((x, y)) = self.literal_mask(m) {
+            let xy = (self.s.m.i32(x), self.s.m.i32(y));
+            self.ballots.insert(lo, xy);
+            return Ok(if high { xy.1 } else { xy.0 });
+        }
+        if m == Bool::TRUE && self.halves && self.full_console_waves() {
+            let ones = self.s.m.i32(u32::MAX);
+            let xy = (ones, ones);
+            self.ballots.insert(lo, xy);
+            return Ok(if high { xy.1 } else { xy.0 });
+        }
+        // A mask joined by a phi is a per-lane boolean every arriving lane
+        // computes, so a ballot at its (join) block gives the whole mask.
+        // Other masks `active` does not hold (a complement, a copy made where
+        // EXEC is not known) may name lanes that never reach the block that
+        // wrote them; those are rebuilt from the scalar write instead.
+        if !self.x.st.active.contains(&lo)
+            && !self.ballots.contains_key(&lo)
+            && !self.phi_at.contains_key(&lo)
+        {
+            self.mask_number_depth += 1;
+            let xy = self.mask_number(lo);
+            self.mask_number_depth -= 1;
+            let xy = xy?;
             self.ballots.insert(lo, xy);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
                 let def = self.def_block.get(&lo).copied();
-                let mut at = match def {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(b) if b == self.cur_ir => self.cur,
-                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
                 // If the whole group fits, there are no dispatched lanes in
                 // the upper half and the host ballot covers every active lane.
                 // Otherwise the halves pass their ballots to each other.
                 let single_half = self.halves && self.one_host_wave();
                 let across = self.halves && !single_half;
-                if across {
-                    at = self.across_at(def).ok_or(halves::MASK_ACROSS)?;
-                }
+                // Where the ballot goes: a block every lane of the group runs
+                // the same number of times. The console compiler's place, the
+                // block writing the mask, is preferred; where that block is not
+                // proven (`in_step`, a per-lane region), the point reading the
+                // mask is, if it is itself proven (a wave-uniform block after
+                // reconvergence). A mask joined by a phi is placed at the join,
+                // which every lane reaches. With neither point, the two host
+                // halves cannot meet there, and the read stays refused.
+                let at = if across {
+                    match self.across_at(def) {
+                        Some(a) => a,
+                        None if self.mask_number_depth == 0
+                            && !self.in_fill_phis
+                            && self.across_here() =>
+                        {
+                            self.cur
+                        }
+                        None => return Err(halves::MASK_ACROSS),
+                    }
+                } else {
+                    match def {
+                        // Program inputs (EXEC on entry).
+                        None => self.s.entry,
+                        Some(b) if b == self.cur_ir => self.cur,
+                        Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    }
+                };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
@@ -2263,6 +2437,40 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// The two dwords of a lane mask whose bit is a literal: none
+    /// ([`Bool::FALSE`]) or one `Atom::Constant` (the register's number in
+    /// every lane). Such a mask is one value for the whole wave, so reading it
+    /// needs no ballot and no exchange; both dwords are the literal's.
+    fn literal_mask(&self, m: Bool) -> Option<(u32, u32)> {
+        if m == Bool::FALSE {
+            return Some((0, 0));
+        }
+        match self.x.st.bools.node(m) {
+            Some((Atom::Constant(k), Bool::FALSE, Bool::TRUE)) => {
+                Some((k as u32, (k >> 32) as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is a phi every one of whose incoming values is a lane mask
+    /// (structure keeps it in `masks`): the register holds no data on any path,
+    /// so its join is one mask number, balloted at the join. A phi that joins
+    /// a mask with data (a register the compiler reuses) is a data phi.
+    fn pure_mask_phi(&self, v: Value) -> bool {
+        let st = self.x.st;
+        if !(st.masks.contains_key(&v) || st.highs.contains_key(&v)) {
+            return false;
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        self.x.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .all(|a| st.masks.contains_key(a) || st.highs.contains_key(a))
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
