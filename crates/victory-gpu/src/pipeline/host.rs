@@ -442,10 +442,11 @@ impl HostPipeline {
             s.translated()?;
         }
         // Mesh shaders whose standalone output footprint exceeds Metal's 32 KiB
-        // limit are re-translated together with their paired pixel shader,
-        // pruning outputs the pixel shader never reads.
+        // limit (either packed or Metal-aligned) are re-translated together
+        // with their paired pixel shader, pruning outputs the pixel shader
+        // never reads.
         let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
-            let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
+            let bytes = mesh_output_bytes(&ms.translated()?.host.dxil)?;
             if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
                 return None;
             }
@@ -467,9 +468,7 @@ impl HostPipeline {
             // The larger of the packed count and the aligned layout: shaders
             // the packed count puts under the limit (34,816 bytes aligned,
             // #172) still hang the queue.
-            && let Some(bytes) = victory_shader::emit::mesh_outputs(&t.host.dxil)
-                .map(|o| o.bytes())
-                .max(metal_mesh_bytes(&t.host.dxil))
+            && let Some(bytes) = mesh_output_bytes(&t.host.dxil)
             && bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
         {
             tracing::warn!(
@@ -1064,6 +1063,14 @@ pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
     Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
+/// The larger of the packed mesh output footprint and Metal's aligned
+/// layout (`metal_mesh_bytes`), matching the linking and refusal threshold.
+pub(crate) fn mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    victory_shader::emit::mesh_outputs(dxil)
+        .map(|o| o.bytes())
+        .max(metal_mesh_bytes(dxil))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1187,70 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn mesh_output_bytes_catches_metal_aligned_over_limit() {
+        // Synthesize a minimal DXBC container with OSG1 and PSV0 parts:
+        // per-vertex elements: SV_Position (kind=1, 4 comps -> 16B), a scalar
+        // (kind=0, 1 comp -> 4B), and 14 vec4s (kind=0, 4 comps -> 16B each),
+        // giving 61 packed components (244B/vtx) * 128 vtx = 31,232B (<= 32 KiB),
+        // while Metal's 16B alignment after the scalar wastes 12B -> 256B/vtx *
+        // 128 = 32,768B, and one extra vec4 (128 vtx, 65 comps packed * 4 ->
+        // let's use 118 vtx: 69 packed comps * 4 * 118 = 32,568B <= 32,768B,
+        // Metal-aligned = (16 + 4 + 12pad + 16*16 = 288B) * 118 = 33,984B > 32,768B).
+        let sig_part = |elems: &[(u32, u8)]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + 32 * elems.len());
+            out.extend_from_slice(&(elems.len() as u32).to_le_bytes());
+            out.extend_from_slice(&8u32.to_le_bytes());
+            for (reg, &(kind, mask)) in elems.iter().enumerate() {
+                let mut rec = [0u8; 32];
+                rec[12..16].copy_from_slice(&kind.to_le_bytes());
+                rec[20..24].copy_from_slice(&(reg as u32).to_le_bytes());
+                rec[24] = mask;
+                out.extend_from_slice(&rec);
+            }
+            out
+        };
+        let mut osg1_elems = vec![(1u32, 0b1111u8), (0, 0b0001)];
+        osg1_elems.extend(std::iter::repeat_n((0u32, 0b1111u8), 16));
+        let osg1 = sig_part(&osg1_elems);
+        let mut psv0 = Vec::new();
+        let info_size = 36u32;
+        psv0.extend_from_slice(&info_size.to_le_bytes());
+        let mut info = [0u8; 36];
+        info[12..14].copy_from_slice(&118u16.to_le_bytes()); // max vertices
+        info[14..16].copy_from_slice(&0u16.to_le_bytes()); // max primitives
+        info[24] = 13; // D3D12 mesh shader kind
+        psv0.extend_from_slice(&info);
+
+        let parts: [(&[u8; 4], &[u8]); 2] = [(b"OSG1", &osg1), (b"PSV0", &psv0)];
+        let header_size = 32 + 4 * parts.len();
+        let mut dxbc = Vec::new();
+        dxbc.extend_from_slice(b"DXBC");
+        dxbc.extend_from_slice(&[0u8; 20]);
+        dxbc.extend_from_slice(&0u32.to_le_bytes()); // total size patched below
+        dxbc.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        let mut offset = header_size;
+        for (_, data) in &parts {
+            dxbc.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + data.len();
+        }
+        for (tag, data) in &parts {
+            dxbc.extend_from_slice(*tag);
+            dxbc.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            dxbc.extend_from_slice(data);
+        }
+        let total = dxbc.len() as u32;
+        dxbc[24..28].copy_from_slice(&total.to_le_bytes());
+
+        let packed = victory_shader::emit::mesh_outputs(&dxbc)
+            .expect("valid mesh outputs")
+            .bytes();
+        let aligned = metal_mesh_bytes(&dxbc).expect("valid aligned size");
+        let reported = mesh_output_bytes(&dxbc).expect("combined size");
+        assert!(packed <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES, "packed={packed}");
+        assert!(aligned > victory_shader::emit::METAL_MESH_OUTPUT_BYTES, "aligned={aligned}");
+        assert_eq!(reported, aligned);
     }
 }

@@ -220,10 +220,9 @@ impl Shader {
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
-                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                && host::mesh_output_bytes(&t.host.dxil).is_some_and(|bytes| {
+                                    bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+                                }))
                     });
                     if !keep {
                         *container = Vec::new();
