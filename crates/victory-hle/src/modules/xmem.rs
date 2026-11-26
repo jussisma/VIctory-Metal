@@ -32,6 +32,8 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod share;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -384,6 +386,12 @@ struct Section {
     /// placeholder-view metadata.
     #[cfg(feature = "diagnostics")]
     shared: Option<victory_gpu::PhysicalHeap>,
+    /// The opt-in host-visible file behind this section (`share`), if the
+    /// provider was configured and succeeded. Pagefile and diagnostic
+    /// sections have none, and never claim one. Read by
+    /// `share::resolve_guest_range`.
+    #[allow(dead_code)]
+    share: Option<Arc<share::Backing>>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -417,13 +425,68 @@ impl Section {
 }
 
 /// A section of `size` bytes for an allocation of physical pages: the
-/// pagefile in production, or in tests a file a synthetic caller provides.
+/// pagefile in production, a file the opt-in share provider names when
+/// `VICTORY_METAL_SHARE_DIR` is set, or in tests a file a synthetic caller
+/// provides.
 fn new_section(size: usize) -> Option<Arc<Section>> {
     #[cfg(test)]
     if let Some(section) = tests::file_section(size) {
         return Some(section);
     }
+    // Diagnostic heaps alias the section's pages onto a GPU heap, so they
+    // keep the pagefile and never claim a share file.
+    #[cfg(not(feature = "diagnostics"))]
+    match share::section(size) {
+        Ok(section) => return Some(section),
+        Err(share::Failure::Unconfigured) => {}
+        Err(error) => tracing::warn!(
+            size,
+            %error,
+            "host-visible XMem backing failed; keeping the pagefile section"
+        ),
+    }
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os(share::DIRECTORY).is_some_and(|value| !value.is_empty()) {
+        tracing::debug!(
+            "VICTORY_METAL_SHARE_DIR is set, but diagnostic heaps keep the pagefile path"
+        );
+    }
     pagefile_section(size)
+}
+
+/// A section over `file`: its pages are the file's pages. `share` records a
+/// provider backing the file, if any. The file must outlive every view of
+/// the section (callers keep it, or a `share::Backing`, alive).
+fn file_section(
+    file: &std::fs::File,
+    size: usize,
+    share: Option<Arc<share::Backing>>,
+) -> Option<Arc<Section>> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: plain file-backed section creation; the caller keeps the file
+    // open while the section and its views live.
+    let handle = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    Some(Arc::new(Section {
+        handle,
+        size,
+        // The file is the backing, not the GPU's host heap.
+        #[cfg(feature = "diagnostics")]
+        shared: None,
+        share,
+        whole: OnceLock::new(),
+    }))
 }
 
 /// A pagefile-backed section: the documents' physical pages, committed when
@@ -452,6 +515,7 @@ fn pagefile_section(size: usize) -> Option<Arc<Section>> {
         size,
         #[cfg(feature = "diagnostics")]
         shared: victory_gpu::physical_heap(size),
+        share: None,
         whole: OnceLock::new(),
     }))
 }
@@ -1245,8 +1309,10 @@ mod tests {
 
     thread_local! {
         /// The file the next allocation in this thread makes its section
-        /// from; production always allocates from the pagefile.
-        static SECTION_FILE: std::cell::RefCell<Option<std::fs::File>> =
+        /// from; production allocates from the pagefile or the share
+        /// provider. `share`'s tests use it to prove such a section is not
+        /// reported as host-visible.
+        pub(super) static SECTION_FILE: std::cell::RefCell<Option<std::fs::File>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -1256,35 +1322,8 @@ mod tests {
         SECTION_FILE.with(|file| {
             file.borrow()
                 .as_ref()
-                .and_then(|file| section_from_file(file, size))
+                .and_then(|file| super::file_section(file, size, None))
         })
-    }
-
-    fn section_from_file(file: &std::fs::File, size: usize) -> Option<Arc<Section>> {
-        use std::os::windows::io::AsRawHandle;
-        // SAFETY: plain file-backed section creation; the caller keeps the
-        // file open while the section and its views live.
-        let handle = unsafe {
-            CreateFileMappingW(
-                file.as_raw_handle() as HANDLE,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                (size as u64 >> 32) as u32,
-                size as u32,
-                std::ptr::null(),
-            )
-        };
-        if handle.is_null() {
-            return None;
-        }
-        Some(Arc::new(Section {
-            handle,
-            size,
-            // The file is the backing, not the GPU's host heap.
-            #[cfg(feature = "diagnostics")]
-            shared: None,
-            whole: OnceLock::new(),
-        }))
     }
 
     #[test]
