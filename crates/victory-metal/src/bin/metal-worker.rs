@@ -19,10 +19,13 @@
 //! VICTORY_IPC_READY=1
 //! ```
 //!
-//! The native host exists only on the ARM64 macOS host. Windows is still built
-//! for `--all-targets`, so this target compiles there only to keep that build
-//! honest: the macOS-only helpers are then intentionally unused, and the
-//! explicit `main` below reports that the worker is unsupported.
+//! The native host exists only on the ARM64 macOS host. The Win64 build is the
+//! counterpart guest probe: `metal-worker --guest-v3` connects to a running
+//! host, registers one real file-backed allocation, and drives Wire v3 frames
+//! (`KIND_SUBMISSION_V3`) over the same loopback envelope the production queue
+//! will carry. It proves the guest end of the ring, the explicit failure
+//! statuses and that the guest process has no D3DMetal module loaded. Without
+//! `--guest-v3` the Win64 build still reports that the host is unsupported.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
@@ -42,7 +45,9 @@ use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::PixelFormat;
 #[cfg(target_os = "macos")]
-use victory_metal::wire::{Command, Reply, ReplyStatus, Submission};
+use victory_metal::wire::{BufferBinding, Command, Reply, ReplyStatus, Submission};
+#[cfg(target_os = "macos")]
+use victory_metal::wire_v3::{CommandV3, SubmissionV3};
 #[cfg(target_os = "macos")]
 use victory_metal::{DirectMetalTransport, MetalError, MetalTransport, VmBufferId, VmPipelineId};
 
@@ -98,7 +103,8 @@ fragment float4 vm_frame_fragment(VOut in [[stage_in]]) {
 const FRAME_TARGET_EDGE: usize = 64;
 /// Row-major index of the target's centre pixel.
 #[cfg(target_os = "macos")]
-const FRAME_CENTRE_PIXEL: usize = (FRAME_TARGET_EDGE / 2) * FRAME_TARGET_EDGE + FRAME_TARGET_EDGE / 2;
+const FRAME_CENTRE_PIXEL: usize =
+    (FRAME_TARGET_EDGE / 2) * FRAME_TARGET_EDGE + FRAME_TARGET_EDGE / 2;
 
 const USAGE: &str = "\
 usage: metal-worker --secret-hex <64 hex chars> --share-dir <private dir> [options]
@@ -151,11 +157,24 @@ fn main() -> ExitCode {
     }
 }
 
-/// The native host worker has no non-macOS implementation; fail explicitly
-/// instead of pretending this target could serve a session.
+/// On Win64 the worker is the guest probe (`--guest-v3`); it never serves the
+/// host. Any other invocation fails explicitly instead of pretending this
+/// target could run a native session.
 #[cfg(not(target_os = "macos"))]
 fn main() -> ExitCode {
-    eprintln!("metal-worker: the native Metal host is only available on ARM64 macOS");
+    if env::args().nth(1).as_deref() == Some("--guest-v3") {
+        return match guest_v3::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("metal-worker guest: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    eprintln!(
+        "metal-worker: the native Metal host is only available on ARM64 macOS; \
+         the Win64 build is the guest probe (--guest-v3)"
+    );
     ExitCode::from(2)
 }
 
@@ -182,12 +201,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.frame_gate {
         let executor = FrameGateExecutor::new(transport, args.share_dir.clone());
-        let host = IpcHost::new(args.secret, &args.share_dir, executor)?
-            .with_io_timeout(args.io_timeout);
+        let host =
+            IpcHost::new(args.secret, &args.share_dir, executor)?.with_io_timeout(args.io_timeout);
         serve(host, args.port, args.accept_timeout)
     } else {
-        let host = IpcHost::new(args.secret, &args.share_dir, transport)?
-            .with_io_timeout(args.io_timeout);
+        let host =
+            IpcHost::new(args.secret, &args.share_dir, transport)?.with_io_timeout(args.io_timeout);
         serve(host, args.port, args.accept_timeout)
     }
 }
@@ -268,6 +287,29 @@ impl FrameGateExecutor {
                     "compute submission has no bound allocation to observe".to_string(),
                 )
             })?;
+        self.binding_value(binding)
+    }
+
+    /// Version 3 counterpart of [`Self::compute_value`].
+    fn compute_value_v3(&self, submission: &SubmissionV3) -> Result<u32, MetalError> {
+        let binding = submission
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                CommandV3::Dispatch1d(dispatch) => dispatch.bindings.first(),
+                CommandV3::Dispatch3d(dispatch) => dispatch.bindings.first(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MetalError::InternalError(
+                    "v3 compute submission has no bound allocation to observe".to_string(),
+                )
+            })?;
+        self.binding_value(binding)
+    }
+
+    /// Reads the first dword of `binding` from the guest-visible backing file.
+    fn binding_value(&self, binding: &BufferBinding) -> Result<u32, MetalError> {
         let path = self
             .share_dir
             .join(format!("{:016x}.bin", binding.allocation_id));
@@ -291,14 +333,11 @@ impl FrameGateExecutor {
 
     fn report_draw(&self) -> Result<(), MetalError> {
         let pixels = self.transport.host_target_pixels()?;
-        let centre = pixels
-            .get(FRAME_CENTRE_PIXEL)
-            .copied()
-            .ok_or_else(|| {
-                MetalError::InternalError(
-                    "host render target is smaller than the frame gate expects".to_string(),
-                )
-            })?;
+        let centre = pixels.get(FRAME_CENTRE_PIXEL).copied().ok_or_else(|| {
+            MetalError::InternalError(
+                "host render target is smaller than the frame gate expects".to_string(),
+            )
+        })?;
         let matching = pixels.iter().filter(|pixel| **pixel == centre).count();
         println!(
             "kind=draw centre={},{},{},{} pixels={matching}",
@@ -336,9 +375,30 @@ impl BatchExecutor for FrameGateExecutor {
                 let value = self.compute_value(submission)?;
                 println!("kind=compute value={value}");
             }
-            io::stdout()
-                .flush()
-                .map_err(|error| MetalError::InternalError(format!("stdout flush failed: {error}")))?;
+            io::stdout().flush().map_err(|error| {
+                MetalError::InternalError(format!("stdout flush failed: {error}"))
+            })?;
+        }
+        Ok(reply)
+    }
+
+    fn submit_v3(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+    ) -> Result<Reply, MetalError> {
+        let reply = BatchExecutor::submit_v3(&self.transport, submission, allocations)?;
+        if reply.status == ReplyStatus::Ok {
+            let graphics = submission.commands.iter().any(is_graphics_v3_command);
+            if graphics {
+                self.report_draw()?;
+            } else {
+                let value = self.compute_value_v3(submission)?;
+                println!("kind=compute value={value}");
+            }
+            io::stdout().flush().map_err(|error| {
+                MetalError::InternalError(format!("stdout flush failed: {error}"))
+            })?;
         }
         Ok(reply)
     }
@@ -346,6 +406,19 @@ impl BatchExecutor for FrameGateExecutor {
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
         BatchExecutor::load_pipeline(&self.transport, metallib, entry)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_graphics_v3_command(command: &CommandV3) -> bool {
+    matches!(
+        command,
+        CommandV3::BeginRenderPass(_)
+            | CommandV3::Draw(_)
+            | CommandV3::DrawIndexed(_)
+            | CommandV3::DrawInstanced(_)
+            | CommandV3::DrawIndexedInstanced(_)
+            | CommandV3::DispatchMesh(_)
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -415,9 +488,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--secret-hex" => {
                 let value = next_value(&mut args, "--secret-hex")?;
-                secret = Some(
-                    HostSecret::from_hex(&value).map_err(|error| error.to_string())?,
-                );
+                secret = Some(HostSecret::from_hex(&value).map_err(|error| error.to_string())?);
                 secret_source = Some("--secret-hex");
             }
             "--secret-file" => {
@@ -491,4 +562,369 @@ fn read_secret_file(path: &str) -> Result<HostSecret, String> {
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| "secret file is neither 32 raw bytes nor hex text".to_string())?;
     HostSecret::from_hex(text).map_err(|error| error.to_string())
+}
+
+/// Win64 guest probe for the Wire v3 ring.
+///
+/// This is the largest guest-side slice the current tree can carry: the
+/// production `victory-gpu` producer still installs `DisconnectedSink` and
+/// `GuestIpcClient` has no v3 encoder, so this binary frames the same
+/// `SubmissionV3` bytes with the canonical codec and the frozen kind-5
+/// envelope. It registers one real file-backed allocation in the session share
+/// directory, executes a compute list on the published pipeline, and asserts
+/// the alias-visible result, replay refusal, unknown-allocation refusal and
+/// unsupported-opcode refusal. It also enumerates its own PE modules and
+/// records that no D3DMetal module is loaded.
+#[cfg(not(target_os = "macos"))]
+mod guest_v3 {
+    use std::ffi::c_void;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use victory_metal::wire::{
+        BufferBinding, Dispatch1d, ListIdentity, Reply, ReplyStatus, decode_reply,
+    };
+    use victory_metal::wire_v3::{
+        CommandV3, PROTOCOL_VERSION_V3, SubmissionV3, encode_submission_v3,
+    };
+
+    /// Frozen envelope constants shared with `victory_metal::ipc_host`
+    /// (`ipc_host` is macOS-only, so the Win64 guest names them itself).
+    const KIND_AUTH: u8 = 1;
+    const KIND_REGISTER: u8 = 2;
+    const KIND_SUBMISSION_V3: u8 = 5;
+    const KIND_ACK: u8 = 128;
+    const V3_REQUEST_MAGIC: [u8; 4] = *b"V3RQ";
+    const V3_REQUEST_HEADER_LEN: usize = 16;
+    const REGISTER_PAYLOAD_LEN: usize = 16;
+    const SECRET_LEN: usize = 32;
+    const ALLOCATION_ID: u64 = 1;
+    const GENERATION: u32 = 1;
+    const PAGE: usize = 64 * 1024;
+    const THREADS: u32 = 64;
+    const COMPUTE_BYTES: u64 = THREADS as u64 * 4;
+
+    fn env(name: &str) -> Result<String, String> {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{name} is not set"))
+    }
+
+    fn secret() -> Result<[u8; SECRET_LEN], String> {
+        let path = PathBuf::from(env("VICTORY_IPC_SECRET_FILE")?);
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let text = text.trim();
+        if text.len() != SECRET_LEN * 2 {
+            return Err(format!(
+                "the secret file must be {} hex characters",
+                SECRET_LEN * 2
+            ));
+        }
+        let mut secret = [0u8; SECRET_LEN];
+        for (index, slot) in secret.iter_mut().enumerate() {
+            let pair = &text[index * 2..index * 2 + 2];
+            *slot = u8::from_str_radix(pair, 16)
+                .map_err(|_| "the secret file contains a non-hex digit".to_string())?;
+        }
+        Ok(secret)
+    }
+
+    struct Client {
+        stream: TcpStream,
+    }
+
+    impl Client {
+        fn connect(port: u16, secret: &[u8; SECRET_LEN]) -> Result<Self, String> {
+            let stream = TcpStream::connect(("127.0.0.1", port))
+                .map_err(|error| format!("connect 127.0.0.1:{port}: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .map_err(|error| format!("set read timeout: {error}"))?;
+            let mut client = Self { stream };
+            client.write_frame(KIND_AUTH, secret)?;
+            match client.read_frame()? {
+                Some((KIND_ACK, payload)) if payload == [0] => Ok(client),
+                other => Err(format!("authentication was not acknowledged: {other:?}")),
+            }
+        }
+
+        fn register(&mut self, id: u64, len: u64) -> Result<(), String> {
+            let mut payload = [0u8; REGISTER_PAYLOAD_LEN];
+            payload[..8].copy_from_slice(&id.to_le_bytes());
+            payload[8..].copy_from_slice(&len.to_le_bytes());
+            self.write_frame(KIND_REGISTER, &payload)?;
+            match self.read_frame()? {
+                Some((KIND_ACK, payload)) if payload == [0] => Ok(()),
+                other => Err(format!("registration was not acknowledged: {other:?}")),
+            }
+        }
+
+        fn write_frame(&mut self, kind: u8, payload: &[u8]) -> Result<(), String> {
+            let mut header = [0u8; 5];
+            header[0] = kind;
+            header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            self.stream
+                .write_all(&header)
+                .and_then(|()| self.stream.write_all(payload))
+                .and_then(|()| self.stream.flush())
+                .map_err(|error| format!("write frame: {error}"))
+        }
+
+        fn read_frame(&mut self) -> Result<Option<(u8, Vec<u8>)>, String> {
+            let mut header = [0u8; 5];
+            let mut filled = 0usize;
+            while filled < header.len() {
+                match self.stream.read(&mut header[filled..]) {
+                    Ok(0) if filled == 0 => return Ok(None),
+                    Ok(0) => return Err("the host closed inside an envelope".to_string()),
+                    Ok(read) => filled += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(format!("read frame: {error}")),
+                }
+            }
+            let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let mut payload = vec![0u8; len];
+            self.stream
+                .read_exact(&mut payload)
+                .map_err(|error| format!("read payload: {error}"))?;
+            Ok(Some((header[0], payload)))
+        }
+
+        fn submit(&mut self, sequence: u32, frame: &[u8]) -> Result<Reply, String> {
+            let mut payload = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len());
+            payload.extend_from_slice(&V3_REQUEST_MAGIC);
+            payload.extend_from_slice(&PROTOCOL_VERSION_V3.to_le_bytes());
+            payload.extend_from_slice(&sequence.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            payload.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            payload.extend_from_slice(frame);
+            self.write_frame(KIND_SUBMISSION_V3, &payload)?;
+            let (kind, reply) = self
+                .read_frame()?
+                .ok_or_else(|| "the host closed before the v3 reply".to_string())?;
+            if kind != KIND_SUBMISSION_V3 {
+                return Err(format!("unexpected reply kind {kind}"));
+            }
+            decode_reply(&reply).map_err(|error| format!("decode v3 reply: {error}"))
+        }
+    }
+
+    fn dispatch(pipeline: u64, allocation: u64) -> SubmissionV3 {
+        SubmissionV3 {
+            sequence: 0,
+            list: None,
+            commands: vec![CommandV3::Dispatch1d(Dispatch1d {
+                pipeline_id: pipeline,
+                threads: THREADS,
+                threads_per_group: THREADS,
+                bindings: vec![BufferBinding {
+                    allocation_id: allocation,
+                    generation: GENERATION,
+                    offset: 0,
+                    length: COMPUTE_BYTES,
+                }],
+            })],
+        }
+    }
+
+    fn alias_words(path: &Path, count: usize) -> Result<Vec<u32>, String> {
+        let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        if bytes.len() < count * 4 {
+            return Err(format!(
+                "{} is {} bytes, expected at least {}",
+                path.display(),
+                bytes.len(),
+                count * 4
+            ));
+        }
+        Ok(bytes[..count * 4]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect())
+    }
+
+    type Handle = *mut c_void;
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn EnumProcessModules(
+            process: Handle,
+            modules: *mut Handle,
+            bytes: u32,
+            needed: *mut u32,
+        ) -> i32;
+        fn GetModuleFileNameExW(process: Handle, module: Handle, name: *mut u16, size: u32) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn GetModuleHandleW(name: *const u16) -> Handle;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Enumerates the guest process's PE modules through psapi.
+    fn loaded_modules() -> Result<Vec<String>, String> {
+        // SAFETY: The pseudo-handle names this process and the buffer is sized
+        // for 2048 module handles; psapi writes at most `bytes`.
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut handles = vec![std::ptr::null_mut(); 2048];
+            let mut needed = 0u32;
+            let ok = EnumProcessModules(
+                process,
+                handles.as_mut_ptr(),
+                (handles.len() * std::mem::size_of::<Handle>()) as u32,
+                &mut needed,
+            );
+            if ok == 0 {
+                return Err(format!(
+                    "EnumProcessModules failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let count = ((needed as usize) / std::mem::size_of::<Handle>()).min(handles.len());
+            let mut names = Vec::with_capacity(count);
+            for module in &handles[..count] {
+                let mut buffer = [0u16; 1024];
+                let len = GetModuleFileNameExW(
+                    process,
+                    *module,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                );
+                if len > 0 {
+                    names.push(String::from_utf16_lossy(&buffer[..len as usize]));
+                }
+            }
+            Ok(names)
+        }
+    }
+
+    fn d3dmetal_loaded() -> Result<(usize, bool), String> {
+        let modules = loaded_modules()?;
+        let found = modules
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains("d3dmetal"));
+        // Belt and braces: a named module lookup catches a lazily loaded module
+        // whose path psapi did not report.
+        // SAFETY: `wide` is NUL-terminated and GetModuleHandleW only reads it.
+        let named = unsafe { GetModuleHandleW(wide("d3dmetal.dll").as_ptr()) };
+        Ok((modules.len(), found || !named.is_null()))
+    }
+
+    pub(super) fn run() -> Result<(), String> {
+        let share = PathBuf::from(env("VICTORY_METAL_SHARE_DIR")?);
+        let port: u16 = env("VICTORY_IPC_PORT")?
+            .parse()
+            .map_err(|_| "VICTORY_IPC_PORT is not a number".to_string())?;
+        let pipeline: u64 = env("VICTORY_IPC_PIPELINE_ID")?
+            .parse()
+            .map_err(|_| "VICTORY_IPC_PIPELINE_ID is not a number".to_string())?;
+        let secret = secret()?;
+        let allocation = share.join(format!("{ALLOCATION_ID:016x}.bin"));
+
+        // One real page-backed allocation the host maps through the session
+        // share directory. This is the guest-visible alias the GPU writes.
+        fs::write(&allocation, vec![0u8; PAGE])
+            .map_err(|error| format!("create {}: {error}", allocation.display()))?;
+        {
+            let mut bytes = fs::read(&allocation).expect("read the new allocation");
+            for index in 0..THREADS as usize {
+                let at = index * 4;
+                bytes[at..at + 4].copy_from_slice(&(index as u32 + 1).to_le_bytes());
+            }
+            fs::write(&allocation, &bytes)
+                .map_err(|error| format!("write inputs {}: {error}", allocation.display()))?;
+        }
+
+        let mut client = Client::connect(port, &secret)?;
+        client.register(ALLOCATION_ID, PAGE as u64)?;
+
+        let identity = ListIdentity {
+            list_id: 7,
+            list_generation: 1,
+        };
+        let mut compute = dispatch(pipeline, ALLOCATION_ID);
+        compute.sequence = 1;
+        compute.list = Some(identity);
+        let frame = encode_submission_v3(&compute).map_err(|error| error.to_string())?;
+        let reply = client.submit(1, &frame)?;
+        if reply.status != ReplyStatus::Ok {
+            return Err(format!("the compute list was refused: {reply:?}"));
+        }
+        let words = alias_words(&allocation, THREADS as usize)?;
+        for (index, value) in words.iter().enumerate() {
+            let expected = (index as u32 + 1) * 3 + 7;
+            if *value != expected {
+                return Err(format!(
+                    "alias dword {index} is {value}, expected {expected}"
+                ));
+            }
+        }
+
+        // Replay of the same list identity: refused, alias unchanged.
+        let before = fs::read(&allocation).expect("snapshot the alias");
+        let mut replay = compute.clone();
+        replay.sequence = 2;
+        let frame = encode_submission_v3(&replay).map_err(|error| error.to_string())?;
+        let reply = client.submit(2, &frame)?;
+        if reply.status != ReplyStatus::AlreadyExecuted {
+            return Err(format!("the replay was not refused: {reply:?}"));
+        }
+        let after = fs::read(&allocation).expect("re-read the alias");
+        if after != before {
+            return Err("the refused replay changed the guest alias".to_string());
+        }
+
+        // Unknown allocation: explicit UnknownHandle, no GPU work.
+        let mut unknown = dispatch(pipeline, ALLOCATION_ID + 9_999);
+        unknown.sequence = 3;
+        let frame = encode_submission_v3(&unknown).map_err(|error| error.to_string())?;
+        let reply = client.submit(3, &frame)?;
+        if reply.status != ReplyStatus::UnknownHandle {
+            return Err(format!(
+                "an unknown allocation was not refused explicitly: {reply:?}"
+            ));
+        }
+        if fs::read(&allocation).expect("re-read after refusal") != before {
+            return Err("an unknown allocation changed the guest alias".to_string());
+        }
+
+        // Unsupported opcode: the decoder refuses the frame and the host answers.
+        let mut frame = encode_submission_v3(&replay).map_err(|error| error.to_string())?;
+        if frame.len() < 34 {
+            return Err("encoded frame is too short to carry an opcode".to_string());
+        }
+        frame[32..34].copy_from_slice(&0x00FFu16.to_le_bytes());
+        let reply = client.submit(4, &frame)?;
+        if reply.status != ReplyStatus::ExecutionFailed {
+            return Err(format!(
+                "an unsupported opcode was not an explicit failure: {reply:?}"
+            ));
+        }
+
+        let (modules, d3dmetal) = d3dmetal_loaded()?;
+        if d3dmetal {
+            return Err("the guest process loaded a D3DMetal module".to_string());
+        }
+
+        println!(
+            "GUEST_V3_PASS compute_threads={THREADS} alias_first={} alias_last={} \
+             replay=AlreadyExecuted alias_unchanged=1 \
+             unknown_allocation=UnknownHandle unsupported_opcode=ExecutionFailed \
+             d3dmetal_modules=0 guest_modules={modules} method=psapi_EnumProcessModules",
+            words[0],
+            words[THREADS as usize - 1]
+        );
+        Ok(())
+    }
 }
