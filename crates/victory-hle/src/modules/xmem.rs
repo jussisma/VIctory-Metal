@@ -32,6 +32,8 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+#[cfg(test)]
+mod e2e;
 mod share;
 
 const MIB: usize = 1 << 20;
@@ -1368,8 +1370,9 @@ mod tests {
         };
         let (a, b) = (reserve(), reserve());
         assert!(!a.is_null() && !b.is_null());
-        let bytes = |at: *mut c_void, offset: usize, len: usize| unsafe {
-            std::slice::from_raw_parts(at.cast::<u8>().add(offset), len).to_vec()
+        let bytes = |at: *mut c_void, offset: usize, len: usize| {
+            // SAFETY: `at` is a live mapped view holding at least `offset + len` bytes.
+            unsafe { std::slice::from_raw_parts(at.cast::<u8>().add(offset), len).to_vec() }
         };
 
         // Map page 1 (section offset 65536) through the existing HLE path
@@ -1386,6 +1389,8 @@ mod tests {
         // A write through this view is visible through an alias, and
         // survives the alias's unmap and remap.
         let written: Vec<u8> = (0..16).map(|i| 0xe0 + i as u8).collect();
+        // SAFETY: `a` is mapped read-write for a whole page and `WRITTEN + 16`
+        // is inside it; `written` is a distinct live local buffer.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 written.as_ptr(),
@@ -1483,8 +1488,10 @@ mod tests {
         let (a, b) = (reserve(), reserve());
         assert!(!a.is_null() && !b.is_null());
         assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
-        let view =
-            |at: *mut c_void| unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE).to_vec() };
+        let view = |at: *mut c_void| {
+            // SAFETY: `at` is a live mapped view of one whole page.
+            unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE).to_vec() }
+        };
         // The view shows section offset 64 KiB, not the file's first page.
         assert_eq!(&view(a)[GUARD..GUARD + 4], guard);
 
@@ -1496,7 +1503,9 @@ mod tests {
                 word.to_le_bytes()
             })
             .collect();
+        // SAFETY: `b` is the live one-page alias mapped just above.
         let alias = unsafe { std::slice::from_raw_parts_mut(b.cast::<u8>(), PAGE) };
+
         alias[PAYLOAD..PAYLOAD + payload.len()].copy_from_slice(&payload);
         alias[SENTINEL_AT..SENTINEL_AT + 4].copy_from_slice(&SENTINEL.to_le_bytes());
         // The source view and the untouched guard see the alias write.
@@ -1529,12 +1538,13 @@ mod tests {
         std::fs::write(&temporary, format!("offset={OFFSET}\n")).expect("the marker");
         std::fs::rename(&temporary, &marker).expect("publishing the marker");
 
-        let sum = payload.chunks_exact(4).fold(0u32, |sum, w| {
-            sum.wrapping_add(u32::from_le_bytes(w.try_into().unwrap()))
-        });
-        let xor = payload.chunks_exact(4).fold(0u32, |xor, w| {
-            xor ^ u32::from_le_bytes(w.try_into().unwrap())
-        });
+        let mut sum = 0u32;
+        let mut xor = 0u32;
+        for word in payload.as_chunks::<4>().0 {
+            let word = u32::from_le_bytes(*word);
+            sum = sum.wrapping_add(word);
+            xor ^= word;
+        }
         println!(
             "HLE_WROTE offset={OFFSET} page={} sum={sum:#010x} xor={xor:#010x} sentinel={SENTINEL:#010x}",
             pages[1]

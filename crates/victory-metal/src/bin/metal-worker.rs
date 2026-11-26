@@ -18,6 +18,13 @@
 //! VICTORY_IPC_LISTEN=127.0.0.1:<port>
 //! VICTORY_IPC_READY=1
 //! ```
+//!
+//! The native host exists only on the ARM64 macOS host. Windows is still built
+//! for `--all-targets`, so this target compiles there only to keep that build
+//! honest: the macOS-only helpers are then intentionally unused, and the
+//! explicit `main` below reports that the worker is unsupported.
+
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
 use std::env;
 use std::fs;
@@ -27,7 +34,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use victory_metal::ipc_host::{HostSecret, IpcHost};
+#[cfg(target_os = "macos")]
 use victory_metal::{DirectMetalTransport, MetalTransport};
 
 /// Deterministic, synthetic compute kernel used by the e2e harness.
@@ -57,6 +66,7 @@ usage: metal-worker --secret-hex <64 hex chars> --share-dir <private dir> [optio
 The worker binds 127.0.0.1 only and serves one peer synchronously.
 ";
 
+#[cfg(target_os = "macos")]
 struct Args {
     port: u16,
     secret: HostSecret,
@@ -66,6 +76,7 @@ struct Args {
     accept_timeout: Duration,
 }
 
+#[cfg(target_os = "macos")]
 fn main() -> ExitCode {
     match parse_args() {
         Ok(None) => {
@@ -87,6 +98,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// The native host worker has no non-macOS implementation; fail explicitly
+/// instead of pretending this target could serve a session.
+#[cfg(not(target_os = "macos"))]
+fn main() -> ExitCode {
+    eprintln!("metal-worker: the native Metal host is only available on ARM64 macOS");
+    ExitCode::from(2)
+}
+
+#[cfg(target_os = "macos")]
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let transport = DirectMetalTransport::new()?;
     if args.bootstrap_compute {
@@ -152,6 +172,7 @@ fn accept_bounded(listener: &TcpListener, timeout: Duration) -> io::Result<TcpSt
     }
 }
 
+#[cfg(target_os = "macos")]
 fn parse_args() -> Result<Option<Args>, String> {
     let mut port = 0u16;
     let mut secret = None;
@@ -236,6 +257,7 @@ fn parse_timeout(value: &str, flag: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
+#[cfg(target_os = "macos")]
 fn read_secret_file(path: &str) -> Result<HostSecret, String> {
     let bytes = fs::read(path).map_err(|error| format!("cannot read secret file: {error}"))?;
     if bytes.len() == 32 {

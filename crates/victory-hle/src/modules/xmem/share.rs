@@ -313,10 +313,10 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
 }
 
 /// The tracked view holding `at`, as `(base, length, first slice)`.
-fn view_at<'a>(
-    physical: &'a super::Physical,
+fn view_at(
+    physical: &super::Physical,
     at: usize,
-) -> Option<(usize, usize, &'a super::Slice)> {
+) -> Option<(usize, usize, &super::Slice)> {
     physical
         .views
         .range(..=at)
