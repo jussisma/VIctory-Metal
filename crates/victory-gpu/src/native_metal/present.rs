@@ -280,6 +280,15 @@ impl NativeSwapchain {
         self.in_flight
     }
 
+    /// The validated step that presents this swapchain's own surface.
+    ///
+    /// The narrow accessor the native queue uses: a present can only name the
+    /// surface this state owns, and `sync_interval` is validated exactly as
+    /// [`translate_present`] does (no state is changed here).
+    pub fn present_step(&self, sync_interval: u32) -> Result<PresentStep, PresentError> {
+        translate_present(self, SwapchainPresent::new(self.surface_id, sync_interval))
+    }
+
     /// Marks the in-flight frame as finished and releases the surface.
     ///
     /// This is the completion signal the host sends after the window server
