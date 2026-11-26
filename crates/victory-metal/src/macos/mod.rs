@@ -1,5 +1,6 @@
 //! macOS-native Metal, IRConverter, and C ABI implementations.
 
+pub mod bindings;
 pub mod c_api;
 pub mod cache;
 pub mod device;

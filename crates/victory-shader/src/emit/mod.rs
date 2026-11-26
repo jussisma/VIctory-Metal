@@ -254,6 +254,7 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_store_tests;
 mod lower;
+mod mesh_pack;
 #[cfg(test)]
 mod mark_tests;
 mod deltas;
@@ -280,6 +281,7 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+mod wave_audit;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};

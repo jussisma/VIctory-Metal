@@ -49,6 +49,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(any(windows, test))]
+pub mod native_metal;
 #[cfg(all(windows, test))]
 mod list_bench;
 #[cfg(windows)]

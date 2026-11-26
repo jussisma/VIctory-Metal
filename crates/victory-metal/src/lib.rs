@@ -30,6 +30,7 @@ pub mod ipc_host;
 pub mod macos;
 pub mod transport;
 pub mod wire;
+pub mod wire_v3;
 
 pub use abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmLibraryId, VmPipelineId, VmStatus};
 pub use guest_ipc::{
