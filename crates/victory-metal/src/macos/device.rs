@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
 use crate::macos::irconverter;
+use crate::macos::msc::{self, MscUavDispatch};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::transport::{MetalError, MetalTransport};
 use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
@@ -17,6 +18,10 @@ const APPLE_SILICON_NOCOPY_PAGE_SIZE: usize = 16 * 1024;
 /// `MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared | MTLResourceHazardTrackingModeDefault`.
 const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
+/// `MTLResourceUsageRead`.
+const MTL_RESOURCE_USAGE_READ: usize = 1;
+/// `MTLResourceUsageWrite`.
+const MTL_RESOURCE_USAGE_WRITE: usize = 2;
 /// Conservative byte alignment for a bound range offset.
 ///
 /// `setBuffer:offset:atIndex:` accepts 4-byte-aligned offsets for general
@@ -25,7 +30,7 @@ const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// frame. This entry point therefore enforces the 4-byte ABI minimum and leaves
 /// stricter shader-specific alignment to Metal's runtime validation; application
 /// layouts should place every typed declaration on its natural alignment.
-const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
+pub(crate) const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
 pub(crate) struct RegisteredBuffer {
     pub(crate) buffer: ObjcObject,
@@ -392,6 +397,183 @@ impl DirectMetalTransport {
 
         self.create_compute_pipeline(&lib, entry)
     }
+
+    /// Binds one registered UAV for the verified Metal Shader Converter root
+    /// signature and executes a 1D compute dispatch.
+    ///
+    /// This is an explicit opt-in path, separate from
+    /// [`MetalTransport::dispatch_compute_1d`] and from wire submissions. It
+    /// encodes the **one verified shape** only: the converted shader reads an
+    /// 8-byte device address from argument offset 0 of a top-level argument
+    /// buffer bound at Metal `buffer(2)`. Callers must have obtained that shape
+    /// from a verified conversion, not guessed it. Any other slot or offset is
+    /// requested through [`MscUavLayout::new`] with explicit values.
+    ///
+    /// # Contract
+    ///
+    /// * `pipeline` must come from the same [`DirectMetalTransport`], typically
+    ///   from [`Self::load_metallib`] on bytes produced by the x86_64 converter
+    ///   process; `uav` must be a live handle from
+    ///   [`MetalTransport::register_zerocopy`].
+    /// * `offset`/`length` must describe the UAV range inside the registered
+    ///   backing. The range is validated here: nonzero, at most
+    ///   [`wire::MAX_RESOURCE_LEN`], 4-byte offset alignment, no overflow, and
+    ///   `offset + length <= registered_len`. Invalid ranges fail before any
+    ///   Metal object or command buffer is created.
+    /// * `threads_per_group` above the pipeline's
+    ///   `maxTotalThreadsPerThreadgroup` is rejected with
+    ///   [`MetalError::InvalidArg`]; it is never clamped.
+    /// * The internal state lock is held through synchronous completion, so the
+    ///   registered backing, the pipeline and the argument buffer all outlive
+    ///   the GPU work. The argument buffer is a local RAII object dropped only
+    ///   after `waitUntilCompleted`.
+    /// * Residency: the UAV is declared with
+    ///   `useResource:usage:(Read|Write)` on the encoder, as the verified
+    ///   harness does. The directly bound argument buffer needs no extra
+    ///   declaration.
+    ///
+    /// An unknown pipeline/buffer returns [`MetalError::NotFound`]; a GPU fault
+    /// returns [`MetalError::InternalError`] with Metal's command-buffer
+    /// diagnostic.
+    pub fn dispatch_msc_uav_1d(&self, request: &MscUavDispatch) -> Result<(), MetalError> {
+        if request.threads == 0 || request.threads_per_group == 0 {
+            return Err(MetalError::InvalidArg(
+                "threads and threads_per_group must be non-zero",
+            ));
+        }
+
+        let _pool = AutoreleasePool::new();
+        // Hold the state lock through synchronous completion so the pipeline and
+        // the registered backing cannot be released while the GPU uses them.
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MetalError::InternalError("Metal state mutex poisoned".to_string()))?;
+
+        let pso = state
+            .pipelines
+            .get(&request.pipeline.0)
+            .ok_or_else(|| MetalError::NotFound(format!("pipeline {}", request.pipeline.0)))?;
+        let uav = state
+            .buffers
+            .get(&request.uav.0)
+            .ok_or_else(|| MetalError::NotFound(format!("buffer {}", request.uav.0)))?;
+
+        let (offset, _end) = msc::checked_binding_range(request.offset, request.length, uav.len)?;
+
+        // SAFETY: `pso` is a valid `MTLComputePipelineState`.
+        let max_threads = unsafe {
+            objc::msg_send_usize_0(pso.as_raw(), objc::sel(c"maxTotalThreadsPerThreadgroup"))
+        }
+        .max(1);
+        if request.threads_per_group as usize > max_threads {
+            return Err(MetalError::InvalidArg(
+                "dispatch threads_per_group exceeds pipeline threadgroup maximum",
+            ));
+        }
+
+        // SAFETY: `uav.buffer` is a live `MTLBuffer`; `gpuAddress` is its base device address.
+        let base_address =
+            unsafe { objc::msg_send_u64_0(uav.buffer.as_raw(), objc::sel(c"gpuAddress")) };
+        let device_address = base_address.checked_add(offset as u64).ok_or_else(|| {
+            MetalError::InternalError("UAV device address overflowed".to_string())
+        })?;
+
+        // The argument buffer is created per dispatch so no stale address can be
+        // observed by a later submission. Metal zero-initializes new buffers;
+        // zero it again explicitly and then write the single address field.
+        // SAFETY: `self.device` is a valid `MTLDevice`; shared storage is CPU-visible.
+        let args_raw = unsafe {
+            objc::msg_send_new_buffer(
+                self.device.as_raw(),
+                request.layout.argument_buffer_len(),
+                MTL_RESOURCE_STORAGE_MODE_SHARED,
+            )
+        };
+        let arguments = ObjcObject::from_retained(args_raw).ok_or_else(|| {
+            MetalError::InternalError("argument buffer allocation returned null".to_string())
+        })?;
+        // SAFETY: `arguments` is a live shared-storage `MTLBuffer`; `contents`
+        // points to exactly `argument_buffer_len()` writable bytes.
+        let contents = unsafe { objc::msg_send_ptr_0(arguments.as_raw(), objc::sel(c"contents")) };
+        if contents.is_null() {
+            return Err(MetalError::InternalError(
+                "argument buffer has no CPU-visible contents".to_string(),
+            ));
+        }
+        // SAFETY: The slice covers the whole freshly created argument buffer.
+        let arguments_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                contents.cast::<u8>(),
+                request.layout.argument_buffer_len(),
+            )
+        };
+        arguments_bytes.fill(0);
+        msc::write_uav_address(arguments_bytes, request.layout, device_address)?;
+
+        // SAFETY: `self.queue` is a valid `MTLCommandQueue`; returns an autoreleased command buffer.
+        let cb = unsafe { objc::msg_send_id_0(self.queue.as_raw(), objc::sel(c"commandBuffer")) };
+        if cb.is_null() {
+            return Err(MetalError::InternalError(
+                "MTLCommandQueue.commandBuffer returned null".to_string(),
+            ));
+        }
+        // SAFETY: `cb` is a valid uncommitted `MTLCommandBuffer`.
+        let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"computeCommandEncoder")) };
+        if enc.is_null() {
+            return Err(MetalError::InternalError(
+                "MTLCommandBuffer.computeCommandEncoder returned null".to_string(),
+            ));
+        }
+
+        // SAFETY: `enc`, `pso`, `arguments` and `uav.buffer` are valid Metal
+        // objects for the active encoder scope; the range was validated above.
+        unsafe {
+            objc::msg_send_void_1(enc, objc::sel(c"setComputePipelineState:"), pso.as_raw());
+            objc::msg_send_set_buffer(
+                enc,
+                arguments.as_raw(),
+                0,
+                request.layout.argument_buffer_index(),
+            );
+            objc::msg_send_use_resource(
+                enc,
+                uav.buffer.as_raw(),
+                MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+            );
+            objc::msg_send_dispatch_threads(
+                enc,
+                MTLSize {
+                    width: request.threads as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: request.threads_per_group as usize,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            objc::msg_send_void_0(enc, objc::sel(c"endEncoding"));
+            objc::msg_send_void_0(cb, objc::sel(c"commit"));
+            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
+        }
+
+        // SAFETY: `cb` has completed via `waitUntilCompleted`; `arguments` stays
+        // alive until this function returns.
+        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            // SAFETY: `[cb error]` returns an autoreleased `NSError *` describing the GPU fault.
+            let err_raw = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
+            // SAFETY: `err_raw` is either null or a valid `NSError *`.
+            let msg = unsafe { objc::nserror_message(err_raw) };
+            return Err(MetalError::InternalError(format!(
+                "Metal MSC argument-buffer dispatch failed (status={status}): {msg}"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl MetalTransport for DirectMetalTransport {
@@ -643,6 +825,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::DirectMetalTransport;
+    use crate::macos::msc::{MscUavDispatch, MscUavLayout};
     use crate::transport::{MetalError, MetalTransport};
     use crate::wire::{self, BufferBinding, Command, Dispatch1d, Reply, ReplyStatus, Submission};
 
@@ -658,6 +841,20 @@ kernel void vm_metallib_affine(device uint *data [[buffer(0)]],
 kernel void vm_metallib_unused(device uint *data [[buffer(0)]],
                                uint tid [[thread_position_in_grid]]) {
     data[tid] = data[tid] + 1u;
+}
+"#;
+
+    /// ARM64 stand-in for the converted top-level argument buffer contract:
+    /// Metal `buffer(2)` holds a `device uint *` device address at offset 0.
+    const MSC_ABI_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct VmMscUavArgs {
+    device uint *uav [[id(0)]];
+};
+kernel void vm_msc_uav_affine(constant VmMscUavArgs &args [[buffer(2)]],
+                              uint tid [[thread_position_in_grid]]) {
+    args.uav[tid] = tid * 3u + 7u;
 }
 "#;
 
@@ -702,12 +899,18 @@ kernel void vm_metallib_unused(device uint *data [[buffer(0)]],
     /// offline Metal toolchain. Returns `None` only when the toolchain is not
     /// installed, so a host without Xcode skips instead of pretending to pass.
     fn compile_fixture(dir: &Path) -> Option<PathBuf> {
+        compile_source(dir, "victory_metallib_fixture", METALLIB_SOURCE)
+    }
+
+    /// Compiles one synthetic MSL source into a `.metallib` with Apple's offline
+    /// Metal toolchain, returning `None` when `metal`/`metallib` are unavailable.
+    fn compile_source(dir: &Path, stem: &str, source_text: &str) -> Option<PathBuf> {
         let metal = tool_path("metal")?;
         let metallib = tool_path("metallib")?;
-        let source = dir.join("victory_metallib_fixture.metal");
-        let air = dir.join("victory_metallib_fixture.air");
-        let library = dir.join("victory_metallib_fixture.metallib");
-        fs::write(&source, METALLIB_SOURCE).expect("write fixture source");
+        let source = dir.join(format!("{stem}.metal"));
+        let air = dir.join(format!("{stem}.air"));
+        let library = dir.join(format!("{stem}.metallib"));
+        fs::write(&source, source_text).expect("write fixture source");
 
         let compiled = ProcessCommand::new(metal)
             .arg("-c")
@@ -856,5 +1059,109 @@ kernel void vm_metallib_unused(device uint *data [[buffer(0)]],
         transport
             .unregister_buffer(buf_id)
             .expect("unregister_buffer should succeed");
+    }
+
+    /// Hardware proof for [`DirectMetalTransport::dispatch_msc_uav_1d`].
+    ///
+    /// Not part of the default suite: the ARM64 GPU is a serialized resource
+    /// owned by the IPC/shader and mesh gates. When it is free, set
+    /// `VICTORY_MSC_METALLIB` to a metallib converted from the synthetic
+    /// `RootFlags(0), UAV(u0)` HLSL (entry `main`, `gOut[tid] = tid * 3 + 7`)
+    /// to test the real converter output. With the variable unset the test
+    /// compiles an ABI-equivalent MSL fixture instead, so it still exercises the
+    /// binder and residency declarations without an x86_64 converter process.
+    #[test]
+    #[ignore = "GPU hardware test; run only when the native ARM64 Metal device is free"]
+    fn msc_uav_argument_buffer_hardware_dispatch() {
+        const ALIGN: usize = 16384;
+        const BYTES: usize = 65536;
+        const COUNT: usize = BYTES / 4;
+
+        let dir = TempDir::new("msc-uav-e2e");
+        let (metallib, entry) = match std::env::var_os("VICTORY_MSC_METALLIB") {
+            Some(path) => (fs::read(&path).expect("read VICTORY_MSC_METALLIB"), "main"),
+            None => {
+                let Some(library) =
+                    compile_source(dir.path(), "victory_msc_abi_fixture", MSC_ABI_SOURCE)
+                else {
+                    eprintln!(
+                        "skipping MSC argument-buffer hardware dispatch: \
+                         VICTORY_MSC_METALLIB unset and Apple Metal toolchain not found"
+                    );
+                    return;
+                };
+                (
+                    fs::read(&library).expect("read compiled metallib"),
+                    "vm_msc_uav_affine",
+                )
+            }
+        };
+        assert!(!metallib.is_empty());
+
+        unsafe extern "C" {
+            fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+            fn free(ptr: *mut c_void);
+        }
+
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation into `raw`.
+        let rc = unsafe { posix_memalign(&mut raw, ALIGN, BYTES) };
+        assert_eq!(rc, 0, "posix_memalign failed");
+        assert!(!raw.is_null());
+
+        struct PageGuard(*mut c_void);
+        impl Drop for PageGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` came from `posix_memalign` and is no longer registered.
+                unsafe { free(self.0) };
+            }
+        }
+        let _guard = PageGuard(raw);
+
+        // SAFETY: `[raw, raw + BYTES)` is freshly allocated and u32-aligned.
+        let host = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u32>(), COUNT) };
+        host.fill(0);
+
+        // SAFETY: `raw` points to 64 KiB valid memory that outlives `unregister_buffer`.
+        let buf_id = unsafe { transport.register_zerocopy(raw.cast::<u8>(), BYTES) }
+            .expect("register_zerocopy should succeed on 16 KiB unified memory");
+
+        let pipeline = transport
+            .load_metallib(&metallib, entry)
+            .expect("MSC metallib should load and register its entry point");
+
+        let request = MscUavDispatch {
+            pipeline,
+            uav: buf_id,
+            offset: 0,
+            length: BYTES as u64,
+            threads: COUNT as u32,
+            threads_per_group: 64,
+            layout: MscUavLayout::DEFAULT,
+        };
+        transport
+            .dispatch_msc_uav_1d(&request)
+            .expect("MSC argument-buffer dispatch should complete");
+
+        for (index, &value) in host.iter().enumerate() {
+            assert_eq!(
+                value,
+                index as u32 * 3 + 7,
+                "mismatch at dword {index} (entry={entry})"
+            );
+        }
+
+        transport
+            .unregister_buffer(buf_id)
+            .expect("unregister_buffer should succeed");
+
+        eprintln!(
+            "MSC argument-buffer hardware dispatch: entry={entry}, verified_words={COUNT}, \
+             slot={}, uav_offset={}",
+            MscUavLayout::DEFAULT.argument_buffer_index(),
+            MscUavLayout::DEFAULT.address_offset()
+        );
     }
 }

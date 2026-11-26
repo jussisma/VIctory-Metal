@@ -15,6 +15,9 @@
 //! - On macOS, [`ipc_host`] adds the loopback transport, authentication,
 //!   allocation file mapping and one-peer session around the same
 //!   [`macos::device::DirectMetalTransport::submit_batch`] entry point.
+//! - [`macos::msc`] is the opt-in typed binder for the verified Metal Shader
+//!   Converter `UAV(u0)` argument-buffer shape; see
+//!   `crates/victory-metal/docs/IR-BRIDGE-CONTRACT.md`.
 
 pub mod abi;
 pub mod guest_ipc;
