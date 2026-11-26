@@ -517,6 +517,10 @@ fn program(wide: bool) -> Vec<u32> {
 }
 
 fn build(wide: bool, memory: bool) -> HostShader {
+    build_with(wide, memory, false)
+}
+
+fn build_with(wide: bool, memory: bool, bvh_no_hit: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -598,6 +602,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        bvh_no_hit,
         view_marks: false,
     })
     .expect("lower");
