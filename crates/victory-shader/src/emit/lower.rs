@@ -25,7 +25,7 @@ mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
-use barriers::{in_step, split_wave_barriers};
+use barriers::{in_step, in_step_one_wave, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::{pack_rows, prune_signature, row_order};
 
@@ -713,6 +713,10 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();
+        // The group is one console wave, and that wave's LDS is synced by
+        // the barriers [`split_wave_barriers`] placed: the one-wave proof
+        // `lane_uniform` gives is group-uniform, LDS-derived values included.
+        let (mut one_console_wave, mut lds_synced) = (false, false);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -757,6 +761,7 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            one_console_wave = x.native.wave64 && one_wave;
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
@@ -771,6 +776,7 @@ impl<'a> Lower<'a> {
                 if let Some(b) = split_wave_barriers(p, x.st, &halves::lane_uniform(x)) {
                     split_barriers = b;
                     synced = true;
+                    lds_synced = true;
                 }
             }
             // A host whose waves are narrower than WaveSize(64) does not run
@@ -849,6 +855,21 @@ impl<'a> Lower<'a> {
         } else {
             HashSet::new()
         };
+        // A group that is one console wave proves its first-lane reads
+        // group-uniform the same way the barriers above do, so a loop on
+        // one runs alike in both host halves and values may pass between
+        // them in it. LDS-derived uniform values are trusted only where
+        // those barriers were placed (or there is no LDS to race); a group
+        // of several console waves keeps the generic refusal.
+        let step = if halves {
+            if one_console_wave && (s.lds_dwords == 0 || lds_synced) {
+                in_step_one_wave(p, x.st, &alike)
+            } else {
+                in_step(p, x.st)
+            }
+        } else {
+            Vec::new()
+        };
         Lower {
             s,
             x,
@@ -900,7 +921,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step,
             half_words: None,
             level: 0,
             alike,

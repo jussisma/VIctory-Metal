@@ -153,7 +153,11 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
 /// it runs as many times in each. Only the console wave's uniformity is
 /// needed here because the group is that one wave; a group of several waves
 /// must use [`in_step`], where such a read is not alike.
-fn in_step_one_wave(p: &Program, st: &Structured, wave_unif: &HashSet<Value>) -> Vec<bool> {
+pub(super) fn in_step_one_wave(
+    p: &Program,
+    st: &Structured,
+    wave_unif: &HashSet<Value>,
+) -> Vec<bool> {
     in_step_impl(p, st, Some(wave_unif))
 }
 

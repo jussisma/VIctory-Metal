@@ -1487,7 +1487,8 @@ const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
 const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
 const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
 const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
-const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502; // v_readfirstlane_b32 s21, v2
+const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502;
+const V_MOV_V2_1: u32 = 0x7E04_0281; // v_mov_b32 v2, 1 // v_readfirstlane_b32 s21, v2
 const V_MBCNT_LO_V1: [u32; 2] = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
 const V_CMP_GT_VCC_40_V0: u32 = 0x7D88_00A8; // v_cmp_gt_u32 vcc, 40, v0
 const V_MOV_V1_VCC_HI: u32 = 0x7E02_026B; // v_mov_b32 v1, vcc_hi
@@ -1584,6 +1585,51 @@ fn lds_in_a_loop_on_a_uniform_first_lane_read_syncs_inside_the_loop() {
 }
 
 #[test]
+fn a_cross_half_ballot_in_a_one_wave_loop_on_a_uniform_first_lane_read_exchanges() {
+    // The count is the first lane of a value every lane holds (1): the group
+    // is one console wave, so `in_step_one_wave` proves the loop body runs
+    // alike in both host halves. The ballot stored inside it needs the halves
+    // to pass their masks, which must happen there; losing the proof would
+    // refuse it with `MASK_ACROSS`.
+    let w = looped(
+        &[
+            V_MOV_V2_1,
+            READFIRSTLANE_S21_V2,
+            V_MBCNT_LO_V1[0],
+            V_MBCNT_LO_V1[1],
+            V_MOV_V3_0,
+        ],
+        &[
+            V_CMP_GT_VCC_40_V0,
+            V_MOV_V1_VCC_HI,
+            DS_WRITE_V3_V1[0],
+            DS_WRITE_V3_V1[1],
+        ],
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let unif: std::collections::HashSet<_> = p.blocks[0]
+        .insts
+        .iter()
+        .filter(|i| i.name() == "v_mov_b32")
+        .flat_map(|i| i.writes.iter().filter(|w| w.0 == crate::ir::Reg::V(2)))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(unif.len(), 1);
+    assert!(!super::in_step(&p, &st)[1], "not group-convergent alone");
+    assert!(super::in_step_one_wave(&p, &st, &unif)[1]);
+    let l = try_lowered(&w, 64, true, true).expect("the halves exchange in the loop");
+    assert!(l.wave_ops, "the ballot crossed the halves");
+    // The same ballot in a group of two console waves stays refused.
+    let why = try_lowered(&w, 128, false, true)
+        .err()
+        .expect("two console waves do not agree on the count")
+        .to_string();
+    assert!(why.contains("a lane mask read as data (wave64"), "{why}");
+}
+
+#[test]
 fn a_per_console_wave_first_lane_count_is_not_group_convergent() {
     // A 128-thread group is two console waves: `v0 >> 6`'s first lane is 0
     // in one and 1 in the other. A loop on it is therefore not `step` for
@@ -1646,6 +1692,47 @@ fn a_guarded_uniform_first_lane_read_is_not_admitted() {
     assert_eq!(unif.len(), 1);
     assert!(barriers_at_unif(&p, &unif).is_none());
     assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+#[test]
+fn a_guarded_first_lane_count_keeps_a_cross_half_ballot_in_the_loop_refused() {
+    // The one-wave proof does not reach the guarded first-lane read, so the
+    // loop is not `step` and the ballot inside it cannot cross the halves.
+    let w = looped(
+        &[
+            V_MOV_V2_1,
+            SAVE_EXEC,
+            CMPX_V0_EQ_0,
+            READFIRSTLANE_S21_V2,
+            RESTORE_EXEC,
+            V_MBCNT_LO_V1[0],
+            V_MBCNT_LO_V1[1],
+            V_MOV_V3_0,
+        ],
+        &[
+            V_CMP_GT_VCC_40_V0,
+            V_MOV_V1_VCC_HI,
+            DS_WRITE_V3_V1[0],
+            DS_WRITE_V3_V1[1],
+        ],
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let unif: std::collections::HashSet<_> = p.blocks[0]
+        .insts
+        .iter()
+        .filter(|i| i.name() == "v_mov_b32")
+        .flat_map(|i| i.writes.iter().filter(|w| w.0 == crate::ir::Reg::V(2)))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(unif.len(), 1);
+    assert!(!super::in_step_one_wave(&p, &st, &unif)[1]);
+    let why = try_lowered(&w, 64, true, true)
+        .err()
+        .expect("a guarded count does not admit the exchange")
+        .to_string();
+    assert!(why.contains("a lane mask read as data (wave64"), "{why}");
 }
 
 #[test]
