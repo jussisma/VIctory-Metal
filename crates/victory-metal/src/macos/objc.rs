@@ -364,6 +364,16 @@ pub(crate) unsafe fn msg_send_void_1(target: Id, s: Sel, a0: Id) {
     }
 }
 
+pub(crate) unsafe fn msg_send_void_u8(target: Id, s: Sel, value: u8) {
+    type Fn = unsafe extern "C" fn(Id, Sel, u8);
+    // SAFETY: Caller supplies a valid Objective-C receiver and selector taking a
+    // single `BOOL` byte (for example `setDepthWriteEnabled:`).
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, s, value);
+    }
+}
+
 pub(crate) unsafe fn msg_send_set_buffer(enc: Id, buf: Id, offset: usize, index: usize) {
     type Fn = unsafe extern "C" fn(Id, Sel, Id, usize, usize);
     // SAFETY: Caller supplies a valid `MTLComputeCommandEncoder` and `MTLBuffer`.
