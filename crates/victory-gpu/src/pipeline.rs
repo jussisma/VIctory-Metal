@@ -303,9 +303,22 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
     ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
 }
 
+/// Whether a container's program activates screen-probe rays, which do not run
+/// when `bvh_no_hit` is active (Belobug `6986a571`).
+fn idle_without_rays(container: &[u8], bvh_no_hit: bool) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    bvh_no_hit && container.windows(NAME.len()).any(|w| w == NAME)
+}
+
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+    if idle_without_rays(container, crate::shader_cache::bvh_no_hit()) {
+        return (
+            Err("screen-probe ray activation skipped without rays (VICTORY_BVH_NO_HIT=1)".to_owned()),
+            false,
+        );
+    }
     let (host, cached) = crate::shader_cache::host_shader(container);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
@@ -1195,6 +1208,15 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn screen_probe_ray_activation_skips_only_without_rays() {
+        let with_name = b"prefix\0CS_ScreenProbes_ActivateRays\0suffix";
+        let other = b"prefix\0CS_Other\0suffix";
+        assert!(!idle_without_rays(with_name, false));
+        assert!(idle_without_rays(with_name, true));
+        assert!(!idle_without_rays(other, true));
     }
 }
 
