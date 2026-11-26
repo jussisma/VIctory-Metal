@@ -474,6 +474,57 @@ impl<'a> PresentPath<'a> {
         Ok(())
     }
 
+    /// Presents a frame the caller has already drawn into `image`.
+    ///
+    /// This path encodes no render pass and reads no pixels: it waits for the
+    /// GPU work already submitted against `image`'s texture on this
+    /// transport's queue to finish, then hands the surface to `sink`. The wait
+    /// is an empty command buffer committed to the same queue and awaited;
+    /// Metal executes command buffers on one queue in submission order, so its
+    /// completion fences every earlier command buffer that drew into the
+    /// surface.
+    ///
+    /// In-flight and foreign-surface rules match [`Self::present`]: a second
+    /// call before [`Self::finish_present`] returns
+    /// [`PresentError::FrameInFlight`] without touching the surface.
+    pub fn present_drawn(
+        &mut self,
+        image: &mut SurfaceImage,
+        sink: &mut dyn PresentSink,
+    ) -> Result<(), PresentError> {
+        if let Some(inflight) = self.in_flight {
+            return Err(PresentError::FrameInFlight {
+                frame_index: inflight.frame_index,
+                surface_id: inflight.surface_id,
+            });
+        }
+        if image.device != self.transport.device_raw() {
+            return Err(PresentError::ForeignSurface);
+        }
+
+        let frame_index = self.next_frame_index;
+        let timestamp_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        wait_for_queue_completion(self.transport.queue_raw())?;
+
+        // The drawn frame is complete in the surface now; hand it over
+        // unchanged. A Metal failure above did not consume an index.
+        self.next_frame_index = frame_index.wrapping_add(1);
+        image.frame_index = Some(frame_index);
+        let frame = PresentedFrame {
+            surface_id: image.surface_id,
+            frame_index,
+            timestamp_ns,
+        };
+        self.in_flight = Some(frame);
+        if let Err(error) = sink.present(frame) {
+            // The sink did not take ownership: nothing is in flight.
+            self.in_flight = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Marks the in-flight frame as finished and releases the surface.
     ///
     /// This is the completion signal a windowed host sends after the window
@@ -755,6 +806,45 @@ fn encode_clear_pass(
         let message = unsafe { objc::nserror_message(error) };
         return Err(PresentError::Metal(format!(
             "present command buffer failed (status={status}): {message}"
+        )));
+    }
+    Ok(())
+}
+
+/// Commits an empty command buffer and waits for it, fencing earlier work.
+///
+/// Encoding nothing is deliberate: `present_drawn` must not touch the surface.
+/// Because a single `MTLCommandQueue` runs its command buffers in submission
+/// order, this buffer's completion means every earlier buffer on the queue,
+/// including the one that drew the frame, has completed.
+fn wait_for_queue_completion(queue: objc::Id) -> Result<(), PresentError> {
+    let _pool = AutoreleasePool::new();
+
+    // SAFETY: `queue` is the live transport queue; `commandBuffer` returns an
+    // autoreleased `MTLCommandBuffer` that lives for this pool.
+    let command_buffer = unsafe { objc::msg_send_id_0(queue, objc::sel(c"commandBuffer")) };
+    if command_buffer.is_null() {
+        return Err(PresentError::Metal(
+            "MTLCommandQueue.commandBuffer returned null".to_string(),
+        ));
+    }
+
+    // SAFETY: `command_buffer` is a live uncommitted buffer with no encoders;
+    // committing and waiting on it only orders it after earlier queue work.
+    unsafe {
+        objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+        objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
+    }
+
+    // SAFETY: The command buffer completed via `waitUntilCompleted`.
+    let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
+    if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+        // SAFETY: `[command_buffer error]` is null or an autoreleased `NSError *`.
+        let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
+        // SAFETY: `error` is null or a live `NSError *` inside this pool.
+        let message = unsafe { objc::nserror_message(error) };
+        return Err(PresentError::Metal(format!(
+            "present fence command buffer failed (status={status}): {message}"
         )));
     }
     Ok(())
