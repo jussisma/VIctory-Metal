@@ -20,6 +20,8 @@
 //! The hardware tests are `#[ignore]`d because the GPU is shared; run them one
 //! at a time with `--ignored --test-threads=1`.
 
+#![cfg(target_os = "macos")]
+
 use std::path::PathBuf;
 
 use victory_metal::macos::cache::TranslationOptions;
