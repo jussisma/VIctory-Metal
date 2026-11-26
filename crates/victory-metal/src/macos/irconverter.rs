@@ -151,6 +151,7 @@ enum IRCompiler {}
 enum IRObject {}
 enum IRMetalLibBinary {}
 enum IRError {}
+enum IRShaderReflection {}
 
 type FnIRCompilerCreate = unsafe extern "C" fn() -> *mut IRCompiler;
 type FnIRCompilerDestroy = unsafe extern "C" fn(*mut IRCompiler);
@@ -173,6 +174,18 @@ type FnIRMetalLibGetBytecodeSize = unsafe extern "C" fn(*const IRMetalLibBinary)
 type FnIRMetalLibGetBytecodeData = unsafe extern "C" fn(*const IRMetalLibBinary) -> *mut c_void;
 type FnIRErrorGetCode = unsafe extern "C" fn(*const IRError) -> u32;
 type FnIRErrorDestroy = unsafe extern "C" fn(*mut IRError);
+/// Fills a caller-created reflection object for one shader stage.
+///
+/// The stage argument is the value reported by
+/// `IRObjectGetMetalIRShaderStage` (`8` for compute). The reflection is only
+/// populated for the linked AIR object, not the input DXIL object.
+type FnIRObjectGetReflection =
+    unsafe extern "C" fn(*const IRObject, c_int, *mut IRShaderReflection);
+type FnIRShaderReflectionCreate = unsafe extern "C" fn() -> *mut IRShaderReflection;
+type FnIRShaderReflectionDestroy = unsafe extern "C" fn(*mut IRShaderReflection);
+type FnIRShaderReflectionCopyJSONString =
+    unsafe extern "C" fn(*const IRShaderReflection) -> *const c_char;
+type FnIRShaderReflectionFreeString = unsafe extern "C" fn(*const c_char);
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -215,6 +228,23 @@ struct Api {
     metallib_data: FnIRMetalLibGetBytecodeData,
     err_code: FnIRErrorGetCode,
     err_destroy: FnIRErrorDestroy,
+    reflection_get: Option<FnIRObjectGetReflection>,
+    reflection_create: Option<FnIRShaderReflectionCreate>,
+    reflection_destroy: Option<FnIRShaderReflectionDestroy>,
+    reflection_json: Option<FnIRShaderReflectionCopyJSONString>,
+    reflection_free: Option<FnIRShaderReflectionFreeString>,
+}
+
+unsafe fn load_sym_opt<T: Copy>(handle: *mut c_void, name: &CStr) -> Option<T> {
+    if mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
+        return None;
+    }
+    // SAFETY: `handle` is an open `dlopen` handle and `name` is NUL-terminated.
+    let sym = unsafe { dlsym(handle, name.as_ptr()) };
+    let ptr = NonNull::new(sym)?;
+    // SAFETY: Caller specifies the exact C symbol signature matching Apple's
+    // IRConverter ABI; this is the optional-symbol form of `load_sym`.
+    Some(unsafe { mem::transmute_copy::<*mut c_void, T>(&ptr.as_ptr()) })
 }
 
 unsafe fn load_sym<T: Copy>(handle: *mut c_void, name: &CStr) -> Result<T, MetalError> {
@@ -278,6 +308,11 @@ fn load_api(lib: DynLib) -> Result<Api, MetalError> {
             metallib_data: load_sym(h, c"IRMetalLibGetBytecodeData")?,
             err_code: load_sym(h, c"IRErrorGetCode")?,
             err_destroy: load_sym(h, c"IRErrorDestroy")?,
+            reflection_get: load_sym_opt(h, c"IRObjectGetReflection"),
+            reflection_create: load_sym_opt(h, c"IRShaderReflectionCreate"),
+            reflection_destroy: load_sym_opt(h, c"IRShaderReflectionDestroy"),
+            reflection_json: load_sym_opt(h, c"IRShaderReflectionCopyJSONString"),
+            reflection_free: load_sym_opt(h, c"IRShaderReflectionFreeString"),
             _lib: lib,
         })
     }
@@ -407,6 +442,9 @@ struct CompiledBinary<'a> {
     // Drop the binary before the linked AIR object (`bin` is declared first).
     bin: Scoped<IRMetalLibBinary>,
     _air: Scoped<IRObject>,
+    /// Converter reflection JSON captured from the linked AIR object when the
+    /// caller asked for it. `None` for the plain bytecode path.
+    reflection_json: Option<String>,
     size_fn: FnIRMetalLibGetBytecodeSize,
     data_fn: FnIRMetalLibGetBytecodeData,
     _api: std::marker::PhantomData<&'a Api>,
@@ -477,6 +515,7 @@ fn compile_to_binary<'a>(
     api: &'a Api,
     dxil: &[u8],
     entry_c: &CStr,
+    with_reflection: bool,
 ) -> Result<CompiledBinary<'a>, MetalError> {
     // SAFETY: `IRCompilerCreate` takes no arguments and returns a newly allocated compiler.
     let compiler_raw = unsafe { (api.compiler_create)() };
@@ -530,6 +569,12 @@ fn compile_to_binary<'a>(
         drop_fn: api.obj_destroy,
     };
 
+    let reflection_json = if with_reflection {
+        Some(copy_reflection_json(api, air.ptr, stage)?)
+    } else {
+        None
+    };
+
     // SAFETY: `IRMetalLibBinaryCreate` returns an empty container freed by `metallib_destroy`.
     let bin_raw = unsafe { (api.metallib_create)() };
     if bin_raw.is_null() {
@@ -554,10 +599,87 @@ fn compile_to_binary<'a>(
         stage,
         bin,
         _air: air,
+        reflection_json,
         size_fn: api.metallib_size,
         data_fn: api.metallib_data,
         _api: std::marker::PhantomData,
     })
+}
+
+/// Captures Apple's reflection JSON for a linked AIR object.
+///
+/// `IRObjectGetReflection` only fills the reflection for the *linked* AIR
+/// object, and it takes the stage reported by `IRObjectGetMetalIRShaderStage`.
+/// The JSON is copied into an owned `String` before the reflection object is
+/// destroyed.
+fn copy_reflection_json(
+    api: &Api,
+    air: *const IRObject,
+    stage: i32,
+) -> Result<String, MetalError> {
+    let (
+        Some(get_reflection),
+        Some(create),
+        Some(destroy),
+        Some(copy_json),
+        Some(free_string),
+    ) = (
+        api.reflection_get,
+        api.reflection_create,
+        api.reflection_destroy,
+        api.reflection_json,
+        api.reflection_free,
+    )
+    else {
+        return Err(MetalError::CompileFailed(
+            "IRConverter build does not expose the reflection symbols".to_string(),
+        ));
+    };
+
+    // SAFETY: `create` is the paired constructor for `IRShaderReflection`.
+    let reflection = unsafe { create() };
+    if reflection.is_null() {
+        return Err(MetalError::CompileFailed(
+            "IRShaderReflectionCreate returned null".to_string(),
+        ));
+    }
+    struct ReflectionGuard {
+        ptr: *mut IRShaderReflection,
+        destroy: FnIRShaderReflectionDestroy,
+    }
+    impl Drop for ReflectionGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.ptr` came from `IRShaderReflectionCreate`.
+            unsafe { (self.destroy)(self.ptr) };
+        }
+    }
+    let _guard = ReflectionGuard {
+        ptr: reflection,
+        destroy,
+    };
+
+    // SAFETY: `air` is a live linked AIR object and `reflection` is a live,
+    // caller-created reflection for the requested stage.
+    unsafe { get_reflection(air, stage, reflection) };
+
+    // SAFETY: `reflection` is a live reflection object; the returned string is
+    // owned by the caller and released with `IRShaderReflectionFreeString`.
+    let raw = unsafe { copy_json(reflection) };
+    if raw.is_null() {
+        return Err(MetalError::CompileFailed(
+            "IRShaderReflectionCopyJSONString returned null".to_string(),
+        ));
+    }
+    // SAFETY: `raw` is a NUL-terminated string owned by this call.
+    let text = unsafe { CStr::from_ptr(raw) }
+        .to_str()
+        .map_err(|_| {
+            MetalError::CompileFailed("IRConverter reflection JSON is not UTF-8".to_string())
+        })?
+        .to_string();
+    // SAFETY: `raw` was handed to the caller by `IRShaderReflectionCopyJSONString`.
+    unsafe { free_string(raw) };
+    Ok(text)
 }
 
 /// Converts DXIL bytes into a compiled `MTLLibrary` using the configured
@@ -841,7 +963,7 @@ impl TranslationBackend for InProcessConverter {
     fn translate(&self, request: &TranslationRequest<'_>) -> Result<WorkerOutput, MetalError> {
         let entry_c = c_entry(request.entry)?;
         let api = open_api()?;
-        let compiled = compile_to_binary(&api, request.dxil, &entry_c)?;
+        let compiled = compile_to_binary(&api, request.dxil, &entry_c, false)?;
         let metallib = compiled.serialized_bytes()?;
         let stage = u32::try_from(compiled.stage).unwrap_or(0);
         let reflection = ReflectionPayload::from_translation(
@@ -1116,12 +1238,63 @@ pub fn convert_dxil_to_metallib(
     validate_dxil(dxil)?;
     let entry_c = c_entry(entry)?;
     let api = open_api_from_path(converter_path)?;
-    let compiled = compile_to_binary(&api, dxil, &entry_c)?;
+    let compiled = compile_to_binary(&api, dxil, &entry_c, false)?;
     let bytes = compiled.serialized_bytes()?;
     Ok(MetallibOutput {
         bytes,
         stage: u32::try_from(compiled.stage).unwrap_or(0),
     })
+}
+
+/// Converted metallib plus Apple's reflection JSON for the linked program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetallibWithReflection {
+    /// Serialized metallib bytes and reported stage.
+    pub metallib: MetallibOutput,
+    /// `IRShaderReflectionCopyJSONString` output for the linked AIR object.
+    ///
+    /// The JSON lists the converted entry point, stage, root parameters in
+    /// `TopLevelArgumentBuffer` (byte offset, size, register slot/space and the
+    /// `Constant`/`CBV`/`SRV`/`UAV`/`Table` type) plus `UsedResources`. It is
+    /// the only source for the flattened argument-buffer ABI; see
+    /// [`crate::macos::bindings::RootSignatureLayout`].
+    pub reflection_json: String,
+}
+
+/// Converts DXIL and also returns Apple's shader reflection JSON.
+///
+/// This uses the same x86_64 `libmetalirconverter.dylib` path as
+/// [`convert_dxil_to_metallib`]. Reflection is only populated for the linked
+/// AIR object, so the call happens between `IRCompilerAllocCompileAndLink` and
+/// bytecode serialization. Builds without the `IRShaderReflection*` symbols
+/// return [`MetalError::CompileFailed`] rather than a partial layout.
+pub fn convert_dxil_to_metallib_with_reflection(
+    dxil: &[u8],
+    entry: &str,
+    converter_path: &Path,
+) -> Result<MetallibWithReflection, MetalError> {
+    validate_dxil(dxil)?;
+    let entry_c = c_entry(entry)?;
+    let api = open_api_from_path(converter_path)?;
+    let compiled = compile_to_binary(&api, dxil, &entry_c, true)?;
+    let bytes = compiled.serialized_bytes()?;
+    let stage = u32::try_from(compiled.stage).unwrap_or(0);
+    let reflection_json = compiled.reflection_json.ok_or_else(|| {
+        MetalError::InternalError("reflection JSON was not captured for this build".to_string())
+    })?;
+    Ok(MetallibWithReflection {
+        metallib: MetallibOutput { bytes, stage },
+        reflection_json,
+    })
+}
+
+/// First existing converter library from the documented search order.
+///
+/// Mirrors [`candidate_paths`] without opening the library, so callers can
+/// decide whether reflection-based layout construction is possible before
+/// attempting a conversion.
+pub fn converter_library_path() -> Option<PathBuf> {
+    candidate_paths().into_iter().find(|path| path.is_file())
 }
 
 #[cfg(test)]
