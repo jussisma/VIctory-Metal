@@ -52,6 +52,9 @@ opus-pure.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The end-to-end synthetic test drives the Win64 guest IPC client against the
+# separate native ARM64 host (`tools/macos/metal-poc/xmem-ipc.sh`).
+victory-metal.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).

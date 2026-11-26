@@ -32,6 +32,10 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+#[cfg(test)]
+mod e2e;
+mod share;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -384,6 +388,12 @@ struct Section {
     /// placeholder-view metadata.
     #[cfg(feature = "diagnostics")]
     shared: Option<victory_gpu::PhysicalHeap>,
+    /// The opt-in host-visible file behind this section (`share`), if the
+    /// provider was configured and succeeded. Pagefile and diagnostic
+    /// sections have none, and never claim one. Read by
+    /// `share::resolve_guest_range`.
+    #[allow(dead_code)]
+    share: Option<Arc<share::Backing>>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -414,6 +424,102 @@ impl Section {
         });
         (at != 0).then_some(at)
     }
+}
+
+/// A section of `size` bytes for an allocation of physical pages: the
+/// pagefile in production, a file the opt-in share provider names when
+/// `VICTORY_METAL_SHARE_DIR` is set, or in tests a file a synthetic caller
+/// provides.
+fn new_section(size: usize) -> Option<Arc<Section>> {
+    #[cfg(test)]
+    if let Some(section) = tests::file_section(size) {
+        return Some(section);
+    }
+    // Diagnostic heaps alias the section's pages onto a GPU heap, so they
+    // keep the pagefile and never claim a share file.
+    #[cfg(not(feature = "diagnostics"))]
+    match share::section(size) {
+        Ok(section) => return Some(section),
+        Err(share::Failure::Unconfigured) => {}
+        Err(error) => tracing::warn!(
+            size,
+            %error,
+            "host-visible XMem backing failed; keeping the pagefile section"
+        ),
+    }
+    #[cfg(feature = "diagnostics")]
+    if std::env::var_os(share::DIRECTORY).is_some_and(|value| !value.is_empty()) {
+        tracing::debug!(
+            "VICTORY_METAL_SHARE_DIR is set, but diagnostic heaps keep the pagefile path"
+        );
+    }
+    pagefile_section(size)
+}
+
+/// A section over `file`: its pages are the file's pages. `share` records a
+/// provider backing the file, if any. The file must outlive every view of
+/// the section (callers keep it, or a `share::Backing`, alive).
+fn file_section(
+    file: &std::fs::File,
+    size: usize,
+    share: Option<Arc<share::Backing>>,
+) -> Option<Arc<Section>> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: plain file-backed section creation; the caller keeps the file
+    // open while the section and its views live.
+    let handle = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    Some(Arc::new(Section {
+        handle,
+        size,
+        // The file is the backing, not the GPU's host heap.
+        #[cfg(feature = "diagnostics")]
+        shared: None,
+        share,
+        whole: OnceLock::new(),
+    }))
+}
+
+/// A pagefile-backed section: the documents' physical pages, committed when
+/// first mapped or written.
+fn pagefile_section(size: usize) -> Option<Arc<Section>> {
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            // Under Wine a committed section is a sparse file, free until
+            // touched, and committing a reserved one page by page costs a
+            // wineserver request each that scans every range committed so
+            // far: commit it whole there.
+            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    Some(Arc::new(Section {
+        handle,
+        size,
+        #[cfg(feature = "diagnostics")]
+        shared: victory_gpu::physical_heap(size),
+        share: None,
+        whole: OnceLock::new(),
+    }))
 }
 
 impl Drop for Section {
@@ -545,43 +651,21 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
+    // A section of `size` bytes, its pages committed when first mapped or
+    // written (`commit`): Grand Theft Auto VI asks for 6.1 GiB at once,
+    // which a busy host often cannot commit (error 1450).
+    let Some(section) = new_section(size) else {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
-    }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section {
-        handle,
-        size,
-        #[cfg(feature = "diagnostics")]
-        shared: victory_gpu::physical_heap(size),
-        whole: OnceLock::new(),
-    });
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -1224,6 +1308,252 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The file the next allocation in this thread makes its section
+        /// from; production allocates from the pagefile or the share
+        /// provider. `share`'s tests use it to prove such a section is not
+        /// reported as host-visible.
+        pub(super) static SECTION_FILE: std::cell::RefCell<Option<std::fs::File>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A section over the test's own file, if it installed one for this
+    /// thread. The file must outlive every view of the section.
+    pub(super) fn file_section(size: usize) -> Option<Arc<Section>> {
+        SECTION_FILE.with(|file| {
+            file.borrow()
+                .as_ref()
+                .and_then(|file| super::file_section(file, size, None))
+        })
+    }
+
+    #[test]
+    fn file_backed_pages_keep_bytes_at_a_nonzero_section_offset() {
+        // Three pages of a real file: the page at section offset 64 KiB has
+        // a distinct pattern, so reading it cannot read page 0.
+        const MARK: usize = 0x100;
+        const WRITTEN: usize = 0x180;
+        let file = tempfile::tempfile().expect("a temporary file");
+        file.set_len((3 * PAGE) as u64).expect("three pages");
+        let page1: Vec<u8> = (0..64).map(|i| 0x40 + i as u8).collect();
+        let mut page0 = [0u8; 64];
+        page0.fill(0x11);
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut out = &file;
+            out.seek(SeekFrom::Start((PAGE + MARK) as u64)).unwrap();
+            out.write_all(&page1).unwrap();
+            out.seek(SeekFrom::Start(MARK as u64)).unwrap();
+            out.write_all(&page0).unwrap();
+        }
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = Some(file.try_clone().expect("a copy")));
+
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1,
+            "an allocation from the injected section"
+        );
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(n, 3);
+
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let bytes = |at: *mut c_void, offset: usize, len: usize| {
+            // SAFETY: `at` is a live mapped view holding at least `offset + len` bytes.
+            unsafe { std::slice::from_raw_parts(at.cast::<u8>().add(offset), len).to_vec() }
+        };
+
+        // Map page 1 (section offset 65536) through the existing HLE path
+        // and read the file's original bytes there.
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(bytes(a, MARK, 64), page1, "page 1 at section offset 64 KiB");
+        assert_ne!(
+            bytes(a, MARK, 64),
+            page0,
+            "page 1 is not page 0 of the file"
+        );
+
+        // A write through this view is visible through an alias, and
+        // survives the alias's unmap and remap.
+        let written: Vec<u8> = (0..16).map(|i| 0xe0 + i as u8).collect();
+        // SAFETY: `a` is mapped read-write for a whole page and `WRITTEN + 16`
+        // is inside it; `written` is a distinct live local buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                written.as_ptr(),
+                a.cast::<u8>().add(WRITTEN),
+                written.len(),
+            )
+        };
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        assert_eq!(bytes(b, MARK, 64), page1);
+        assert_eq!(bytes(b, WRITTEN, 16), written);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(query(b).host.State, MEM_RESERVE);
+        assert_eq!(bytes(a, MARK, 64), page1);
+        assert_eq!(bytes(a, WRITTEN, 16), written);
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        assert_eq!(bytes(b, MARK, 64), page1);
+        assert_eq!(bytes(b, WRITTEN, 16), written);
+
+        // Unmapped and mapped again from the same section, both the file's
+        // original page and our written bytes are still there.
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        assert_eq!(bytes(a, MARK, 64), page1);
+        assert_eq!(bytes(a, WRITTEN, 16), written);
+
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        drop(file);
+    }
+
+    /// Opt-in cross-process proof: the actual XMem path writes a payload
+    /// through a `map_alias` view of a file-backed physical page whose
+    /// section offset is 64 KiB, flushes it, then publishes an atomic
+    /// marker. `tools/macos/metal-poc/xmem-arm64.sh` runs a native arm64
+    /// process that waits for the marker and reads the same file through a
+    /// no-copy Metal buffer. Without both variables the test does nothing,
+    /// so the default suite is unchanged.
+    #[test]
+    fn external_fixture_alias_write_for_native_gpu() {
+        use windows_sys::Win32::System::Memory::FlushViewOfFile;
+
+        const OFFSET: usize = PAGE; // 64 KiB from the start of the fixture.
+        const GUARD: usize = 0x200; // Original page-1 bytes, left untouched.
+        const PAYLOAD: usize = 0x400;
+        const WORDS: usize = 1024;
+        const SENTINEL_AT: usize = 0x2000;
+        const SENTINEL: u32 = 0xC0DE_D00D;
+
+        let Ok(fixture) = std::env::var("VICTORY_XMEM_GPU_FIXTURE") else {
+            eprintln!("skipped: VICTORY_XMEM_GPU_FIXTURE is not set");
+            return;
+        };
+        let marker =
+            std::env::var("VICTORY_XMEM_GPU_MARKER").expect("a marker for the native GPU process");
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture)
+            .expect("the fixture file");
+        let length = file.metadata().expect("fixture metadata").len() as usize;
+        assert!(length >= 2 * PAGE, "the fixture needs two 64 KiB pages");
+        let original = std::fs::read(&fixture).expect("the fixture bytes");
+        assert_eq!(&original[..16], [0xA5; 16], "page 0 is the sentinel page");
+        let page1 = &original[OFFSET..OFFSET + PAGE];
+        assert_ne!(&page1[..16], &original[..16], "page 1 is not page 0");
+        // The driver fills page 1 with a known byte pattern; the guard word
+        // must still be that pattern after the HLE write.
+        let guard: Vec<u8> = (0..4).map(|i| 0x80 | ((GUARD + i) as u8 & 0x3f)).collect();
+        assert_eq!(&page1[GUARD..GUARD + 4], guard);
+
+        // Make the next physical-page allocation in this thread use the
+        // fixture, then map its second page (section offset 64 KiB).
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = Some(file.try_clone().expect("a copy")));
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1,
+            "an allocation from the fixture"
+        );
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(n, 2);
+
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        let view = |at: *mut c_void| {
+            // SAFETY: `at` is a live mapped view of one whole page.
+            unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE).to_vec() }
+        };
+        // The view shows section offset 64 KiB, not the file's first page.
+        assert_eq!(&view(a)[GUARD..GUARD + 4], guard);
+
+        // The GPU's page-mapping copy, then a write through the alias.
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        let payload: Vec<u8> = (0..WORDS)
+            .flat_map(|i| {
+                let word = 0x51E3_0000u32 ^ (i as u32).wrapping_mul(0x9E37_79B9);
+                word.to_le_bytes()
+            })
+            .collect();
+        // SAFETY: `b` is the live one-page alias mapped just above.
+        let alias = unsafe { std::slice::from_raw_parts_mut(b.cast::<u8>(), PAGE) };
+
+        alias[PAYLOAD..PAYLOAD + payload.len()].copy_from_slice(&payload);
+        alias[SENTINEL_AT..SENTINEL_AT + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+        // The source view and the untouched guard see the alias write.
+        assert_eq!(&view(a)[PAYLOAD..PAYLOAD + payload.len()], payload);
+        assert_eq!(
+            &view(a)[SENTINEL_AT..SENTINEL_AT + 4],
+            SENTINEL.to_le_bytes()
+        );
+        assert_eq!(&view(a)[GUARD..GUARD + 4], guard);
+        // SAFETY: the whole page is a live mapped view of the section.
+        assert_ne!(unsafe { FlushViewOfFile(b.cast(), PAGE) }, 0);
+        file.sync_all().expect("flushing the fixture");
+
+        // The bytes are in the file itself, at the identified offset.
+        let on_disk = std::fs::read(&fixture).expect("the fixture after the write");
+        assert_eq!(&on_disk[..OFFSET], &original[..OFFSET]);
+        assert_eq!(
+            &on_disk[OFFSET + PAYLOAD..OFFSET + PAYLOAD + payload.len()],
+            payload
+        );
+        assert_eq!(
+            &on_disk[OFFSET + SENTINEL_AT..OFFSET + SENTINEL_AT + 4],
+            SENTINEL.to_le_bytes()
+        );
+        assert_eq!(&on_disk[OFFSET + GUARD..OFFSET + GUARD + 4], guard);
+
+        // Atomic handoff: the native process only maps the file after the
+        // marker appears, so it cannot observe a partial write.
+        let temporary = format!("{marker}.tmp");
+        std::fs::write(&temporary, format!("offset={OFFSET}\n")).expect("the marker");
+        std::fs::rename(&temporary, &marker).expect("publishing the marker");
+
+        let mut sum = 0u32;
+        let mut xor = 0u32;
+        for word in payload.as_chunks::<4>().0 {
+            let word = u32::from_le_bytes(*word);
+            sum = sum.wrapping_add(word);
+            xor ^= word;
+        }
+        println!(
+            "HLE_WROTE offset={OFFSET} page={} sum={sum:#010x} xor={xor:#010x} sentinel={SENTINEL:#010x}",
+            pages[1]
+        );
+
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
