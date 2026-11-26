@@ -19,3 +19,8 @@ blake3.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Host-side shader proofs: the mesh/compute unblocking tasks translate real
+# DXIL and then execute it through IRConverter on the ARM64 Metal GPU.
+victory-shader = { path = "../victory-shader" }
