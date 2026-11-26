@@ -74,7 +74,13 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // Renderer port #2: records copied into the view heap via memcpy/memmove are marked.
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::port_descriptors::import(name, address));
+        }
+        Some(address)
     }
 }
 

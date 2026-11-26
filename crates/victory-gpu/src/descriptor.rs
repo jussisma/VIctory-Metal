@@ -191,6 +191,8 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    // Renderer port #2: its record is looked at again with the title's own.
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -212,24 +214,58 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    /// A heap's start, its address, and the ranges written since the last sync.
-    type Written = (u64, usize, Vec<(usize, usize)>);
+    /// A heap's start, its address, and `(from, to, fallback_check)` byte ranges.
+    type Written = (u64, usize, Vec<(usize, usize, bool)>);
+    let frame = crate::frame::current();
+    let page_size = crate::watch::PAGE;
     // The written ranges of every heap, taken in one short hold of the lock.
     let work: Vec<Written> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
-            .filter_map(|&(start, _, at)| {
+            .filter_map(|&(start, end, at)| {
                 // SAFETY: registered heaps are live (removed when dropped).
                 let heap = unsafe { &*(at as *const Heap) };
                 // As before: ranges are taken only once the heap has its
                 // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
+                let (Some(Some(_)), Some(written), Some(step)) =
                     (heap.host.get(), &heap.written, increment(heap.desc.kind))
                 else {
                     return None;
                 };
-                Some((start, at, written.take(start as usize, usize::MAX)))
+                let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+                if crate::port_descriptors::adopted(start) {
+                    // Renderer port #2: the slots the title's patched stores and our
+                    // calls marked, plus periodic fallback pages from the write watch.
+                    let step = step as usize;
+                    for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
+                        let from = start as usize + first as usize * step;
+                        let to = (from + n as usize * step).min(end as usize);
+                        if from < to {
+                            parts.push((from, to, false));
+                        }
+                    }
+                    if crate::port_descriptors::ask_due(frame) {
+                        let taken = written.take(start as usize, usize::MAX);
+                        crate::port_descriptors::asked(&taken);
+                    }
+                    for page in crate::port_descriptors::to_check(frame) {
+                        let from = page.max(start as usize);
+                        let to = page.saturating_add(page_size).min(end as usize);
+                        if from < to {
+                            parts.push((from, to, true));
+                        }
+                    }
+                } else {
+                    for (from, to) in written.take(start as usize, usize::MAX) {
+                        let from = from.max(start as usize);
+                        let to = to.min(end as usize);
+                        if from < to {
+                            parts.push((from, to, false));
+                        }
+                    }
+                }
+                Some((start, at, parts))
             })
             .collect()
     };
@@ -239,11 +275,11 @@ pub(crate) fn sync_heaps() {
     // 650,000 slots checked a frame, 29 submissions). A heap is not dropped
     // while its page is made: `Heap::drop` takes the write lock to leave the
     // list, so a heap still listed under the lock is alive.
-    let page_size = crate::watch::PAGE;
     let mut page_buf = vec![0u8; page_size];
     for (start, at, ranges) in work {
-        for (from, to) in ranges {
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
+        for (from, to, check) in ranges {
+            let checking = check.then(std::time::Instant::now);
+            for base in (from & !(page_size - 1)..to).step_by(page_size) {
                 let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
                 if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
                     break;
@@ -255,7 +291,7 @@ pub(crate) fn sync_heaps() {
                     break;
                 };
                 let step = u64::from(step);
-                let (page, end) = (page.max(from), (page + page_size).min(to));
+                let (page, end) = (base.max(from), (base + page_size).min(to));
                 let len = end - page;
                 // By page: read the whole mapped range once; one with nothing
                 // mapped (the title unmaps heap pages too) holds no records.
@@ -271,13 +307,20 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots_bytes(
+                host.sync_slots_bytes_checked(
                     first as u32,
                     last.min(u64::from(heap.desc.count)) as u32,
                     start,
                     step,
                     page as u64,
                     &page_buf[..len],
+                    check,
+                );
+            }
+            if let Some(began) = checking {
+                crate::port_descriptors::CHECKED[4].fetch_add(
+                    began.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
                 );
             }
         }
@@ -416,6 +459,7 @@ impl Drop for Heap {
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
         drop(heaps);
+        crate::port_descriptors::let_go(self.start);
         crate::memory::release(at);
     }
 }
@@ -582,7 +626,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
     /// The resource objects the view names.
@@ -999,6 +1043,9 @@ pub(crate) extern "system" fn create_heap(
     let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
     #[cfg(windows)]
     if visible && result == crate::object::S_OK {
+        if placed && desc.kind == VIEWS_KIND {
+            crate::port_descriptors::adopt(start, desc.count);
+        }
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         register_heap(&mut heaps, (start, start + size), at);
     }

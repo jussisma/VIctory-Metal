@@ -1171,12 +1171,15 @@ fn install() {
         if HOLDING.with(|h| h.get()) {
             if read_only(at) {
                 open_under_lock(at / PAGE);
+                crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let mut g = guards();
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+            drop(g);
+            crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod crash;
+pub mod descriptor_sites;
 pub mod masked;
 pub mod wide;
 #[cfg(windows)]

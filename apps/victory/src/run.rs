@@ -165,6 +165,30 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // Renderer port #2 (`VICTORY_PORT_DESCRIPTORS=1`): the title's stores of
+    // descriptor records tell the layer their slots. Patched before wide
+    // store splitting so the original `vmovups` bytes match.
+    #[cfg(windows)]
+    if execute && victory_hle::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and
+        // `MARKS` lives in static memory.
+        let done = unsafe {
+            apply(
+                image.base(),
+                size,
+                victory_hle::port_descriptors::marks_address(),
+                &SITES,
+            )
+        };
+        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+        println!(
+            "renderer port 2: {patched} of {} descriptor record stores of the title patched",
+            SITES.len()
+        );
+        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {

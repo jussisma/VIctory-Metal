@@ -815,6 +815,7 @@ impl HostHeap {
 
     /// Like [`HostHeap::sync_slots`], reading records that lie inside
     /// `buf` (`[buf_start, buf_start + buf.len())`) without re-reading title memory.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sync_slots_bytes(
         &self,
         first: u32,
@@ -823,6 +824,22 @@ impl HostHeap {
         step: u64,
         buf_start: u64,
         buf: &[u8],
+    ) {
+        self.sync_slots_bytes_checked(first, last, start, step, buf_start, buf, false);
+    }
+
+    /// Like [`HostHeap::sync_slots_bytes`], reporting any unmirrored changed
+    /// slots to [`crate::port_descriptors::missed`] when `check` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_slots_bytes_checked(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        buf_start: u64,
+        buf: &[u8],
+        check: bool,
     ) {
         let last = last.min(self.count);
         if first >= last {
@@ -836,7 +853,7 @@ impl HostHeap {
             .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
-        let mut stale: Vec<u32> = Vec::new();
+        let mut stale: Vec<(u32, bool)> = Vec::new();
         let mut candidates: Vec<(u32, [u32; 3])> = Vec::new();
 
         for i in first..last {
@@ -852,7 +869,7 @@ impl HostHeap {
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
                 if self.made_is_nonzero(i) {
-                    stale.push(i);
+                    stale.push((i, false));
                 }
                 continue;
             }
@@ -875,13 +892,17 @@ impl HostHeap {
                     None => true,
                 };
                 if changed {
-                    stale.push(i);
+                    stale.push((i, true));
                 }
             }
         }
 
-        for i in stale {
-            self.mirror(i, at(i), false);
+        for (i, is_view) in stale {
+            let handle = at(i);
+            if check {
+                crate::port_descriptors::missed(i, handle, is_view, false);
+            }
+            self.mirror(i, handle, false);
         }
 
         for b in b_first..=b_last {

@@ -4287,6 +4287,7 @@ impl Meter {
                  max records {records:.0}/frame ({counted:.0} under a count)",
                 making = crate::pipeline::making()
             );
+            crate::port_descriptors::line(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

@@ -57,6 +57,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod placement;
 #[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
