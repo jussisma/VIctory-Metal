@@ -1992,6 +1992,23 @@ mod tests {
         vertex_rows: &[&[u8]],
         primitive_rows: u32,
     ) -> Result<HostShader, ShaderError> {
+        let (bytes, native) = shaped_mesh_parts(vertices, primitives, vertex_rows, primitive_rows)?;
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// [`shaped_mesh`] before emission: its container bytes and native
+    /// program, for tests that emit it with the linked path's pruning.
+    fn shaped_mesh_parts(
+        vertices: u32,
+        primitives: u32,
+        vertex_rows: &[&[u8]],
+        primitive_rows: u32,
+    ) -> Result<(Vec<u8>, NativeProgram), ShaderError> {
         let mut words: Vec<u32> = vec![
             0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -2076,12 +2093,7 @@ mod tests {
         let osg1 = container::signature(&osg, false);
         let psg1 = container::signature(&psg, false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
-        let c = Container::parse(&bytes)?;
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let st = structure::structure(&p)?;
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        Ok((bytes, native))
     }
 
     /// Rows of 4 + 4 + 4 + 4 + 4, 3 and 1, 2, 3 and 1, then 3 seven times
@@ -2144,6 +2156,83 @@ mod tests {
         assert_eq!(mesh_outputs(&[]), None);
         #[cfg(windows)]
         assert_eq!(mesh_outputs(&constant_color()), None);
+    }
+
+    /// Metal counts a mesh shader's outputs in its aligned layout, not the
+    /// packed component count: 4 bytes per component, but every signature
+    /// element rounded up to its own size. 29 full rows, then a row emitted
+    /// as 1+3 components, then two 2-component rows make 128 components and
+    /// exactly 32 KiB packed. The 1-then-3 order pads to 33,280 B (over the
+    /// limit); the 3-then-1 order draws at 32,768 B. Linked pruning keeps the
+    /// same elements and masks, only their order within one register row
+    /// changes.
+    #[test]
+    fn linked_mesh_row_packing_fits_metal_aligned_budget() {
+        let mut rows: Vec<&[u8]> = vec![&[4]; 29];
+        rows.push(&[1, 3]);
+        rows.extend([&[2][..]; 2]);
+        let (bytes, native) = shaped_mesh_parts(64, 32, &rows, 0).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let before = super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let mut keep = lower::KeptOutputs::new();
+        for e in before.iter().filter(|e| e.kind == 0) {
+            keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
+        }
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit_pruned(
+            &EmitInput {
+                c: &c,
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+            },
+            Options::default(),
+            Some(&keep),
+        )
+        .unwrap();
+        let after = super::signature(
+            Container::parse(&ms.dxil)
+                .unwrap()
+                .part(FourCC::OSG1)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        let components =
+            |els: &[SigElement]| -> u32 { els.iter().map(|e| u32::from(e.cols)).sum() };
+        assert_eq!(components(&before), 128);
+        assert_eq!(components(&after), components(&before));
+        let aligned = |els: &[SigElement]| -> u32 {
+            let distances: u32 = els
+                .iter()
+                .filter(|e| matches!(e.kind, 6 | 7))
+                .map(|e| 4 * u32::from(e.cols))
+                .sum();
+            let mut end = distances + 16;
+            for e in els.iter().filter(|e| e.kind != 3) {
+                let size = 4 * u32::from(e.cols);
+                end = end.next_multiple_of(size) + size;
+            }
+            end * 64
+        };
+        assert!(aligned(&before) > METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(aligned(&before), 33_280);
+        assert_eq!(aligned(&after), 32_768);
+        assert_eq!(mesh_bytes(&ms.dxil), Some(32_768));
+        let fields = |els: &[SigElement]| {
+            let mut v: Vec<(String, u32, u8, Option<u32>, u8, u8)> = els
+                .iter()
+                .map(|e| (e.name.clone(), e.index, e.kind, e.row, e.col, e.cols))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(fields(&before), fields(&after));
     }
 
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
