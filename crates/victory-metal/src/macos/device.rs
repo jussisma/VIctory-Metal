@@ -27,24 +27,6 @@ const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// layouts should place every typed declaration on its natural alignment.
 const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
-/// Maps wire allocation IDs and generations to live registered Metal buffers.
-///
-/// The resolver owns no GPU state: [`DirectMetalTransport`] keeps every mapped
-/// buffer alive through synchronous completion. Returning `None` for a stale or
-/// unknown generation rejects the whole batch before any GPU work starts.
-/// Implementations should be a pure lookup and must not call back into the
-/// transport, because resolution runs while the device state lock is held.
-pub trait AllocationResolver {
-    /// Resolves `allocation_id` at `generation` to a registered buffer handle.
-    fn resolve(&self, allocation_id: u64, generation: u32) -> Option<VmBufferId>;
-}
-
-impl AllocationResolver for HashMap<(u64, u32), VmBufferId> {
-    fn resolve(&self, allocation_id: u64, generation: u32) -> Option<VmBufferId> {
-        self.get(&(allocation_id, generation)).copied()
-    }
-}
-
 struct RegisteredBuffer {
     buffer: ObjcObject,
     /// Byte length reported to Metal at registration time.
@@ -149,14 +131,23 @@ impl DirectMetalTransport {
     ///
     /// # Contract
     ///
-    /// * Every command is fully resolved against `resolver`, the pipeline table
-    ///   and the registered buffer table before any command buffer exists. An
-    ///   unknown pipeline, allocation, stale generation or out-of-range binding
-    ///   returns [`ReplyStatus::UnknownHandle`] and performs no GPU work.
+    /// * `allocations` is a caller-owned snapshot of the allocation registry,
+    ///   keyed by `(allocation_id, generation)`. It is a plain `HashMap`, not a
+    ///   callback, so no caller code can run while the internal state mutex is
+    ///   held; refreshing the snapshot is the caller's responsibility.
+    /// * Every command is fully resolved against `allocations`, the pipeline
+    ///   table and the registered buffer table before any command buffer exists.
+    ///   An unknown pipeline, allocation, stale generation, zero allocation ID or
+    ///   generation, or out-of-range binding returns
+    ///   [`ReplyStatus::UnknownHandle`] and performs no GPU work.
     /// * A binding range must satisfy `offset % 4 == 0` and
     ///   `offset + length <= registered_length`. `length` is a lifetime/validity
     ///   claim for the registered range, not a shader index bound: host kernels
     ///   are trusted, and Metal validates shader-specific alignment at dispatch.
+    /// * `threads_per_group` must not exceed the pipeline's
+    ///   `maxTotalThreadsPerThreadgroup`; an explicit width over the limit is
+    ///   rejected with [`MetalError::InvalidArg`] before GPU work. Silently
+    ///   clamping would change threadgroup indices and shader semantics.
     /// * One `MTLCommandBuffer` holds one compute encoder per command, so Metal's
     ///   hazard tracking orders the dispatches while keeping the batch atomic.
     /// * The state lock is held through synchronous completion, so a registered
@@ -169,7 +160,7 @@ impl DirectMetalTransport {
     pub fn submit_batch(
         &self,
         submission: &Submission,
-        resolver: &dyn AllocationResolver,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Result<Reply, MetalError> {
         if submission.sequence == 0 {
             return Err(MetalError::InvalidArg(
@@ -228,14 +219,17 @@ impl DirectMetalTransport {
 
             let mut bindings = Vec::with_capacity(dispatch.bindings.len());
             for (slot, binding) in dispatch.bindings.iter().enumerate() {
-                if binding.length == 0
+                if binding.allocation_id == 0
+                    || binding.generation == 0
+                    || binding.length == 0
                     || binding.length > wire::MAX_RESOURCE_LEN
                     || !binding.offset.is_multiple_of(MTL_BUFFER_OFFSET_ALIGNMENT)
                 {
                     return Ok(reply(ReplyStatus::UnknownHandle));
                 }
-                let Some(registered_id) =
-                    resolver.resolve(binding.allocation_id, binding.generation)
+                let Some(registered_id) = allocations
+                    .get(&(binding.allocation_id, binding.generation))
+                    .copied()
                 else {
                     return Ok(reply(ReplyStatus::UnknownHandle));
                 };
@@ -255,14 +249,20 @@ impl DirectMetalTransport {
                 bindings.push((registered.buffer.as_raw(), offset, slot));
             }
 
-            // Match the legacy single-dispatch API: clamp the threadgroup width
-            // to the pipeline's hardware maximum instead of failing the batch.
+            // Unlike the legacy single-dispatch API, do not clamp an explicit
+            // wire width: that would change threadgroup indices and shader
+            // semantics. Reject before the command buffer exists.
             // SAFETY: `pso` is a valid `MTLComputePipelineState`.
             let max_threads = unsafe {
                 objc::msg_send_usize_0(pso.as_raw(), objc::sel(c"maxTotalThreadsPerThreadgroup"))
             }
             .max(1);
-            let threads_per_group = (dispatch.threads_per_group as usize).min(max_threads);
+            let threads_per_group = dispatch.threads_per_group as usize;
+            if threads_per_group > max_threads {
+                return Err(MetalError::InvalidArg(
+                    "dispatch threads_per_group exceeds pipeline threadgroup maximum",
+                ));
+            }
             prepared.push((pso.as_raw(), dispatch.threads, threads_per_group, bindings));
         }
 

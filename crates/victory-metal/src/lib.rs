@@ -318,6 +318,133 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn wire_batch_rejects_zero_handle_fields_and_oversized_threadgroup_without_gpu_work() {
+        use std::collections::HashMap;
+
+        use crate::wire::{BufferBinding, Command, Dispatch1d, Reply, ReplyStatus, Submission};
+
+        unsafe extern "C" {
+            fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+            fn free(ptr: *mut c_void);
+        }
+
+        const ALIGN: usize = 16384;
+        const BYTES: usize = 65536;
+        const DWORDS: usize = BYTES / 4;
+        const ALLOCATION_ID: u64 = 1;
+        const GENERATION: u32 = 1;
+        const SEQUENCE: u32 = 9;
+
+        let transport = crate::DirectMetalTransport::new().expect("Metal device should open");
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation into `raw`.
+        let rc = unsafe { posix_memalign(&mut raw, ALIGN, BYTES) };
+        assert_eq!(rc, 0, "posix_memalign failed");
+        assert!(!raw.is_null());
+
+        struct PageGuard(*mut c_void);
+        impl Drop for PageGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` came from `posix_memalign` and is no longer registered.
+                unsafe { free(self.0) };
+            }
+        }
+        let _guard = PageGuard(raw);
+
+        // SAFETY: `[raw, raw + BYTES)` is freshly allocated and u32-aligned.
+        let work = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u32>(), DWORDS) };
+        for (index, slot) in work.iter_mut().enumerate() {
+            *slot = index as u32 + 1;
+        }
+
+        // SAFETY: `raw` points to 64 KiB valid memory that outlives `unregister_buffer`.
+        let buf_id = unsafe { transport.register_zerocopy(raw.cast::<u8>(), BYTES) }
+            .expect("register_zerocopy should succeed on 16 KiB unified memory");
+
+        let msl = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void vm_batch_guard(device uint *data [[buffer(0)]],
+                                       uint tid [[thread_position_in_grid]]) {
+                data[tid] = data[tid] + 1u;
+            }
+        "#;
+        let pipeline = transport
+            .compile_msl(msl, "vm_batch_guard")
+            .expect("guard kernel should compile");
+
+        // Deliberately seed the snapshot with the forbidden zero keys: the
+        // programmatic entry point must reject them exactly like the codec.
+        let mut allocations = HashMap::new();
+        allocations.insert((0, GENERATION), buf_id);
+        allocations.insert((ALLOCATION_ID, 0), buf_id);
+        allocations.insert((ALLOCATION_ID, GENERATION), buf_id);
+
+        let submission = |allocation_id: u64, generation: u32, threads_per_group: u32| Submission {
+            sequence: SEQUENCE,
+            commands: vec![Command::Dispatch1d(Dispatch1d {
+                pipeline_id: pipeline.0,
+                threads: DWORDS as u32,
+                threads_per_group,
+                bindings: vec![BufferBinding {
+                    allocation_id,
+                    generation,
+                    offset: 0,
+                    length: BYTES as u64,
+                }],
+            })],
+        };
+        let expect_unknown_handle = |submission: &Submission, label: &str| {
+            let reply = transport
+                .submit_batch(submission, &allocations)
+                .expect("invalid handle fields should return a reply");
+            assert_eq!(
+                reply,
+                Reply {
+                    sequence: SEQUENCE,
+                    status: ReplyStatus::UnknownHandle,
+                },
+                "{label}"
+            );
+        };
+
+        expect_unknown_handle(&submission(0, GENERATION, 64), "zero allocation ID");
+        expect_unknown_handle(&submission(ALLOCATION_ID, 0, 64), "zero generation");
+        assert!(
+            work.iter()
+                .enumerate()
+                .all(|(index, &value)| value == index as u32 + 1),
+            "rejected zero-handle batch modified GPU-visible memory"
+        );
+
+        // Any explicit width above the pipeline maximum must fail instead of
+        // being clamped to a different threadgroup shape.
+        let device_max = transport
+            .device_info()
+            .expect("device_info should succeed")
+            .max_threads_per_threadgroup;
+        let oversized = device_max.saturating_add(1);
+        let err = transport
+            .submit_batch(&submission(ALLOCATION_ID, GENERATION, oversized), &allocations)
+            .expect_err("oversized threadgroup width should be rejected");
+        assert!(
+            matches!(err, MetalError::InvalidArg(_)),
+            "unexpected oversized-width error: {err:?}"
+        );
+        assert!(
+            work.iter()
+                .enumerate()
+                .all(|(index, &value)| value == index as u32 + 1),
+            "rejected oversized-threadgroup batch modified GPU-visible memory"
+        );
+
+        transport
+            .unregister_buffer(buf_id)
+            .expect("unregister_buffer should succeed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn c_api_roundtrip_opens_engine_and_queries_device() {
         let mut engine = std::ptr::null_mut();
         // SAFETY: `engine` is a valid stack pointer for the C API out parameter.
