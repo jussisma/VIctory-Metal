@@ -23,8 +23,12 @@
 //! | 14 | 2 | reserved, must be zero |
 //! | 16 | 4 | payload length in bytes |
 //!
-//! A submission payload is an ordered list of commands. Version 1 has exactly
-//! one command, a 1D compute dispatch:
+//! A submission payload is an ordered list of commands. Version 1 defines two
+//! command opcodes: a 1D grid (opcode 1) and an explicit 3D threadgroup grid
+//! (opcode 2). A decoder that predates opcode 2 rejects it as
+//! [`WireError::UnknownOpcode`]; it never guesses at a newer payload layout.
+//!
+//! The opcode 1 command layout is frozen:
 //!
 //! | offset | size | field |
 //! | ---: | ---: | --- |
@@ -36,6 +40,30 @@
 //! | 20 | 2 | binding count (at most [`MAX_BINDINGS_PER_DISPATCH`]) |
 //! | 22 | 2 | reserved, must be zero |
 //! | 24 | 32 x N | bound buffer ranges, in slot order |
+//!
+//! The opcode 2 command carries the same handles and bindings but an explicit
+//! D3D-style threadgroup grid:
+//!
+//! | offset | size | field |
+//! | ---: | ---: | --- |
+//! | 0 | 2 | opcode (2 = dispatch 3D groups) |
+//! | 2 | 2 | flags, must be zero |
+//! | 4 | 8 | pre-created pipeline ID (never zero) |
+//! | 12 | 4 | threadgroup count X (never zero) |
+//! | 16 | 4 | threadgroup count Y (never zero) |
+//! | 20 | 4 | threadgroup count Z (never zero) |
+//! | 24 | 4 | threads per threadgroup X (never zero) |
+//! | 28 | 4 | threads per threadgroup Y (never zero) |
+//! | 32 | 4 | threads per threadgroup Z (never zero) |
+//! | 36 | 2 | binding count (at most [`MAX_BINDINGS_PER_DISPATCH`]) |
+//! | 38 | 2 | reserved, must be zero |
+//! | 40 | 32 x N | bound buffer ranges, in slot order |
+//!
+//! The group count and local dimension products must each fit in `u64`, and
+//! their combined total thread count must also fit; overflow is rejected by
+//! [`WireError::ThreadCountOverflow`] before execution. The native host still
+//! rejects a local threadgroup whose product exceeds the pipeline's hardware
+//! limit before it creates a command buffer.
 //!
 //! Each bound range is an allocation ID, generation, reserved word, byte
 //! offset and byte length. IDs, generations and lengths must be nonzero;
@@ -88,9 +116,11 @@ const KIND_SUBMISSION: u16 = 1;
 const KIND_REPLY: u16 = 2;
 
 const OPCODE_DISPATCH_1D: u16 = 1;
+const OPCODE_DISPATCH_3D: u16 = 2;
 
 const FRAME_HEADER_LEN: usize = 20;
 const COMMAND_HEADER_LEN: usize = 24;
+const DISPATCH_3D_HEADER_LEN: usize = 40;
 const BINDING_LEN: usize = 32;
 const REPLY_PAYLOAD_LEN: usize = 4;
 
@@ -109,6 +139,9 @@ pub struct Submission {
 pub enum Command {
     /// A pre-created compute pipeline dispatched over a 1D grid.
     Dispatch1d(Dispatch1d),
+    /// A pre-created compute pipeline dispatched over an explicit 3D
+    /// threadgroup grid.
+    Dispatch3d(Dispatch3d),
 }
 
 /// One ordered 1D compute dispatch.
@@ -122,6 +155,47 @@ pub struct Dispatch1d {
     pub threads_per_group: u32,
     /// Bound buffer ranges in `[[buffer(0)]]`, `[[buffer(1)]]`, ... order.
     pub bindings: Vec<BufferBinding>,
+}
+
+/// One ordered 3D compute dispatch with an exact D3D threadgroup grid.
+///
+/// The native host maps `group_counts` to
+/// `dispatchThreadgroups:threadsPerThreadgroup:` and `threads_per_group` to
+/// the local `MTLSize`, preserving non-divisible and non-cubic grids exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatch3d {
+    /// Host pipeline handle, created before the submission.
+    pub pipeline_id: u64,
+    /// D3D `Dispatch(x, y, z)` threadgroup counts; every dimension is nonzero.
+    pub group_counts: [u32; 3],
+    /// Local threads per threadgroup; every dimension is nonzero.
+    pub threads_per_group: [u32; 3],
+    /// Bound buffer ranges in `[[buffer(0)]]`, `[[buffer(1)]]`, ... order.
+    pub bindings: Vec<BufferBinding>,
+}
+
+impl Dispatch3d {
+    /// Returns the checked product of the three group counts.
+    pub fn checked_group_count(&self) -> Option<u64> {
+        checked_dimension_product(self.group_counts)
+    }
+
+    /// Returns the checked product of the three local thread dimensions.
+    pub fn checked_threads_per_group(&self) -> Option<u64> {
+        checked_dimension_product(self.threads_per_group)
+    }
+
+    /// Returns the checked total thread count for the whole grid.
+    pub fn checked_total_threads(&self) -> Option<u64> {
+        self.checked_group_count()?
+            .checked_mul(self.checked_threads_per_group()?)
+    }
+}
+
+fn checked_dimension_product(dimensions: [u32; 3]) -> Option<u64> {
+    dimensions.into_iter().try_fold(1u64, |product, dimension| {
+        product.checked_mul(u64::from(dimension))
+    })
 }
 
 /// One borrowed allocation range bound to a buffer slot.
@@ -212,6 +286,9 @@ pub enum WireError {
     ZeroPipelineId,
     /// Thread count or threads per threadgroup was zero.
     ZeroThreads,
+    /// A 3D group count, local dimension or total thread product overflowed
+    /// `u64`.
+    ThreadCountOverflow,
     /// Allocation ID zero is not a valid registry key.
     ZeroAllocationId,
     /// Generation zero does not identify a live allocation.
@@ -257,6 +334,7 @@ impl fmt::Display for WireError {
             Self::UnknownOpcode(opcode) => write!(f, "unknown command opcode {opcode}"),
             Self::ZeroPipelineId => write!(f, "pipeline ID must be nonzero"),
             Self::ZeroThreads => write!(f, "thread counts must be nonzero"),
+            Self::ThreadCountOverflow => write!(f, "3D thread count product overflows u64"),
             Self::ZeroAllocationId => write!(f, "allocation ID must be nonzero"),
             Self::ZeroGeneration => write!(f, "allocation generation must be nonzero"),
             Self::ZeroLength => write!(f, "bound range length must be nonzero"),
@@ -296,6 +374,11 @@ pub fn encode_submission(submission: &Submission) -> Result<Vec<u8>, WireError> 
                     .checked_add(dispatch_encoded_len(dispatch)?)
                     .ok_or(WireError::FrameTooLarge)?;
             }
+            Command::Dispatch3d(dispatch) => {
+                payload_len = payload_len
+                    .checked_add(dispatch3d_encoded_len(dispatch)?)
+                    .ok_or(WireError::FrameTooLarge)?;
+            }
         }
     }
     let payload_len_field = u32::try_from(payload_len).map_err(|_| WireError::FrameTooLarge)?;
@@ -313,6 +396,7 @@ pub fn encode_submission(submission: &Submission) -> Result<Vec<u8>, WireError> 
     for command in &submission.commands {
         match command {
             Command::Dispatch1d(dispatch) => write_dispatch(&mut out, dispatch),
+            Command::Dispatch3d(dispatch) => write_dispatch_3d(&mut out, dispatch),
         }
     }
     Ok(out)
@@ -436,18 +520,42 @@ fn validate_binding(binding: &BufferBinding) -> Result<(), WireError> {
 fn dispatch_encoded_len(dispatch: &Dispatch1d) -> Result<usize, WireError> {
     validate_pipeline(dispatch.pipeline_id)?;
     validate_threads(dispatch.threads, dispatch.threads_per_group)?;
-    if dispatch.bindings.len() > MAX_BINDINGS_PER_DISPATCH {
-        return Err(WireError::TooManyBindings(dispatch.bindings.len()));
+    encoded_len_with_bindings(COMMAND_HEADER_LEN, &dispatch.bindings)
+}
+
+fn dispatch3d_encoded_len(dispatch: &Dispatch3d) -> Result<usize, WireError> {
+    validate_pipeline(dispatch.pipeline_id)?;
+    validate_dimensions(dispatch.group_counts)?;
+    validate_dimensions(dispatch.threads_per_group)?;
+    if dispatch.checked_total_threads().is_none() {
+        return Err(WireError::ThreadCountOverflow);
     }
-    for binding in &dispatch.bindings {
+    encoded_len_with_bindings(DISPATCH_3D_HEADER_LEN, &dispatch.bindings)
+}
+
+fn validate_dimensions(dimensions: [u32; 3]) -> Result<(), WireError> {
+    if dimensions.contains(&0) {
+        Err(WireError::ZeroThreads)
+    } else {
+        Ok(())
+    }
+}
+
+fn encoded_len_with_bindings(
+    header_len: usize,
+    bindings: &[BufferBinding],
+) -> Result<usize, WireError> {
+    if bindings.len() > MAX_BINDINGS_PER_DISPATCH {
+        return Err(WireError::TooManyBindings(bindings.len()));
+    }
+    for binding in bindings {
         validate_binding(binding)?;
     }
 
-    dispatch
-        .bindings
+    bindings
         .len()
         .checked_mul(BINDING_LEN)
-        .and_then(|bindings_len| bindings_len.checked_add(COMMAND_HEADER_LEN))
+        .and_then(|bindings_len| bindings_len.checked_add(header_len))
         .ok_or(WireError::FrameTooLarge)
 }
 
@@ -459,6 +567,7 @@ fn read_command(reader: &mut Reader<'_>) -> Result<Command, WireError> {
     }
     match opcode {
         OPCODE_DISPATCH_1D => Ok(Command::Dispatch1d(read_dispatch(reader)?)),
+        OPCODE_DISPATCH_3D => Ok(Command::Dispatch3d(read_dispatch_3d(reader)?)),
         other => Err(WireError::UnknownOpcode(other)),
     }
 }
@@ -471,6 +580,42 @@ fn read_dispatch(reader: &mut Reader<'_>) -> Result<Dispatch1d, WireError> {
     let threads_per_group = reader.u32()?;
     validate_threads(threads, threads_per_group)?;
 
+    let bindings = read_bindings(reader)?;
+
+    Ok(Dispatch1d {
+        pipeline_id,
+        threads,
+        threads_per_group,
+        bindings,
+    })
+}
+
+fn read_dispatch_3d(reader: &mut Reader<'_>) -> Result<Dispatch3d, WireError> {
+    let pipeline_id = reader.u64()?;
+    validate_pipeline(pipeline_id)?;
+
+    let group_counts = [reader.u32()?, reader.u32()?, reader.u32()?];
+    validate_dimensions(group_counts)?;
+    let threads_per_group = [reader.u32()?, reader.u32()?, reader.u32()?];
+    validate_dimensions(threads_per_group)?;
+
+    let dispatch = Dispatch3d {
+        pipeline_id,
+        group_counts,
+        threads_per_group,
+        bindings: Vec::new(),
+    };
+    if dispatch.checked_total_threads().is_none() {
+        return Err(WireError::ThreadCountOverflow);
+    }
+    let bindings = read_bindings(reader)?;
+    Ok(Dispatch3d {
+        bindings,
+        ..dispatch
+    })
+}
+
+fn read_bindings(reader: &mut Reader<'_>) -> Result<Vec<BufferBinding>, WireError> {
     let binding_count = usize::from(reader.u16()?);
     if reader.u16()? != 0 {
         return Err(WireError::NonZeroReserved);
@@ -483,13 +628,7 @@ fn read_dispatch(reader: &mut Reader<'_>) -> Result<Dispatch1d, WireError> {
     for _ in 0..binding_count {
         bindings.push(read_binding(reader)?);
     }
-
-    Ok(Dispatch1d {
-        pipeline_id,
-        threads,
-        threads_per_group,
-        bindings,
-    })
+    Ok(bindings)
 }
 
 fn read_binding(reader: &mut Reader<'_>) -> Result<BufferBinding, WireError> {
@@ -584,7 +723,26 @@ fn write_dispatch(out: &mut Vec<u8>, dispatch: &Dispatch1d) {
     write_u32(out, dispatch.threads_per_group);
     write_u16(out, dispatch.bindings.len() as u16);
     write_u16(out, 0);
-    for binding in &dispatch.bindings {
+    write_bindings(out, &dispatch.bindings);
+}
+
+fn write_dispatch_3d(out: &mut Vec<u8>, dispatch: &Dispatch3d) {
+    write_u16(out, OPCODE_DISPATCH_3D);
+    write_u16(out, 0);
+    write_u64(out, dispatch.pipeline_id);
+    for dimension in dispatch.group_counts {
+        write_u32(out, dimension);
+    }
+    for dimension in dispatch.threads_per_group {
+        write_u32(out, dimension);
+    }
+    write_u16(out, dispatch.bindings.len() as u16);
+    write_u16(out, 0);
+    write_bindings(out, &dispatch.bindings);
+}
+
+fn write_bindings(out: &mut Vec<u8>, bindings: &[BufferBinding]) {
+    for binding in bindings {
         write_u64(out, binding.allocation_id);
         write_u32(out, binding.generation);
         write_u32(out, 0);
@@ -665,6 +823,9 @@ mod tests {
     const GENERATION_AT: usize = BINDING_START + 8;
     const OFFSET_AT: usize = BINDING_START + 16;
     const LENGTH_AT: usize = BINDING_START + 24;
+    const DISPATCH_3D_GROUP_X_AT: usize = COMMAND_START + 12;
+    const DISPATCH_3D_LOCAL_Z_AT: usize = COMMAND_START + 32;
+    const DISPATCH_3D_BINDING_START: usize = COMMAND_START + DISPATCH_3D_HEADER_LEN;
     const REPLY_STATUS_AT: usize = FRAME_HEADER_LEN;
 
     const GOLDEN_SUBMISSION: &str = "
@@ -675,6 +836,14 @@ mod tests {
         01 00 00 00 02 00 00 00 00 00 00 00 00 00 01 00 40 00 00 00 01 00 00 00
         01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
         00 00 01 00 00 00 00 00 00 00 01 00 00 00 00 00
+    ";
+
+    const GOLDEN_3D_SUBMISSION: &str = "
+        56 4d 57 46 01 00 01 00 03 00 00 00 01 00 00 00 48 00 00 00
+        02 00 00 00 03 00 00 00 00 00 00 00 02 00 00 00 03 00 00 00 04 00 00 00
+        04 00 00 00 02 00 00 00 01 00 00 00 01 00 00 00
+        01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+        00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00
     ";
 
     const GOLDEN_REPLY: &str =
@@ -716,6 +885,15 @@ mod tests {
         }
     }
 
+    fn dispatch_3d(pipeline_id: u64, offset: u64) -> Dispatch3d {
+        Dispatch3d {
+            pipeline_id,
+            group_counts: [2, 3, 4],
+            threads_per_group: [4, 2, 1],
+            bindings: vec![binding(offset)],
+        }
+    }
+
     fn two_dispatch_submission() -> Submission {
         Submission {
             sequence: 1,
@@ -726,14 +904,40 @@ mod tests {
         }
     }
 
+    fn dispatch_3d_submission() -> Submission {
+        Submission {
+            sequence: 3,
+            commands: vec![Command::Dispatch3d(dispatch_3d(3, 0))],
+        }
+    }
+
     fn dispatch_of(command: &Command) -> &Dispatch1d {
         match command {
             Command::Dispatch1d(dispatch) => dispatch,
+            other => panic!("expected 1D dispatch, got {other:?}"),
+        }
+    }
+
+    fn dispatch_3d_of(command: &Command) -> &Dispatch3d {
+        match command {
+            Command::Dispatch3d(dispatch) => dispatch,
+            other => panic!("expected 3D dispatch, got {other:?}"),
+        }
+    }
+
+    fn dispatch_1d_mut(command: &mut Command) -> &mut Dispatch1d {
+        match command {
+            Command::Dispatch1d(dispatch) => dispatch,
+            other => panic!("expected 1D dispatch, got {other:?}"),
         }
     }
 
     fn encoded_fixture() -> Vec<u8> {
         encode_submission(&two_dispatch_submission()).expect("fixture encodes")
+    }
+
+    fn encoded_3d_fixture() -> Vec<u8> {
+        encode_submission(&dispatch_3d_submission()).expect("3D fixture encodes")
     }
 
     #[test]
@@ -756,6 +960,117 @@ mod tests {
         assert_eq!(
             decode_reply(&unhex(GOLDEN_REPLY)).expect("golden reply decodes"),
             reply
+        );
+    }
+
+    #[test]
+    fn golden_3d_fixture_pins_opcode_2_without_changing_opcode_1() {
+        let submission = dispatch_3d_submission();
+        assert_eq!(encoded_3d_fixture(), unhex(GOLDEN_3D_SUBMISSION));
+        assert_eq!(
+            decode_submission(&unhex(GOLDEN_3D_SUBMISSION)).expect("3D golden decodes"),
+            submission
+        );
+
+        // The frozen opcode 1 frame and reply remain byte-for-byte identical.
+        assert_eq!(encoded_fixture(), unhex(GOLDEN_SUBMISSION));
+        assert_eq!(
+            decode_submission(&unhex(GOLDEN_SUBMISSION)).expect("opcode 1 golden decodes"),
+            two_dispatch_submission()
+        );
+        assert_eq!(
+            encode_reply(&Reply {
+                sequence: 1,
+                status: ReplyStatus::UnknownHandle,
+            })
+            .expect("reply encodes"),
+            unhex(GOLDEN_REPLY)
+        );
+    }
+
+    #[test]
+    fn dispatch3d_roundtrip_preserves_exact_grid_and_shared_bindings() {
+        let submission = dispatch_3d_submission();
+        let decoded =
+            decode_submission(&encode_submission(&submission).expect("encode")).expect("decode");
+
+        assert_eq!(decoded.sequence, 3);
+        assert_eq!(decoded.commands.len(), 1);
+        let dispatch = dispatch_3d_of(&decoded.commands[0]);
+        assert_eq!(dispatch.pipeline_id, 3);
+        assert_eq!(dispatch.group_counts, [2, 3, 4]);
+        assert_eq!(dispatch.threads_per_group, [4, 2, 1]);
+        assert_eq!(dispatch.checked_group_count(), Some(24));
+        assert_eq!(dispatch.checked_threads_per_group(), Some(8));
+        assert_eq!(dispatch.checked_total_threads(), Some(192));
+        assert_eq!(dispatch.bindings.len(), 1);
+        assert_eq!(dispatch.bindings[0], binding(0));
+    }
+
+    #[test]
+    fn dispatch3d_rejects_zero_dimensions_and_overflow_before_storage() {
+        for offset in [
+            DISPATCH_3D_GROUP_X_AT,
+            DISPATCH_3D_GROUP_X_AT + 4,
+            DISPATCH_3D_GROUP_X_AT + 8,
+            DISPATCH_3D_LOCAL_Z_AT - 8,
+            DISPATCH_3D_LOCAL_Z_AT - 4,
+            DISPATCH_3D_LOCAL_Z_AT,
+        ] {
+            let mut frame = encoded_3d_fixture();
+            frame[offset..offset + 4].fill(0);
+            assert_eq!(
+                decode_submission(&frame),
+                Err(WireError::ZeroThreads),
+                "zero dimension at offset {offset}"
+            );
+        }
+
+        let mut zero_group = dispatch_3d_submission();
+        let Command::Dispatch3d(dispatch) = &mut zero_group.commands[0] else {
+            unreachable!()
+        };
+        dispatch.group_counts[1] = 0;
+        assert_eq!(encode_submission(&zero_group), Err(WireError::ZeroThreads));
+
+        let mut overflow = dispatch_3d_submission();
+        let Command::Dispatch3d(dispatch) = &mut overflow.commands[0] else {
+            unreachable!()
+        };
+        dispatch.group_counts = [u32::MAX; 3];
+        assert_eq!(dispatch.checked_group_count(), None);
+        assert_eq!(dispatch.checked_total_threads(), None);
+        assert_eq!(
+            encode_submission(&overflow),
+            Err(WireError::ThreadCountOverflow)
+        );
+
+        let mut frame = encoded_3d_fixture();
+        for offset in [
+            DISPATCH_3D_GROUP_X_AT,
+            DISPATCH_3D_GROUP_X_AT + 4,
+            DISPATCH_3D_GROUP_X_AT + 8,
+        ] {
+            frame[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert_eq!(
+            decode_submission(&frame),
+            Err(WireError::ThreadCountOverflow)
+        );
+
+        let mut oversized = dispatch_3d_submission();
+        let Command::Dispatch3d(dispatch) = &mut oversized.commands[0] else {
+            unreachable!()
+        };
+        dispatch.bindings = vec![binding(0); MAX_BINDINGS_PER_DISPATCH + 1];
+        assert_eq!(
+            encode_submission(&oversized),
+            Err(WireError::TooManyBindings(MAX_BINDINGS_PER_DISPATCH + 1))
+        );
+
+        assert_eq!(
+            DISPATCH_3D_BINDING_START,
+            COMMAND_START + DISPATCH_3D_HEADER_LEN
         );
     }
 
@@ -905,7 +1220,7 @@ mod tests {
         );
 
         let mut zero_pipeline = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut zero_pipeline.commands[0];
+        let dispatch = dispatch_1d_mut(&mut zero_pipeline.commands[0]);
         dispatch.pipeline_id = 0;
         assert_eq!(
             encode_submission(&zero_pipeline),
@@ -913,7 +1228,7 @@ mod tests {
         );
 
         let mut zero_allocation = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut zero_allocation.commands[0];
+        let dispatch = dispatch_1d_mut(&mut zero_allocation.commands[0]);
         dispatch.bindings[0].allocation_id = 0;
         assert_eq!(
             encode_submission(&zero_allocation),
@@ -921,7 +1236,7 @@ mod tests {
         );
 
         let mut zero_generation = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut zero_generation.commands[0];
+        let dispatch = dispatch_1d_mut(&mut zero_generation.commands[0]);
         dispatch.bindings[0].generation = 0;
         assert_eq!(
             encode_submission(&zero_generation),
@@ -929,12 +1244,12 @@ mod tests {
         );
 
         let mut zero_length = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut zero_length.commands[0];
+        let dispatch = dispatch_1d_mut(&mut zero_length.commands[0]);
         dispatch.bindings[0].length = 0;
         assert_eq!(encode_submission(&zero_length), Err(WireError::ZeroLength));
 
         let mut zero_threads = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut zero_threads.commands[0];
+        let dispatch = dispatch_1d_mut(&mut zero_threads.commands[0]);
         dispatch.threads = 0;
         assert_eq!(
             encode_submission(&zero_threads),
@@ -961,13 +1276,13 @@ mod tests {
         assert_eq!(decode_submission(&frame), Err(WireError::OffsetOverflow));
 
         let mut overflow = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut overflow.commands[0];
+        let dispatch = dispatch_1d_mut(&mut overflow.commands[0]);
         dispatch.bindings[0].offset = u64::MAX;
         dispatch.bindings[0].length = 2;
         assert_eq!(encode_submission(&overflow), Err(WireError::OffsetOverflow));
 
         let mut oversized = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut oversized.commands[0];
+        let dispatch = dispatch_1d_mut(&mut oversized.commands[0]);
         dispatch.bindings[0].length = MAX_RESOURCE_LEN + 1;
         assert_eq!(
             encode_submission(&oversized),
@@ -1012,7 +1327,7 @@ mod tests {
         );
 
         let mut too_many_bindings = two_dispatch_submission();
-        let Command::Dispatch1d(dispatch) = &mut too_many_bindings.commands[0];
+        let dispatch = dispatch_1d_mut(&mut too_many_bindings.commands[0]);
         dispatch.bindings = vec![binding(0); MAX_BINDINGS_PER_DISPATCH + 1];
         assert_eq!(
             encode_submission(&too_many_bindings),
@@ -1029,11 +1344,13 @@ mod tests {
             Err(WireError::UnexpectedKind(KIND_REPLY))
         );
 
+        // Opcode 2 is defined in this version; an opcode this decoder does not
+        // know is rejected explicitly instead of being interpreted by guesswork.
         let mut wrong_opcode = encoded_fixture();
-        wrong_opcode[OPCODE_AT..OPCODE_AT + 2].copy_from_slice(&2u16.to_le_bytes());
+        wrong_opcode[OPCODE_AT..OPCODE_AT + 2].copy_from_slice(&3u16.to_le_bytes());
         assert_eq!(
             decode_submission(&wrong_opcode),
-            Err(WireError::UnknownOpcode(2))
+            Err(WireError::UnknownOpcode(3))
         );
 
         let mut flags = encoded_fixture();
