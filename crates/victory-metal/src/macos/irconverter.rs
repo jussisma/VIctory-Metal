@@ -23,12 +23,20 @@
 //! IRConverter retaining the pointer.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::{NonNull, null_mut};
 use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use crate::abi::VmDxilCompileOutput;
+use crate::macos::cache::{
+    BindingMetadata, Cached, DiskCache, MAX_CACHED_ROOT_SIGNATURE_BYTES, ReflectionPayload,
+    TranslationKey, TranslationOptions, blake3_bytes,
+};
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
 use crate::transport::MetalError;
 
@@ -50,6 +58,70 @@ pub const MAX_ENTRY_POINT_BYTES: usize = 256;
 /// The bound is checked against both `IRMetalLibGetBytecodeSize` and the mapped
 /// `dispatch_data_t` length before any output is written.
 pub const MAX_METALLIB_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Version string mixed into the translation cache key.
+///
+/// It covers this crate's conversion protocol rather than the (unversioned)
+/// `libmetalirconverter.dylib` file itself. Deployments that replace the dylib
+/// must set `VICTORY_IRCONVERTER_VERSION` (or pass an explicit
+/// [`ProcessWorker::with_version`]) so cached output is invalidated.
+pub const DEFAULT_CONVERTER_VERSION: &str =
+    concat!("victory-metal/", env!("CARGO_PKG_VERSION"), "/irconverter-protocol-1");
+
+/// One translation request handed to a [`TranslationBackend`].
+///
+/// The root signature, options and binding metadata travel with the DXIL so the
+/// Rosetta worker and the cache see exactly the same inputs the caller saw.
+#[derive(Debug)]
+pub struct TranslationRequest<'a> {
+    /// Raw DXIL bytes.
+    pub dxil: &'a [u8],
+    /// Entry point named in the DXIL module.
+    pub entry: &'a str,
+    /// Raw root signature bytes when the caller has them. The conversion still
+    /// consumes the root signature embedded in the DXIL; this value selects the
+    /// cache key and is carried into the reflection payload.
+    pub root_signature: Option<&'a [u8]>,
+    /// Translation options that can change output.
+    pub options: &'a TranslationOptions,
+    /// Verified binding metadata for the binder.
+    pub bindings: &'a [BindingMetadata],
+    /// Converter/protocol version mixed into the key.
+    pub converter_version: &'a str,
+}
+
+/// Raw result produced by a translation backend before cache validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerOutput {
+    /// Serialized metallib bytes.
+    pub metallib: Vec<u8>,
+    /// Reflection metadata describing the result.
+    pub reflection: ReflectionPayload,
+}
+
+/// A cache-aware translation result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationOutcome {
+    /// Serialized metallib bytes.
+    pub metallib: Vec<u8>,
+    /// Reflection metadata the binder consumes.
+    pub reflection: ReflectionPayload,
+    /// True when the result came from the persistent disk cache.
+    pub cache_hit: bool,
+}
+
+/// Pluggable DXIL-to-metallib translator.
+///
+/// Production uses [`ProcessWorker`] (x86_64 Rosetta worker) or
+/// [`InProcessConverter`] (legacy same-process `dlopen`). Tests inject counting
+/// or failing backends without a converter or GPU.
+pub trait TranslationBackend {
+    /// Converter/protocol version mixed into the cache key.
+    fn converter_version(&self) -> &str;
+
+    /// Translates one request. Implementations must not cache by themselves.
+    fn translate(&self, request: &TranslationRequest<'_>) -> Result<WorkerOutput, MetalError>;
+}
 
 #[link(name = "System")]
 unsafe extern "C" {
@@ -488,29 +560,62 @@ fn compile_to_binary<'a>(
     })
 }
 
-/// Converts DXIL bytes into a compiled `MTLLibrary` using `libmetalirconverter.dylib`.
+/// Converts DXIL bytes into a compiled `MTLLibrary` using the configured
+/// translation backend (Rosetta worker, or the legacy in-process library).
 pub(crate) fn compile_dxil_to_library(
     device: &ObjcObject,
     dxil: &[u8],
     entry: &str,
 ) -> Result<(ObjcObject, VmDxilCompileOutput), MetalError> {
+    compile_dxil_to_library_with_layout(
+        device,
+        dxil,
+        entry,
+        None,
+        &TranslationOptions::default(),
+        &[],
+    )
+}
+
+/// Translation entry point with an explicit root layout, options and binding
+/// metadata.
+pub(crate) fn compile_dxil_to_library_with_layout(
+    device: &ObjcObject,
+    dxil: &[u8],
+    entry: &str,
+    root_signature: Option<&[u8]>,
+    options: &TranslationOptions,
+    bindings: &[BindingMetadata],
+) -> Result<(ObjcObject, VmDxilCompileOutput), MetalError> {
     validate_dxil(dxil)?;
-    let entry_c = c_entry(entry)?;
-    let api = open_api()?;
-    let compiled = compile_to_binary(&api, dxil, &entry_c)?;
-    let stage = compiled.stage;
-    let metallib_bytes = compiled.byte_len();
-    let dispatch_data = compiled.dispatch_data()?;
+    c_entry(entry)?;
+    let backend: Box<dyn TranslationBackend> = match ProcessWorker::from_env() {
+        Some(worker) => Box::new(worker),
+        None => Box::new(InProcessConverter),
+    };
+    let outcome = translate_dxil_with(
+        global_cache(),
+        backend.as_ref(),
+        dxil,
+        entry,
+        0,
+        root_signature,
+        options,
+        bindings,
+    )?;
 
     let _pool = AutoreleasePool::new();
+    let dispatch_data = objc::dispatch_data_copy(&outcome.metallib).ok_or_else(|| {
+        MetalError::InternalError("dispatch_data_create returned null".to_string())
+    })?;
     let mut ns_err = objc::empty_id();
-    // SAFETY: `device` is a valid `MTLDevice` and `dispatch_data` is borrowed
-    // from `compiled`, which stays alive for this call.
+    // SAFETY: `device` is a valid `MTLDevice`, `dispatch_data` is a retained
+    // `dispatch_data_t`, and `ns_err` receives an autoreleased `NSError *`.
     let lib_raw = unsafe {
         objc::msg_send_id_err(
             device.as_raw(),
             objc::sel(c"newLibraryWithData:error:"),
-            dispatch_data,
+            dispatch_data.as_raw(),
             &mut ns_err,
         )
     };
@@ -523,10 +628,472 @@ pub(crate) fn compile_dxil_to_library(
     Ok((
         lib,
         VmDxilCompileOutput {
-            stage: u32::try_from(stage).unwrap_or(0),
-            metallib_bytes,
+            stage: outcome.reflection.stage,
+            metallib_bytes: outcome.metallib.len(),
         },
     ))
+}
+
+/// Cache-aware translation.
+///
+/// A valid cache entry is returned without calling `backend` at all. On a miss
+/// the backend runs, its output hash and metadata are verified against the key,
+/// and only then is the result stored. A backend failure or a verification
+/// failure is never cached.
+pub fn translate_dxil_with(
+    cache: Option<&DiskCache>,
+    backend: &dyn TranslationBackend,
+    dxil: &[u8],
+    entry: &str,
+    stage: u32,
+    root_signature: Option<&[u8]>,
+    options: &TranslationOptions,
+    bindings: &[BindingMetadata],
+) -> Result<TranslationOutcome, MetalError> {
+    validate_dxil(dxil)?;
+    c_entry(entry)?;
+    if let Some(root) = root_signature {
+        if root.len() > MAX_CACHED_ROOT_SIGNATURE_BYTES {
+            return Err(MetalError::InvalidArg(
+                "root signature exceeds the 1 MiB cache limit",
+            ));
+        }
+    }
+
+    let version = backend.converter_version();
+    let key = TranslationKey::new(dxil, root_signature, entry, stage, version, options);
+
+    if let Some(cache) = cache {
+        if let Some(cached) = cache.get(&key) {
+            if cached_matches_request(&cached.reflection, &key, entry, stage, options, bindings) {
+                return Ok(TranslationOutcome {
+                    metallib: cached.metallib,
+                    reflection: cached.reflection,
+                    cache_hit: true,
+                });
+            }
+        }
+    }
+
+    let request = TranslationRequest {
+        dxil,
+        entry,
+        root_signature,
+        options,
+        bindings,
+        converter_version: version,
+    };
+    let output = backend.translate(&request)?;
+    verify_output(&output, &key, entry, stage, options, bindings)?;
+
+    if let Some(cache) = cache {
+        let cached = Cached {
+            metallib: output.metallib.clone(),
+            reflection: output.reflection.clone(),
+        };
+        if let Err(err) = cache.put(&key, &cached) {
+            tracing::warn!(
+                error = %err,
+                dir = %cache.dir().display(),
+                "failed to store translated shader in the disk cache"
+            );
+        }
+    }
+
+    Ok(TranslationOutcome {
+        metallib: output.metallib,
+        reflection: output.reflection,
+        cache_hit: false,
+    })
+}
+
+fn cached_matches_request(
+    reflection: &ReflectionPayload,
+    key: &TranslationKey,
+    entry: &str,
+    stage: u32,
+    options: &TranslationOptions,
+    bindings: &[BindingMetadata],
+) -> bool {
+    reflection.entry == entry
+        && (stage == 0 || reflection.stage == stage)
+        && reflection.dxil_hash == key.dxil_hash
+        && reflection.root_layout_hash == key.root_layout_hash
+        && reflection.converter_version == key.converter_version
+        && &reflection.options == options
+        && reflection.bindings == bindings
+}
+
+fn verify_output(
+    output: &WorkerOutput,
+    key: &TranslationKey,
+    entry: &str,
+    stage: u32,
+    options: &TranslationOptions,
+    bindings: &[BindingMetadata],
+) -> Result<(), MetalError> {
+    if output.metallib.is_empty() {
+        return Err(MetalError::CompileFailed(
+            "translation backend produced an empty metallib".to_string(),
+        ));
+    }
+    if output.metallib.len() > MAX_METALLIB_OUTPUT_BYTES {
+        return Err(MetalError::CompileFailed(format!(
+            "translation backend produced {} bytes; limit is {}",
+            output.metallib.len(),
+            MAX_METALLIB_OUTPUT_BYTES
+        )));
+    }
+    let reflection = &output.reflection;
+    if reflection.stage == 0 {
+        return Err(MetalError::CompileFailed(
+            "translation backend reported stage 0".to_string(),
+        ));
+    }
+    if stage != 0 && reflection.stage != stage {
+        return Err(MetalError::CompileFailed(format!(
+            "translation backend reported stage {}; request declared stage {stage}",
+            reflection.stage
+        )));
+    }
+    if reflection.entry != entry {
+        return Err(MetalError::CompileFailed(
+            "translation backend reflection entry does not match the request".to_string(),
+        ));
+    }
+    if reflection.dxil_hash != key.dxil_hash
+        || reflection.root_layout_hash != key.root_layout_hash
+    {
+        return Err(MetalError::CompileFailed(
+            "translation backend reflection hashes do not match the request".to_string(),
+        ));
+    }
+    if reflection.metallib_bytes != output.metallib.len() as u64
+        || reflection.metallib_hash != blake3_bytes(&output.metallib)
+    {
+        return Err(MetalError::CompileFailed(
+            "translation backend metallib hash or size does not match the output".to_string(),
+        ));
+    }
+    if reflection.converter_version != key.converter_version {
+        return Err(MetalError::CompileFailed(
+            "translation backend converter version does not match the request".to_string(),
+        ));
+    }
+    if &reflection.options != options {
+        return Err(MetalError::CompileFailed(
+            "translation backend reflection options do not match the request".to_string(),
+        ));
+    }
+    if reflection.bindings != bindings {
+        return Err(MetalError::CompileFailed(
+            "translation backend reflection bindings do not match the request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the process-wide disk cache configured by
+/// `VICTORY_METAL_SHADER_CACHE`, or `$HOME/Library/Caches/victory-metal/shader-cache`.
+///
+/// Failure to create the cache directory disables caching (translation still
+/// runs) rather than failing compilation.
+fn global_cache() -> Option<&'static DiskCache> {
+    static CACHE: OnceLock<Option<DiskCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let dir = std::env::var_os("VICTORY_METAL_SHADER_CACHE")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        PathBuf::from(home)
+                            .join("Library/Caches/victory-metal/shader-cache")
+                    })
+                })
+                .unwrap_or_else(|| std::env::temp_dir().join("victory-metal-shader-cache"));
+            match DiskCache::open(&dir) {
+                Ok(cache) => Some(cache),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        dir = %dir.display(),
+                        "shader disk cache disabled: cannot create directory"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Legacy same-process translator using `dlopen` on
+/// `libmetalirconverter.dylib`.
+///
+/// Only works in an x86_64 process; on arm64 [`open_api`] returns
+/// [`MetalError::NotSupported`] and [`ProcessWorker`] must be configured.
+pub struct InProcessConverter;
+
+impl TranslationBackend for InProcessConverter {
+    fn converter_version(&self) -> &str {
+        DEFAULT_CONVERTER_VERSION
+    }
+
+    fn translate(&self, request: &TranslationRequest<'_>) -> Result<WorkerOutput, MetalError> {
+        let entry_c = c_entry(request.entry)?;
+        let api = open_api()?;
+        let compiled = compile_to_binary(&api, request.dxil, &entry_c)?;
+        let metallib = compiled.serialized_bytes()?;
+        let stage = u32::try_from(compiled.stage).unwrap_or(0);
+        let reflection = ReflectionPayload::from_translation(
+            &metallib,
+            stage,
+            request.entry,
+            request.dxil,
+            request.root_signature,
+            request.converter_version,
+            request.options,
+            request.bindings,
+        );
+        Ok(WorkerOutput {
+            metallib,
+            reflection,
+        })
+    }
+}
+
+/// x86_64 Rosetta worker process that performs DXIL conversion and writes the
+/// metallib plus a reflection payload.
+#[derive(Debug, Clone)]
+pub struct ProcessWorker {
+    program: PathBuf,
+    converter: PathBuf,
+    converter_version: String,
+}
+
+impl ProcessWorker {
+    /// Builds a worker from an explicit program and converter path.
+    pub fn new(program: impl Into<PathBuf>, converter: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            converter: converter.into(),
+            converter_version: DEFAULT_CONVERTER_VERSION.to_string(),
+        }
+    }
+
+    /// Overrides the converter version mixed into the cache key.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.converter_version = version.into();
+        self
+    }
+
+    /// Resolves the worker from `VICTORY_IRCONVERTER_WORKER` or the
+    /// `victory-irconverter` sibling of the current executable.
+    ///
+    /// Returns `None` when no worker or no converter library is configured, so
+    /// the caller can fall back to the legacy in-process path.
+    pub fn from_env() -> Option<Self> {
+        let program = std::env::var_os("VICTORY_IRCONVERTER_WORKER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                let exe = std::env::current_exe().ok()?;
+                let sibling = exe.parent()?.join("victory-irconverter");
+                sibling.is_file().then_some(sibling)
+            })?;
+
+        let converter = std::env::var_os("VICTORY_METAL_IRCONVERTER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::var_os("D3DMETAL_RES")
+                    .map(|root| PathBuf::from(root).join("libmetalirconverter.dylib"))
+                    .filter(|path| path.is_file())
+            })
+            .or_else(|| candidate_paths().into_iter().find(|path| path.is_file()))?;
+
+        let version = std::env::var("VICTORY_IRCONVERTER_VERSION")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_CONVERTER_VERSION.to_string());
+
+        Some(Self {
+            program,
+            converter,
+            converter_version: version,
+        })
+    }
+
+    /// Worker program path.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Converter library path passed to the worker.
+    pub fn converter(&self) -> &Path {
+        &self.converter
+    }
+
+    fn run(&self, request: &TranslationRequest<'_>) -> Result<WorkerOutput, MetalError> {
+        let scratch = ScratchDir::new()?;
+        let input = scratch.path().join("input.dxil");
+        let output = scratch.path().join("output.metallib");
+        let reflection_path = scratch.path().join("reflection.bin");
+        let root_path = scratch.path().join("root-signature.bin");
+
+        fs::write(&input, request.dxil).map_err(|err| {
+            MetalError::CompileFailed(format!("failed to write worker DXIL input: {err}"))
+        })?;
+        if let Some(root) = request.root_signature {
+            fs::write(&root_path, root).map_err(|err| {
+                MetalError::CompileFailed(format!("failed to write worker root signature: {err}"))
+            })?;
+        }
+
+        let mut command = Command::new(&self.program);
+        command
+            .arg("--converter")
+            .arg(&self.converter)
+            .arg("--entry")
+            .arg(request.entry)
+            .arg("--converter-version")
+            .arg(request.converter_version)
+            .arg("--reflection")
+            .arg(&reflection_path)
+            .arg("--target")
+            .arg(&request.options.target)
+            .arg("--min-os")
+            .arg(&request.options.min_os);
+        if request.root_signature.is_some() {
+            command.arg("--root-signature").arg(&root_path);
+        }
+        for flag in &request.options.flags {
+            command.arg("--flag").arg(flag);
+        }
+        for binding in request.bindings {
+            command.arg("--binding").arg(format!(
+                "{}:{}:{}:{}",
+                binding.kind.as_str(),
+                binding.register,
+                binding.metal_index,
+                binding.byte_offset
+            ));
+        }
+        command.arg(&input).arg(&output);
+
+        let result = command.output().map_err(|err| {
+            MetalError::CompileFailed(format!(
+                "failed to spawn IRConverter worker {}: {err}",
+                self.program.display()
+            ))
+        })?;
+        if !result.status.success() {
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            return Err(MetalError::CompileFailed(format!(
+                "IRConverter worker failed with {}: {}{}",
+                result.status,
+                stdout.trim(),
+                stderr.trim()
+            )));
+        }
+
+        let metallib = read_limited(
+            &output,
+            MAX_METALLIB_OUTPUT_BYTES,
+            "worker metallib output",
+        )?;
+        let reflection_bytes = fs::read(&reflection_path).map_err(|err| {
+            MetalError::CompileFailed(format!(
+                "IRConverter worker did not write a reflection payload: {err}"
+            ))
+        })?;
+        let reflection = ReflectionPayload::decode(&reflection_bytes).ok_or_else(|| {
+            MetalError::CompileFailed(
+                "IRConverter worker wrote a malformed reflection payload".to_string(),
+            )
+        })?;
+        Ok(WorkerOutput {
+            metallib,
+            reflection,
+        })
+    }
+}
+
+impl TranslationBackend for ProcessWorker {
+    fn converter_version(&self) -> &str {
+        &self.converter_version
+    }
+
+    fn translate(&self, request: &TranslationRequest<'_>) -> Result<WorkerOutput, MetalError> {
+        self.run(request)
+    }
+}
+
+fn read_limited(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>, MetalError> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        MetalError::CompileFailed(format!("failed to stat {label} {}: {err}", path.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(MetalError::CompileFailed(format!(
+            "{label} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let reported = metadata.len();
+    if reported == 0 {
+        return Err(MetalError::CompileFailed(format!(
+            "{label} is empty: {}",
+            path.display()
+        )));
+    }
+    if reported > limit as u64 {
+        return Err(MetalError::CompileFailed(format!(
+            "{label} is {reported} bytes; limit is {limit}: {}",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|err| {
+        MetalError::CompileFailed(format!("failed to read {label} {}: {err}", path.display()))
+    })?;
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err(MetalError::CompileFailed(format!(
+            "{label} has invalid size {} (limit {limit}): {}",
+            bytes.len(),
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new() -> Result<Self, MetalError> {
+        let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "victory-irconverter-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).map_err(|err| {
+            MetalError::CompileFailed(format!(
+                "failed to create IRConverter scratch directory {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Converts DXIL to serialized metallib bytes without opening a `MTLDevice`.
@@ -599,5 +1166,408 @@ mod tests {
             convert_dxil_to_metallib(&[0x42], "main", missing),
             Err(MetalError::NotSupported(_))
         ));
+    }
+
+    use crate::macos::cache::{BindingKind, TempDir, blake3_bytes, root_layout_hash};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    #[derive(Default)]
+    struct CountingBackend {
+        calls: AtomicUsize,
+        version: String,
+        fail_first: AtomicBool,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                version: DEFAULT_CONVERTER_VERSION.to_string(),
+                fail_first: AtomicBool::new(false),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl TranslationBackend for CountingBackend {
+        fn converter_version(&self) -> &str {
+            &self.version
+        }
+
+        fn translate(
+            &self,
+            request: &TranslationRequest<'_>,
+        ) -> Result<WorkerOutput, MetalError> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_first.load(AtomicOrdering::SeqCst) && call == 0 {
+                return Err(MetalError::CompileFailed(
+                    "synthetic translation failure".to_string(),
+                ));
+            }
+            let metallib = format!(
+                "METALLIB entry={} dxil={} root={}",
+                request.entry,
+                request.dxil.len(),
+                request.root_signature.map_or(0, <[u8]>::len)
+            )
+            .into_bytes();
+            let reflection = ReflectionPayload::from_translation(
+                &metallib,
+                8,
+                request.entry,
+                request.dxil,
+                request.root_signature,
+                request.converter_version,
+                request.options,
+                request.bindings,
+            );
+            Ok(WorkerOutput {
+                metallib,
+                reflection,
+            })
+        }
+    }
+
+    fn sample_options() -> TranslationOptions {
+        TranslationOptions::default()
+    }
+
+    #[test]
+    fn same_key_is_one_backend_invocation() {
+        let dir = TempDir::new("ir-same-key");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let backend = CountingBackend::new();
+        let options = sample_options();
+
+        let first = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-same",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("first translation");
+        assert!(!first.cache_hit);
+        assert_eq!(backend.calls(), 1);
+
+        let second = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-same",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("cached translation");
+        assert!(second.cache_hit);
+        assert_eq!(backend.calls(), 1, "cache hit must not invoke the backend");
+        assert_eq!(first.metallib, second.metallib);
+        assert_eq!(first.reflection, second.reflection);
+    }
+
+    #[test]
+    fn different_inputs_get_different_keys_and_recompute() {
+        let dir = TempDir::new("ir-different");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let backend = CountingBackend::new();
+        let options = sample_options();
+        let other_options = TranslationOptions {
+            target: "apple-macos".to_string(),
+            min_os: "15.0".to_string(),
+            flags: vec!["-O3".to_string()],
+        };
+
+        let calls = [
+            (b"dxil-a".as_slice(), "main", Some(b"root-a".as_slice()), &options),
+            (b"dxil-b".as_slice(), "main", Some(b"root-a".as_slice()), &options),
+            (b"dxil-a".as_slice(), "other", Some(b"root-a".as_slice()), &options),
+            (b"dxil-a".as_slice(), "main", Some(b"root-b".as_slice()), &options),
+            (b"dxil-a".as_slice(), "main", None, &options),
+            (b"dxil-a".as_slice(), "main", Some(b"root-a".as_slice()), &other_options),
+        ];
+        for (index, (dxil, entry, root, options)) in calls.iter().enumerate() {
+            let outcome = translate_dxil_with(
+                Some(&cache),
+                &backend,
+                dxil,
+                entry,
+                8,
+                *root,
+                options,
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("translation {index} failed: {err}"));
+            assert!(!outcome.cache_hit, "input {index} must not be a cache hit");
+            assert_eq!(backend.calls(), index + 1);
+        }
+    }
+
+    #[test]
+    fn corrupt_entry_is_a_miss_and_is_recomputed() {
+        let dir = TempDir::new("ir-corrupt");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let backend = CountingBackend::new();
+        let options = sample_options();
+        let key = TranslationKey::new(b"dxil-corrupt", Some(b"root"), "main", 8, DEFAULT_CONVERTER_VERSION, &options);
+        translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-corrupt",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("first translation");
+        assert_eq!(backend.calls(), 1);
+
+        let path = cache.path_for(&key);
+        let mut bytes = fs::read(&path).expect("read entry");
+        bytes.truncate(bytes.len() - 16);
+        fs::write(&path, bytes).expect("truncate entry");
+        assert!(cache.get(&key).is_none());
+
+        let outcome = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-corrupt",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("recomputed translation");
+        assert!(!outcome.cache_hit);
+        assert_eq!(backend.calls(), 2);
+        assert!(cache.get(&key).is_some());
+    }
+
+    #[test]
+    fn failed_translation_is_never_cached() {
+        let dir = TempDir::new("ir-failure");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let backend = CountingBackend::new();
+        backend.fail_first.store(true, AtomicOrdering::SeqCst);
+        let options = sample_options();
+
+        assert!(
+            translate_dxil_with(
+                Some(&cache),
+                &backend,
+                b"dxil-fail",
+                "main",
+                8,
+                Some(b"root"),
+                &options,
+                &[],
+            )
+            .is_err()
+        );
+        assert_eq!(backend.calls(), 1);
+
+        let outcome = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-fail",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("second attempt succeeds");
+        assert!(!outcome.cache_hit);
+        assert_eq!(backend.calls(), 2);
+
+        let cached = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-fail",
+            "main",
+            8,
+            Some(b"root"),
+            &options,
+            &[],
+        )
+        .expect("third attempt is a hit");
+        assert!(cached.cache_hit);
+        assert_eq!(backend.calls(), 2);
+    }
+
+    #[test]
+    fn process_worker_is_spawned_once_and_output_is_cached() {
+        let dir = TempDir::new("ir-process-worker");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let dxil = b"dxil-process-worker".to_vec();
+        let root = b"root-process-worker".to_vec();
+        let options = TranslationOptions {
+            target: "apple-macos".to_string(),
+            min_os: "14.0".to_string(),
+            flags: vec!["-O2".to_string()],
+        };
+        let bindings = [BindingMetadata {
+            kind: BindingKind::Uav,
+            register: 0,
+            metal_index: 2,
+            byte_offset: 0,
+        }];
+        let metallib = b"FAKE-PROCESS-METALLIB".to_vec();
+        let reflection = ReflectionPayload::from_translation(
+            &metallib,
+            8,
+            "main",
+            &dxil,
+            Some(&root),
+            DEFAULT_CONVERTER_VERSION,
+            &options,
+            &bindings,
+        );
+
+        let metallib_path = dir.path().join("fixture.metallib");
+        let reflection_path = dir.path().join("fixture.reflection");
+        let converter_path = dir.path().join("fixture.dylib");
+        let counter_path = dir.path().join("invocations");
+        fs::write(&metallib_path, &metallib).expect("write metallib fixture");
+        fs::write(&reflection_path, reflection.encode()).expect("write reflection fixture");
+        fs::write(&converter_path, b"not a real dylib").expect("write converter placeholder");
+
+        let script_path = dir.path().join("worker.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             count={counter}\n\
+             if [ -e \"$count\" ]; then\n\
+               echo 'worker invoked more than once' >&2\n\
+               exit 17\n\
+             fi\n\
+             : > \"$count\"\n\
+             reflection=''\n\
+             want=''\n\
+             for arg in \"$@\"; do\n\
+               if [ \"$want\" = reflection ]; then reflection=\"$arg\"; want=''; continue; fi\n\
+               if [ \"$arg\" = --reflection ]; then want=reflection; fi\n\
+             done\n\
+             output=''\n\
+             for arg in \"$@\"; do output=\"$arg\"; done\n\
+             cp {reflection_fixture} \"$reflection\"\n\
+             cp {metallib_fixture} \"$output\"\n\
+             echo 'IRCONVERT_OK entry=\"main\" stage=8'\n",
+            counter = shell_quote(&counter_path),
+            reflection_fixture = shell_quote(&reflection_path),
+            metallib_fixture = shell_quote(&metallib_path),
+        );
+        fs::write(&script_path, script).expect("write worker script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("mark worker executable");
+        }
+
+        let backend = ProcessWorker::new(&script_path, &converter_path);
+        let first = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            &dxil,
+            "main",
+            8,
+            Some(&root),
+            &options,
+            &bindings,
+        )
+        .expect("worker translation");
+        assert!(!first.cache_hit);
+        assert_eq!(first.metallib, metallib);
+        assert!(counter_path.is_file(), "worker script must have run");
+
+        let second = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            &dxil,
+            "main",
+            8,
+            Some(&root),
+            &options,
+            &bindings,
+        )
+        .expect("cached translation");
+        assert!(second.cache_hit);
+        assert_eq!(second.reflection.bindings, bindings);
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn process_worker_rejects_missing_reflection_payload() {
+        let dir = TempDir::new("ir-process-missing-reflection");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let converter_path = dir.path().join("fixture.dylib");
+        fs::write(&converter_path, b"not a real dylib").expect("write converter placeholder");
+        let script_path = dir.path().join("worker.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\noutput=''\nfor arg in \"$@\"; do output=\"$arg\"; done\nprintf 'METALLIB' > \"$output\"\n",
+        )
+        .expect("write worker script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+                .expect("mark worker executable");
+        }
+        let backend = ProcessWorker::new(&script_path, &converter_path);
+        let options = sample_options();
+        let error = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            b"dxil-no-reflection",
+            "main",
+            8,
+            None,
+            &options,
+            &[],
+        )
+        .expect_err("missing reflection must fail");
+        assert!(matches!(error, MetalError::CompileFailed(_)));
+    }
+
+    #[test]
+    fn cache_hit_skips_worker_and_reports_reflection_hashes() {
+        let dir = TempDir::new("ir-hit-hashes");
+        let cache = DiskCache::open(dir.path()).expect("open cache");
+        let backend = CountingBackend::new();
+        let options = sample_options();
+        let dxil = b"dxil-hash-check";
+        let outcome = translate_dxil_with(
+            Some(&cache),
+            &backend,
+            dxil,
+            "main",
+            8,
+            None,
+            &options,
+            &[],
+        )
+        .expect("translation");
+        assert_eq!(outcome.reflection.dxil_hash, blake3_bytes(dxil));
+        assert_eq!(outcome.reflection.root_layout_hash, root_layout_hash(None));
+        assert_eq!(
+            outcome.reflection.metallib_hash,
+            blake3_bytes(&outcome.metallib)
+        );
+        assert_eq!(outcome.reflection.metallib_bytes, outcome.metallib.len() as u64);
     }
 }
