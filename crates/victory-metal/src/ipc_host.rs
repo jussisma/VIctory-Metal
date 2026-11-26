@@ -695,6 +695,9 @@ impl<E: BatchExecutor> IpcHost<E> {
         let bindings = match command {
             Command::Dispatch1d(dispatch) => &dispatch.bindings,
             Command::Dispatch3d(dispatch) => &dispatch.bindings,
+            // Graphics and state commands are not executable by the compute
+            // host yet; refuse them before any range reaches the GPU.
+            _ => return false,
         };
         bindings
             .iter()

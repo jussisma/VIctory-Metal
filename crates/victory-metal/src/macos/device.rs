@@ -305,6 +305,15 @@ impl DirectMetalTransport {
                         ));
                     }
                 }
+                // The version 2 graphics and state opcodes decode at the wire
+                // layer but this compute executor cannot record them yet. They
+                // are refused explicitly instead of being skipped, so a batch
+                // never reports success for work that did not run.
+                _ => {
+                    return Err(MetalError::NotSupported(
+                        "graphics and state commands require the graphics executor",
+                    ));
+                }
             }
         }
 
@@ -331,6 +340,11 @@ impl DirectMetalTransport {
             let (pipeline_id, wire_bindings) = match command {
                 Command::Dispatch1d(dispatch) => (dispatch.pipeline_id, &dispatch.bindings),
                 Command::Dispatch3d(dispatch) => (dispatch.pipeline_id, &dispatch.bindings),
+                _ => {
+                    return Err(MetalError::NotSupported(
+                        "graphics and state commands require the graphics executor",
+                    ));
+                }
             };
             let Some(pso) = state.pipelines.get(&pipeline_id) else {
                 return Ok(reply(ReplyStatus::UnknownHandle));
@@ -386,6 +400,11 @@ impl DirectMetalTransport {
                         },
                         bindings,
                     });
+                }
+                _ => {
+                    return Err(MetalError::NotSupported(
+                        "graphics and state commands require the graphics executor",
+                    ));
                 }
             }
         }
