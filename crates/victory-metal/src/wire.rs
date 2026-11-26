@@ -571,6 +571,11 @@ pub enum ReplyStatus {
     UnknownHandle,
     /// The host accepted the handles but GPU execution failed.
     ExecutionFailed,
+    /// The submission named a command list that has already executed.
+    ///
+    /// The host performed no work for this submission: a replay of a list that
+    /// was claimed earlier is refused instead of being executed a second time.
+    AlreadyExecuted,
 }
 
 impl ReplyStatus {
@@ -579,6 +584,7 @@ impl ReplyStatus {
             Self::Ok => 0,
             Self::UnknownHandle => 1,
             Self::ExecutionFailed => 2,
+            Self::AlreadyExecuted => 3,
         }
     }
 
@@ -587,6 +593,7 @@ impl ReplyStatus {
             0 => Ok(Self::Ok),
             1 => Ok(Self::UnknownHandle),
             2 => Ok(Self::ExecutionFailed),
+            3 => Ok(Self::AlreadyExecuted),
             other => Err(WireError::UnsupportedStatus(other)),
         }
     }
@@ -2497,6 +2504,7 @@ mod tests {
             ReplyStatus::Ok,
             ReplyStatus::UnknownHandle,
             ReplyStatus::ExecutionFailed,
+            ReplyStatus::AlreadyExecuted,
         ] {
             let reply = Reply {
                 sequence: 42,
