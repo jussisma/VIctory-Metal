@@ -202,6 +202,431 @@ pub(crate) fn fits_mesh_output_budget(dxil: &[u8]) -> Result<bool, ShaderError> 
 }
 
 // ---------------------------------------------------------------------------
+// Linked-pair proof.
+//
+// The linked path (`crate::emit::translate_linked`) already drops arbitrary
+// mesh outputs no pixel shader input reads and then packs the survivors. The
+// proof below performs the same decision on two emitted `DXIL` containers and
+// reports what would be carried, so a caller can prove a pair fits without a
+// device, and see exactly which rows and channels were given up.
+//
+// It is deliberately more conservative than the runtime path: a row is only
+// pruned when the paired pixel container proves it reads none of its channels.
+// If the pixel stage cannot be identified, the signature is left whole and the
+// pair is refused (`fits == false`) rather than truncated. System values are
+// never pruned, and a retained arbitrary row keeps its semantic, index, guest
+// register row and every channel the pixel shader reads.
+
+/// Why [`mesh_pack_proof`] does not carry a mesh output row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshPruneReason {
+    /// No pixel shader input (`ISG1`) reads any channel of this semantic.
+    UnreadByPixel,
+    /// An arbitrary row with no guest register: no export can name it.
+    Unallocated,
+}
+
+/// One `OSG1` row's outcome under [`mesh_pack_proof`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshRowProof {
+    pub name: String,
+    pub index: u32,
+    /// DXIL semantic kind (mapped the same way the emitter's signature reader
+    /// maps it).
+    pub kind: u8,
+    /// The guest register row, before packing.
+    pub row: Option<u32>,
+    /// The channel span carried (trimmed for a retained arbitrary row).
+    pub col: u8,
+    pub cols: u8,
+    /// The channel span the signature declared, before compaction.
+    pub declared_col: u8,
+    pub declared_cols: u8,
+    /// The paired pixel shader's read mask, absolute within the four channels.
+    pub read: u8,
+    /// Why the row was dropped; `None` when it is retained.
+    pub reason: Option<MeshPruneReason>,
+}
+
+impl MeshRowProof {
+    /// Whether the row was retained with a narrower channel span than declared.
+    pub fn compacted(&self) -> bool {
+        self.reason.is_none() && (self.col != self.declared_col || self.cols != self.declared_cols)
+    }
+}
+
+/// The linked mesh/pixel footprint before and after dead-export pruning and
+/// packing, as [`mesh_pack_proof`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshPackProof {
+    pub vertices: u32,
+    pub primitives: u32,
+    /// Metal's limit, [`crate::emit::METAL_MESH_OUTPUT_BYTES`].
+    pub limit: u32,
+    /// 4 bytes per declared register-bearing component, before pruning.
+    pub declared_packed: u32,
+    /// Metal's aligned layout before pruning (the runtime's larger count).
+    pub declared_aligned: u32,
+    /// The same two counts after pruning, channel compaction and packing.
+    pub packed_after: u32,
+    pub aligned_after: u32,
+    /// Whether the paired pixel stage was identified well enough to prove
+    /// which rows it does not read. `false` keeps every row and refuses.
+    pub linkage_proven: bool,
+    /// `max(packed_after, aligned_after) <= limit`, and the linkage proven.
+    pub fits: bool,
+    /// Rows carried into the packed signature, before wide-row splitting.
+    pub retained: Vec<MeshRowProof>,
+    /// Rows not carried, with their reason.
+    pub pruned: Vec<MeshRowProof>,
+    /// The packed vertex outputs: `(register row, col, cols, kind)`.
+    pub rows_after: Vec<(u32, u8, u8, u8)>,
+}
+
+/// A parsed `OSG1`/`PSG1` row and the channel mask its record declares.
+struct SpanRow {
+    element: SigElement,
+    mask: u8,
+}
+
+/// The semantic-kind mapping the emitter's signature reader uses; a row the
+/// proof cannot classify is reported rather than guessed at.
+fn mapped_kind(raw: u32) -> Result<u8, ShaderError> {
+    Ok(match raw {
+        0 => 0,
+        1 => 3,
+        2 => 6,
+        3 => 7,
+        4 => 4,
+        5 => 5,
+        6 => 1,
+        7 => 10,
+        8 => 2,
+        9 => 13,
+        10 => 12,
+        23 => 28,
+        25 => 30,
+        64 => 16,
+        65 => 17,
+        66 => 14,
+        67 => 19,
+        68 => 18,
+        69 => 20,
+        70 => 15,
+        _ => {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a system value in the proof signature",
+            });
+        }
+    })
+}
+
+/// The rows of an `OSG1`/`PSG1`/`ISG1` part, with their declared channel mask.
+fn read_rows(part: &[u8]) -> Result<Vec<SpanRow>, ShaderError> {
+    let count = u32_at(part, 0)? as usize;
+    let base = u32_at(part, 4)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = base + 32 * i;
+        let name_at = u32_at(part, at + 4)? as usize;
+        let name = part
+            .get(name_at..)
+            .and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let mask = *part
+            .get(at + 24)
+            .ok_or(ShaderError::Malformed("truncated signature row"))?;
+        let register = u32_at(part, at + 20)?;
+        out.push(SpanRow {
+            element: SigElement {
+                name: String::from_utf8_lossy(name).into_owned(),
+                index: u32_at(part, at + 8)?,
+                kind: mapped_kind(u32_at(part, at + 12)?)?,
+                comp: 9,
+                interp: 0,
+                row: (register != u32::MAX).then_some(register),
+                col: mask.trailing_zeros().min(3) as u8,
+                cols: mask.count_ones().max(1) as u8,
+                usage: 0,
+                half: false,
+            },
+            mask,
+        });
+    }
+    Ok(out)
+}
+
+/// The packed count the runtime uses: 4 bytes per declared, register-bearing
+/// component of each declared vertex and primitive.
+fn packed_count(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    vertices: u32,
+    primitives: u32,
+) -> u32 {
+    let components = |els: &[SigElement]| -> u32 {
+        els.iter()
+            .filter(|e| e.row.is_some())
+            .map(|e| u32::from(e.cols))
+            .sum()
+    };
+    4u32.saturating_mul(
+        components(outputs)
+            .saturating_mul(vertices)
+            .saturating_add(components(prims).saturating_mul(primitives)),
+    )
+}
+
+/// Metal's aligned layout for the declared counts.
+fn aligned_count(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    vertices: u32,
+    primitives: u32,
+) -> u32 {
+    vertices
+        .saturating_mul(vertex_aligned(outputs))
+        .saturating_add(primitives.saturating_mul(primitive_aligned(prims)))
+}
+
+/// Whether a container is a pixel shader: `PSV0`'s shader kind is 0. `None`
+/// when the container, part or runtime info cannot be read.
+fn pixel_stage(dxil: &[u8]) -> Option<bool> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?;
+    let size = u32_at(psv.data, 0).ok()? as usize;
+    let info = psv.data.get(4..4 + size).filter(|i| i.len() >= 33)?;
+    Some(info[24] == 0)
+}
+
+/// The pixel inputs' read masks, or `None` when the linkage cannot be proven.
+fn proven_pixel_reads(pixel: &[u8]) -> Option<super::lower::KeptOutputs> {
+    if pixel_stage(pixel) != Some(true) {
+        return None;
+    }
+    super::pixel_input_reads(pixel).ok()
+}
+
+/// The rows a signature declared, as proof records (all retained).
+fn whole_rows(rows: &[SpanRow], reads: Option<&super::lower::KeptOutputs>) -> Vec<MeshRowProof> {
+    rows.iter()
+        .map(|span| {
+            let e = &span.element;
+            let read = reads
+                .map(|r| {
+                    r.get(&(e.name.to_ascii_uppercase(), e.index))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            MeshRowProof {
+                name: e.name.clone(),
+                index: e.index,
+                kind: e.kind,
+                row: e.row,
+                col: e.col,
+                cols: e.cols,
+                declared_col: e.col,
+                declared_cols: e.cols,
+                read,
+                reason: None,
+            }
+        })
+        .collect()
+}
+
+/// Proves what a mesh/pixel `DXIL` pair would carry under the linked packer.
+///
+/// `mesh` is an emitted mesh container and `pixel` its emitted pixel consumer
+/// (`None` for a depth-only draw). Returns `None` for a non-mesh container.
+/// The proof prunes an arbitrary mesh output row only when the pixel stage is
+/// positively identified and reads none of its channels; a retained row keeps
+/// its semantic, index and guest register row, and its declared channel span is
+/// narrowed only to the read channels. When the pixel linkage cannot be
+/// proven, every row is kept and [`MeshPackProof::fits`] is `false`.
+pub fn mesh_pack_proof(
+    mesh: &[u8],
+    pixel: Option<&[u8]>,
+) -> Result<Option<MeshPackProof>, ShaderError> {
+    let Some((vertices, primitives)) = declared_mesh_counts(mesh)? else {
+        return Ok(None);
+    };
+    let c = Container::parse(mesh)?;
+    let outputs = match c.part(FourCC::OSG1) {
+        Some(part) => read_rows(part.data)?,
+        None => Vec::new(),
+    };
+    let prims = match c.part(FourCC::PSG1) {
+        Some(part) => read_rows(part.data)?,
+        None => Vec::new(),
+    };
+    let output_elements: Vec<SigElement> = outputs.iter().map(|r| r.element.clone()).collect();
+    let prim_elements: Vec<SigElement> = prims.iter().map(|r| r.element.clone()).collect();
+    let declared_packed = packed_count(&output_elements, &prim_elements, vertices, primitives);
+    let declared_aligned = aligned_count(&output_elements, &prim_elements, vertices, primitives);
+
+    // A depth-only draw has no consumer, so no arbitrary output is observable.
+    // An absent or non-pixel consumer proves nothing: keep every row.
+    let (reads, linkage_proven) = match pixel {
+        None => (Some(super::lower::KeptOutputs::new()), true),
+        Some(bytes) => match proven_pixel_reads(bytes) {
+            Some(reads) => (Some(reads), true),
+            None => (None, false),
+        },
+    };
+    if !linkage_proven {
+        let retained = whole_rows(&outputs, None);
+        return Ok(Some(MeshPackProof {
+            vertices,
+            primitives,
+            limit: METAL_MESH_OUTPUT_BYTES,
+            declared_packed,
+            declared_aligned,
+            packed_after: declared_packed,
+            aligned_after: declared_aligned,
+            linkage_proven: false,
+            fits: false,
+            retained,
+            pruned: Vec::new(),
+            rows_after: output_elements
+                .iter()
+                .filter_map(|e| e.row.map(|row| (row, e.col, e.cols, e.kind)))
+                .collect(),
+        }));
+    }
+    let reads = reads.expect("proven linkage has reads");
+
+    let mut retained = Vec::new();
+    let mut retained_proofs = Vec::new();
+    let mut pruned = Vec::new();
+    let mut channel_mismatch = false;
+    for span in &outputs {
+        let e = &span.element;
+        let read = reads
+            .get(&(e.name.to_ascii_uppercase(), e.index))
+            .copied()
+            .unwrap_or(0);
+        let base = MeshRowProof {
+            name: e.name.clone(),
+            index: e.index,
+            kind: e.kind,
+            row: e.row,
+            col: e.col,
+            cols: e.cols,
+            declared_col: e.col,
+            declared_cols: e.cols,
+            read,
+            reason: None,
+        };
+        if e.kind != 0 {
+            // System values are observed by the pipeline itself (position,
+            // clip/cull, targets): never prune.
+            retained.push(e.clone());
+            retained_proofs.push(base);
+            continue;
+        }
+        if e.row.is_none() {
+            // No register means no export, but a pixel that still reads the
+            // semantic cannot be linked: report the pair as unproven rather
+            // than silently dropping a row it depends on.
+            if read != 0 {
+                channel_mismatch = true;
+            }
+            pruned.push(MeshRowProof {
+                reason: Some(MeshPruneReason::Unallocated),
+                ..base
+            });
+            continue;
+        }
+        if read == 0 {
+            pruned.push(MeshRowProof {
+                reason: Some(MeshPruneReason::UnreadByPixel),
+                ..base
+            });
+            continue;
+        }
+        if read & !span.mask != 0 {
+            // The pixel declares a channel this row does not: not provable.
+            // Keep the row whole; the whole pair is refused below.
+            channel_mismatch = true;
+            retained.push(e.clone());
+            retained_proofs.push(base);
+            continue;
+        }
+        // Channel compaction within the declared span: keep the contiguous
+        // range from the first to the last channel the pixel reads. Unread
+        // edge channels are not observable; interior gaps stay because the
+        // declared semantic width does not let us renumber channels.
+        let rel = ((read >> e.col) as u16) & ((1u16 << u32::from(e.cols)) - 1);
+        let first = rel.trailing_zeros() as u8;
+        let last = 15 - rel.leading_zeros() as u8;
+        let mut carried = e.clone();
+        carried.col = e.col + first;
+        carried.cols = last - first + 1;
+        let proof = MeshRowProof {
+            col: carried.col,
+            cols: carried.cols,
+            ..base
+        };
+        retained.push(carried);
+        retained_proofs.push(proof);
+    }
+    if channel_mismatch {
+        // A read outside the declared span means the pair cannot be linked as
+        // claimed: report the declared signature and refuse it, untrimmed.
+        return Ok(Some(MeshPackProof {
+            vertices,
+            primitives,
+            limit: METAL_MESH_OUTPUT_BYTES,
+            declared_packed,
+            declared_aligned,
+            packed_after: declared_packed,
+            aligned_after: declared_aligned,
+            linkage_proven: false,
+            fits: false,
+            retained: whole_rows(&outputs, None),
+            pruned: Vec::new(),
+            rows_after: output_elements
+                .iter()
+                .filter_map(|e| e.row.map(|row| (row, e.col, e.cols, e.kind)))
+                .collect(),
+        }));
+    }
+
+    let mut after = retained.clone();
+    split_wide_rows(&mut after);
+    pack_within_rows(&mut after);
+    if let Some(order) = row_order(&after) {
+        for e in &mut after {
+            if let Some(emitted) = e.row.and_then(|row| order.get(&row).copied()) {
+                e.row = Some(emitted);
+            }
+        }
+        after.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+    }
+    let packed_after = packed_count(&after, &prim_elements, vertices, primitives);
+    let aligned_after = aligned_count(&after, &prim_elements, vertices, primitives);
+    Ok(Some(MeshPackProof {
+        vertices,
+        primitives,
+        limit: METAL_MESH_OUTPUT_BYTES,
+        declared_packed,
+        declared_aligned,
+        packed_after,
+        aligned_after,
+        linkage_proven: true,
+        fits: packed_after.max(aligned_after) <= METAL_MESH_OUTPUT_BYTES,
+        retained: retained_proofs,
+        pruned,
+        rows_after: after
+            .iter()
+            .filter_map(|e| e.row.map(|row| (row, e.col, e.cols, e.kind)))
+            .collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Whole-signature packing.
 //
 // A mesh output signature is written to `OSG1` sorted by register row (stable
@@ -764,5 +1189,323 @@ mod tests {
         assert_eq!(aligned_mesh_bytes(&dxil).unwrap(), None);
         assert_eq!(mesh_output_bytes(&dxil).unwrap(), None);
         assert!(fits_mesh_output_budget(&dxil).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // Linked-pair proof: the three refused size classes, and the cases it
+    // must keep refusing.
+
+    /// One console signature row with its name and channel spans.
+    #[derive(Clone)]
+    struct RowSpec {
+        name: &'static str,
+        index: u32,
+        /// Raw D3D system value (`0` arbitrary, `1` position).
+        kind: u32,
+        register: u32,
+        /// The declared channel mask.
+        declared: u8,
+        /// For a pixel `ISG1` row, the channels read.
+        read: u8,
+    }
+
+    /// `OSG1`/`PSG1`/`ISG1` bytes: count, 32-byte rows from offset 8, names.
+    fn sig_part(rows: &[RowSpec]) -> Vec<u8> {
+        let mut names = Vec::new();
+        let mut offsets = Vec::with_capacity(rows.len());
+        for r in rows {
+            offsets.push((8 + 32 * rows.len() + names.len()) as u32);
+            names.extend_from_slice(r.name.as_bytes());
+            names.push(0);
+        }
+        let mut out = Vec::new();
+        out.extend((rows.len() as u32).to_le_bytes());
+        out.extend(8u32.to_le_bytes());
+        for (r, &offset) in rows.iter().zip(&offsets) {
+            out.extend(0u32.to_le_bytes()); // stream
+            out.extend(offset.to_le_bytes());
+            out.extend(r.index.to_le_bytes());
+            out.extend(r.kind.to_le_bytes());
+            out.extend(3u32.to_le_bytes()); // float32
+            out.extend(r.register.to_le_bytes());
+            out.extend([r.declared, r.read, 0, 0]);
+            out.extend(0u32.to_le_bytes());
+        }
+        out.extend(names);
+        out
+    }
+
+    /// A mesh container: `OSG1`/`PSG1` plus a mesh `PSV0`.
+    fn mesh_container(osg: &[RowSpec], psg: &[RowSpec], vertices: u16, primitives: u16) -> Vec<u8> {
+        let mut psv = Vec::new();
+        psv.extend(48u32.to_le_bytes());
+        psv.resize(4 + 48, 0);
+        psv[4 + 12..4 + 14].copy_from_slice(&vertices.to_le_bytes());
+        psv[4 + 14..4 + 16].copy_from_slice(&primitives.to_le_bytes());
+        psv[4 + 24] = 13; // mesh
+        build(&[
+            (FourCC::OSG1, &sig_part(osg)),
+            (FourCC::PSG1, &sig_part(psg)),
+            (FourCC::PSV0, &psv),
+        ])
+    }
+
+    /// A pixel container: `ISG1` plus a pixel `PSV0`.
+    fn pixel_container(isg: &[RowSpec]) -> Vec<u8> {
+        let mut psv = Vec::new();
+        psv.extend(48u32.to_le_bytes());
+        psv.resize(4 + 48, 0);
+        psv[4 + 24] = 0; // pixel
+        build(&[(FourCC::ISG1, &sig_part(isg)), (FourCC::PSV0, &psv)])
+    }
+
+    /// Position plus `widths`, each width list one register row, `TEXCOORD`
+    /// indices assigned in emitted order.
+    fn mesh_shape(widths: &[&[u8]], vertices: u16) -> Vec<RowSpec> {
+        let mut rows = vec![RowSpec {
+            name: "SV_Position",
+            index: 0,
+            kind: 1,
+            register: 0,
+            declared: 0xF,
+            read: 0,
+        }];
+        let mut index = 0u32;
+        for (register, width) in (1..).zip(widths) {
+            let mut col = 0u8;
+            for &cols in *width {
+                let mask = (((1u32 << cols) - 1) << col) as u8;
+                rows.push(RowSpec {
+                    name: "TEXCOORD",
+                    index,
+                    kind: 0,
+                    register,
+                    declared: mask,
+                    read: 0,
+                });
+                index += 1;
+                col += cols;
+            }
+        }
+        rows
+    }
+
+    /// The pixel inputs reading `read(row)` non-zero, one `ISG1` row each.
+    fn pixel_inputs(mesh: &[RowSpec], read: impl Fn(&RowSpec) -> u8) -> Vec<RowSpec> {
+        mesh.iter()
+            .filter(|r| r.kind == 0)
+            .filter_map(|r| {
+                let mask = read(r);
+                (mask != 0).then(|| RowSpec {
+                    name: "TEXCOORD",
+                    index: r.index,
+                    kind: 0,
+                    register: 0,
+                    declared: mask,
+                    read: mask,
+                })
+            })
+            .collect()
+    }
+
+    /// Every declared row appears exactly once as retained or pruned.
+    fn assert_partition(mesh: &[RowSpec], proof: &MeshPackProof) {
+        let mut got: Vec<(String, u32)> = proof
+            .retained
+            .iter()
+            .chain(&proof.pruned)
+            .map(|r| (r.name.clone(), r.index))
+            .collect();
+        got.sort();
+        let mut want: Vec<(String, u32)> =
+            mesh.iter().map(|r| (r.name.to_string(), r.index)).collect();
+        want.sort();
+        assert_eq!(got, want, "every declared row is accounted for once");
+    }
+
+    /// Class 1: 33,280 B (520 B per vertex at 64 vertices). One dead full row
+    /// and one over-declared 3-component element. Dead-export pruning and
+    /// channel compaction bring it under the limit.
+    #[test]
+    fn proof_fits_the_33280_class_after_pruning_and_channel_compaction() {
+        let mut widths: Vec<&[u8]> = vec![&[4]; 29];
+        widths.push(&[1, 3]);
+        widths.extend([&[2][..]; 2]);
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let inputs = pixel_inputs(&mesh, |r| match r.index {
+            5 => 0,          // a whole full row nobody observes
+            30 => 0b0110,    // the 3-component element: read channels 1 and 2
+            _ => r.declared, // every other row is read in full
+        });
+        let pixel = pixel_container(&inputs);
+        let proof = mesh_pack_proof(&container, Some(&pixel))
+            .expect("the mesh container parses")
+            .expect("a mesh output declaration");
+
+        assert_eq!(proof.declared_aligned, 33_280);
+        assert_eq!(proof.declared_packed, 128 * 4 * 64);
+        assert!(proof.declared_aligned > METAL_MESH_OUTPUT_BYTES);
+        assert!(proof.linkage_proven);
+        assert!(proof.fits, "{proof:?}");
+        assert!(proof.aligned_after <= METAL_MESH_OUTPUT_BYTES);
+        assert!(proof.packed_after <= METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(proof.pruned.len(), 1);
+        assert_eq!(proof.pruned[0].index, 5);
+        assert_eq!(proof.pruned[0].reason, Some(MeshPruneReason::UnreadByPixel));
+        let compacted = proof
+            .retained
+            .iter()
+            .find(|r| r.index == 30)
+            .expect("the 3-component element is retained");
+        assert_eq!((compacted.col, compacted.cols), (1, 2));
+        assert!(compacted.compacted());
+        assert_eq!(compacted.read, 0b0110);
+        // The position and every retained semantic keep their identity.
+        assert!(proof.retained.iter().any(|r| r.kind == 3 && r.index == 0));
+        assert_partition(&mesh, &proof);
+        for row in &proof.rows_after {
+            assert!(u32::from(row.1) + u32::from(row.2) <= 4, "{row:?}");
+        }
+    }
+
+    /// Class 2: 33,792 B (528 B per vertex: position plus 32 full rows at 64
+    /// vertices). Dropping the one arbitrary row the pixel does not read lands
+    /// on exactly 32,768 B.
+    #[test]
+    fn proof_fits_the_33792_class_by_dropping_one_dead_row() {
+        let widths: Vec<&[u8]> = vec![&[4]; 32];
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let inputs = pixel_inputs(&mesh, |r| if r.index == 7 { 0 } else { r.declared });
+        let pixel = pixel_container(&inputs);
+        let proof = mesh_pack_proof(&container, Some(&pixel))
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert_eq!(proof.declared_aligned, 33_792);
+        assert_eq!(proof.declared_packed, 132 * 4 * 64);
+        assert!(proof.linkage_proven);
+        assert!(proof.fits, "{proof:?}");
+        assert_eq!(proof.aligned_after, 32_768);
+        assert_eq!(proof.packed_after, 32_768);
+        assert_eq!(proof.pruned.len(), 1);
+        assert_eq!(proof.pruned[0].index, 7);
+        assert_partition(&mesh, &proof);
+    }
+
+    /// Class 3: 35,328 B (552 B per vertex: position, 33 full rows and a
+    /// 2-component row at 64 vertices). Three dead rows go; the result is
+    /// exactly the budget, not a truncation.
+    #[test]
+    fn proof_fits_the_35328_class_by_dropping_its_dead_rows() {
+        let mut widths: Vec<&[u8]> = vec![&[4]; 33];
+        widths.push(&[2]);
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let inputs = pixel_inputs(&mesh, |r| match r.index {
+            3 | 10 | 33 => 0,
+            _ => r.declared,
+        });
+        let pixel = pixel_container(&inputs);
+        let proof = mesh_pack_proof(&container, Some(&pixel))
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert_eq!(proof.declared_aligned, 35_328);
+        assert_eq!(proof.declared_packed, 138 * 4 * 64);
+        assert!(proof.linkage_proven);
+        assert!(proof.fits, "{proof:?}");
+        assert!(proof.aligned_after <= METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(proof.pruned.len(), 3);
+        assert_eq!(proof.aligned_after, 32_768);
+        assert_partition(&mesh, &proof);
+    }
+
+    /// A row the pixel reads is never pruned, even if it is the only reader of
+    /// one channel: it is retained and narrowed to that channel.
+    #[test]
+    fn a_row_the_pixel_reads_is_never_pruned() {
+        let widths: Vec<&[u8]> = vec![&[4]; 16];
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let inputs = pixel_inputs(&mesh, |r| if r.index == 3 { 0b0100 } else { 0 });
+        let pixel = pixel_container(&inputs);
+        let proof = mesh_pack_proof(&container, Some(&pixel))
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert!(proof.pruned.iter().all(|r| r.index != 3));
+        let kept = proof
+            .retained
+            .iter()
+            .find(|r| r.index == 3)
+            .expect("a read row is retained");
+        assert_eq!((kept.col, kept.cols), (2, 1));
+        assert_eq!(kept.read, 0b0100);
+        assert!(proof.fits);
+    }
+
+    /// A pair that still does not fit is reported as such: every row stays
+    /// (nothing is truncated) and `fits` is false.
+    #[test]
+    fn a_pair_that_cannot_fit_is_reported_not_truncated() {
+        let mut widths: Vec<&[u8]> = vec![&[4]; 33];
+        widths.push(&[2]);
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let inputs = pixel_inputs(&mesh, |r| r.declared);
+        let pixel = pixel_container(&inputs);
+        let proof = mesh_pack_proof(&container, Some(&pixel))
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert!(proof.pruned.is_empty());
+        assert_eq!(proof.retained.len(), mesh.len());
+        assert_eq!(proof.aligned_after, proof.declared_aligned);
+        assert_eq!(proof.aligned_after, 35_328);
+        assert!(!proof.fits);
+        assert_partition(&mesh, &proof);
+    }
+
+    /// An unidentifiable pixel stage proves no linkage: every row is kept and
+    /// the pair is refused rather than pruned on a guess.
+    #[test]
+    fn unprovable_pixel_linkage_keeps_every_row_and_refuses() {
+        let widths: Vec<&[u8]> = vec![&[4]; 32];
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let proof = mesh_pack_proof(&container, Some(b"not a container"))
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert!(!proof.linkage_proven);
+        assert!(!proof.fits);
+        assert!(proof.pruned.is_empty());
+        assert_eq!(proof.retained.len(), mesh.len());
+    }
+
+    /// With no pixel stage (a depth-only draw), no arbitrary output is
+    /// observable: all arbitrary rows are pruned, only the system values stay.
+    #[test]
+    fn a_depth_only_pair_prunes_arbitrary_outputs_and_keeps_system_values() {
+        let widths: Vec<&[u8]> = vec![&[4]; 32];
+        let mesh = mesh_shape(&widths, 64);
+        let container = mesh_container(&mesh, &[], 64, 0);
+        let proof = mesh_pack_proof(&container, None)
+            .unwrap()
+            .expect("a mesh output declaration");
+
+        assert!(proof.linkage_proven);
+        assert!(proof.fits);
+        assert_eq!(proof.retained.len(), 1);
+        assert_eq!(proof.retained[0].kind, 3);
+        assert_eq!(proof.pruned.len(), mesh.len() - 1);
+        assert!(
+            proof
+                .pruned
+                .iter()
+                .all(|r| r.reason == Some(MeshPruneReason::UnreadByPixel))
+        );
     }
 }
