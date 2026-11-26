@@ -13,6 +13,7 @@ miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
+victory-metal = { path = "../victory-metal" }
 victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]

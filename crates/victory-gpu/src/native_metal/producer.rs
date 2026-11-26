@@ -8,13 +8,12 @@
 //!
 //! # Dependency direction
 //!
-//! `victory-gpu` is the Win64 guest-side crate and does not link the host
-//! `victory-metal` crate. This module therefore mirrors the subset of the
-//! version 3 model it emits field-for-field ([`SubmissionV3`],
-//! [`CommandV3`], [`BeginRenderPass`], ...), exactly as
-//! [`super::present`] mirrors the present payload. The IPC bridge maps one
-//! mirror value to its `victory_metal::wire_v3` twin; the opcodes below are
-//! the frozen wire numbers, so the mapping is a struct copy.
+//! `victory-gpu` is the Win64 guest-side crate and reuses the canonical
+//! version 3 model from `victory_metal::wire_v3` ([`SubmissionV3`],
+//! [`CommandV3`], [`BeginRenderPass`], ...): the producer owns recording and
+//! lowering, the codec owns encoding. The IPC transport itself stays in the
+//! separate bridge task; this module opens no socket and carries its
+//! submissions only through [`WireV3Sink`].
 //!
 //! # Recording model
 //!
@@ -45,41 +44,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Maximum commands in one submission (mirrors `wire_v3::MAX_COMMANDS_V3`).
-pub const MAX_COMMANDS_V3: usize = 1024;
-/// Maximum color attachments in one render pass (D3D12 allows 8).
-pub const MAX_COLOR_ATTACHMENTS: usize = 8;
-/// Maximum vertex-buffer bindings in one `SetVertexBuffers` command.
-pub const MAX_VERTEX_BUFFERS: usize = 16;
-/// Maximum inline root-constant bytes in one command.
-pub const MAX_ROOT_CONSTANT_BYTES_V3: usize = 256;
-/// Maximum barrier entries in one `ResourceBarrier` command.
-pub const MAX_BARRIERS_V3: usize = 32;
+use victory_metal::wire::{
+    Dispatch3d, DispatchMesh, ListIdentity, Reply, ReplyStatus, ResourceBarrier, WireError,
+};
+pub use victory_metal::wire::BarrierEntry;
+use victory_metal::wire_v3::{
+    BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture,
+    DepthStencilAttachment, DescriptorTableV3, DrawIndexedInstanced, DrawInstanced,
+    IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
+    RootBufferView, RootConstantsV3, ScissorRect, StoreOp, VertexBuffer, VertexBufferSet, Viewport,
+    MAX_BARRIERS_V3, MAX_COLOR_ATTACHMENTS, MAX_COMMANDS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
+    MAX_VERTEX_BUFFERS, OP_BEGIN_RENDER_PASS, OP_COPY_BUFFER, OP_COPY_TEXTURE,
+    OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH, OP_PRESENT, OP_RESOURCE_BARRIER,
+    OP_ROOT_CONSTANTS, OP_SET_INDEX_BUFFER, OP_SET_PRIMITIVE_TOPOLOGY, OP_SET_ROOT_BUFFER_VIEW,
+    OP_SET_SCISSOR, OP_SET_VIEWPORT, OP_SET_VERTEX_BUFFERS,
+};
+pub use victory_metal::wire_v3::SubmissionV3;
+
 /// Input-assembler vertex-buffer slots a D3D12 list tracks.
 pub const MAX_VERTEX_SLOTS: usize = 32;
-
-// Frozen version 3 opcodes (mirror of `victory_metal::wire_v3`).
-pub const OP_DISPATCH_3D: u16 = 2;
-pub const OP_DISPATCH_MESH: u16 = 5;
-pub const OP_RESOURCE_BARRIER: u16 = 6;
-pub const OP_ROOT_CONSTANTS: u16 = 8;
-pub const OP_DESCRIPTOR_TABLE: u16 = 9;
-pub const OP_BEGIN_RENDER_PASS: u16 = 16;
-pub const OP_END_RENDER_PASS: u16 = 17;
-pub const OP_SET_VIEWPORT: u16 = 18;
-pub const OP_SET_SCISSOR: u16 = 19;
-pub const OP_SET_GRAPHICS_PIPELINE: u16 = 20;
-pub const OP_SET_MESH_PIPELINE: u16 = 21;
-pub const OP_SET_COMPUTE_PIPELINE: u16 = 22;
-pub const OP_SET_PRIMITIVE_TOPOLOGY: u16 = 23;
-pub const OP_SET_VERTEX_BUFFERS: u16 = 24;
-pub const OP_SET_INDEX_BUFFER: u16 = 25;
-pub const OP_SET_ROOT_BUFFER_VIEW: u16 = 26;
-pub const OP_DRAW_INSTANCED: u16 = 27;
-pub const OP_DRAW_INDEXED_INSTANCED: u16 = 28;
-pub const OP_COPY_BUFFER: u16 = 29;
-pub const OP_COPY_TEXTURE: u16 = 30;
-pub const OP_PRESENT: u16 = 31;
 
 /// Sequence numbers are session-wide so two lists never collide.
 static NEXT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
@@ -119,89 +102,52 @@ impl ResourceId {
     }
 }
 
-/// Identity of the recorded list carried with every submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListIdentity {
-    /// Host-visible command-list identifier, never zero.
-    pub list_id: u64,
-    /// Generation of that list, never zero.
-    pub list_generation: u32,
-}
-
-impl ListIdentity {
-    fn checked(list_id: u64, list_generation: u32) -> Result<Self, ProducerError> {
-        if list_id == 0 || list_generation == 0 {
-            return Err(ProducerError::InvalidListIdentity);
-        }
-        Ok(Self {
-            list_id,
-            list_generation,
-        })
+/// A checked list identity (both fields nonzero).
+fn checked_identity(
+    list_id: u64,
+    list_generation: u32,
+) -> Result<ListIdentity, ProducerError> {
+    if list_id == 0 || list_generation == 0 {
+        return Err(ProducerError::InvalidListIdentity);
     }
+    Ok(ListIdentity {
+        list_id,
+        list_generation,
+    })
 }
 
-/// Attachment load action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadOp {
-    /// Preserve previous contents.
-    Load,
-    /// Clear to the supplied value.
-    Clear,
-    /// Do not read previous contents.
-    DontCare,
+/// `IASetPrimitiveTopology`'s number as a version 3 topology.
+///
+/// Console-only topologies (rectangles, line loops, quads, quad strips) have
+/// no native equivalent: the D3D12 path draws them as a triangle list, but
+/// the native path refuses them instead of changing the geometry the title
+/// asked for.
+fn primitive_topology(value: u32) -> Result<PrimitiveTopology, ProducerError> {
+    Ok(match value {
+        1 => PrimitiveTopology::PointList,
+        2 => PrimitiveTopology::LineList,
+        3 => PrimitiveTopology::LineStrip,
+        4 => PrimitiveTopology::TriangleList,
+        5 => PrimitiveTopology::TriangleStrip,
+        _ => {
+            return Err(ProducerError::unsupported_opcode(
+                "IASetPrimitiveTopology: no native equivalent",
+                OP_SET_PRIMITIVE_TOPOLOGY,
+            ));
+        }
+    })
 }
 
-/// Attachment store action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreOp {
-    /// Write the pass result back.
-    Store,
-    /// Discard the pass result.
-    DontCare,
-}
-
-/// One color attachment.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ColorAttachment {
-    /// Texture allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Mip level rendered into.
-    pub mip_level: u16,
-    /// Array slice rendered into.
-    pub slice: u16,
-    /// Load action applied at pass start.
-    pub load: LoadOp,
-    /// Store action applied at pass end.
-    pub store: StoreOp,
-    /// Clear color, used when `load == LoadOp::Clear`.
-    pub clear_color: [f64; 4],
-}
-
-/// Depth/stencil attachment.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DepthStencilAttachment {
-    /// Texture allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Mip level rendered into.
-    pub mip_level: u16,
-    /// Array slice rendered into.
-    pub slice: u16,
-    /// Load action for depth.
-    pub depth_load: LoadOp,
-    /// Store action for depth.
-    pub depth_store: StoreOp,
-    /// Clear depth, used when `depth_load == LoadOp::Clear`.
-    pub clear_depth: f32,
-    /// Load action for stencil.
-    pub stencil_load: LoadOp,
-    /// Store action for stencil.
-    pub stencil_store: StoreOp,
-    /// Clear stencil value.
-    pub clear_stencil: u32,
+/// A DXGI index format number as a version 3 element width.
+fn index_format(format: u32) -> Result<IndexFormat, ProducerError> {
+    match format {
+        57 => Ok(IndexFormat::Uint16),
+        42 => Ok(IndexFormat::Uint32),
+        _ => Err(ProducerError::unsupported_opcode(
+            "IASetIndexBuffer: only R16_UINT and R32_UINT are expressed",
+            OP_SET_INDEX_BUFFER,
+        )),
+    }
 }
 
 /// A render target requested by `OMSetRenderTargets`.
@@ -311,138 +257,6 @@ impl DepthTarget {
     }
 }
 
-/// Opens a render pass.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BeginRenderPass {
-    /// Color attachments in RTV slot order; 1..=8.
-    pub colors: Vec<ColorAttachment>,
-    /// Optional depth/stencil attachment.
-    pub depth_stencil: Option<DepthStencilAttachment>,
-}
-
-/// Viewport in drawable pixel coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Viewport {
-    /// Top-left x.
-    pub x: f64,
-    /// Top-left y.
-    pub y: f64,
-    /// Width in pixels.
-    pub width: f64,
-    /// Height in pixels.
-    pub height: f64,
-    /// Near depth plane.
-    pub near: f64,
-    /// Far depth plane.
-    pub far: f64,
-}
-
-/// Scissor rectangle in drawable pixel coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScissorRect {
-    /// Left edge.
-    pub x: u32,
-    /// Top edge.
-    pub y: u32,
-    /// Width in pixels; nonzero.
-    pub width: u32,
-    /// Height in pixels; nonzero.
-    pub height: u32,
-}
-
-/// Host pipeline handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PipelineRef {
-    /// Pipeline ID; never zero.
-    pub pipeline_id: u64,
-}
-
-/// D3D primitive topology with a version 3 equivalent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrimitiveTopology {
-    /// One vertex per point.
-    PointList,
-    /// Two vertices per line.
-    LineList,
-    /// Connected line strip.
-    LineStrip,
-    /// Three vertices per triangle.
-    TriangleList,
-    /// Connected triangle strip.
-    TriangleStrip,
-}
-
-impl PrimitiveTopology {
-    /// `IASetPrimitiveTopology`'s number as a version 3 topology.
-    ///
-    /// Console-only topologies (rectangles, line loops, quads, quad strips)
-    /// have no native equivalent: the D3D12 path draws them as a triangle
-    /// list, but the native path refuses them instead of changing the
-    /// geometry the title asked for.
-    pub fn from_d3d12(value: u32) -> Result<Self, ProducerError> {
-        Ok(match value {
-            1 => Self::PointList,
-            2 => Self::LineList,
-            3 => Self::LineStrip,
-            4 => Self::TriangleList,
-            5 => Self::TriangleStrip,
-            _ => {
-                return Err(ProducerError::unsupported_opcode(
-                    "IASetPrimitiveTopology: no native equivalent",
-                    OP_SET_PRIMITIVE_TOPOLOGY,
-                ));
-            }
-        })
-    }
-}
-
-/// Index-buffer element width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexFormat {
-    /// 16-bit indices (`DXGI_FORMAT_R16_UINT`).
-    Uint16,
-    /// 32-bit indices (`DXGI_FORMAT_R32_UINT`).
-    Uint32,
-}
-
-impl IndexFormat {
-    /// Maps a DXGI format number.
-    pub fn from_dxgi(format: u32) -> Result<Self, ProducerError> {
-        match format {
-            57 => Ok(Self::Uint16),
-            42 => Ok(Self::Uint32),
-            _ => Err(ProducerError::unsupported_opcode(
-                "IASetIndexBuffer: only R16_UINT and R32_UINT are expressed",
-                OP_SET_INDEX_BUFFER,
-            )),
-        }
-    }
-}
-
-/// One vertex buffer binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VertexBuffer {
-    /// Allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Byte offset of the first element.
-    pub offset: u64,
-    /// Byte stride between elements; nonzero.
-    pub stride: u32,
-    /// Byte length visible to the shader; nonzero.
-    pub length: u64,
-}
-
-/// A contiguous run of vertex-buffer bindings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VertexBufferSet {
-    /// First input slot.
-    pub start_slot: u16,
-    /// Buffers in slot order; 1..=16.
-    pub buffers: Vec<VertexBuffer>,
-}
-
 /// One `IASetVertexBuffer` view as the title passed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VertexBufferView {
@@ -452,324 +266,6 @@ pub struct VertexBufferView {
     pub size: u32,
     /// Byte stride between elements.
     pub stride: u32,
-}
-
-/// The bound index buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexBufferBinding {
-    /// Allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Byte offset of the first index.
-    pub offset: u64,
-    /// Byte length of the index range; nonzero.
-    pub length: u64,
-    /// Element width.
-    pub format: IndexFormat,
-}
-
-/// Inline root constants for one slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootConstantsV3 {
-    /// Root parameter slot.
-    pub slot: u16,
-    /// Constant bytes; 1..=256.
-    pub bytes: Vec<u8>,
-}
-
-/// Descriptor-table kind at the base register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescriptorKind {
-    /// Constant buffer views.
-    Cbv,
-    /// Shader resource views.
-    Srv,
-    /// Unordered access views.
-    Uav,
-    /// Samplers.
-    Sampler,
-}
-
-/// One borrowed allocation range bound to a descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferBinding {
-    /// Allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Byte offset within the allocation.
-    pub offset: u64,
-    /// Byte length of the range; nonzero.
-    pub length: u64,
-}
-
-/// A descriptor table binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DescriptorTableV3 {
-    /// Descriptor set index.
-    pub set: u16,
-    /// Base register of the table.
-    pub base_register: u16,
-    /// Register kind.
-    pub kind: DescriptorKind,
-    /// Buffers/textures in register order; 1..=32.
-    pub bindings: Vec<BufferBinding>,
-}
-
-/// A root buffer view: a 64-bit GPU address for root SRV/UAV/CBV.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RootBufferView {
-    /// Root parameter slot.
-    pub slot: u16,
-    /// Allocation ID; never zero.
-    pub allocation_id: u64,
-    /// Allocation generation; never zero.
-    pub generation: u32,
-    /// Byte offset within the allocation.
-    pub offset: u64,
-    /// Byte length; nonzero.
-    pub length: u64,
-}
-
-/// One transition of a borrowed allocation range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BarrierEntry {
-    /// Allocation registry key.
-    pub allocation_id: u64,
-    /// Allocation generation.
-    pub generation: u32,
-    /// Byte offset within the allocation.
-    pub offset: u64,
-    /// Byte length of the range; never zero.
-    pub length: u64,
-    /// D3D12 state before the transition.
-    pub before_state: u32,
-    /// D3D12 state after the transition.
-    pub after_state: u32,
-}
-
-/// An ordered batch of resource transitions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceBarrier {
-    /// Transitions in execution order; never empty.
-    pub entries: Vec<BarrierEntry>,
-}
-
-/// Instanced non-indexed draw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrawInstanced {
-    /// Vertices per instance; nonzero.
-    pub vertex_count_per_instance: u32,
-    /// Instances; nonzero.
-    pub instance_count: u32,
-    /// First vertex.
-    pub start_vertex: u32,
-    /// First instance.
-    pub start_instance: u32,
-}
-
-/// Instanced indexed draw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrawIndexedInstanced {
-    /// Indices per instance; nonzero.
-    pub index_count_per_instance: u32,
-    /// Instances; nonzero.
-    pub instance_count: u32,
-    /// First index value.
-    pub start_index: u32,
-    /// Signed value added to every index.
-    pub base_vertex: i32,
-    /// First instance.
-    pub start_instance: u32,
-}
-
-/// One ordered 3D compute dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dispatch3d {
-    /// Host pipeline handle.
-    pub pipeline_id: u64,
-    /// D3D threadgroup counts; every dimension nonzero.
-    pub group_counts: [u32; 3],
-    /// Local threads per threadgroup; every dimension nonzero.
-    pub threads_per_group: [u32; 3],
-    /// Bound buffer ranges in slot order.
-    pub bindings: Vec<BufferBinding>,
-}
-
-/// One mesh-shader dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchMesh {
-    /// Host pipeline handle.
-    pub pipeline_id: u64,
-    /// D3D threadgroup counts; every dimension nonzero.
-    pub group_counts: [u32; 3],
-    /// Bound buffer ranges in slot order.
-    pub bindings: Vec<BufferBinding>,
-}
-
-/// Buffer-to-buffer copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CopyBuffer {
-    /// Source allocation ID.
-    pub src_allocation_id: u64,
-    /// Source generation.
-    pub src_generation: u32,
-    /// Source byte offset.
-    pub src_offset: u64,
-    /// Destination allocation ID.
-    pub dst_allocation_id: u64,
-    /// Destination generation.
-    pub dst_generation: u32,
-    /// Destination byte offset.
-    pub dst_offset: u64,
-    /// Bytes copied; nonzero.
-    pub length: u64,
-}
-
-/// Texture-to-texture copy of one mip/slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CopyTexture {
-    /// Source allocation ID.
-    pub src_allocation_id: u64,
-    /// Source generation.
-    pub src_generation: u32,
-    /// Source mip level.
-    pub src_mip: u16,
-    /// Source array slice.
-    pub src_slice: u16,
-    /// Destination allocation ID.
-    pub dst_allocation_id: u64,
-    /// Destination generation.
-    pub dst_generation: u32,
-    /// Destination mip level.
-    pub dst_mip: u16,
-    /// Destination array slice.
-    pub dst_slice: u16,
-    /// Copy width in texels; nonzero.
-    pub width: u32,
-    /// Copy height in texels; nonzero.
-    pub height: u32,
-    /// Copy depth in texels/slices; nonzero.
-    pub depth: u32,
-}
-
-/// Presents one swapchain surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Present {
-    /// Swapchain/IOSurface handle.
-    pub surface_id: u64,
-    /// D3D12 sync interval (`0` = immediate, `1` = vsync).
-    pub sync_interval: u32,
-}
-
-/// One stateful command in a version 3 stream.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandV3 {
-    /// 3D compute dispatch with an explicit threadgroup grid.
-    Dispatch3d(Dispatch3d),
-    /// Mesh-shader dispatch.
-    DispatchMesh(DispatchMesh),
-    /// Ordered resource transitions.
-    ResourceBarrier(ResourceBarrier),
-    /// Inline root constants for one root parameter slot.
-    SetRootConstants(RootConstantsV3),
-    /// Descriptor table at a base register.
-    SetDescriptorTable(DescriptorTableV3),
-    /// Opens a render pass.
-    BeginRenderPass(BeginRenderPass),
-    /// Closes the active render pass.
-    EndRenderPass,
-    /// Sets the viewport of the active pass.
-    SetViewport(Viewport),
-    /// Sets the scissor rectangle of the active pass.
-    SetScissor(ScissorRect),
-    /// Selects a graphics pipeline.
-    SetGraphicsPipeline(PipelineRef),
-    /// Selects a mesh pipeline.
-    SetMeshPipeline(PipelineRef),
-    /// Selects a compute pipeline.
-    SetComputePipeline(PipelineRef),
-    /// Selects the primitive topology for later draws.
-    SetPrimitiveTopology(PrimitiveTopology),
-    /// Binds a contiguous run of vertex buffers.
-    SetVertexBuffers(VertexBufferSet),
-    /// Binds the index buffer and its element width.
-    SetIndexBuffer(IndexBufferBinding),
-    /// Binds a root buffer view.
-    SetRootBufferView(RootBufferView),
-    /// Instanced non-indexed draw.
-    DrawInstanced(DrawInstanced),
-    /// Instanced indexed draw.
-    DrawIndexedInstanced(DrawIndexedInstanced),
-    /// Buffer-to-buffer copy.
-    CopyBuffer(CopyBuffer),
-    /// Texture-to-texture copy.
-    CopyTexture(CopyTexture),
-    /// Presents a swapchain surface.
-    Present(Present),
-}
-
-impl CommandV3 {
-    /// Returns the frozen wire opcode for this command.
-    pub const fn opcode(&self) -> u16 {
-        match self {
-            Self::Dispatch3d(_) => OP_DISPATCH_3D,
-            Self::DispatchMesh(_) => OP_DISPATCH_MESH,
-            Self::ResourceBarrier(_) => OP_RESOURCE_BARRIER,
-            Self::SetRootConstants(_) => OP_ROOT_CONSTANTS,
-            Self::SetDescriptorTable(_) => OP_DESCRIPTOR_TABLE,
-            Self::BeginRenderPass(_) => OP_BEGIN_RENDER_PASS,
-            Self::EndRenderPass => OP_END_RENDER_PASS,
-            Self::SetViewport(_) => OP_SET_VIEWPORT,
-            Self::SetScissor(_) => OP_SET_SCISSOR,
-            Self::SetGraphicsPipeline(_) => OP_SET_GRAPHICS_PIPELINE,
-            Self::SetMeshPipeline(_) => OP_SET_MESH_PIPELINE,
-            Self::SetComputePipeline(_) => OP_SET_COMPUTE_PIPELINE,
-            Self::SetPrimitiveTopology(_) => OP_SET_PRIMITIVE_TOPOLOGY,
-            Self::SetVertexBuffers(_) => OP_SET_VERTEX_BUFFERS,
-            Self::SetIndexBuffer(_) => OP_SET_INDEX_BUFFER,
-            Self::SetRootBufferView(_) => OP_SET_ROOT_BUFFER_VIEW,
-            Self::DrawInstanced(_) => OP_DRAW_INSTANCED,
-            Self::DrawIndexedInstanced(_) => OP_DRAW_INDEXED_INSTANCED,
-            Self::CopyBuffer(_) => OP_COPY_BUFFER,
-            Self::CopyTexture(_) => OP_COPY_TEXTURE,
-            Self::Present(_) => OP_PRESENT,
-        }
-    }
-}
-
-/// One version 3 submission: an ordered stateful command stream.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SubmissionV3 {
-    /// Submission sequence; nonzero, strictly increasing per session.
-    pub sequence: u32,
-    /// Identity of the recorded command list.
-    pub list: Option<ListIdentity>,
-    /// Commands in execution order.
-    pub commands: Vec<CommandV3>,
-}
-
-/// Execution outcome echoed by the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyStatus {
-    /// All commands were submitted and completed.
-    Ok,
-    /// A handle was stale or unknown; no GPU work ran.
-    UnknownHandle,
-    /// A command failed during execution.
-    ExecutionFailed,
-    /// The list identity had already executed.
-    AlreadyExecuted,
-}
-
-/// Reply to one submission, echoing its sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reply {
-    /// Sequence of the submission this reply completes.
-    pub sequence: u32,
-    /// Execution outcome.
-    pub status: ReplyStatus,
 }
 
 /// Why the producer or its sink refused a call.
@@ -1033,7 +529,7 @@ impl MetalProducer {
     /// Starts a producer for one recorded list generation.
     pub fn new(list_id: u64, list_generation: u32) -> Result<Self, ProducerError> {
         Ok(Self {
-            identity: ListIdentity::checked(list_id, list_generation)?,
+            identity: checked_identity(list_id, list_generation)?,
             pass: PassState::default(),
             pass_open: false,
             graphics: GraphicsState::default(),
@@ -1308,7 +804,7 @@ impl MetalProducer {
 
     /// `IASetPrimitiveTopology` with a D3D12 topology number.
     pub fn set_topology_value(&mut self, topology: u32) -> Result<(), ProducerError> {
-        self.set_topology(PrimitiveTopology::from_d3d12(topology)?)
+        self.set_topology(primitive_topology(topology)?)
     }
 
     /// `IASetPrimitiveTopology` with a version 3 topology.
@@ -1424,7 +920,7 @@ impl MetalProducer {
             generation: 1,
             offset: 0,
             length: u64::from(size),
-            format: IndexFormat::from_dxgi(format)?,
+            format: index_format(format)?,
         });
         self.dirty.index = true;
         Ok(())
@@ -2158,6 +1654,10 @@ impl MetalList {
 mod tests {
     use super::*;
     use crate::backend::GpuBackend;
+    use victory_metal::wire_v3::{
+        OP_DRAW_INDEXED_INSTANCED, OP_END_RENDER_PASS, OP_SET_COMPUTE_PIPELINE,
+        OP_SET_GRAPHICS_PIPELINE, OP_SET_MESH_PIPELINE,
+    };
 
     fn resource(allocation_id: u64) -> ResourceId {
         ResourceId::new(allocation_id, 1).expect("test resource identity")
