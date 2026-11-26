@@ -321,6 +321,52 @@ impl DirectMetalTransport {
 
         Ok(reply(ReplyStatus::Ok))
     }
+
+    /// Loads a precompiled Metal library (`.metallib` bytes) and registers the
+    /// compute function `entry` in the same pipeline table that
+    /// [`Self::submit_batch`] resolves.
+    ///
+    /// This is the native bridge for offline-compiled libraries, such as the
+    /// bytes produced by a separate Rosetta `libmetalirconverter` host or by
+    /// Apple's `metal`/`metallib` tools. The byte slice is copied into a
+    /// `dispatch_data_t` and handed to `-[MTLDevice newLibraryWithData:error:]`,
+    /// so the current process needs no shader source, no x86_64 library and no
+    /// filesystem path at load time.
+    ///
+    /// The returned [`VmPipelineId`] is immediately valid for
+    /// [`crate::wire`] submissions through [`Self::submit_batch`]. An unknown
+    /// entry returns [`MetalError::NotFound`]; malformed library bytes return
+    /// [`MetalError::CompileFailed`] with Metal's diagnostic.
+    pub fn load_metallib(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
+        if metallib.is_empty() || entry.is_empty() {
+            return Err(MetalError::InvalidArg(
+                "metallib bytes or entry point is empty",
+            ));
+        }
+        let _pool = AutoreleasePool::new();
+        let data = objc::dispatch_data_copy(metallib).ok_or_else(|| {
+            MetalError::InternalError("dispatch_data_create returned null".to_string())
+        })?;
+
+        let mut ns_err = objc::empty_id();
+        // SAFETY: `device` is a valid `MTLDevice`, `data` is a retained
+        // `dispatch_data_t`, and `ns_err` receives an autoreleased `NSError *`.
+        let lib_raw = unsafe {
+            objc::msg_send_id_err(
+                self.device.as_raw(),
+                objc::sel(c"newLibraryWithData:error:"),
+                data.as_raw(),
+                &mut ns_err,
+            )
+        };
+        let lib = ObjcObject::from_retained(lib_raw).ok_or_else(|| {
+            // SAFETY: `ns_err` was populated by Metal when the library failed to load.
+            let msg = unsafe { objc::nserror_message(ns_err) };
+            MetalError::CompileFailed(msg)
+        })?;
+
+        self.create_compute_pipeline(&lib, entry)
+    }
 }
 
 impl MetalTransport for DirectMetalTransport {
@@ -560,4 +606,230 @@ fn query_device_info(device: &ObjcObject) -> VmDeviceInfo {
     info.page_size = nocopy_page as u64;
 
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command as ProcessCommand;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::DirectMetalTransport;
+    use crate::transport::{MetalError, MetalTransport};
+    use crate::wire::{self, BufferBinding, Command, Dispatch1d, Reply, ReplyStatus, Submission};
+
+    /// Original synthetic compute source. Two entry points prove that a named
+    /// function inside the precompiled library is selected, not the first one.
+    const METALLIB_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void vm_metallib_affine(device uint *data [[buffer(0)]],
+                               uint tid [[thread_position_in_grid]]) {
+    data[tid] = data[tid] * 3u + 7u;
+}
+kernel void vm_metallib_unused(device uint *data [[buffer(0)]],
+                               uint tid [[thread_position_in_grid]]) {
+    data[tid] = data[tid] + 1u;
+}
+"#;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let path = std::env::temp_dir()
+                .join(format!("victory-{label}-{}-{stamp}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tool_path(name: &str) -> Option<PathBuf> {
+        let output = ProcessCommand::new("xcrun")
+            .args(["-f", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    }
+
+    /// Compiles the original synthetic source into a `.metallib` with Apple's
+    /// offline Metal toolchain. Returns `None` only when the toolchain is not
+    /// installed, so a host without Xcode skips instead of pretending to pass.
+    fn compile_fixture(dir: &Path) -> Option<PathBuf> {
+        let metal = tool_path("metal")?;
+        let metallib = tool_path("metallib")?;
+        let source = dir.join("victory_metallib_fixture.metal");
+        let air = dir.join("victory_metallib_fixture.air");
+        let library = dir.join("victory_metallib_fixture.metallib");
+        fs::write(&source, METALLIB_SOURCE).expect("write fixture source");
+
+        let compiled = ProcessCommand::new(metal)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&air)
+            .output()
+            .expect("spawn metal");
+        assert!(
+            compiled.status.success(),
+            "metal -c failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+
+        let linked = ProcessCommand::new(metallib)
+            .arg(&air)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .expect("spawn metallib");
+        assert!(
+            linked.status.success(),
+            "metallib failed: {}",
+            String::from_utf8_lossy(&linked.stderr)
+        );
+        Some(library)
+    }
+
+    #[test]
+    fn precompiled_metallib_runs_through_wire_batch() {
+        let dir = TempDir::new("metallib-e2e");
+        let Some(library) = compile_fixture(dir.path()) else {
+            eprintln!(
+                "skipping precompiled metallib e2e: Apple Metal toolchain (metal/metallib) not found"
+            );
+            return;
+        };
+        let metallib = fs::read(&library).expect("read compiled metallib");
+        assert!(!metallib.is_empty());
+
+        unsafe extern "C" {
+            fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+            fn free(ptr: *mut c_void);
+        }
+
+        const ALIGN: usize = 16384;
+        const BYTES: usize = 65536;
+        const COUNT: usize = BYTES / 4;
+        const ALLOCATION_ID: u64 = 1;
+        const GENERATION: u32 = 1;
+        const SEQUENCE: u32 = 1;
+
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+        // CPU-side argument validation is independent of any GPU work.
+        assert!(matches!(
+            transport.load_metallib(&[], "vm_metallib_affine"),
+            Err(MetalError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            transport.load_metallib(&metallib, ""),
+            Err(MetalError::InvalidArg(_))
+        ));
+
+        let pipeline = transport
+            .load_metallib(&metallib, "vm_metallib_affine")
+            .expect("precompiled metallib should load and register its entry point");
+        assert_ne!(pipeline.0, 0);
+        assert!(matches!(
+            transport.load_metallib(&metallib, "vm_metallib_missing"),
+            Err(MetalError::NotFound(_))
+        ));
+
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation into `raw`.
+        let rc = unsafe { posix_memalign(&mut raw, ALIGN, BYTES) };
+        assert_eq!(rc, 0, "posix_memalign failed");
+        assert!(!raw.is_null());
+
+        struct PageGuard(*mut c_void);
+        impl Drop for PageGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` came from `posix_memalign` and is no longer registered.
+                unsafe { free(self.0) };
+            }
+        }
+        let _guard = PageGuard(raw);
+
+        // SAFETY: `[raw, raw + BYTES)` is freshly allocated and u32-aligned.
+        let host = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u32>(), COUNT) };
+        for (index, slot) in host.iter_mut().enumerate() {
+            *slot = index as u32 + 1;
+        }
+
+        // SAFETY: `raw` points to 64 KiB valid memory that outlives `unregister_buffer`.
+        let buf_id = unsafe { transport.register_zerocopy(raw.cast::<u8>(), BYTES) }
+            .expect("register_zerocopy should succeed on 16 KiB unified memory");
+
+        let submission = Submission {
+            sequence: SEQUENCE,
+            commands: vec![Command::Dispatch1d(Dispatch1d {
+                pipeline_id: pipeline.0,
+                threads: COUNT as u32,
+                threads_per_group: 64,
+                bindings: vec![BufferBinding {
+                    allocation_id: ALLOCATION_ID,
+                    generation: GENERATION,
+                    offset: 0,
+                    length: BYTES as u64,
+                }],
+            })],
+        };
+
+        // Round-trip the real wire codec, then execute the decoded submission.
+        let frame = wire::encode_submission(&submission).expect("submission should encode");
+        let decoded = wire::decode_submission(&frame).expect("submission should decode");
+        assert_eq!(decoded, submission);
+
+        let mut allocations = HashMap::new();
+        allocations.insert((ALLOCATION_ID, GENERATION), buf_id);
+
+        let reply = transport
+            .submit_batch(&decoded, &allocations)
+            .expect("wire batch should complete");
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: SEQUENCE,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        for (index, &value) in host.iter().enumerate() {
+            let want = (index as u32 + 1) * 3 + 7;
+            assert_eq!(value, want, "mismatch at dword {index}");
+        }
+
+        let device = transport.device_info().expect("device_info should succeed");
+        eprintln!(
+            "precompiled metallib e2e: {} bytes, entry=vm_metallib_affine, verified_words={}, device={}",
+            metallib.len(),
+            COUNT,
+            device.name_str()
+        );
+
+        transport
+            .unregister_buffer(buf_id)
+            .expect("unregister_buffer should succeed");
+    }
 }

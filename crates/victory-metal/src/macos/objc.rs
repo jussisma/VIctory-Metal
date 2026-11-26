@@ -40,6 +40,16 @@ unsafe extern "C" {
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
 
+#[link(name = "System")]
+unsafe extern "C" {
+    fn dispatch_data_create(
+        buffer: *const c_void,
+        size: usize,
+        queue: *mut c_void,
+        destructor: *mut c_void,
+    ) -> Id;
+}
+
 unsafe extern "C" {
     fn getpagesize() -> c_int;
 }
@@ -150,6 +160,23 @@ pub(crate) fn nsstring(s: &str) -> Option<ObjcObject> {
         )
     };
     ObjcObject::from_retained(init)
+}
+
+/// Copies `bytes` into a retained `dispatch_data_t` with system-owned storage.
+///
+/// Passing the default destructor (a null block) makes libdispatch copy the
+/// caller's buffer, so `bytes` only has to be valid for the duration of this
+/// call. This is the input expected by `newLibraryWithData:error:`.
+pub(crate) fn dispatch_data_copy(bytes: &[u8]) -> Option<ObjcObject> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // SAFETY: `bytes` is valid for `bytes.len()` bytes during the call; a null
+    // queue plus `DISPATCH_DATA_DESTRUCTOR_DEFAULT` (null) requests the copying
+    // path, so no queue or destructor is stored or invoked.
+    let raw =
+        unsafe { dispatch_data_create(bytes.as_ptr().cast(), bytes.len(), null_mut(), null_mut()) };
+    ObjcObject::from_retained(raw)
 }
 
 /// Converts an `NSString *` or `NSError *` into a Rust `String` within an active autorelease pool.
