@@ -228,13 +228,7 @@ pub(crate) unsafe fn msg_send_id_err(target: Id, s: Sel, a0: Id, err: *mut Id) -
     }
 }
 
-pub(crate) unsafe fn msg_send_id_3_err(
-    target: Id,
-    s: Sel,
-    a0: Id,
-    a1: Id,
-    err: *mut Id,
-) -> Id {
+pub(crate) unsafe fn msg_send_id_3_err(target: Id, s: Sel, a0: Id, a1: Id, err: *mut Id) -> Id {
     type Fn = unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id;
     // SAFETY: Caller supplies valid receiver, selector, 2 pointer args, and `NSError **` out pointer.
     unsafe {
@@ -361,6 +355,16 @@ pub(crate) unsafe fn msg_send_void_1(target: Id, s: Sel, a0: Id) {
     unsafe {
         let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
         f(target, s, a0);
+    }
+}
+
+pub(crate) unsafe fn msg_send_void_u8(target: Id, s: Sel, value: u8) {
+    type Fn = unsafe extern "C" fn(Id, Sel, u8);
+    // SAFETY: Caller supplies a valid Objective-C receiver and selector taking a
+    // single `BOOL` byte (for example `setDepthWriteEnabled:`).
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, s, value);
     }
 }
 

@@ -24,10 +24,14 @@
 
 use std::ffi::c_void;
 use std::mem;
+use std::ops::Range;
 
-use crate::macos::device::DirectMetalTransport;
+use crate::abi::VmBufferId;
+use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
+use crate::macos::texture::VmTextureId;
 use crate::transport::MetalError;
+use crate::wire_v3::{CommandV3, MAX_COLOR_ATTACHMENTS};
 
 /// `MTLPixelFormatRGBA8Unorm`.
 const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
@@ -35,6 +39,10 @@ const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
 /// `MTLPixelFormatDepth32Float`.
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: usize = 252;
+/// `MTLPixelFormatDepth32Float_Stencil8`.
+const MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8: usize = 253;
+/// `MTLStorageModeShared`.
+const MTL_STORAGE_MODE_SHARED: usize = 0;
 /// `MTLStorageModePrivate`.
 const MTL_STORAGE_MODE_PRIVATE: usize = 2;
 /// `MTLTextureUsageShaderRead`.
@@ -47,14 +55,26 @@ const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 const MTL_LOAD_ACTION_LOAD: usize = 1;
 /// `MTLLoadActionClear`.
 const MTL_LOAD_ACTION_CLEAR: usize = 2;
+/// `MTLLoadActionDontCare`.
+const MTL_LOAD_ACTION_DONT_CARE: usize = 0;
 /// `MTLStoreActionStore`.
 const MTL_STORE_ACTION_STORE: usize = 1;
 /// `MTLStoreActionDontCare`.
 const MTL_STORE_ACTION_DONT_CARE: usize = 0;
+/// `MTLBarrierScopeBuffers`.
+pub(crate) const MTL_BARRIER_SCOPE_BUFFERS: usize = 1;
+/// `MTLBarrierScopeTextures`.
+pub(crate) const MTL_BARRIER_SCOPE_TEXTURES: usize = 2;
 /// `MTLIndexTypeUInt16`.
 const MTL_INDEX_TYPE_UINT16: usize = 0;
 /// `MTLIndexTypeUInt32`.
 const MTL_INDEX_TYPE_UINT32: usize = 1;
+/// `MTLPrimitiveTypePoint`.
+const MTL_PRIMITIVE_TYPE_POINT: usize = 0;
+/// `MTLPrimitiveTypeLine`.
+const MTL_PRIMITIVE_TYPE_LINE: usize = 1;
+/// `MTLPrimitiveTypeLineStrip`.
+const MTL_PRIMITIVE_TYPE_LINE_STRIP: usize = 2;
 /// `MTLPrimitiveTypeTriangle`.
 const MTL_PRIMITIVE_TYPE_TRIANGLE: usize = 3;
 /// `MTLPrimitiveTypeTriangleStrip`.
@@ -115,6 +135,8 @@ pub enum PixelFormat {
     Rgba8Unorm,
     /// `MTLPixelFormatDepth32Float`, valid only for depth attachments.
     Depth32Float,
+    /// `MTLPixelFormatDepth32Float_Stencil8`, a depth/stencil attachment.
+    Depth32FloatStencil8,
 }
 
 impl PixelFormat {
@@ -123,19 +145,40 @@ impl PixelFormat {
         matches!(self, Self::Bgra8Unorm | Self::Rgba8Unorm)
     }
 
+    /// Whether this format can back a depth attachment.
+    pub const fn is_depth(self) -> bool {
+        matches!(self, Self::Depth32Float | Self::Depth32FloatStencil8)
+    }
+
+    /// Whether this format carries a stencil plane.
+    pub const fn has_stencil(self) -> bool {
+        matches!(self, Self::Depth32FloatStencil8)
+    }
+
+    /// Bytes per texel for the supported uncompressed formats.
+    pub const fn bytes_per_texel(self) -> u32 {
+        match self {
+            Self::Bgra8Unorm | Self::Rgba8Unorm => 4,
+            Self::Depth32Float => 4,
+            Self::Depth32FloatStencil8 => 8,
+        }
+    }
+
     const fn mtl_pixel_format(self) -> usize {
         match self {
             Self::Bgra8Unorm => MTL_PIXEL_FORMAT_BGRA8_UNORM,
             Self::Rgba8Unorm => MTL_PIXEL_FORMAT_RGBA8_UNORM,
             Self::Depth32Float => MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
+            Self::Depth32FloatStencil8 => MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8,
         }
     }
 
-    fn from_mtl_pixel_format(value: usize) -> Option<Self> {
+    pub(crate) fn from_mtl_pixel_format(value: usize) -> Option<Self> {
         match value {
             MTL_PIXEL_FORMAT_BGRA8_UNORM => Some(Self::Bgra8Unorm),
             MTL_PIXEL_FORMAT_RGBA8_UNORM => Some(Self::Rgba8Unorm),
             MTL_PIXEL_FORMAT_DEPTH32_FLOAT => Some(Self::Depth32Float),
+            MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8 => Some(Self::Depth32FloatStencil8),
             _ => None,
         }
     }
@@ -148,6 +191,8 @@ pub enum LoadAction {
     Load,
     /// Discard previous contents and apply the clear value.
     Clear,
+    /// Previous contents are undefined and not read.
+    DontCare,
 }
 
 impl LoadAction {
@@ -155,6 +200,7 @@ impl LoadAction {
         match self {
             Self::Load => MTL_LOAD_ACTION_LOAD,
             Self::Clear => MTL_LOAD_ACTION_CLEAR,
+            Self::DontCare => MTL_LOAD_ACTION_DONT_CARE,
         }
     }
 }
@@ -180,6 +226,12 @@ impl StoreAction {
 /// Primitive topology accepted by the draw entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimitiveType {
+    /// `MTLPrimitiveTypePoint`.
+    Point,
+    /// `MTLPrimitiveTypeLine`.
+    Line,
+    /// `MTLPrimitiveTypeLineStrip`.
+    LineStrip,
     /// `MTLPrimitiveTypeTriangle`.
     Triangle,
     /// `MTLPrimitiveTypeTriangleStrip`.
@@ -189,6 +241,9 @@ pub enum PrimitiveType {
 impl PrimitiveType {
     const fn mtl_value(self) -> usize {
         match self {
+            Self::Point => MTL_PRIMITIVE_TYPE_POINT,
+            Self::Line => MTL_PRIMITIVE_TYPE_LINE,
+            Self::LineStrip => MTL_PRIMITIVE_TYPE_LINE_STRIP,
             Self::Triangle => MTL_PRIMITIVE_TYPE_TRIANGLE,
             Self::TriangleStrip => MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
         }
@@ -324,6 +379,64 @@ impl RenderTarget {
     pub(crate) fn as_raw(&self) -> objc::Id {
         self.texture.as_raw()
     }
+
+    /// Retains the underlying texture as an independent +1 `ObjcObject`.
+    pub(crate) fn clone_objc(&self) -> Result<ObjcObject, MetalError> {
+        // SAFETY: `self.texture` is a live retained `MTLTexture`; `retain`
+        // returns that same object with an additional +1 reference.
+        let raw = unsafe { objc::msg_send_id_0(self.texture.as_raw(), objc::sel(c"retain")) };
+        ObjcObject::from_retained(raw).ok_or(MetalError::InternalError(
+            "MTLTexture retain returned null".to_string(),
+        ))
+    }
+}
+
+/// Geometry, format and subresource counts of a live `MTLTexture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextureInfo {
+    /// Level-0 width in texels.
+    pub width: u32,
+    /// Level-0 height in texels.
+    pub height: u32,
+    /// Supported pixel format.
+    pub format: PixelFormat,
+    /// Number of mip levels.
+    pub mip_levels: u32,
+    /// Number of array slices.
+    pub slices: u32,
+}
+
+/// Reads the geometry and format of a live `MTLTexture`.
+pub(crate) fn texture_info(raw: objc::Id) -> Result<TextureInfo, MetalError> {
+    // SAFETY: `raw` is a live `MTLTexture`; the accessors only read immutable
+    // texture properties.
+    let (width, height, format, mip_levels, slices) = unsafe {
+        (
+            objc::msg_send_usize_0(raw, objc::sel(c"width")),
+            objc::msg_send_usize_0(raw, objc::sel(c"height")),
+            objc::msg_send_usize_0(raw, objc::sel(c"pixelFormat")),
+            objc::msg_send_usize_0(raw, objc::sel(c"mipmapLevelCount")),
+            objc::msg_send_usize_0(raw, objc::sel(c"arrayLength")),
+        )
+    };
+    let width = u32::try_from(width)
+        .map_err(|_| MetalError::InternalError("texture width exceeds u32".to_string()))?;
+    let height = u32::try_from(height)
+        .map_err(|_| MetalError::InternalError("texture height exceeds u32".to_string()))?;
+    let mip_levels = u32::try_from(mip_levels)
+        .map_err(|_| MetalError::InternalError("texture mip count exceeds u32".to_string()))?;
+    let slices = u32::try_from(slices)
+        .map_err(|_| MetalError::InternalError("texture slice count exceeds u32".to_string()))?;
+    let format = PixelFormat::from_mtl_pixel_format(format).ok_or(MetalError::NotSupported(
+        "texture must be BGRA8Unorm, RGBA8Unorm, Depth32Float or Depth32Float_Stencil8",
+    ))?;
+    Ok(TextureInfo {
+        width,
+        height,
+        format,
+        mip_levels,
+        slices,
+    })
 }
 
 impl DirectMetalTransport {
@@ -475,9 +588,12 @@ impl RenderPass {
     /// dimensions must match the colour attachment exactly; otherwise
     /// [`MetalError::InvalidArg`] is returned.
     pub fn with_depth(mut self, depth: RenderAttachment) -> Result<Self, MetalError> {
-        if depth.target.pixel_format != PixelFormat::Depth32Float {
+        if !matches!(
+            depth.target.pixel_format,
+            PixelFormat::Depth32Float | PixelFormat::Depth32FloatStencil8
+        ) {
             return Err(MetalError::InvalidArg(
-                "depth attachment must be Depth32Float",
+                "depth attachment must be Depth32Float or Depth32Float_Stencil8",
             ));
         }
         if depth.target.width != self.color.target.width
@@ -505,12 +621,13 @@ impl RenderPass {
 /// A compiled `MTLRenderPipelineState` for one vertex/fragment pair.
 pub struct GraphicsPipeline {
     state: ObjcObject,
-    color_format: PixelFormat,
+    color_formats: Vec<PixelFormat>,
     depth_format: Option<PixelFormat>,
+    depth_state: Option<ObjcObject>,
 }
 
 impl GraphicsPipeline {
-    /// Compiles `source` and builds a render pipeline state.
+    /// Compiles `source` and builds a single-colour render pipeline state.
     ///
     /// The library is compiled once; both named entry points are resolved from
     /// it. MSL or pipeline-creation failures return
@@ -523,21 +640,51 @@ impl GraphicsPipeline {
         color_format: PixelFormat,
         depth_format: Option<PixelFormat>,
     ) -> Result<Self, MetalError> {
+        Self::compile_mrt(
+            transport,
+            source,
+            vertex_entry,
+            fragment_entry,
+            &[color_format],
+            depth_format,
+        )
+    }
+
+    /// Compiles `source` into a pipeline with 1..=8 colour attachments.
+    ///
+    /// Every colour format is written into the pipeline descriptor at its
+    /// attachment index, so an MRT pass can use one pipeline state. When a
+    /// depth format is given, the pipeline owns a depth-stencil state with
+    /// `MTLCompareFunctionLess` and depth writes enabled, which is what makes
+    /// draw order respect depth instead of painting order.
+    pub fn compile_mrt(
+        transport: &DirectMetalTransport,
+        source: &str,
+        vertex_entry: &str,
+        fragment_entry: &str,
+        color_formats: &[PixelFormat],
+        depth_format: Option<PixelFormat>,
+    ) -> Result<Self, MetalError> {
         if source.is_empty() || vertex_entry.is_empty() || fragment_entry.is_empty() {
             return Err(MetalError::InvalidArg(
                 "MSL source and both entry point names must be non-empty",
             ));
         }
-        if !color_format.is_color() {
+        if color_formats.is_empty() || color_formats.len() > MAX_COLOR_ATTACHMENTS {
             return Err(MetalError::InvalidArg(
-                "render pipeline colour format must be BGRA8Unorm or RGBA8Unorm",
+                "render pipeline needs 1..=8 colour attachment formats",
+            ));
+        }
+        if color_formats.iter().any(|format| !format.is_color()) {
+            return Err(MetalError::InvalidArg(
+                "render pipeline colour formats must be BGRA8Unorm or RGBA8Unorm",
             ));
         }
         if let Some(format) = depth_format
-            && format != PixelFormat::Depth32Float
+            && !format.is_depth()
         {
             return Err(MetalError::InvalidArg(
-                "render pipeline depth format must be Depth32Float",
+                "render pipeline depth format must be Depth32Float or Depth32Float_Stencil8",
             ));
         }
 
@@ -601,26 +748,40 @@ impl GraphicsPipeline {
                     "MTLRenderPipelineDescriptor.colorAttachments is nil".to_string(),
                 ));
             }
-            let attachment =
-                msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0);
-            if attachment.is_null() {
-                return Err(MetalError::InternalError(
-                    "colour attachment descriptor at index 0 is nil".to_string(),
-                ));
+            for (index, format) in color_formats.iter().enumerate() {
+                let attachment =
+                    msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index);
+                if attachment.is_null() {
+                    return Err(MetalError::InternalError(
+                        "colour attachment descriptor is nil".to_string(),
+                    ));
+                }
+                msg_send_void_usize(
+                    attachment,
+                    objc::sel(c"setPixelFormat:"),
+                    format.mtl_pixel_format(),
+                );
             }
-            msg_send_void_usize(
-                attachment,
-                objc::sel(c"setPixelFormat:"),
-                color_format.mtl_pixel_format(),
-            );
             if let Some(format) = depth_format {
                 msg_send_void_usize(
                     descriptor.as_raw(),
                     objc::sel(c"setDepthAttachmentPixelFormat:"),
                     format.mtl_pixel_format(),
                 );
+                if format.has_stencil() {
+                    msg_send_void_usize(
+                        descriptor.as_raw(),
+                        objc::sel(c"setStencilAttachmentPixelFormat:"),
+                        format.mtl_pixel_format(),
+                    );
+                }
             }
         }
+
+        let depth_state = match depth_format {
+            Some(_) => Some(new_less_depth_state(transport)?),
+            None => None,
+        };
 
         let mut ns_err = objc::empty_id();
         // SAFETY: `descriptor` is fully configured and `ns_err` receives an
@@ -641,10 +802,74 @@ impl GraphicsPipeline {
 
         Ok(Self {
             state,
-            color_format,
+            color_formats: color_formats.to_vec(),
             depth_format,
+            depth_state,
         })
     }
+
+    /// Colour attachment formats this pipeline declares, in slot order.
+    pub(crate) fn color_formats(&self) -> &[PixelFormat] {
+        &self.color_formats
+    }
+
+    /// Depth attachment format this pipeline declares.
+    pub(crate) fn depth_format(&self) -> Option<PixelFormat> {
+        self.depth_format
+    }
+
+    /// Raw `MTLRenderPipelineState` handle.
+    pub(crate) fn state_raw(&self) -> objc::Id {
+        self.state.as_raw()
+    }
+
+    /// Raw `MTLDepthStencilState` handle, when the pipeline tests depth.
+    pub(crate) fn depth_state_raw(&self) -> Option<objc::Id> {
+        self.depth_state.as_ref().map(ObjcObject::as_raw)
+    }
+}
+
+/// Builds a depth-stencil state with `MTLCompareFunctionLess` and writes on.
+fn new_less_depth_state(transport: &DirectMetalTransport) -> Result<ObjcObject, MetalError> {
+    /// `MTLCompareFunctionLess`.
+    const MTL_COMPARE_FUNCTION_LESS: usize = 1;
+    let class = objc::class(c"MTLDepthStencilDescriptor");
+    if class.is_null() {
+        return Err(MetalError::InternalError(
+            "MTLDepthStencilDescriptor class unavailable".to_string(),
+        ));
+    }
+    // SAFETY: `class` is the documented class and `new` returns a retained,
+    // zero-initialized descriptor.
+    let raw = unsafe { objc::msg_send_id_0(class, objc::sel(c"new")) };
+    let descriptor = ObjcObject::from_retained(raw).ok_or_else(|| {
+        MetalError::InternalError("MTLDepthStencilDescriptor creation returned null".to_string())
+    })?;
+    // SAFETY: The descriptor is live and both values are the documented
+    // `MTLCompareFunction`/`BOOL` encodings.
+    unsafe {
+        msg_send_void_usize(
+            descriptor.as_raw(),
+            objc::sel(c"setDepthCompareFunction:"),
+            MTL_COMPARE_FUNCTION_LESS,
+        );
+        objc::msg_send_void_u8(descriptor.as_raw(), objc::sel(c"setDepthWriteEnabled:"), 1);
+    }
+    // SAFETY: `descriptor` is a live depth-stencil descriptor. The device
+    // selector has no `error:` argument and returns a retained state or nil.
+    let state_raw = unsafe {
+        objc::msg_send_id_1(
+            transport.device_raw(),
+            objc::sel(c"newDepthStencilStateWithDescriptor:"),
+            descriptor.as_raw(),
+        )
+    };
+    let state = ObjcObject::from_retained(state_raw).ok_or_else(|| {
+        MetalError::InternalError(
+            "MTLDevice.newDepthStencilStateWithDescriptor returned nil".to_string(),
+        )
+    })?;
+    Ok(state)
 }
 
 /// Resolves one named function from a compiled `MTLLibrary`.
@@ -673,8 +898,11 @@ fn new_library_function(library: &ObjcObject, entry: &str) -> Result<ObjcObject,
 /// submitted. Call [`RenderEncoder::finish`] to close, commit and wait.
 pub struct RenderEncoder<'a> {
     transport: &'a DirectMetalTransport,
-    pass: &'a RenderPass,
-    pipeline: &'a GraphicsPipeline,
+    pass: Option<&'a RenderPass>,
+    pipeline: Option<&'a GraphicsPipeline>,
+    descriptor: Option<objc::Id>,
+    command_buffer: Option<objc::Id>,
+    extent: (u32, u32),
     pool: Option<AutoreleasePool>,
     cb: objc::Id,
     enc: objc::Id,
@@ -691,7 +919,7 @@ impl<'a> RenderEncoder<'a> {
         pass: &'a RenderPass,
         pipeline: &'a GraphicsPipeline,
     ) -> Result<Self, MetalError> {
-        if pass.color.target.pixel_format != pipeline.color_format {
+        if pipeline.color_formats.first() != Some(&pass.color.target.pixel_format) {
             return Err(MetalError::InvalidArg(
                 "pipeline colour format does not match the render pass",
             ));
@@ -704,13 +932,89 @@ impl<'a> RenderEncoder<'a> {
         }
         Ok(Self {
             transport,
-            pass,
-            pipeline,
+            pass: Some(pass),
+            pipeline: Some(pipeline),
+            descriptor: None,
+            command_buffer: None,
+            extent: (pass.color.target.width, pass.color.target.height),
             pool: None,
             cb: objc::empty_id(),
             enc: objc::empty_id(),
             ended: false,
         })
+    }
+
+    /// Prepares an encoder over a caller-built `MTLRenderPassDescriptor` on an
+    /// existing, uncommitted command buffer.
+    ///
+    /// The descriptor must stay alive for the encoder's lifetime (for example
+    /// in the caller's autorelease pool). The default viewport and scissor
+    /// cover `width`x`height`; the pipeline state is set by the caller through
+    /// [`Self::set_pipeline_state`]. This is the v3 path: several encoders of
+    /// different classes share one command buffer.
+    pub(crate) fn new_with_descriptor(
+        transport: &'a DirectMetalTransport,
+        command_buffer: objc::Id,
+        descriptor: objc::Id,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            transport,
+            pass: None,
+            pipeline: None,
+            descriptor: Some(descriptor),
+            command_buffer: Some(command_buffer),
+            extent: (width, height),
+            pool: None,
+            cb: objc::empty_id(),
+            enc: objc::empty_id(),
+            ended: false,
+        }
+    }
+
+    /// Creates the command buffer, pass descriptor and encoder if they do not
+    /// exist yet, so an empty (clear-only) pass still records its work.
+    pub(crate) fn ensure_started(&mut self) -> Result<(), MetalError> {
+        self.ensure_encoder()
+    }
+
+    /// Ends the encoder without committing the shared command buffer.
+    pub(crate) fn end_encoding(&mut self) {
+        if !self.enc.is_null() && !self.ended {
+            // SAFETY: `self.enc` is a live render encoder not yet ended.
+            unsafe { objc::msg_send_void_0(self.enc, objc::sel(c"endEncoding")) };
+            self.ended = true;
+        }
+    }
+
+    /// Sets a raw render pipeline state and its optional depth-stencil state.
+    pub(crate) fn set_pipeline_state(
+        &mut self,
+        state: objc::Id,
+        depth_state: Option<objc::Id>,
+    ) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder; `state` and
+        // `depth_state` are live Metal objects owned by the pipeline registry.
+        unsafe {
+            objc::msg_send_void_1(self.enc, objc::sel(c"setRenderPipelineState:"), state);
+            if let Some(depth_state) = depth_state {
+                objc::msg_send_void_1(self.enc, objc::sel(c"setDepthStencilState:"), depth_state);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits an explicit `memoryBarrierWithScope:` on the active encoder.
+    pub(crate) fn memory_barrier(&mut self, scope: usize) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder and `scope` is a
+        // documented `MTLBarrierScope` mask.
+        unsafe {
+            msg_send_void_usize(self.enc, objc::sel(c"memoryBarrierWithScope:"), scope);
+        }
+        Ok(())
     }
 
     /// Sets the viewport. Width and height must be positive.
@@ -880,6 +1184,43 @@ impl<'a> RenderEncoder<'a> {
         Ok(())
     }
 
+    /// Draws `instance_count` instances of `vertex_count` non-indexed vertices.
+    ///
+    /// A zero vertex or instance count is rejected before the command buffer
+    /// exists.
+    pub fn draw_primitives_instanced(
+        &mut self,
+        primitive: PrimitiveType,
+        vertex_start: usize,
+        vertex_count: usize,
+        instance_count: usize,
+        base_instance: usize,
+    ) -> Result<(), MetalError> {
+        if vertex_count == 0 {
+            return Err(MetalError::InvalidArg("draw vertex count must be nonzero"));
+        }
+        if instance_count == 0 {
+            return Err(MetalError::InvalidArg(
+                "draw instance count must be nonzero",
+            ));
+        }
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder and every count is passed
+        // as the selector's `NSUInteger` arguments.
+        unsafe {
+            msg_send_draw_primitives_instanced(
+                self.enc,
+                objc::sel(c"drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+                primitive.mtl_value(),
+                vertex_start,
+                vertex_count,
+                instance_count,
+                base_instance,
+            );
+        }
+        Ok(())
+    }
+
     /// Draws `index_count` indices from `index_buffer`, adding `base_vertex` to
     /// every fetched index.
     ///
@@ -900,8 +1241,46 @@ impl<'a> RenderEncoder<'a> {
         index_buffer_offset: usize,
         base_vertex: isize,
     ) -> Result<(), MetalError> {
+        // SAFETY: Forwarded with the caller's buffer guarantees.
+        unsafe {
+            self.draw_indexed_primitives_instanced(
+                primitive,
+                index_count,
+                index_type,
+                index_buffer,
+                index_buffer_offset,
+                1,
+                base_vertex,
+                0,
+            )
+        }
+    }
+
+    /// Draws `instance_count` instances of an indexed primitive range.
+    ///
+    /// # Safety
+    ///
+    /// `index_buffer` must be a live `id<MTLBuffer>` whose backing storage
+    /// stays valid until the pass's command buffer completes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn draw_indexed_primitives_instanced(
+        &mut self,
+        primitive: PrimitiveType,
+        index_count: usize,
+        index_type: IndexType,
+        index_buffer: *mut c_void,
+        index_buffer_offset: usize,
+        instance_count: usize,
+        base_vertex: isize,
+        base_instance: usize,
+    ) -> Result<(), MetalError> {
         if index_count == 0 {
             return Err(MetalError::InvalidArg("draw index count must be nonzero"));
+        }
+        if instance_count == 0 {
+            return Err(MetalError::InvalidArg(
+                "draw instance count must be nonzero",
+            ));
         }
         if index_buffer.is_null() {
             return Err(MetalError::InvalidArg("index buffer is nil"));
@@ -924,9 +1303,9 @@ impl<'a> RenderEncoder<'a> {
                 index_type.mtl_value(),
                 index_buffer,
                 index_buffer_offset,
-                1,
+                instance_count,
                 base_vertex,
-                0,
+                base_instance,
             );
         }
         Ok(())
@@ -969,16 +1348,30 @@ impl<'a> RenderEncoder<'a> {
             return Ok(());
         }
         let pool = AutoreleasePool::new();
-        // SAFETY: `queue` is a valid `MTLCommandQueue`; the returned command
-        // buffer is autoreleased and stays alive for `pool`'s lifetime.
-        let cb =
-            unsafe { objc::msg_send_id_0(self.transport.queue_raw(), objc::sel(c"commandBuffer")) };
+        let cb = match self.command_buffer {
+            Some(command_buffer) => command_buffer,
+            None => {
+                // SAFETY: `queue` is a valid `MTLCommandQueue`; the returned
+                // command buffer is autoreleased and stays alive for `pool`.
+                unsafe {
+                    objc::msg_send_id_0(self.transport.queue_raw(), objc::sel(c"commandBuffer"))
+                }
+            }
+        };
         if cb.is_null() {
             return Err(MetalError::InternalError(
                 "MTLCommandQueue.commandBuffer returned null".to_string(),
             ));
         }
-        let descriptor = build_render_pass_descriptor(self.pass)?;
+        let descriptor = match self.descriptor {
+            Some(descriptor) => descriptor,
+            None => {
+                let pass = self.pass.ok_or(MetalError::InternalError(
+                    "render encoder has neither a descriptor nor a pass".to_string(),
+                ))?;
+                build_render_pass_descriptor(pass)?
+            }
+        };
         // SAFETY: `cb` is a live uncommitted command buffer and `descriptor`
         // is a live `MTLRenderPassDescriptor` in this pool.
         let enc = unsafe {
@@ -994,30 +1387,35 @@ impl<'a> RenderEncoder<'a> {
             ));
         }
 
-        let color = &self.pass.color.target;
+        let (width, height) = self.extent;
         let viewport = MTLViewport {
             origin_x: 0.0,
             origin_y: 0.0,
-            width: f64::from(color.width),
-            height: f64::from(color.height),
+            width: f64::from(width),
+            height: f64::from(height),
             znear: 0.0,
             zfar: 1.0,
         };
         let scissor = MTLScissorRect {
             x: 0,
             y: 0,
-            width: color.width as usize,
-            height: color.height as usize,
+            width: width as usize,
+            height: height as usize,
         };
-        // SAFETY: `enc` is a live render encoder, `pipeline.state` is a valid
-        // `MTLRenderPipelineState`, and the default viewport/scissor cover the
-        // colour attachment.
+        // SAFETY: `enc` is a live render encoder, the optional pipeline state
+        // and depth state are live Metal objects, and the default
+        // viewport/scissor cover the attachment extent.
         unsafe {
-            objc::msg_send_void_1(
-                enc,
-                objc::sel(c"setRenderPipelineState:"),
-                self.pipeline.state.as_raw(),
-            );
+            if let Some(pipeline) = self.pipeline {
+                objc::msg_send_void_1(
+                    enc,
+                    objc::sel(c"setRenderPipelineState:"),
+                    pipeline.state.as_raw(),
+                );
+                if let Some(depth_state) = pipeline.depth_state_raw() {
+                    objc::msg_send_void_1(enc, objc::sel(c"setDepthStencilState:"), depth_state);
+                }
+            }
             msg_send_void_viewport(enc, objc::sel(c"setViewport:"), viewport);
             msg_send_void_scissor(enc, objc::sel(c"setScissorRect:"), scissor);
         }
@@ -1140,6 +1538,187 @@ fn configure_depth_attachment(raw: objc::Id, attachment: &RenderAttachment) {
     }
 }
 
+/// One already-resolved colour attachment of a v3 render pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawColorAttachment {
+    /// Live `id<MTLTexture>` held by the attachment registry.
+    pub texture: objc::Id,
+    /// Load action applied at pass start.
+    pub load: LoadAction,
+    /// Store action applied at pass end.
+    pub store: StoreAction,
+    /// Clear colour used with [`LoadAction::Clear`].
+    pub clear_color: [f64; 4],
+    /// Mip level rendered into.
+    pub level: usize,
+    /// Array slice rendered into.
+    pub slice: usize,
+}
+
+/// One already-resolved depth/stencil attachment of a v3 render pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawDepthAttachment {
+    /// Live `id<MTLTexture>` held by the attachment registry.
+    pub texture: objc::Id,
+    /// Whether the texture carries a stencil plane.
+    pub has_stencil: bool,
+    /// Load action applied to depth at pass start.
+    pub depth_load: LoadAction,
+    /// Store action applied to depth at pass end.
+    pub depth_store: StoreAction,
+    /// Clear depth used with [`LoadAction::Clear`].
+    pub clear_depth: f64,
+    /// Load action applied to stencil at pass start.
+    pub stencil_load: LoadAction,
+    /// Store action applied to stencil at pass end.
+    pub stencil_store: StoreAction,
+    /// Clear stencil used with [`LoadAction::Clear`].
+    pub clear_stencil: u32,
+    /// Mip level rendered into.
+    pub level: usize,
+    /// Array slice rendered into.
+    pub slice: usize,
+}
+
+/// Builds an autoreleased `MTLRenderPassDescriptor` from resolved attachments.
+///
+/// This is the v3 encoding path: every texture handle, level, slice and extent
+/// was validated against the registry before this call, so the descriptor is
+/// pure CPU object configuration.
+pub(crate) fn build_mrt_render_pass_descriptor(
+    colors: &[RawColorAttachment],
+    depth: Option<&RawDepthAttachment>,
+) -> Result<objc::Id, MetalError> {
+    if colors.is_empty() || colors.len() > MAX_COLOR_ATTACHMENTS {
+        return Err(MetalError::InvalidArg(
+            "render pass needs 1..=8 colour attachments",
+        ));
+    }
+    let cls = objc::class(c"MTLRenderPassDescriptor");
+    if cls.is_null() {
+        return Err(MetalError::InternalError(
+            "MTLRenderPassDescriptor class unavailable".to_string(),
+        ));
+    }
+    // SAFETY: `cls` is the documented class factory and the returned descriptor
+    // is autoreleased into the caller's active pool.
+    let descriptor = unsafe { objc::msg_send_id_0(cls, objc::sel(c"renderPassDescriptor")) };
+    if descriptor.is_null() {
+        return Err(MetalError::InternalError(
+            "MTLRenderPassDescriptor creation returned null".to_string(),
+        ));
+    }
+    // SAFETY: `descriptor` is a live render pass descriptor.
+    let attachments = unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"colorAttachments")) };
+    if attachments.is_null() {
+        return Err(MetalError::InternalError(
+            "MTLRenderPassDescriptor.colorAttachments is nil".to_string(),
+        ));
+    }
+    for (index, attachment) in colors.iter().enumerate() {
+        // SAFETY: `attachments` is the colour attachment array and `index` is
+        // below the declared 1..=8 limit.
+        let raw = unsafe {
+            msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index)
+        };
+        if raw.is_null() {
+            return Err(MetalError::InternalError(
+                "colour attachment descriptor is nil".to_string(),
+            ));
+        }
+        let clear = MTLClearColor {
+            red: attachment.clear_color[0],
+            green: attachment.clear_color[1],
+            blue: attachment.clear_color[2],
+            alpha: attachment.clear_color[3],
+        };
+        // SAFETY: `raw` is a live colour attachment descriptor, `texture` is a
+        // live retained texture, and the values are documented encodings.
+        unsafe {
+            objc::msg_send_void_1(raw, objc::sel(c"setTexture:"), attachment.texture);
+            msg_send_void_usize(raw, objc::sel(c"setLevel:"), attachment.level);
+            msg_send_void_usize(raw, objc::sel(c"setSlice:"), attachment.slice);
+            msg_send_void_usize(
+                raw,
+                objc::sel(c"setLoadAction:"),
+                attachment.load.mtl_value(),
+            );
+            msg_send_void_usize(
+                raw,
+                objc::sel(c"setStoreAction:"),
+                attachment.store.mtl_value(),
+            );
+            msg_send_void_clear_color(raw, objc::sel(c"setClearColor:"), clear);
+        }
+    }
+
+    if let Some(depth) = depth {
+        // SAFETY: `descriptor` is a live render pass descriptor.
+        let depth_attachment =
+            unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"depthAttachment")) };
+        if depth_attachment.is_null() {
+            return Err(MetalError::InternalError(
+                "MTLRenderPassDescriptor.depthAttachment is nil".to_string(),
+            ));
+        }
+        // SAFETY: `depth_attachment` is a live depth attachment descriptor.
+        unsafe {
+            objc::msg_send_void_1(depth_attachment, objc::sel(c"setTexture:"), depth.texture);
+            msg_send_void_usize(depth_attachment, objc::sel(c"setLevel:"), depth.level);
+            msg_send_void_usize(depth_attachment, objc::sel(c"setSlice:"), depth.slice);
+            msg_send_void_usize(
+                depth_attachment,
+                objc::sel(c"setLoadAction:"),
+                depth.depth_load.mtl_value(),
+            );
+            msg_send_void_usize(
+                depth_attachment,
+                objc::sel(c"setStoreAction:"),
+                depth.depth_store.mtl_value(),
+            );
+            msg_send_void_f64(
+                depth_attachment,
+                objc::sel(c"setClearDepth:"),
+                depth.clear_depth,
+            );
+        }
+        if depth.has_stencil {
+            // SAFETY: `descriptor` is a live render pass descriptor.
+            let stencil_attachment =
+                unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"stencilAttachment")) };
+            if stencil_attachment.is_null() {
+                return Err(MetalError::InternalError(
+                    "MTLRenderPassDescriptor.stencilAttachment is nil".to_string(),
+                ));
+            }
+            // SAFETY: `stencil_attachment` is a live stencil attachment
+            // descriptor and `clear_stencil` is a `uint32_t` value.
+            unsafe {
+                objc::msg_send_void_1(stencil_attachment, objc::sel(c"setTexture:"), depth.texture);
+                msg_send_void_usize(stencil_attachment, objc::sel(c"setLevel:"), depth.level);
+                msg_send_void_usize(stencil_attachment, objc::sel(c"setSlice:"), depth.slice);
+                msg_send_void_usize(
+                    stencil_attachment,
+                    objc::sel(c"setLoadAction:"),
+                    depth.stencil_load.mtl_value(),
+                );
+                msg_send_void_usize(
+                    stencil_attachment,
+                    objc::sel(c"setStoreAction:"),
+                    depth.stencil_store.mtl_value(),
+                );
+                msg_send_void_u32(
+                    stencil_attachment,
+                    objc::sel(c"setClearStencil:"),
+                    depth.clear_stencil,
+                );
+            }
+        }
+    }
+
+    Ok(descriptor)
+}
+
 /// Creates an autoreleased `MTLTextureDescriptor` for a non-mipmapped 2D texture.
 fn texture_2d_descriptor(
     pixel_format: usize,
@@ -1233,9 +1812,574 @@ fn read_back_texture(transport: &DirectMetalTransport, target: &RenderTarget) ->
     bytes.to_vec()
 }
 
+/// A CPU-visible texture and the `MTLBuffer` that backs it.
+///
+/// Both registry entries share **one** ID: the same `(allocation_id,
+/// generation)` handle names the buffer for compute/UAV bindings and the
+/// texture for attachments or blits. That aliasing is deliberate and lets a
+/// blit populate GPU-visible bytes that a later compute segment reads as a
+/// buffer without a second copy.
+pub struct SharedTexture2d {
+    /// Registered texture handle.
+    pub texture_id: VmTextureId,
+    /// Registered buffer handle (same numeric ID as `texture_id`).
+    pub buffer_id: VmBufferId,
+    /// Texture width in texels.
+    pub width: u32,
+    /// Texture height in texels.
+    pub height: u32,
+    /// Padded row pitch of the backing buffer in bytes.
+    pub bytes_per_row: usize,
+    /// Backing buffer length in bytes.
+    pub len: usize,
+}
+
+impl DirectMetalTransport {
+    /// Creates a shared-storage texture backed by a CPU-visible `MTLBuffer`.
+    ///
+    /// The buffer is registered by [`VmBufferId`] and the texture is registered
+    /// by [`VmTextureId`] under the same numeric ID, so one allocation handle
+    /// can be a blit destination and a compute binding. Rows are padded to a
+    /// 256-byte pitch, which satisfies linear-texture alignment for 4-byte
+    /// formats on Apple GPUs.
+    pub fn create_shared_texture_2d(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<SharedTexture2d, MetalError> {
+        if !format.is_color() {
+            return Err(MetalError::InvalidArg(
+                "shared texture format must be BGRA8Unorm or RGBA8Unorm",
+            ));
+        }
+        if width == 0 || height == 0 {
+            return Err(MetalError::InvalidArg(
+                "shared texture width and height must be nonzero",
+            ));
+        }
+        if width > MAX_RENDER_TARGET_DIMENSION || height > MAX_RENDER_TARGET_DIMENSION {
+            return Err(MetalError::InvalidArg(
+                "shared texture exceeds the supported 2D dimension limit",
+            ));
+        }
+        let row_bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(format.bytes_per_texel() as usize))
+            .ok_or(MetalError::InvalidArg(
+                "shared texture row length overflows",
+            ))?;
+        let bytes_per_row = row_bytes.next_multiple_of(256);
+        let len = bytes_per_row
+            .checked_mul(height as usize)
+            .ok_or(MetalError::InvalidArg("shared texture length overflows"))?;
+
+        let _pool = AutoreleasePool::new();
+        // SAFETY: `device` is a valid `MTLDevice`; storage mode `0` is shared,
+        // `len` is nonzero, and the result is retained (+1).
+        let buffer_raw = unsafe { objc::msg_send_new_buffer(self.device_raw(), len, 0) };
+        let buffer = ObjcObject::from_retained(buffer_raw).ok_or_else(|| {
+            MetalError::InternalError("shared texture buffer allocation returned null".to_string())
+        })?;
+        let descriptor =
+            texture_2d_descriptor(format.mtl_pixel_format(), width as usize, height as usize)?;
+        // SAFETY: `descriptor` is a live `MTLTextureDescriptor` in this pool;
+        // the shared buffer storage mode must match the descriptor.
+        unsafe {
+            msg_send_void_usize(
+                descriptor,
+                objc::sel(c"setStorageMode:"),
+                MTL_STORAGE_MODE_SHARED,
+            );
+            msg_send_void_usize(
+                descriptor,
+                objc::sel(c"setUsage:"),
+                MTL_TEXTURE_USAGE_SHADER_READ,
+            );
+        }
+        // SAFETY: `buffer` is a live shared buffer with `len` bytes and the
+        // descriptor requests a nonzero `bytes_per_row`; the selector is
+        // `MTLBuffer`'s buffer-backed texture factory.
+        let texture_raw = unsafe {
+            msg_send_texture_from_buffer(
+                buffer.as_raw(),
+                objc::sel(c"newTextureWithDescriptor:offset:bytesPerRow:"),
+                descriptor,
+                0,
+                bytes_per_row,
+            )
+        };
+        let texture = ObjcObject::from_retained(texture_raw).ok_or_else(|| {
+            MetalError::InternalError(
+                "MTLBuffer.newTextureWithDescriptor:offset:bytesPerRow: returned null".to_string(),
+            )
+        })?;
+
+        let mut state = self.lock_state()?;
+        let id = state.alloc_id();
+        state.buffers.insert(id, RegisteredBuffer { buffer, len });
+        state.textures.insert(id, texture);
+        Ok(SharedTexture2d {
+            texture_id: VmTextureId(id),
+            buffer_id: VmBufferId(id),
+            width,
+            height,
+            bytes_per_row,
+            len,
+        })
+    }
+}
+
+/// One contiguous encoder segment of a version 3 command stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// Segment class and the command range it encodes.
+    pub kind: SegmentKind,
+}
+
+/// Encoder class and command range of a [`Segment`].
+///
+/// Ranges index the submission's command slice. A render range includes any
+/// state commands recorded before `BeginRenderPass` up to (excluding) the
+/// matching `EndRenderPass`; the `Begin`/`End` commands themselves are skipped
+/// by the executor and the pass descriptor comes from `pass_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentKind {
+    /// One `MTLComputeCommandEncoder` over this command range.
+    Compute(Range<usize>),
+    /// One `MTLRenderCommandEncoder` for render pass `pass_index`.
+    Render {
+        /// Zero-based index of the `BeginRenderPass` in submission order.
+        pass_index: usize,
+        /// Commands replayed inside the encoder.
+        range: Range<usize>,
+    },
+    /// One `MTLBlitCommandEncoder` over this command range.
+    Blit(Range<usize>),
+}
+
+impl Segment {
+    /// The command range this segment encodes.
+    pub fn range(&self) -> Range<usize> {
+        match &self.kind {
+            SegmentKind::Compute(range) | SegmentKind::Blit(range) => range.clone(),
+            SegmentKind::Render { range, .. } => range.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkKind {
+    Compute,
+    Render,
+    Blit,
+}
+
+fn plan_error(message: &'static str) -> MetalError {
+    MetalError::InvalidArg(message)
+}
+
+/// Plans contiguous encoder segments for one version 3 command stream.
+///
+/// This is a pure CPU function: it inspects opcodes and ordering only, creates
+/// no Metal objects and can be tested without a device. The rules are exactly
+/// those ADR-006 needs for a single command buffer:
+///
+/// * Consecutive compute dispatches (including state commands and explicit
+///   barriers between them) share one [`SegmentKind::Compute`].
+/// * Each `BeginRenderPass`/`EndRenderPass` pair is one
+///   [`SegmentKind::Render`], including every draw and state command inside it
+///   and any state recorded immediately before the `Begin`.
+/// * Consecutive copies share one [`SegmentKind::Blit`].
+/// * Compute, copy and present commands inside an open pass, a second `Begin`
+///   without `End`, `End` without `Begin`, a draw without a graphics pipeline,
+///   and any command after `Present` are explicit [`MetalError::InvalidArg`]
+///   errors instead of being silently dropped.
+///
+/// A trailing open pass or a state command that is never followed by work is
+/// also an error; nothing is skipped without the caller knowing.
+pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, MetalError> {
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut current: Option<(WorkKind, usize)> = None;
+    let mut pass_open: Option<usize> = None;
+    let mut pass_count = 0usize;
+    let mut graphics_pipeline_selected = false;
+    let mut cursor = 0usize;
+    let mut pending_work_state = 0usize;
+    let mut presented = false;
+
+    for (index, command) in commands.iter().enumerate() {
+        if presented {
+            return Err(plan_error("commands are recorded after Present"));
+        }
+        match command {
+            CommandV3::Dispatch1d(dispatch) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("compute dispatch inside an open render pass"));
+                }
+                if dispatch.pipeline_id == 0
+                    || dispatch.threads == 0
+                    || dispatch.threads_per_group == 0
+                {
+                    return Err(plan_error(
+                        "dispatch pipeline handle and thread counts must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Compute, segment_index)) => {
+                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Compute(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Compute, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::Dispatch3d(dispatch) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("compute dispatch inside an open render pass"));
+                }
+                if dispatch.pipeline_id == 0
+                    || dispatch.group_counts.contains(&0)
+                    || dispatch.threads_per_group.contains(&0)
+                    || dispatch.checked_total_threads().is_none()
+                {
+                    return Err(plan_error(
+                        "3D dispatch handle, dimensions and thread product must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Compute, segment_index)) => {
+                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Compute(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Compute, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::DispatchMesh(mesh) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("mesh dispatch inside an open render pass"));
+                }
+                if mesh.pipeline_id == 0 || mesh.group_counts.contains(&0) {
+                    return Err(plan_error(
+                        "mesh dispatch pipeline handle and group counts must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Compute, segment_index)) => {
+                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Compute(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Compute, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::CopyBuffer(copy) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("buffer copy inside an open render pass"));
+                }
+                if copy.length == 0 {
+                    return Err(plan_error("buffer copy length must be nonzero"));
+                }
+                match current {
+                    Some((WorkKind::Blit, segment_index)) => {
+                        if let SegmentKind::Blit(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Blit(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Blit, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::CopyTexture(copy) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("texture copy inside an open render pass"));
+                }
+                if copy.width == 0 || copy.height == 0 || copy.depth == 0 {
+                    return Err(plan_error(
+                        "texture copy width, height and depth must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Blit, segment_index)) => {
+                        if let SegmentKind::Blit(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Blit(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Blit, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::BeginRenderPass(pass) => {
+                if pass_open.is_some() {
+                    return Err(plan_error(
+                        "BeginRenderPass while a render pass is already open",
+                    ));
+                }
+                if pass.colors.is_empty() || pass.colors.len() > MAX_COLOR_ATTACHMENTS {
+                    return Err(plan_error("render pass needs 1..=8 colour attachments"));
+                }
+                for color in &pass.colors {
+                    if color.allocation_id == 0 || color.generation == 0 {
+                        return Err(plan_error(
+                            "colour attachment allocation and generation must be nonzero",
+                        ));
+                    }
+                }
+                if let Some(depth) = &pass.depth_stencil
+                    && (depth.allocation_id == 0 || depth.generation == 0)
+                {
+                    return Err(plan_error(
+                        "depth attachment allocation and generation must be nonzero",
+                    ));
+                }
+                pass_count += 1;
+                let pass_index = pass_count - 1;
+                segments.push(Segment {
+                    kind: SegmentKind::Render {
+                        pass_index,
+                        range: cursor..index + 1,
+                    },
+                });
+                pass_open = Some(segments.len() - 1);
+                current = Some((WorkKind::Render, segments.len() - 1));
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::EndRenderPass => {
+                let Some(segment_index) = pass_open.take() else {
+                    return Err(plan_error("EndRenderPass without an open render pass"));
+                };
+                if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind {
+                    range.end = index;
+                }
+                current = None;
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::Draw(_)
+            | CommandV3::DrawIndexed(_)
+            | CommandV3::DrawInstanced(_)
+            | CommandV3::DrawIndexedInstanced(_) => {
+                if pass_open.is_none() {
+                    return Err(plan_error("draw outside a render pass"));
+                }
+                if !graphics_pipeline_selected {
+                    return Err(plan_error("draw requires a preceding SetGraphicsPipeline"));
+                }
+                if let Some((WorkKind::Render, segment_index)) = current {
+                    if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind
+                        && range.end < index + 1
+                    {
+                        range.end = index + 1;
+                    }
+                } else {
+                    return Err(plan_error("draw outside a render pass"));
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::SetGraphicsPipeline(pipeline) => {
+                if pipeline.pipeline_id == 0 {
+                    return Err(plan_error("graphics pipeline handle must be nonzero"));
+                }
+                graphics_pipeline_selected = true;
+                if pass_open.is_none() {
+                    // Pipeline selection before Begin is host-side state; it is
+                    // still part of the pending run so the render range covers
+                    // it, but it is not "work state" that must be followed by a
+                    // dispatch or draw.
+                    continue;
+                }
+            }
+            CommandV3::SetMeshPipeline(pipeline) => {
+                if pipeline.pipeline_id == 0 {
+                    return Err(plan_error("mesh pipeline handle must be nonzero"));
+                }
+                // A mesh pipeline cannot serve a normal draw; a following draw
+                // must re-select a graphics pipeline.
+                graphics_pipeline_selected = false;
+                if pass_open.is_none() {
+                    continue;
+                }
+            }
+            CommandV3::SetPipeline(pipeline) => {
+                if pipeline.pipeline_id == 0 {
+                    return Err(plan_error("pipeline handle must be nonzero"));
+                }
+                graphics_pipeline_selected = true;
+                if pass_open.is_none() {
+                    continue;
+                }
+            }
+            CommandV3::SetComputePipeline(pipeline) => {
+                if pipeline.pipeline_id == 0 {
+                    return Err(plan_error("compute pipeline handle must be nonzero"));
+                }
+                if pass_open.is_some() {
+                    return Err(plan_error("compute pipeline inside an open render pass"));
+                }
+            }
+            CommandV3::ResourceBarrier(barrier) => {
+                if barrier.entries.is_empty() {
+                    return Err(plan_error("resource barrier needs at least one entry"));
+                }
+                if pass_open.is_none() {
+                    if let Some((WorkKind::Compute, segment_index)) = current {
+                        // Keep consecutive dispatches in one encoder; the
+                        // explicit barrier is emitted inside it.
+                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                        cursor = index + 1;
+                        pending_work_state = 0;
+                        continue;
+                    }
+                    if let Some((WorkKind::Blit, _)) = current {
+                        // A blit encoder has no `memoryBarrier`; the encoder
+                        // boundary after the barrier provides the fence, so the
+                        // current blit segment closes and the barrier stays in
+                        // the pending run for the next segment.
+                        current = None;
+                    }
+                }
+                pending_work_state += 1;
+                if pass_open.is_some() {
+                    pending_work_state = 0;
+                }
+            }
+            CommandV3::Present(present) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("Present inside an open render pass"));
+                }
+                if present.surface_id == 0 {
+                    return Err(plan_error("Present surface handle must be nonzero"));
+                }
+                if pending_work_state > 0 {
+                    return Err(plan_error(
+                        "state commands are not followed by work before Present",
+                    ));
+                }
+                presented = true;
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::SetViewport(_)
+            | CommandV3::SetScissor(_)
+            | CommandV3::SetPrimitiveTopology(_)
+            | CommandV3::SetVertexBuffers(_)
+            | CommandV3::SetIndexBuffer(_)
+            | CommandV3::SetRootConstants(_)
+            | CommandV3::SetDescriptorTable(_)
+            | CommandV3::SetRootBufferView(_) => {
+                if pass_open.is_some() {
+                    // Inside a pass the contiguous range already covers this
+                    // command up to `EndRenderPass`.
+                    continue;
+                }
+                pending_work_state += 1;
+            }
+        }
+    }
+
+    if pass_open.is_some() {
+        return Err(plan_error(
+            "render pass is opened but never ended with EndRenderPass",
+        ));
+    }
+    if pending_work_state > 0 {
+        return Err(plan_error(
+            "state commands are not followed by a dispatch, draw or copy",
+        ));
+    }
+    Ok(segments)
+}
+
 #[link(name = "objc")]
 unsafe extern "C" {
     fn objc_msgSend();
+}
+
+unsafe fn msg_send_void_u32(target: objc::Id, s: objc::Sel, value: u32) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, u32);
+    // SAFETY: Caller supplies a valid receiver/selector taking one `uint32_t`.
+    let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe { f(target, s, value) }
+}
+
+unsafe fn msg_send_texture_from_buffer(
+    buffer: objc::Id,
+    s: objc::Sel,
+    descriptor: objc::Id,
+    offset: usize,
+    bytes_per_row: usize,
+) -> objc::Id {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, usize) -> objc::Id;
+    // SAFETY: Caller supplies a live `MTLBuffer` with at least
+    // `offset + rows * bytes_per_row` bytes and a matching texture descriptor.
+    let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe { f(buffer, s, descriptor, offset, bytes_per_row) }
+}
+
+unsafe fn msg_send_draw_primitives_instanced(
+    target: objc::Id,
+    s: objc::Sel,
+    primitive: usize,
+    vertex_start: usize,
+    vertex_count: usize,
+    instance_count: usize,
+    base_instance: usize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, usize, usize);
+    // SAFETY: Caller supplies a valid render encoder and nonzero counts.
+    let f: Fn = unsafe { mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    // SAFETY: `f` matches the selector's documented argument layout.
+    unsafe {
+        f(
+            target,
+            s,
+            primitive,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        )
+    }
 }
 
 unsafe fn msg_send_id_usize(target: objc::Id, s: objc::Sel, value: usize) -> objc::Id {
@@ -1837,5 +2981,388 @@ mod tests {
             "render depth pass: device={}, depth_clear=1.0, pixels={PIXEL_COUNT}",
             device.name_str()
         );
+    }
+    // ---- plan_encoder_segments (pure CPU, no Metal objects) ----------------
+
+    use crate::wire::{BarrierEntry, Dispatch1d, ResourceBarrier};
+    use crate::wire_v3::{
+        BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture, DrawIndexedState,
+        DrawState, LoadOp, PipelineRef, Present, ScissorRect as WireScissor, StoreOp,
+        Viewport as WireViewport,
+    };
+
+    fn segment_dispatch(pipeline_id: u64) -> CommandV3 {
+        CommandV3::Dispatch1d(Dispatch1d {
+            pipeline_id,
+            threads: 64,
+            threads_per_group: 64,
+            bindings: Vec::new(),
+        })
+    }
+
+    fn segment_begin() -> CommandV3 {
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![ColorAttachment {
+                allocation_id: 1,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            }],
+            depth_stencil: None,
+        })
+    }
+
+    fn segment_begin_with_colors(count: usize) -> CommandV3 {
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: (0..count)
+                .map(|_| ColorAttachment {
+                    allocation_id: 1,
+                    generation: 1,
+                    mip_level: 0,
+                    slice: 0,
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                    clear_color: [0.0; 4],
+                })
+                .collect(),
+            depth_stencil: None,
+        })
+    }
+
+    fn segment_pipeline() -> CommandV3 {
+        CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id: 7 })
+    }
+
+    fn segment_viewport() -> CommandV3 {
+        CommandV3::SetViewport(WireViewport {
+            x: 0.0,
+            y: 0.0,
+            width: 64.0,
+            height: 64.0,
+            near: 0.0,
+            far: 1.0,
+        })
+    }
+
+    fn segment_scissor() -> CommandV3 {
+        CommandV3::SetScissor(WireScissor {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        })
+    }
+
+    fn segment_draw() -> CommandV3 {
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        })
+    }
+
+    fn segment_draw_indexed() -> CommandV3 {
+        CommandV3::DrawIndexed(DrawIndexedState {
+            index_count: 3,
+            instance_count: 1,
+            start_index: 0,
+            base_vertex: 0,
+            start_instance: 0,
+        })
+    }
+
+    fn segment_copy_buffer() -> CommandV3 {
+        CommandV3::CopyBuffer(CopyBuffer {
+            src_allocation_id: 1,
+            src_generation: 1,
+            src_offset: 0,
+            dst_allocation_id: 2,
+            dst_generation: 1,
+            dst_offset: 0,
+            length: 16,
+        })
+    }
+
+    fn segment_copy_texture() -> CommandV3 {
+        CommandV3::CopyTexture(CopyTexture {
+            src_allocation_id: 1,
+            src_generation: 1,
+            src_mip: 0,
+            src_slice: 0,
+            dst_allocation_id: 2,
+            dst_generation: 1,
+            dst_mip: 0,
+            dst_slice: 0,
+            width: 64,
+            height: 64,
+            depth: 1,
+        })
+    }
+
+    fn segment_barrier() -> CommandV3 {
+        CommandV3::ResourceBarrier(ResourceBarrier {
+            entries: vec![BarrierEntry {
+                allocation_id: 1,
+                generation: 1,
+                offset: 0,
+                length: 16,
+                before_state: 0,
+                after_state: 1,
+            }],
+        })
+    }
+
+    fn segment_present() -> CommandV3 {
+        CommandV3::Present(Present {
+            surface_id: 1,
+            sync_interval: 1,
+        })
+    }
+
+    #[test]
+    fn segment_plan_coalesces_consecutive_dispatches_into_one_compute_segment() {
+        let plan = plan_encoder_segments(&[
+            segment_dispatch(1),
+            segment_dispatch(2),
+            segment_dispatch(3),
+        ])
+        .expect("three dispatches should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..3)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_keeps_consecutive_dispatches_with_barrier_in_one_segment() {
+        let plan =
+            plan_encoder_segments(&[segment_dispatch(1), segment_barrier(), segment_dispatch(2)])
+                .expect("a barrier between dispatches should keep one compute segment");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..3)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_coalesces_copies_into_one_blit_segment() {
+        let plan = plan_encoder_segments(&[segment_copy_buffer(), segment_copy_texture()])
+            .expect("two copies should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Blit(0..2)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_uses_one_render_segment_per_pass_and_covers_its_commands() {
+        let plan = plan_encoder_segments(&[
+            segment_pipeline(),
+            segment_begin(),
+            segment_viewport(),
+            segment_scissor(),
+            segment_draw(),
+            segment_draw_indexed(),
+            CommandV3::EndRenderPass,
+            segment_begin(),
+            segment_draw(),
+            CommandV3::EndRenderPass,
+        ])
+        .expect("two passes with draws should plan");
+
+        assert_eq!(plan.len(), 2, "one render segment per pass: {plan:?}");
+        assert_eq!(
+            plan[0],
+            Segment {
+                kind: SegmentKind::Render {
+                    pass_index: 0,
+                    range: 0..6,
+                }
+            },
+            "the first pass owns its pipeline state, both draws and excludes End"
+        );
+        assert_eq!(
+            plan[1],
+            Segment {
+                kind: SegmentKind::Render {
+                    pass_index: 1,
+                    range: 7..9,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn segment_plan_splits_segments_on_encoder_class_changes() {
+        let plan = plan_encoder_segments(&[
+            segment_dispatch(1),
+            segment_copy_buffer(),
+            segment_pipeline(),
+            segment_begin(),
+            segment_draw(),
+            CommandV3::EndRenderPass,
+            segment_copy_texture(),
+            segment_dispatch(2),
+        ])
+        .expect("mixed encoder classes should plan");
+
+        assert_eq!(plan.len(), 5, "expected five segments: {plan:?}");
+        assert_eq!(
+            plan[0],
+            Segment {
+                kind: SegmentKind::Compute(0..1)
+            }
+        );
+        assert_eq!(
+            plan[1],
+            Segment {
+                kind: SegmentKind::Blit(1..2)
+            }
+        );
+        assert!(matches!(
+            plan[2].kind,
+            SegmentKind::Render { pass_index: 0, .. }
+        ));
+        assert_eq!(
+            plan[3],
+            Segment {
+                kind: SegmentKind::Blit(6..7)
+            }
+        );
+        assert_eq!(
+            plan[4],
+            Segment {
+                kind: SegmentKind::Compute(7..8)
+            }
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_empty_command_list_with_no_segments() {
+        assert!(
+            plan_encoder_segments(&[])
+                .expect("empty stream is legal")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_dispatch_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_dispatch(1),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("compute inside a pass must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("open render pass")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_copy_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_copy_buffer(),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("copy inside a pass must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_present_inside_an_open_pass() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_present()])
+            .expect_err("present inside a pass must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_end_without_begin() {
+        let error = plan_encoder_segments(&[CommandV3::EndRenderPass])
+            .expect_err("EndRenderPass without Begin must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("without an open render pass")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_draw_without_a_graphics_pipeline() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_draw()])
+            .expect_err("draw without a pipeline must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("SetGraphicsPipeline")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_second_begin_before_end() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_begin()])
+            .expect_err("a second Begin must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("already open")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_commands_after_present() {
+        let error = plan_encoder_segments(&[segment_present(), segment_dispatch(1)])
+            .expect_err("work after Present must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("after Present")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_accepts_present_as_the_last_command() {
+        let plan = plan_encoder_segments(&[segment_dispatch(1), segment_present()])
+            .expect("a terminal Present should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Compute(0..1)
+            }]
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_an_unclosed_pass() {
+        let error = plan_encoder_segments(&[segment_begin(), segment_pipeline(), segment_draw()])
+            .expect_err("an unclosed pass must be refused");
+        assert!(
+            matches!(error, MetalError::InvalidArg(message) if message.contains("never ended")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_more_than_eight_color_attachments() {
+        let error =
+            plan_encoder_segments(&[segment_begin_with_colors(9), CommandV3::EndRenderPass])
+                .expect_err("nine color attachments must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_zero_color_attachments() {
+        let error =
+            plan_encoder_segments(&[segment_begin_with_colors(0), CommandV3::EndRenderPass])
+                .expect_err("an empty MRT must be refused");
+        assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
     }
 }
