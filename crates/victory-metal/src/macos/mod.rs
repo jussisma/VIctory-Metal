@@ -2,5 +2,5 @@
 
 pub mod c_api;
 pub mod device;
-pub(crate) mod irconverter;
+pub mod irconverter;
 pub(crate) mod objc;
