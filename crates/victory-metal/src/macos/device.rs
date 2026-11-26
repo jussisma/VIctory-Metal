@@ -255,7 +255,9 @@ fn open_graphics_segment(
 }
 
 /// Reads a private render target back through a shared `MTLBuffer` blit.
-#[cfg(test)]
+///
+/// Public because a host-side diagnostic or the frame gate needs to observe
+/// what was drawn without a second render path.
 fn read_back_render_target(
     transport: &DirectMetalTransport,
     target: &RenderTarget,
@@ -336,8 +338,7 @@ fn read_back_render_target(
     Ok(bytes.to_vec())
 }
 
-/// Apple `MTLOrigin` (`NSUInteger x, y, z`) for the test readback blit.
-#[cfg(test)]
+/// Apple `MTLOrigin` (`NSUInteger x, y, z`) for the readback blit.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct HostOrigin {
@@ -348,7 +349,6 @@ struct HostOrigin {
 
 /// `-[MTLBlitCommandEncoder copyFromTexture:...toBuffer:...]` for a level-0
 /// 2D slice.
-#[cfg(test)]
 unsafe fn msg_send_copy_texture_to_buffer(
     enc: objc::Id,
     texture: objc::Id,
@@ -392,7 +392,6 @@ unsafe fn msg_send_copy_texture_to_buffer(
     }
 }
 
-#[cfg(test)]
 #[link(name = "objc")]
 unsafe extern "C" {
     fn objc_msgSend();
@@ -550,8 +549,12 @@ impl DirectMetalTransport {
     /// Test-only: a blit copies the private texture into a shared `MTLBuffer`,
     /// then the host maps that buffer. The state lock is held through the
     /// synchronous blit, so the target cannot be re-rendered concurrently.
-    #[cfg(test)]
-    pub(crate) fn host_target_pixels(&self) -> Result<Vec<[u8; 4]>, MetalError> {
+    /// Returns the pixels of the shared host render target in row-major
+    /// `[r, g, b, a]` order after the last executed graphics list.
+    ///
+    /// This is a diagnostic readback: it blits the private texture to a
+    /// shared buffer and waits. It is never part of the present path.
+    pub fn host_target_pixels(&self) -> Result<Vec<[u8; 4]>, MetalError> {
         self.ensure_host_target()?;
         let state = self.lock_state()?;
         let target = state.host_target.as_ref().ok_or_else(|| {

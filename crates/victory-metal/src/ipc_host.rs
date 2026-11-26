@@ -735,12 +735,21 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn bindings_within_logical_lengths(&self, command: &Command) -> bool {
+        // Every command that names buffers is checked here so the executor
+        // never resolves a range past its allocation's logical length. State
+        // and barrier commands carry no draw bindings; the device validates
+        // their own fields (handles, generations, entry counts) before it
+        // creates a command buffer.
         let bindings = match command {
             Command::Dispatch1d(dispatch) => &dispatch.bindings,
             Command::Dispatch3d(dispatch) => &dispatch.bindings,
-            // Graphics and state commands are not executable by the compute
-            // host yet; refuse them before any range reaches the GPU.
-            _ => return false,
+            Command::DrawIndexed(draw) => &draw.bindings,
+            Command::Draw(draw) => &draw.bindings,
+            Command::DispatchMesh(dispatch) => &dispatch.bindings,
+            Command::DescriptorTable(table) => &table.bindings,
+            Command::SetPipeline(_) | Command::RootConstants(_) | Command::ResourceBarrier(_) => {
+                return true;
+            }
         };
         bindings
             .iter()
