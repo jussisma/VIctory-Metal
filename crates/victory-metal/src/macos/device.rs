@@ -27,20 +27,21 @@ const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// layouts should place every typed declaration on its natural alignment.
 const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
-struct RegisteredBuffer {
-    buffer: ObjcObject,
+pub(crate) struct RegisteredBuffer {
+    pub(crate) buffer: ObjcObject,
     /// Byte length reported to Metal at registration time.
-    len: usize,
+    pub(crate) len: usize,
 }
 
-struct DeviceState {
+pub(crate) struct DeviceState {
     next_id: u64,
-    buffers: HashMap<u64, RegisteredBuffer>,
+    pub(crate) buffers: HashMap<u64, RegisteredBuffer>,
     pipelines: HashMap<u64, ObjcObject>,
+    pub(crate) textures: HashMap<u64, ObjcObject>,
 }
 
 impl DeviceState {
-    fn alloc_id(&mut self) -> u64 {
+    pub(crate) fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
@@ -77,8 +78,32 @@ impl DirectMetalTransport {
                 next_id: 1,
                 buffers: HashMap::new(),
                 pipelines: HashMap::new(),
+                textures: HashMap::new(),
             }),
         })
+    }
+
+    /// Raw retained `MTLDevice` handle for sibling modules that allocate GPU objects.
+    pub(crate) fn device_raw(&self) -> objc::Id {
+        self.device.as_raw()
+    }
+
+    /// Raw retained `MTLCommandQueue` handle.
+    ///
+    /// Blits submitted through this queue share its serial execution order with
+    /// [`DirectMetalTransport::submit_batch`] and `dispatch_compute_1d`.
+    pub(crate) fn queue_raw(&self) -> objc::Id {
+        self.queue.as_raw()
+    }
+
+    /// Locks the allocation registry.
+    ///
+    /// Callers must hold the guard until any GPU work that references registry
+    /// objects has completed, exactly like the existing batch and legacy paths.
+    pub(crate) fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, DeviceState>, MetalError> {
+        self.state
+            .lock()
+            .map_err(|_| MetalError::InternalError("Metal state mutex poisoned".to_string()))
     }
 
     fn create_compute_pipeline(
