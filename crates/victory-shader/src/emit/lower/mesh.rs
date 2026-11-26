@@ -40,6 +40,37 @@ fn element_bytes(e: &SigElement) -> u32 {
     4 * u32::from(e.cols)
 }
 
+/// Whether `elements` come in the order the container writes them (by
+/// register, unallocated last). Both packers only touch such vectors.
+fn register_sorted(elements: &[SigElement]) -> bool {
+    elements
+        .windows(2)
+        .all(|w| w[0].row.unwrap_or(u32::MAX) <= w[1].row.unwrap_or(u32::MAX))
+}
+
+/// Where the host starts a mesh vertex's output layout: every clip/cull
+/// distance component as a 4-byte scalar, then the 16-byte position. The
+/// distances are counted again in signature order by [`fold`], as the host
+/// counts them.
+fn head_bytes(elements: &[SigElement]) -> u32 {
+    let distances: u32 = elements
+        .iter()
+        .filter(|e| matches!(e.kind, 6 | 7))
+        .map(|e| u32::from(e.cols))
+        .sum();
+    4 * distances + 16
+}
+
+/// Metal's aligned end for `sizes` laid out in order from `end`: every
+/// element is rounded up to its own size (4, 8, 12 or 16 bytes). This is the
+/// fold the host applies to a mesh output signature.
+fn fold(sizes: &[u32], mut end: u32) -> u32 {
+    for &size in sizes {
+        end = end.next_multiple_of(size) + size;
+    }
+    end
+}
+
 /// Reorders the arbitrary (`kind == 0`) elements **within each register row**
 /// to the order Metal's aligned output layout counts smallest. The host lays
 /// mesh outputs out as the clip/cull distances, the position (16 bytes), then
@@ -55,19 +86,11 @@ fn element_bytes(e: &SigElement) -> u32 {
 pub(super) fn pack_rows(elements: &mut [SigElement]) {
     // Only act on the register-sorted vectors the container writes; anything
     // else keeps its declared order.
-    if !elements.windows(2).all(|w| {
-        w[0].row.unwrap_or(u32::MAX) <= w[1].row.unwrap_or(u32::MAX)
-    }) {
+    if !register_sorted(elements) {
         return;
     }
     // Where the host starts: clip/cull distances, then the position.
-    let distances: u32 = elements
-        .iter()
-        .filter(|e| matches!(e.kind, 6 | 7))
-        .map(element_bytes)
-        .sum();
-    let has_position = elements.iter().any(|e| e.kind == 3);
-    let mut end = distances + if has_position { 16 } else { 0 };
+    let mut end = head_bytes(elements);
     let mut i = 0;
     while i < elements.len() {
         let row = elements[i].row;
@@ -75,11 +98,11 @@ pub(super) fn pack_rows(elements: &mut [SigElement]) {
         while j < elements.len() && elements[j].row == row {
             j += 1;
         }
-        // A register row holds at most four one-component elements.
-        if row.is_some()
-            && (2..=4).contains(&(j - i))
-            && elements[i..j].iter().all(|e| e.kind == 0)
-        {
+        // A row's own elements are ordered when that ends smaller. Rows of
+        // one element have nothing to order, and rows holding a system value
+        // are left as declared. Rows may hold more elements than four
+        // components when masks overlap; `least_padded` bounds its search.
+        if row.is_some() && j - i >= 2 && elements[i..j].iter().all(|e| e.kind == 0) {
             let order = least_padded(&elements[i..j], end);
             if order.iter().enumerate().any(|(at, &k)| at != k) {
                 let before: Vec<SigElement> = elements[i..j].to_vec();
@@ -90,13 +113,12 @@ pub(super) fn pack_rows(elements: &mut [SigElement]) {
         }
         // Mirror the host: the position is part of the fixed start, distances
         // are counted again in signature order as it counts them.
-        for e in &elements[i..j] {
-            if e.kind == 3 {
-                continue;
-            }
-            let size = element_bytes(e);
-            end = end.next_multiple_of(size) + size;
-        }
+        let sizes: Vec<u32> = elements[i..j]
+            .iter()
+            .filter(|e| e.kind != 3)
+            .map(element_bytes)
+            .collect();
+        end = fold(&sizes, end);
         i = j;
     }
 }
@@ -110,21 +132,28 @@ pub(super) fn pack_rows(elements: &mut [SigElement]) {
 /// component type and interpolation mode, and a guest row still names the
 /// same elements. Only the register numbers the host lays the signature out
 /// by change, among the arbitrary row numbers the signature already has: the
-/// fixed position row and every other system value stay where they are.
+/// position row and every clip/cull distance row stay where they are.
 pub(super) fn row_order(elements: &[SigElement]) -> Option<HashMap<u32, u32>> {
     // Only the register-sorted vectors the container writes.
-    if !elements.windows(2).all(|w| {
-        w[0].row.unwrap_or(u32::MAX) <= w[1].row.unwrap_or(u32::MAX)
-    }) {
+    if !register_sorted(elements) {
         return None;
     }
-    // Proven safe only beside the position: no 16-bit values, no other
-    // system values (so no distance rows), and one mode per moved row.
-    if elements.iter().any(|e| e.half || !matches!(e.kind, 0 | 3)) {
+    // Proven safe only beside the position: no 16-bit values (their halves
+    // pair by guest row), and no system values besides the position and the
+    // clip/cull distances, which stay fixed.
+    if elements
+        .iter()
+        .any(|e| e.half || !matches!(e.kind, 0 | 3 | 6 | 7))
+    {
         return None;
     }
-    let mut blocks: Vec<(u32, Vec<u32>)> = Vec::new();
-    let mut slots: Vec<u32> = Vec::new();
+    if elements.iter().filter(|e| e.kind == 3).count() > 1 {
+        return None;
+    }
+    // The row groups, by the size of each element: the fixed ones (a
+    // distance element's row) and the ones free to move.
+    let mut fixed: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut movable: Vec<(u32, Vec<u32>)> = Vec::new();
     let mut i = 0;
     while i < elements.len() {
         let row = elements[i].row?;
@@ -133,35 +162,48 @@ pub(super) fn row_order(elements: &[SigElement]) -> Option<HashMap<u32, u32>> {
             j += 1;
         }
         let group = &elements[i..j];
+        let sizes: Vec<u32> = group.iter().map(element_bytes).collect();
         if group.iter().any(|e| e.kind == 3) {
             // The position is fixed and one element; a mixed row is unproven.
             if group.len() != 1 || group[0].kind != 3 {
                 return None;
             }
+        } else if group.iter().any(|e| matches!(e.kind, 6 | 7)) {
+            fixed.push((row, sizes));
         } else {
-            let interp = group[0].interp;
-            if group.iter().any(|e| e.interp != interp) {
-                return None;
-            }
-            slots.push(row);
-            blocks.push((row, group.iter().map(|e| 4 * u32::from(e.cols)).collect()));
+            movable.push((row, sizes));
         }
         i = j;
     }
-    if blocks.len() < 2 {
+    if movable.len() < 2 {
         return None;
     }
-    // The host's fold: the fixed 16-byte position, then every remaining
-    // element in signature order, each rounded up to its own size.
+    // The rows a movable block may take, and every slot either kind fills,
+    // in the signature order the host lays them out in.
+    let mut movable_slots: Vec<u32> = movable.iter().map(|b| b.0).collect();
+    movable_slots.sort_unstable();
+    let mut slots: Vec<u32> = movable_slots.iter().copied().chain(fixed.iter().map(|f| f.0)).collect();
+    slots.sort_unstable();
+    let fixed_at: HashMap<u32, &[u32]> =
+        fixed.iter().map(|(row, sizes)| (*row, sizes.as_slice())).collect();
+    let head = head_bytes(elements);
+    // The host's fold: the fixed start, then every remaining element in
+    // signature order, each rounded up to its own size.
     let end = |order: &[usize]| -> u32 {
-        order.iter().fold(16, |end, &b| {
-            blocks[b]
-                .1
-                .iter()
-                .fold(end, |end, &size| end.next_multiple_of(size) + size)
-        })
+        let mut assigned: HashMap<u32, &[u32]> = HashMap::new();
+        for (at, &block) in order.iter().enumerate() {
+            assigned.insert(movable_slots[at], movable[block].1.as_slice());
+        }
+        let mut end = head;
+        for slot in &slots {
+            // Every slot is a fixed row or one of the movable ones.
+            if let Some(&sizes) = assigned.get(slot).or_else(|| fixed_at.get(slot)) {
+                end = fold(sizes, end);
+            }
+        }
+        end
     };
-    let n = blocks.len();
+    let n = movable.len();
     let identity: Vec<usize> = (0..n).collect();
     let start = end(&identity);
     // Largest registers first: one that ends on a 16-byte boundary leaves
@@ -169,7 +211,7 @@ pub(super) fn row_order(elements: &[SigElement]) -> Option<HashMap<u32, u32>> {
     let mut seeds = vec![identity.clone()];
     let mut by_size: Vec<usize> = (0..n).collect();
     by_size.sort_by_key(|&b| {
-        let sizes = &blocks[b].1;
+        let sizes = &movable[b].1;
         (
             std::cmp::Reverse(sizes.iter().sum::<u32>()),
             std::cmp::Reverse(sizes.iter().copied().max().unwrap_or(0)),
@@ -179,7 +221,7 @@ pub(super) fn row_order(elements: &[SigElement]) -> Option<HashMap<u32, u32>> {
     seeds.push(by_size);
     let mut by_lead: Vec<usize> = (0..n).collect();
     by_lead.sort_by_key(|&b| {
-        let sizes = &blocks[b].1;
+        let sizes = &movable[b].1;
         (
             std::cmp::Reverse(sizes.first().copied().unwrap_or(0)),
             std::cmp::Reverse(sizes.iter().sum::<u32>()),
@@ -231,14 +273,16 @@ pub(super) fn row_order(elements: &[SigElement]) -> Option<HashMap<u32, u32>> {
         best_order
             .iter()
             .enumerate()
-            .map(|(at, &b)| (blocks[b].0, slots[at]))
+            .map(|(at, &b)| (movable[b].0, movable_slots[at]))
             .collect(),
     )
 }
 
 /// The order of `elements` that leaves the smallest aligned end after
-/// `start`. Rows carry at most four elements, so trying every order is
-/// bounded; on ties the declared order is kept.
+/// `start`. A register row's elements usually number at most four, which is
+/// tried exhaustively (so ties keep the declared order); rows whose masks
+/// overlap can declare more, and those try a bounded set of size orders
+/// instead.
 fn least_padded(elements: &[SigElement], start: u32) -> Vec<usize> {
     fn walk(
         sizes: &[u32],
@@ -248,11 +292,10 @@ fn least_padded(elements: &[SigElement], start: u32) -> Vec<usize> {
         best: &mut (u32, Vec<usize>),
     ) {
         if order.len() == sizes.len() {
-            let mut end = start;
-            for &k in order.iter() {
-                let size = sizes[k];
-                end = end.next_multiple_of(size) + size;
-            }
+            let end = fold(
+                &order.iter().map(|&k| sizes[k]).collect::<Vec<u32>>(),
+                start,
+            );
             if end < best.0 {
                 *best = (end, order.clone());
             }
@@ -270,14 +313,33 @@ fn least_padded(elements: &[SigElement], start: u32) -> Vec<usize> {
         }
     }
     let sizes: Vec<u32> = elements.iter().map(element_bytes).collect();
-    let mut best = (u32::MAX, (0..sizes.len()).collect());
-    walk(
-        &sizes,
-        start,
-        &mut Vec::with_capacity(sizes.len()),
-        &mut vec![false; sizes.len()],
-        &mut best,
-    );
+    let identity: Vec<usize> = (0..sizes.len()).collect();
+    let mut best = (u32::MAX, Vec::new());
+    if sizes.len() <= 6 {
+        // 6! is 720 orders, and a row cannot declare more one-component
+        // elements than it has dwords unless its masks overlap.
+        walk(
+            &sizes,
+            start,
+            &mut Vec::with_capacity(sizes.len()),
+            &mut vec![false; sizes.len()],
+            &mut best,
+        );
+        return best.1;
+    }
+    // More elements than a row can hold distinct components: try the
+    // declared order, widest first and narrowest first, keeping the first of
+    // equal ends (the declared order).
+    let mut widest = identity.clone();
+    widest.sort_by_key(|&k| std::cmp::Reverse(sizes[k]));
+    let mut narrowest = identity.clone();
+    narrowest.sort_by_key(|&k| sizes[k]);
+    for order in [identity, widest, narrowest] {
+        let end = fold(&order.iter().map(|&k| sizes[k]).collect::<Vec<u32>>(), start);
+        if end < best.0 {
+            best = (end, order);
+        }
+    }
     best.1
 }
 
@@ -339,5 +401,147 @@ impl Lower<'_> {
         );
         self.flat = Some(f);
         f
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    fn el(name: &str, kind: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: if kind == 3 { 4 } else { 2 },
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        }
+    }
+
+    fn aligned(els: &[SigElement], vertices: u32) -> u32 {
+        let distances: u32 = els
+            .iter()
+            .filter(|e| matches!(e.kind, 6 | 7))
+            .map(|e| 4 * u32::from(e.cols))
+            .sum();
+        let mut end = distances + 16;
+        for e in els.iter().filter(|e| e.kind != 3) {
+            let size = 4 * u32::from(e.cols);
+            end = end.next_multiple_of(size) + size;
+        }
+        end * vertices
+    }
+
+    fn packed(els: &[SigElement], vertices: u32) -> u32 {
+        4 * els.iter().map(|e| u32::from(e.cols)).sum::<u32>() * vertices
+    }
+
+    fn signature(rows: &[&[u8]]) -> Vec<SigElement> {
+        let mut out = vec![el("SV_Position", 3, 0, 0, 4)];
+        for (r, widths) in (1..).zip(rows) {
+            let mut col = 0;
+            for &cols in *widths {
+                out.push(el("TEXCOORD", 0, r, col, cols));
+                col += cols;
+            }
+        }
+        out
+    }
+
+    fn show(label: &str, mut elements: Vec<SigElement>, vertices: u32) {
+        let before = aligned(&elements, vertices);
+        let packed_before = packed(&elements, vertices);
+        pack_rows(&mut elements);
+        let after_rows = aligned(&elements, vertices);
+        let map = row_order(&elements);
+        let mut emitted = elements.clone();
+        if let Some(order) = &map {
+            for e in &mut emitted {
+                if let Some(m) = e.row.and_then(|r| order.get(&r).copied()) {
+                    e.row = Some(m);
+                }
+            }
+            emitted.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+        }
+        eprintln!(
+            "{label}: packed {packed_before} aligned {before} | rows {after_rows} | ordered {} aligned {} packed {}",
+            map.is_some(),
+            aligned(&emitted, vertices),
+            packed(&emitted, vertices)
+        );
+    }
+
+    #[test]
+    fn probe_shapes() {
+        let mut rows: Vec<&[u8]> = vec![&[4]; 29];
+        rows.push(&[1, 3]);
+        rows.extend([&[2][..]; 2]);
+        show("A 128c/64v", signature(&rows), 64);
+
+        let rows: Vec<&[u8]> = std::iter::once(&[1u8][..])
+            .chain(std::iter::repeat_n(&[4u8][..], 16))
+            .collect();
+        show("B 69c/118v", signature(&rows), 118);
+
+        let rows: Vec<&[u8]> = std::iter::repeat_n(&[4u8][..], 15)
+            .chain(std::iter::once(&[1u8][..]))
+            .collect();
+        show("C 65c/128v", signature(&rows), 128);
+
+        // Distances: position, a 4-wide clip distance, then a 3-wide row, two
+        // scalars and 14 full rows (112 vertices: packed under the budget,
+        // aligned over it until the rows are ordered).
+        let mut d = signature(&vec![&[4u8][..]; 0]);
+        let mut clip = el("SV_ClipDistance0", 6, 1, 0, 4);
+        clip.interp = 0;
+        d.push(clip);
+        for (r, widths) in (2..).zip([
+            &[3u8][..],
+            &[1][..],
+            &[1][..],
+        ]
+        .into_iter()
+        .chain(std::iter::repeat_n(&[4u8][..], 14)))
+        {
+            let mut col = 0;
+            for &cols in widths {
+                d.push(el("TEXCOORD", 0, r, col, cols));
+                col += cols;
+            }
+        }
+        d.sort_by_key(|e| e.row.unwrap());
+        show("D distances 69c/112v", d, 112);
+
+        // Mixed interpolation inside one row (float + int 1-component).
+        let mut m = vec![el("SV_Position", 3, 0, 0, 4)];
+        for r in 1..=16u32 {
+            if r == 9 {
+                m.push(el("TEXCOORD", 0, r, 0, 2));
+                let mut u = el("TEXCOORD", 0, r, 2, 1);
+                u.comp = 5;
+                u.interp = 1;
+                m.push(u);
+            } else {
+                m.push(el("TEXCOORD", 0, r, 0, 4));
+            }
+        }
+        show("E mixed interp 65c/64v", m, 64);
+
+        // Five elements in one register row (overlapping masks).
+        let mut f = vec![el("SV_Position", 3, 0, 0, 4)];
+        for r in 1..=15u32 {
+            f.push(el("TEXCOORD", 0, r, 0, 4));
+        }
+        f.push(el("TEXCOORD", 0, 16, 0, 1));
+        f.push(el("TEXCOORD", 0, 16, 0, 1));
+        f.push(el("TEXCOORD", 0, 16, 1, 1));
+        f.push(el("TEXCOORD", 0, 16, 2, 1));
+        f.push(el("TEXCOORD", 0, 16, 3, 1));
+        show("F five-in-row 65c/64v", f, 64);
     }
 }
