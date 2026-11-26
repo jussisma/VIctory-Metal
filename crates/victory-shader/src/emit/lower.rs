@@ -7329,12 +7329,30 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // A source every lane of the console wave holds gives every
+                // lane the value it reads, whatever console lane it names:
+                // no exchange is needed. `alike` is [`halves::lane_uniform`],
+                // so this is only taken for a value proved wave-uniform.
+                let source_uniform = self.halves
+                    && match v.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => inst
+                            .read(Reg::V(reg))
+                            .is_some_and(|x| self.alike.contains(&x)),
+                        // A scalar or a constant is one value for every lane.
+                        Some(&Operand::Scalar { code, .. }) => code != NULL,
+                        Some(&Operand::Const(_) | &Operand::Literal(_)) => true,
+                        _ => false,
+                    };
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
+                }
+                if source_uniform {
+                    // This lane already holds what any lane would read.
+                    return int(self, a);
                 }
                 if self.halves && !self.one_host_wave() {
                     if !self.across_here() {

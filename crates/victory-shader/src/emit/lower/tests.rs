@@ -1485,7 +1485,12 @@ const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
 const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
 const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
 const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
+const S_MOV_S22_0: u32 = 0xBE96_0380; // s_mov_b32 s22, 0
+const S_CMP_LT_S22_4: u32 = 0xBF0A_8416; // s_cmp_lt_u32 s22, 4
+const READLANE_S21_V0_40: [u32; 2] = [0xD760_0015, 0x0001_5100]; // v_readlane_b32 s21, v0, 40
 const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+const V_MOV_V2_V0: u32 = 0x7E04_0300; // v_mov_b32 v2, v0
+const READLANE_S12_V2_40: [u32; 2] = [0xD760_000C, 0x0001_5102]; // v_readlane_b32 s12, v2, 40
 const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
 const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502;
 const V_MOV_V2_1: u32 = 0x7E04_0281; // v_mov_b32 v2, 1 // v_readfirstlane_b32 s21, v2
@@ -1583,6 +1588,132 @@ fn lds_in_a_loop_on_a_uniform_first_lane_read_syncs_inside_the_loop() {
     assert_eq!(split_barriers(&w, 64, true), 2);
     assert_eq!(lowered(&w, 64, true).wave_size, None);
 }
+
+/// `v2 = 1` in every lane and a guard on an alike scalar: `s22 = 0 < 4`.
+/// `skip` is the number of words in the guarded instruction.
+fn uniform_guarded(skip: u32, before: &[u32]) -> Vec<u32> {
+    let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V2_1, S_MOV_S22_0, S_CMP_LT_S22_4];
+    w.push(0xBF84_0000 | skip);
+    w.extend_from_slice(before);
+    w
+}
+
+/// The block holding the loop's LDS write (the loop body).
+fn loop_body(p: &ir::Program) -> usize {
+    p.blocks
+        .iter()
+        .position(|b| b.insts.iter().any(|i| i.name().starts_with("ds_write")))
+        .expect("a loop body with an LDS write")
+}
+
+#[test]
+fn lds_in_a_wave_loop_on_a_uniform_guarded_first_lane_read_syncs() {
+    // The first-lane read of `v2` (one value per console wave) is reached
+    // only through `s22 < 4`, a branch on a scalar every lane computes
+    // alike: `in_step` keeps the region, so the read is one value for the
+    // whole wave and the loop on it is a `step` block.
+    let w = looped(
+        &uniform_guarded(1, &[READFIRSTLANE_S21_V2]),
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let body = loop_body(&p);
+    let unif: std::collections::HashSet<_> = p.blocks[0]
+        .insts
+        .iter()
+        .filter(|i| i.name() == "v_mov_b32")
+        .flat_map(|i| i.writes.iter().filter(|w| w.0 == crate::ir::Reg::V(2)))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(unif.len(), 1);
+    let at = barriers_at_unif(&p, &unif).expect("a barrier can go in the loop");
+    assert!(
+        at.contains(&(body, 0)) && at.contains(&(body, 1)),
+        "the guarded uniform read admits the loop: {at:?}"
+    );
+    assert_eq!(split_barriers(&w, 64, true), 2);
+    assert!(barriers_at(&p).is_none(), "no uniform source: no proof");
+}
+
+#[test]
+fn lds_in_a_wave_loop_on_a_uniform_guarded_constant_lane_read_syncs() {
+    // `v_readlane_b32 s21, v0, 40` reads one constant console lane, so it is
+    // one value for the whole wave; reaching it through a branch on an
+    // alike scalar keeps every lane together. The loop on it is a `step`.
+    let w = looped(
+        &uniform_guarded(2, &READLANE_S21_V0_40),
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let body = loop_body(&p);
+    let at = barriers_at_unif(&p, &std::collections::HashSet::new())
+        .expect("a constant console lane needs no uniform source");
+    assert!(
+        at.contains(&(body, 0)) && at.contains(&(body, 1)),
+        "the constant-lane count admits the loop: {at:?}"
+    );
+    assert_eq!(split_barriers(&w, 64, true), 2);
+}
+
+#[test]
+fn a_lane_dependent_guard_still_refuses_a_wave_constant_lane_count() {
+    // The same `v_readlane` under a per-lane EXEC guard: one host half's
+    // lanes enter and the other's may not, so the scalar is not alike and no
+    // barrier can go in the loop.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0];
+    w.extend_from_slice(&READLANE_S21_V0_40);
+    w.push(RESTORE_EXEC);
+    let w = looped(
+        &w,
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    assert!(barriers_at_unif(&p, &std::collections::HashSet::new()).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+#[test]
+fn a_wave_uniform_readlane_needs_no_half_exchange() {
+    // The read names console lane 40, in the other half, so it used to need
+    // an exchange and was refused where none can go (a per-lane branch). Its
+    // source is 1 in every lane, so the lane read is just that value: no
+    // exchange, no refusal. A lane-varying source still crosses and refuses.
+    let run = |source: u32| {
+        try_lowered(
+            &[
+                source,
+                SAVE_EXEC,
+                CMPX_V0_EQ_0,
+                0xBF88_0005, // s_cbranch_execz +5 (skip the read)
+                READLANE_S12_V2_40[0],
+                READLANE_S12_V2_40[1],
+                0xBF06_800C, // s_cmp_eq_u32 s12, 0
+                0xBF85_0001, // s_cbranch_scc1 +1
+                0xBF80_0000, // s_nop 0
+                RESTORE_EXEC,
+                S_ENDPGM,
+            ],
+            64,
+            true,
+            true,
+        )
+    };
+    let l = run(V_MOV_V2_1).expect("a wave-uniform source needs no exchange");
+    assert_eq!(l.wave_size, Some(32));
+    let neg = run(V_MOV_V2_V0);
+    let why = neg
+        .err()
+        .expect("a lane-varying source still crosses")
+        .to_string();
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
+}
+
 
 #[test]
 fn a_cross_half_ballot_in_a_one_wave_loop_on_a_uniform_first_lane_read_exchanges() {
