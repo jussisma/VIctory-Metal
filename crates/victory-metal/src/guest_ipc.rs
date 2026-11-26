@@ -75,7 +75,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::abi::VmPipelineId;
-use crate::wire::{self, Command, Reply, Submission, WireError};
+use crate::wire::{self, Command, ListIdentity, Reply, Submission, WireError};
 
 /// Frame kind for the first guest frame carrying the authentication secret.
 pub const KIND_HELLO: u8 = 1;
@@ -490,6 +490,33 @@ impl GuestIpcClient {
     /// The sequence is consumed only after the whole frame is written. Any
     /// transport, framing or decoding failure closes the session.
     pub fn submit(&mut self, submission: &Submission) -> Result<Reply, GuestIpcError> {
+        self.submit_with_identity(submission, None)
+    }
+
+    /// Builds a submission with the next sequence, tags it with `identity`, and
+    /// submits it.
+    ///
+    /// The list identity lets the host enforce exactly-once execution for a
+    /// recorded command list: a replay of an already executed list is refused
+    /// with [`crate::wire::ReplyStatus::AlreadyExecuted`] instead of running a
+    /// second time.
+    pub fn submit_with_list(
+        &mut self,
+        commands: Vec<Command>,
+        identity: ListIdentity,
+    ) -> Result<Reply, GuestIpcError> {
+        let submission = Submission {
+            sequence: self.next_sequence,
+            commands,
+        };
+        self.submit_with_identity(&submission, Some(identity))
+    }
+
+    fn submit_with_identity(
+        &mut self,
+        submission: &Submission,
+        list: Option<ListIdentity>,
+    ) -> Result<Reply, GuestIpcError> {
         self.ensure_open()?;
         if submission.sequence != self.next_sequence {
             return Err(GuestIpcError::SequenceMismatch {
@@ -501,7 +528,7 @@ impl GuestIpcClient {
         let next = sequence
             .checked_add(1)
             .ok_or(GuestIpcError::SequenceExhausted)?;
-        let payload = wire::encode_submission(submission)?;
+        let payload = wire::encode_submission_with_list(submission, list)?;
 
         self.write_frame(KIND_SUBMIT, &payload, "submit")?;
         self.next_sequence = next;
@@ -665,7 +692,7 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use super::*;
-    use crate::wire::{BufferBinding, Dispatch1d, ReplyStatus};
+    use crate::wire::{BufferBinding, Dispatch1d, ListIdentity, ReplyStatus};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const SECRET: [u8; SECRET_LEN] = [0x5a; SECRET_LEN];
@@ -882,6 +909,59 @@ mod tests {
         assert_eq!(reply.status, ReplyStatus::Ok);
         assert_eq!(client.next_sequence(), 3);
 
+        client.close();
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn submit_with_list_carries_identity_and_reports_replay() {
+        let identity = ListIdentity {
+            list_id: 77,
+            list_generation: 2,
+        };
+        let (port, server) = spawn_server(move |mut stream| {
+            expect_hello(&mut stream);
+            send_ack(&mut stream, true);
+            for (sequence, status) in [
+                (1u32, ReplyStatus::Ok),
+                (2u32, ReplyStatus::AlreadyExecuted),
+            ] {
+                let (kind, payload) = read_frame(&mut stream);
+                assert_eq!(kind, KIND_SUBMIT);
+                let (submission, list) =
+                    wire::decode_submission_with_list(&payload).expect("submission decodes");
+                assert_eq!(submission.sequence, sequence);
+                assert_eq!(list, Some(identity));
+                send_reply(&mut stream, sequence, status);
+            }
+        });
+
+        let mut client =
+            GuestIpcClient::connect_with_timeout(port, &SECRET, TEST_TIMEOUT).expect("connect");
+        let first = client
+            .submit_with_list(dispatch(1).commands, identity)
+            .expect("first list submission");
+        assert_eq!(
+            first,
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+        assert_eq!(client.next_sequence(), 2);
+
+        let replay = client
+            .submit_with_list(dispatch(2).commands, identity)
+            .expect("replay reply");
+        assert_eq!(
+            replay,
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::AlreadyExecuted,
+            }
+        );
+        assert_eq!(client.next_sequence(), 3);
+        assert!(!client.is_closed());
         client.close();
         server.join().expect("server thread");
     }
