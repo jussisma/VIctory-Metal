@@ -1992,6 +1992,37 @@ mod tests {
         vertex_rows: &[&[u8]],
         primitive_rows: u32,
     ) -> Result<HostShader, ShaderError> {
+        let (bytes, native) = shaped_mesh_parts(vertices, primitives, vertex_rows, primitive_rows)?;
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// [`shaped_mesh`] before emission: its container bytes and native
+    /// program, for tests that emit it with the linked path's pruning.
+    fn shaped_mesh_parts(
+        vertices: u32,
+        primitives: u32,
+        vertex_rows: &[&[u8]],
+        primitive_rows: u32,
+    ) -> Result<(Vec<u8>, NativeProgram), ShaderError> {
+        shaped_mesh_parts_with(vertices, primitives, vertex_rows, primitive_rows, None)
+    }
+
+    /// [`shaped_mesh_parts`] with the vertex row `distinct` (0 is the
+    /// position) exporting four distinct constants instead of the quad's
+    /// coordinates: 0.25, then 0.5, 0.75 and 1.0. A paired pixel shader can
+    /// tell which channel of a reordered row it read.
+    fn shaped_mesh_parts_with(
+        vertices: u32,
+        primitives: u32,
+        vertex_rows: &[&[u8]],
+        primitive_rows: u32,
+        distinct: Option<u32>,
+    ) -> Result<(Vec<u8>, NativeProgram), ShaderError> {
         let mut words: Vec<u32> = vec![
             0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -2008,6 +2039,18 @@ mod tests {
             0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
             TRIANGLE,
         ];
+        if distinct.is_some() {
+            words.extend([
+                0x7E10_02FF, // v_mov_b32 v8, 0.25
+                0.25f32.to_bits(),
+                0x7E14_02FF, // v_mov_b32 v10, 0.5
+                0.5f32.to_bits(),
+                0x7E16_02FF, // v_mov_b32 v11, 0.75
+                0.75f32.to_bits(),
+                0x7E18_02FF, // v_mov_b32 v12, 1.0
+                1.0f32.to_bits(),
+            ]);
+        }
         let element = |name: &str, kind: u8, index: u32, row: u32, col: u8, cols: u8| SigElement {
             name: name.into(),
             index,
@@ -2024,9 +2067,9 @@ mod tests {
         let mut psg = Vec::new();
         let mut outputs = Vec::new();
         let mut param = 0u32;
-        let mut export = |words: &mut Vec<u32>, row: u32, mask: u32, primitive: bool| {
+        let mut export = |words: &mut Vec<u32>, row: u32, mask: u32, src: u32, primitive: bool| {
             // exp param<n> v4, v5, v6, v7 (the channels of `mask`)
-            words.extend([0xF800_0000 | mask | (32 + param) << 4, 0x0706_0504]);
+            words.extend([0xF800_0000 | mask | (32 + param) << 4, src]);
             outputs.push(crate::native::VsOutput {
                 usage: crate::native::Usage::Generic,
                 row: row as u8,
@@ -2043,10 +2086,15 @@ mod tests {
                 osg.push(element("TEXCOORD", 0, index, row, col, cols));
                 (index, col) = (index + 1, col + cols);
             }
-            export(&mut words, row, (1 << col) - 1, false);
+            let src = if distinct == Some(row) {
+                0x0C0B_0A08 // v8, v10, v11, v12
+            } else {
+                0x0706_0504 // v4, v5, v6, v7
+            };
+            export(&mut words, row, (1 << col) - 1, src, false);
         }
         for n in 0..primitive_rows {
-            export(&mut words, n, 0xF, true);
+            export(&mut words, n, 0xF, 0x0706_0504, true);
             psg.push(element("PRIMDATA", 0, n, n, 0, 4));
         }
         words.extend([
@@ -2059,7 +2107,7 @@ mod tests {
         let native = NativeProgram {
             stage: HwStage::Ms,
             wave64: false,
-            vgprs: 10,
+            vgprs: if distinct.is_some() { 13 } else { 10 },
             layout: vec![],
             used: vec![],
             io: StageIo::Ms(crate::native::MeshIo {
@@ -2076,12 +2124,7 @@ mod tests {
         let osg1 = container::signature(&osg, false);
         let psg1 = container::signature(&psg, false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
-        let c = Container::parse(&bytes)?;
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let st = structure::structure(&p)?;
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        Ok((bytes, native))
     }
 
     /// Rows of 4 + 4 + 4 + 4 + 4, 3 and 1, 2, 3 and 1, then 3 seven times
@@ -2146,6 +2189,662 @@ mod tests {
         assert_eq!(mesh_outputs(&constant_color()), None);
     }
 
+    /// Metal counts a mesh shader's outputs in its aligned layout, not the
+    /// packed component count: 4 bytes per component, but every signature
+    /// element rounded up to its own size. 29 full rows, then a row emitted
+    /// as 1+3 components, then two 2-component rows make 128 components and
+    /// exactly 32 KiB packed. The 1-then-3 order pads to 33,280 B (over the
+    /// limit); the 3-then-1 order fits at 32,768 B. Linked pruning keeps the
+    /// same elements and masks, only their order within one register row
+    /// changes. Structure only: D3DMetal refuses 128 unique scalars before
+    /// the byte budget applies, so the hardware draw uses the 116-scalar
+    /// fixture below.
+    #[test]
+    fn linked_mesh_row_packing_fits_metal_aligned_budget() {
+        let mut rows: Vec<&[u8]> = vec![&[4]; 29];
+        rows.push(&[1, 3]);
+        rows.extend([&[2][..]; 2]);
+        let (bytes, native) = shaped_mesh_parts(64, 32, &rows, 0).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let before = super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let mut keep = lower::KeptOutputs::new();
+        for e in before.iter().filter(|e| e.kind == 0) {
+            keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
+        }
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit_pruned(
+            &EmitInput {
+                c: &c,
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+            },
+            Options::default(),
+            Some(&keep),
+        )
+        .unwrap();
+        let after = super::signature(
+            Container::parse(&ms.dxil)
+                .unwrap()
+                .part(FourCC::OSG1)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        let components =
+            |els: &[SigElement]| -> u32 { els.iter().map(|e| u32::from(e.cols)).sum() };
+        assert_eq!(components(&before), 128);
+        assert_eq!(components(&after), components(&before));
+        let aligned = |els: &[SigElement]| -> u32 {
+            let distances: u32 = els
+                .iter()
+                .filter(|e| matches!(e.kind, 6 | 7))
+                .map(|e| 4 * u32::from(e.cols))
+                .sum();
+            let mut end = distances + 16;
+            for e in els.iter().filter(|e| e.kind != 3) {
+                let size = 4 * u32::from(e.cols);
+                end = end.next_multiple_of(size) + size;
+            }
+            end * 64
+        };
+        assert!(aligned(&before) > METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(aligned(&before), 33_280);
+        assert_eq!(aligned(&after), 32_768);
+        assert_eq!(mesh_bytes(&ms.dxil), Some(32_768));
+        let fields = |els: &[SigElement]| {
+            let mut v: Vec<(String, u32, u8, Option<u32>, u8, u8)> = els
+                .iter()
+                .map(|e| (e.name.clone(), e.index, e.kind, e.row, e.col, e.cols))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(fields(&before), fields(&after));
+    }
+
+    /// Whole-register row order: a mesh whose 128 vertices declare 64
+    /// components (the position, 14 full rows and three partial rows,
+    /// 1 + 2 + 1) is exactly 32 KiB packed but 33,280 B in Metal's aligned
+    /// layout, whose 4 + 8 + 4 tail pads to 260 B per vertex. Moving the
+    /// 2-component row before the two scalars is a cross-row reorder (no
+    /// element changes row grouping, semantics, channels or interpolation)
+    /// and lands on 32,768 B exactly. The rows are only numbers the host
+    /// lays out by, so a paired pixel shader reading the moved 2-component
+    /// row's distinct values (0.25, 0.5) keeps its linkage; the hardware
+    /// draw is ready for a host run. 64 unique components stays under
+    /// D3DMetal's 124-scalar refusal.
+    #[test]
+    fn linked_whole_row_order_fits_metal_aligned_budget_and_links() {
+        let vertices = 128;
+        let cols = [4u8; 14];
+        let vertex_rows: Vec<&[u8]> = cols
+            .iter()
+            .map(|c| std::slice::from_ref(c))
+            .chain([&[1u8][..], &[2][..], &[1][..]])
+            .collect();
+        // The 2-component row exports four distinct constants; a paired pixel
+        // shader can tell whether the moved row still links by semantic.
+        let (bytes, native) =
+            shaped_mesh_parts_with(vertices, 32, &vertex_rows, 0, Some(16)).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let before = super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let aligned = |els: &[SigElement], vertices: u32| -> u32 {
+            let distances: u32 = els
+                .iter()
+                .filter(|e| matches!(e.kind, 6 | 7))
+                .map(|e| 4 * u32::from(e.cols))
+                .sum();
+            let mut end = distances + 16;
+            for e in els.iter().filter(|e| e.kind != 3) {
+                let size = 4 * u32::from(e.cols);
+                end = end.next_multiple_of(size) + size;
+            }
+            end * vertices
+        };
+        assert_eq!(aligned(&before, vertices), 33_280);
+
+        // The paired pixel shader reads every kept channel: 14 full rows and
+        // the 1 + 2 + 1 tail. Its last reads are the moved row's channels.
+        let mut ps_sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let texcoord = |index: u32, row: u32, col: u8, cols: u8| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let mut index = 0u32;
+        let mut mask = Vec::new();
+        for row in 1..=17u32 {
+            let width = vertex_rows[row as usize - 1];
+            for (col, &n) in (0u8..).zip(width) {
+                ps_sig.push(texcoord(index, row, col, n));
+                index += 1;
+            }
+            let total: u32 = width.iter().map(|&n| u32::from(n)).sum();
+            mask.push(total);
+        }
+        let p1 = |vdst: u32, attr: u32, ch: u32| {
+            0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let p2 = |vdst: u32, attr: u32, ch: u32| {
+            0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let mut ps_words = Vec::new();
+        for (attr, &n) in mask.iter().enumerate() {
+            for ch in 0..n {
+                ps_words.extend([p1(2, attr as u32, ch), p2(2, attr as u32, ch)]);
+            }
+        }
+        // The moved row is TEXCOORD15 (two components).
+        ps_words.extend([p1(2, 15, 0), p2(2, 15, 0), p1(3, 15, 1), p2(3, 15, 1)]);
+        ps_words.extend([
+            0x7E08_02FF, // v_mov_b32 v4, 0.0
+            0.0f32.to_bits(),
+            0x7E0A_02FF, // v_mov_b32 v5, 1.0
+            1.0f32.to_bits(),
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        let ps_inputs: Vec<crate::native::PsInput> = mask
+            .iter()
+            .enumerate()
+            .map(|(k, &n)| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k as u8 + 1,
+                mask: (1u8 << n) - 1,
+                attr: k as u8,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 6,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: ps_inputs,
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ps_bytes = crate::dxbc::build(&[
+            (FourCC::ISG1, &container::signature(&ps_sig, true)),
+            (FourCC::OSG1, &rows(&[("SV_Target", 16, false)], false)),
+        ]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps_in = EmitInput {
+            c: &pc,
+            native: &ps_native,
+            p: &pp,
+            st: &pst,
+            io: &pio,
+            res: &pres,
+        };
+        let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+        let reads = pixel_input_reads(&full_ps.dxil).unwrap();
+        assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b0011));
+        assert_eq!(reads.get(&("TEXCOORD".into(), 14)), Some(&0b0001));
+
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms_in = EmitInput {
+            c: &c,
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+        };
+        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        let after = super::signature(
+            Container::parse(&linked_ms.dxil)
+                .unwrap()
+                .part(FourCC::OSG1)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+
+        let components =
+            |els: &[SigElement]| -> u32 { els.iter().map(|e| u32::from(e.cols)).sum() };
+        assert_eq!(components(&before), 64);
+        assert_eq!(components(&after), components(&before));
+        assert_eq!(aligned(&after, vertices), 32_768);
+        assert_eq!(mesh_bytes(&linked_ms.dxil), Some(32_768));
+        assert_eq!(super::mesh_outputs(&linked_ms.dxil).unwrap().bytes(), 32_768);
+
+        // Same intended exports: everything but the register row is pinned.
+        let strip = |els: &[SigElement]| {
+            let mut v: Vec<(String, u32, u8, u8, u8, u8, u8, u8, bool)> = els
+                .iter()
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.index,
+                        e.kind,
+                        e.comp,
+                        e.interp,
+                        e.col,
+                        e.cols,
+                        e.usage,
+                        e.half,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(strip(&before), strip(&after));
+        // Whole rows move, never elements: each row's set of element
+        // identities and channels is the same multiset of blocks after the
+        // reorder as before it.
+        let blocks = |els: &[SigElement]| {
+            let mut by_row: Vec<(u32, Vec<(u32, u8, u8, u8)>)> = Vec::new();
+            for e in els.iter().filter(|e| e.kind == 0) {
+                let key = (e.index, e.col, e.cols, e.usage);
+                let row = e.row.unwrap();
+                match by_row.iter_mut().find(|b| b.0 == row) {
+                    Some(b) => b.1.push(key),
+                    None => by_row.push((row, vec![key])),
+                }
+            }
+            for b in &mut by_row {
+                b.1.sort_unstable();
+            }
+            by_row
+        };
+        let mut groupings_before: Vec<Vec<(u32, u8, u8, u8)>> =
+            blocks(&before).into_iter().map(|b| b.1).collect();
+        let mut groupings_after: Vec<Vec<(u32, u8, u8, u8)>> =
+            blocks(&after).into_iter().map(|b| b.1).collect();
+        groupings_before.sort();
+        groupings_after.sort();
+        assert_eq!(groupings_before, groupings_after);
+        let mut rows_before: Vec<u32> = blocks(&before).into_iter().map(|b| b.0).collect();
+        let mut rows_after: Vec<u32> = blocks(&after).into_iter().map(|b| b.0).collect();
+        rows_before.sort_unstable();
+        rows_after.sort_unstable();
+        assert_eq!(rows_before, rows_after);
+        assert_eq!(
+            before.iter().find(|e| e.kind == 3).unwrap().row,
+            after.iter().find(|e| e.kind == 3).unwrap().row
+        );
+        // The reorder is real (no tie-equivalent no-op), and a guest row
+        // still names the same elements: the rows differ only by which
+        // register number carries which whole block.
+        let row_of = |els: &[SigElement], index: u32| {
+            els.iter()
+                .find(|e| e.kind == 0 && e.index == index)
+                .unwrap()
+                .row
+                .unwrap()
+        };
+        assert!(
+            (0..17).any(|i| row_of(&before, i) != row_of(&after, i)),
+            "no whole row moved"
+        );
+        eprintln!(
+            "whole-row order: declared {} B aligned, after {} B aligned, {} B counted",
+            aligned(&before, vertices),
+            aligned(&after, vertices),
+            mesh_bytes(&linked_ms.dxil).unwrap()
+        );
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let host = Host::new(false).expect("the hardware device");
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            assert!(
+                queried.is_ok()
+                    && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+                "no mesh shaders on the hardware device"
+            );
+            let root = host
+                .root_signature_for(&[
+                    (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                    (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                ])
+                .unwrap();
+            let pso = host
+                .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                .unwrap_or_else(|e| panic!("hardware: mesh pipeline: {e}"));
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![
+                            (0, Root::Constants(vec![0])),
+                            (1, Root::Constants(vec![0])),
+                        ],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: 1,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("hardware: draw: {e}"));
+            let expected = [0.25, 0.5, 0.0, 1.0];
+            assert!(
+                texels.iter().all(|t| *t == expected),
+                "hardware: expected {expected:?}, drew {:?}",
+                texels.first()
+            );
+            eprintln!(
+                "hardware whole-row order: {} texels all {:?}",
+                texels.len(),
+                expected
+            );
+        }
+    }
+
+    /// The linked path's row packing keeps a 1+3 register row's semantics in
+    /// a paired pixel draw: the scalar channel (0.25) and the vec3 (0.5,
+    /// 0.75, 1.0) survive the reorder that fits Metal's aligned 32 KiB
+    /// budget, next to every other kept channel. The pixel shader reads all
+    /// 112 arbitrary channels in four 1+3 rows, with 68 declared vertices
+    /// (116 unique scalars, under D3DMetal's 124-scalar limit: 128 is
+    /// refused, see the first run), so pruning keeps them and only the
+    /// packed rows draw: the aligned estimator counts 33,456 B declared and
+    /// 32,096 B packed, 31,552 B in Metal's declared-component count, and
+    /// the hardware device must write those exact pixels (a dropped
+    /// pipeline draws nothing).
+    #[test]
+    fn linked_packed_row_draws_distinct_scalar_and_vec3_channels() {
+        let vertices = 68;
+        let vertex_rows: Vec<&[u8]> = [
+            vec![&[4u8][..]; 24],
+            vec![&[1, 3][..]; 4],
+        ]
+        .concat();
+        let (bytes, native) =
+            shaped_mesh_parts_with(vertices, 32, &vertex_rows, 0, Some(28)).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let before = super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let aligned = |els: &[SigElement]| -> u32 {
+            let distances: u32 = els
+                .iter()
+                .filter(|e| matches!(e.kind, 6 | 7))
+                .map(|e| 4 * u32::from(e.cols))
+                .sum();
+            let mut end = distances + 16;
+            for e in els.iter().filter(|e| e.kind != 3) {
+                let size = 4 * u32::from(e.cols);
+                end = end.next_multiple_of(size) + size;
+            }
+            end * vertices
+        };
+        assert_eq!(aligned(&before), 33_456);
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms_in = EmitInput {
+            c: &c,
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+        };
+        // The paired pixel shader: position, then TEXCOORD0..23 as full rows,
+        // then four 1+3 rows (TEXCOORD24..31). It reads every arbitrary
+        // channel; the last reads are row 28's four channels, written to the
+        // target.
+        let mut ps_sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let texcoord = |index: u32, row: u32, col: u8, cols: u8| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        for k in 0..24u32 {
+            ps_sig.push(texcoord(k, k + 1, 0, 4));
+        }
+        let mut index = 24u32;
+        for row in 25..=28u32 {
+            ps_sig.push(texcoord(index, row, 0, 1));
+            ps_sig.push(texcoord(index + 1, row, 1, 3));
+            index += 2;
+        }
+        let p1 = |vdst: u32, attr: u32, ch: u32| {
+            0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let p2 = |vdst: u32, attr: u32, ch: u32| {
+            0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let mut ps_words = Vec::new();
+        let mut read = |attr: u32, ch: u32| {
+            ps_words.extend([p1(2, attr, ch), p2(2, attr, ch)]);
+        };
+        for attr in 0..27u32 {
+            for ch in 0..4 {
+                read(attr, ch);
+            }
+        }
+        // Row 28's channels side by side: scalar (0.25), vec3 (0.5, 0.75, 1).
+        for ch in 0..4u32 {
+            ps_words.extend([p1(2 + ch, 27, ch), p2(2 + ch, 27, ch)]);
+        }
+        ps_words.extend([
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        let ps_inputs: Vec<crate::native::PsInput> = (0..28u8)
+            .map(|k| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                mask: 0xF,
+                attr: k,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: ps_inputs,
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ps_bytes = crate::dxbc::build(&[
+            (FourCC::ISG1, &container::signature(&ps_sig, true)),
+            (FourCC::OSG1, &rows(&[("SV_Target", 16, false)], false)),
+        ]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps_in = EmitInput {
+            c: &pc,
+            native: &ps_native,
+            p: &pp,
+            st: &pst,
+            io: &pio,
+            res: &pres,
+        };
+        let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+        let reads = pixel_input_reads(&full_ps.dxil).unwrap();
+        assert_eq!(reads.get(&("TEXCOORD".into(), 30)), Some(&0b0001));
+        assert_eq!(reads.get(&("TEXCOORD".into(), 31)), Some(&0b1110));
+        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        let after = super::signature(
+            Container::parse(&linked_ms.dxil)
+                .unwrap()
+                .part(FourCC::OSG1)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        assert_eq!(mesh_bytes(&linked_ms.dxil), Some(31_552));
+        assert_eq!(aligned(&after), 32_096);
+        eprintln!(
+            "row packing: declared {} B aligned, packed {} B, {} B counted",
+            aligned(&before),
+            aligned(&after),
+            mesh_bytes(&linked_ms.dxil).unwrap()
+        );
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let host = Host::new(false).expect("the hardware device");
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            assert!(
+                queried.is_ok()
+                    && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+                "no mesh shaders on the hardware device"
+            );
+            let root = host
+                .root_signature_for(&[
+                    (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                    (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                ])
+                .unwrap();
+            let pso = host
+                .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                .unwrap_or_else(|e| panic!("hardware: mesh pipeline: {e}"));
+            let texels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![
+                            (0, Root::Constants(vec![0])),
+                            (1, Root::Constants(vec![0])),
+                        ],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &[],
+                        stride: 0,
+                        size: (16, 16),
+                        mesh_groups: 1,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("hardware: draw: {e}"));
+            let expected = [0.25, 0.5, 0.75, 1.0];
+            assert!(
+                texels.iter().all(|t| *t == expected),
+                "hardware: expected {expected:?}, drew {:?}",
+                texels.first()
+            );
+            eprintln!("hardware draw: {} texels all {:?}", texels.len(), expected);
+        }
+    }
+
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
     /// the hardware device, as do rows only partly filled whose components
     /// fit (one row or component more, D3DMetal marks the pipeline a no-op
@@ -2154,6 +2853,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn mesh_shaders_at_metals_output_limit_draw() {
+
         use super::host::{Draw, Host, Root};
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,

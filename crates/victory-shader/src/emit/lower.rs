@@ -25,9 +25,9 @@ mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
-use barriers::{in_step, split_wave_barriers};
+use barriers::{in_step, in_step_one_wave, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
-use mesh::prune_signature;
+use mesh::{pack_rows, prune_signature, row_order};
 
 type Why = &'static str;
 
@@ -371,6 +371,10 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
+    /// Mesh: guest row -> row emitted in the linked signature
+    /// ([`mesh::row_order`]). Applied once lowering is done, so exports keep
+    /// resolving guest rows to their elements and channels.
+    row_map: HashMap<u32, u32>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -687,11 +691,29 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let mut row_map = HashMap::new();
         if let Some(keep) = keep {
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
                 prune_signature(&mut s.outputs, keep);
+                // Only mesh outputs pay for Metal's aligned layout; pixel
+                // inputs and primitives keep their pruned declaration order.
+                pack_rows(&mut s.outputs);
+                if let Some(order) = row_order(&s.outputs) {
+                    // D3DMetal lays the mesh outputs out in the signature
+                    // declaration order, not only by register: move the rows
+                    // themselves so the DXIL output signature and OSG1 agree
+                    // on the packed order. Stores search by guest row through
+                    // `row_map`, so their element ids follow this order.
+                    for e in &mut s.outputs {
+                        if let Some(emitted) = e.row.and_then(|row| order.get(&row).copied()) {
+                            e.row = Some(emitted);
+                        }
+                    }
+                    s.outputs.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+                    row_map = order;
+                }
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -704,6 +726,10 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();
+        // The group is one console wave, and that wave's LDS is synced by
+        // the barriers [`split_wave_barriers`] placed: the one-wave proof
+        // `lane_uniform` gives is group-uniform, LDS-derived values included.
+        let (mut one_console_wave, mut lds_synced) = (false, false);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -748,6 +774,7 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            one_console_wave = x.native.wave64 && one_wave;
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
@@ -755,9 +782,14 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                // `one_wave`: the group is one console wave, so
+                // `lane_uniform` is group-uniform here. A group of several
+                // console waves computes one such value per wave, so it is
+                // not passed to `in_step` there.
+                if let Some(b) = split_wave_barriers(p, x.st, &halves::lane_uniform(x)) {
                     split_barriers = b;
                     synced = true;
+                    lds_synced = true;
                 }
             }
             // A host whose waves are narrower than WaveSize(64) does not run
@@ -831,6 +863,26 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let alike = if halves {
+            halves::lane_uniform(x)
+        } else {
+            HashSet::new()
+        };
+        // A group that is one console wave proves its first-lane reads
+        // group-uniform the same way the barriers above do, so a loop on
+        // one runs alike in both host halves and values may pass between
+        // them in it. LDS-derived uniform values are trusted only where
+        // those barriers were placed (or there is no LDS to race); a group
+        // of several console waves keeps the generic refusal.
+        let step = if halves {
+            if one_console_wave && (s.lds_dwords == 0 || lds_synced) {
+                in_step_one_wave(p, x.st, &alike)
+            } else {
+                in_step(p, x.st)
+            }
+        } else {
+            Vec::new()
+        };
         Lower {
             s,
             x,
@@ -882,14 +934,10 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step,
             half_words: None,
             level: 0,
-            alike: if halves {
-                halves::lane_uniform(x)
-            } else {
-                HashSet::new()
-            },
+            alike,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -897,6 +945,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             split_barriers,
             half_outputs: half_outputs(&x.native.io),
+            row_map,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -10819,6 +10868,15 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The row a guest export names, after [`mesh::row_order`] packed the
+    /// signature rows for Metal's layout.
+    fn emitted_row(&self, row: u8) -> u8 {
+        self.row_map
+            .get(&u32::from(row))
+            .and_then(|&emitted| u8::try_from(emitted).ok())
+            .unwrap_or(row)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -10885,8 +10943,9 @@ impl<'a> Lower<'a> {
                         (!high).then_some((row, ch))
                     };
                     let found = src.and_then(|(r, c)| {
+                        let emitted = self.emitted_row(r);
                         outputs.iter().position(|o| {
-                            o.row == Some(u32::from(r)) && c >= o.col && c < o.col + o.cols
+                            o.row == Some(u32::from(emitted)) && c >= o.col && c < o.col + o.cols
                         })
                     });
                     if let Some(id) = found {
@@ -10918,7 +10977,18 @@ impl<'a> Lower<'a> {
                     2 => by_kind(14).map(|id| (id, 0)),
                     _ => None,
                 },
-                Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
+                Target::Param { usage, row } => {
+                    let row = param_row(usage, row).map(|r| self.emitted_row(r));
+                    outputs
+                        .iter()
+                        .position(|o| {
+                            row.is_some_and(|r| o.row == Some(u32::from(r)))
+                                && ch >= o.col
+                                && ch < o.col + o.cols
+                        })
+                        .map(|id| (id, ch - outputs[id].col))
+                }
+                Target::PrimitiveParam { usage, row } => {
                     let row = param_row(usage, row);
                     outputs
                         .iter()
