@@ -15,7 +15,7 @@
 //!
 //! | # | reason string (as emitted) | count | exact lowering site |
 //! |---|----------------------------|------:|---------------------|
-//! | 1 | `a lane mask read as data (wave64 on a 32-lane host)` | 54 | `super::lower::halves::MASK_ACROSS` (`halves.rs`), raised in `Lower::mask_dword` (`lower.rs`, `across_at(def).ok_or(MASK_ACROSS)`) when the ballot's defining block is not `in_step` |
+//! | 1 | `a lane mask read as data (wave64 on a 32-lane host)` | 54 | `super::lower::halves::MASK_ACROSS` (`halves.rs`), raised in `Lower::mask_dword` (`lower.rs`) when neither the block writing the mask nor the block the read starts in is `in_step` |
 //! | 2 | `LDS one console wave64 shares without barriers, on a host of 32-lane waves` | 30 | `Lower::halves_lds` (`halves.rs`), raised through `halves_refused` in `Lower::run` (`lower.rs`) when `split_wave_barriers` (`barriers.rs`) returns no placement for a `step` block |
 //! | 3 | `a wave reduction over both 32-lane halves (wave64 on a 32-lane host)` | 12 | `ACROSS` in `Lower::shape` (`lower.rs`), with `Lower::reduce_across` (`halves.rs`) as the lowering it guards |
 //! | 4 | `a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)` | 8 | `halves::FIRST_ACROSS` (`halves.rs`), raised in the `v_readfirstlane_b32` arm of `Lower::integer` (`lower.rs`) when `across_here()` is false |
@@ -54,7 +54,10 @@
 //! # What still refuses
 //!
 //! * a ballot, reduction, prefix, first-lane or lane read whose block is not a
-//!   `step` block (a per-lane branch, a loop on a lane-dependent count);
+//!   `step` block (a per-lane branch, a loop on a lane-dependent count), and a
+//!   lane mask read as data whose write **and** read blocks are not `step`:
+//!   the read in a block every lane runs after reconvergence is admitted, the
+//!   read inside the per-lane region is not;
 //! * a first-lane read of a value that differs between the halves (`v0`, a
 //!   lane-dependent mask) even in a `step` block, because each half would read
 //!   its own first lane;
@@ -78,3 +81,45 @@
 //!
 //! These are the bounded changes this task makes; the unrelated buckets 7-8
 //! are left for their own tasks.
+//!
+//! # Lane masks read as data (buckets 1 and 6: 56 of 111)
+//!
+//! `Lower::mask_dword` (`lower.rs`) gives a mask's number. Where the host
+//! halves a console wave (`halves`), the ballot of the lanes' bits is taken
+//! into the two 32-lane host halves by `Lower::ballot_across_halves` ->
+//! `Lower::exchange_halves`: one group-shared `uint32` slot per half of the
+//! console wave, written and read between two `barrier` calls with
+//! `mem_flags::mem_threadgroup` (`1 | 8`), both dwords recombined before the
+//! read. Such a barrier needs every lane of the group, so it may go only in a
+//! block `barriers::in_step` proves every lane runs the same number of times.
+//!
+//! Admitted without any exchange:
+//!
+//! | mask | why its number needs no ballot |
+//! |------|-------------------------------|
+//! | a literal lane mask (`Lower::literal_mask`: none, all lanes, or one `Atom::Constant`) | the register holds the same 64-bit number in every lane |
+//! | the live mask of a full console wave (`Bool::TRUE`, `Lower::full_console_waves`) | every one of the 64 lanes of every wave is dispatched and active, so the number is all 64 bits |
+//!
+//! Admitted with the halves' exchange, at a block every lane runs the same
+//! number of times:
+//!
+//! | mask | where the ballot goes |
+//! |------|------------------------|
+//! | a mask written in such a block (the console compiler's place) | the block that writes it (`Lower::across_at`) |
+//! | a pure-mask phi at a join every lane reaches | the join |
+//! | a mask whose write is a per-lane region or a join of one, read in a block every lane runs after reconvergence (`Lower::across_here`) | the block the read starts in (bucket 1's 54: the closing shape) |
+//!
+//! Still refused, with the reason unchanged:
+//!
+//! | mask | reason |
+//! |------|--------|
+//! | read inside the per-lane region that defines it, or in a loop whose count differs between console waves | `a lane mask read as data (wave64 on a 32-lane host)` (`MASK_ACROSS`): no block both halves meet in |
+//! | in `other` and not a literal (an opaque value, a join, a mask structure resolved only at its use) | `a lane mask read as data` (`LANE_MASK`) |
+//! | a register joining a lane mask and data, read where no ballot can be placed | `a register joining a lane mask and data, read as data` |
+//! | a mask whose lanes depend on its own value | `a lane mask whose lanes depend on its own value` |
+//!
+//! The census cannot be re-counted here (no title shader bytes or log
+//! contents are committed), so which of the 54 the closing shape covers is
+//! not claimed: the CPU table (`lower/halves.rs`, `lane_mask_tests`) and the
+//! Metal proof (`victory-metal/tests/wave_lower_gpu.rs`) cover each shape
+//! above.
