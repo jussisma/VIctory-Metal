@@ -700,7 +700,20 @@ impl<'a> Lower<'a> {
                 // Only mesh outputs pay for Metal's aligned layout; pixel
                 // inputs and primitives keep their pruned declaration order.
                 pack_rows(&mut s.outputs);
-                row_map = row_order(&s.outputs).unwrap_or_default();
+                if let Some(order) = row_order(&s.outputs) {
+                    // D3DMetal lays the mesh outputs out in the signature
+                    // declaration order, not only by register: move the rows
+                    // themselves so the DXIL output signature and OSG1 agree
+                    // on the packed order. Stores search by guest row through
+                    // `row_map`, so their element ids follow this order.
+                    for e in &mut s.outputs {
+                        if let Some(emitted) = e.row.and_then(|row| order.get(&row).copied()) {
+                            e.row = Some(emitted);
+                        }
+                    }
+                    s.outputs.sort_by_key(|e| e.row.unwrap_or(u32::MAX));
+                    row_map = order;
+                }
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1684,15 +1697,6 @@ impl<'a> Lower<'a> {
             };
             [m.written_call_blocks(name), table]
         };
-        // Mesh: emit the signature rows in the order chosen for Metal's
-        // aligned layout. Stores name their element and channel, so the
-        // guest-row linkage they resolved while lowering is unchanged.
-        let row_map = &self.row_map;
-        for e in &mut self.s.outputs {
-            if let Some(emitted) = e.row.and_then(|row| row_map.get(&row).copied()) {
-                e.row = Some(emitted);
-            }
-        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -10864,6 +10868,15 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The row a guest export names, after [`mesh::row_order`] packed the
+    /// signature rows for Metal's layout.
+    fn emitted_row(&self, row: u8) -> u8 {
+        self.row_map
+            .get(&u32::from(row))
+            .and_then(|&emitted| u8::try_from(emitted).ok())
+            .unwrap_or(row)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -10930,8 +10943,9 @@ impl<'a> Lower<'a> {
                         (!high).then_some((row, ch))
                     };
                     let found = src.and_then(|(r, c)| {
+                        let emitted = self.emitted_row(r);
                         outputs.iter().position(|o| {
-                            o.row == Some(u32::from(r)) && c >= o.col && c < o.col + o.cols
+                            o.row == Some(u32::from(emitted)) && c >= o.col && c < o.col + o.cols
                         })
                     });
                     if let Some(id) = found {
@@ -10963,7 +10977,18 @@ impl<'a> Lower<'a> {
                     2 => by_kind(14).map(|id| (id, 0)),
                     _ => None,
                 },
-                Target::Param { usage, row } | Target::PrimitiveParam { usage, row } => {
+                Target::Param { usage, row } => {
+                    let row = param_row(usage, row).map(|r| self.emitted_row(r));
+                    outputs
+                        .iter()
+                        .position(|o| {
+                            row.is_some_and(|r| o.row == Some(u32::from(r)))
+                                && ch >= o.col
+                                && ch < o.col + o.cols
+                        })
+                        .map(|id| (id, ch - outputs[id].col))
+                }
+                Target::PrimitiveParam { usage, row } => {
                     let row = param_row(usage, row);
                     outputs
                         .iter()
