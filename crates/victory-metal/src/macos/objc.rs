@@ -358,6 +358,57 @@ pub(crate) unsafe fn msg_send_void_1(target: Id, s: Sel, a0: Id) {
     }
 }
 
+/// Sends a selector taking one `NSUInteger` and returning an object.
+pub(crate) unsafe fn msg_send_id_usize(target: Id, s: Sel, value: usize) -> Id {
+    type Fn = unsafe extern "C" fn(Id, Sel, usize) -> Id;
+    // SAFETY: Caller supplies a valid receiver/selector and an `NSUInteger`.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, s, value)
+    }
+}
+
+/// Sends a selector taking one `NSUInteger` and returning `void`.
+pub(crate) unsafe fn msg_send_void_usize(target: Id, s: Sel, value: usize) {
+    type Fn = unsafe extern "C" fn(Id, Sel, usize);
+    // SAFETY: Caller supplies a valid receiver/selector and an `NSUInteger`.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, s, value)
+    }
+}
+
+/// Whether `target` implements `selector` (`-[NSObject respondsToSelector:]`).
+pub(crate) unsafe fn msg_send_responds_to(target: Id, selector: Sel) -> bool {
+    type Fn = unsafe extern "C" fn(Id, Sel, Sel) -> u8;
+    // SAFETY: `respondsToSelector:` takes one selector and returns `BOOL`.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, sel(c"respondsToSelector:"), selector) != 0
+    }
+}
+
+/// `-[MTLRenderCommandEncoder drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:]`.
+pub(crate) unsafe fn msg_send_draw_mesh_threadgroups(
+    enc: Id,
+    threadgroups_per_grid: MTLSize,
+    threads_per_object_threadgroup: MTLSize,
+    threads_per_mesh_threadgroup: MTLSize,
+) {
+    type Fn = unsafe extern "C" fn(Id, Sel, MTLSize, MTLSize, MTLSize);
+    // SAFETY: Caller supplies a live render encoder and positive `MTLSize` dims.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(
+            enc,
+            sel(c"drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"),
+            threadgroups_per_grid,
+            threads_per_object_threadgroup,
+            threads_per_mesh_threadgroup,
+        );
+    }
+}
+
 pub(crate) unsafe fn msg_send_void_u8(target: Id, s: Sel, value: u8) {
     type Fn = unsafe extern "C" fn(Id, Sel, u8);
     // SAFETY: Caller supplies a valid Objective-C receiver and selector taking a
