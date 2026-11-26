@@ -764,6 +764,10 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
+                // `one_wave`: the group is one console wave, so
+                // `lane_uniform` is group-uniform here. A group of several
+                // console waves computes one such value per wave, so it is
+                // not passed to `in_step` there.
                 if let Some(b) = split_wave_barriers(p, x.st, &halves::lane_uniform(x)) {
                     split_barriers = b;
                     synced = true;
@@ -845,11 +849,6 @@ impl<'a> Lower<'a> {
         } else {
             HashSet::new()
         };
-        let step = if halves {
-            in_step(p, x.st, &alike)
-        } else {
-            Vec::new()
-        };
         Lower {
             s,
             x,
@@ -901,7 +900,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step,
+            step: if halves { in_step(p, x.st) } else { Vec::new() },
             half_words: None,
             level: 0,
             alike,

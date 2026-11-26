@@ -1371,6 +1371,17 @@ fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
 
 /// The same program, lowered.
 fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
+    try_lowered(words, lanes, narrow_waves, false).expect("lower")
+}
+
+/// [`lowered`], with the host declaring 32-lane waves where `halves`, and
+/// propagating a refusal.
+fn try_lowered(
+    words: &[u32],
+    lanes: u32,
+    narrow_waves: bool,
+    host_wave32: bool,
+) -> Result<super::Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1403,11 +1414,10 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
-        host_wave32: false,
+        host_wave32,
         bvh_no_hit: false,
         view_marks: false,
     })
-    .expect("lower")
 }
 
 #[test]
@@ -1478,6 +1488,11 @@ const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
 const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
 const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
 const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502; // v_readfirstlane_b32 s21, v2
+const V_MBCNT_LO_V1: [u32; 2] = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
+const V_CMP_GT_VCC_40_V0: u32 = 0x7D88_00A8; // v_cmp_gt_u32 vcc, 40, v0
+const V_MOV_V1_VCC_HI: u32 = 0x7E02_026B; // v_mov_b32 v1, vcc_hi
+const V_MOV_V3_0: u32 = 0x7E06_0280; // v_mov_b32 v3, 0
+const DS_WRITE_V3_V1: [u32; 2] = [0xD834_0000, 0x0000_0103]; // ds_write_b32 v3, v1
 
 /// `body` in a loop on s20, ending at the compare `cmp` (`s_cbranch_scc1`
 /// back to the body's start).
@@ -1566,6 +1581,42 @@ fn lds_in_a_loop_on_a_uniform_first_lane_read_syncs_inside_the_loop() {
     assert_eq!(barriers_at_unif(&p, &unif).unwrap(), [(1, 0), (1, 1)]);
     assert_eq!(split_barriers(&w, 64, true), 2);
     assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn a_per_console_wave_first_lane_count_is_not_group_convergent() {
+    // A 128-thread group is two console waves: `v0 >> 6`'s first lane is 0
+    // in one and 1 in the other. A loop on it is therefore not `step` for
+    // the group, even though it is for either console wave. The generic
+    // `in_step` must not admit the first-lane read, and a ballot read as
+    // data and stored to LDS in the loop cannot pass between halves (a
+    // group barrier there could meet lanes in different passes).
+    let w = looped(
+        &[
+            V_LSHLREV_V1_2_V0,
+            V_LSHRREV_V2_6_V0,
+            READFIRSTLANE_S21_V2,
+            V_MBCNT_LO_V1[0],
+            V_MBCNT_LO_V1[1],
+            V_MOV_V3_0,
+        ],
+        &[
+            V_CMP_GT_VCC_40_V0,
+            V_MOV_V1_VCC_HI,
+            DS_WRITE_V3_V1[0],
+            DS_WRITE_V3_V1[1],
+        ],
+        S_CMP_LT_S20_S21,
+    );
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let step = super::in_step(&p, &st);
+    assert!(!step[1], "the loop body is not group-convergent: {step:?}");
+    let why = try_lowered(&w, 128, false, true)
+        .err()
+        .expect("a ballot in the loop cannot cross halves")
+        .to_string();
+    assert!(why.contains("a lane mask read as data (wave64"), "{why}");
 }
 
 #[test]
