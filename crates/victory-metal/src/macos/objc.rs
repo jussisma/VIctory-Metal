@@ -400,6 +400,24 @@ pub(crate) unsafe fn msg_send_dispatch_threads(
     }
 }
 
+pub(crate) unsafe fn msg_send_dispatch_threadgroups(
+    enc: Id,
+    threadgroups_per_grid: MTLSize,
+    threads_per_threadgroup: MTLSize,
+) {
+    type Fn = unsafe extern "C" fn(Id, Sel, MTLSize, MTLSize);
+    // SAFETY: Caller supplies a valid `MTLComputeCommandEncoder` and positive `MTLSize` dims.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(
+            enc,
+            sel(c"dispatchThreadgroups:threadsPerThreadgroup:"),
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        );
+    }
+}
+
 pub(crate) fn copy_cstr_to_array<const N: usize>(src: &CStr, dst: &mut [u8; N]) {
     dst.fill(0);
     let bytes = src.to_bytes();

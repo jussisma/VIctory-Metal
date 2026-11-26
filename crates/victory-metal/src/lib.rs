@@ -267,7 +267,9 @@ mod tests {
         // before any command buffer is created: the first command's writes must
         // not appear and the prefix sentinel must stay intact.
         let mut stale = decoded.clone();
-        let Command::Dispatch1d(second) = &mut stale.commands[1];
+        let Command::Dispatch1d(second) = &mut stale.commands[1] else {
+            panic!("expected a 1D dispatch")
+        };
         second.bindings[0].generation = GENERATION + 1;
         let reply = transport
             .submit_batch(&stale, &allocations)
@@ -293,7 +295,9 @@ mod tests {
 
         // An unknown pipeline is likewise rejected before GPU work.
         let mut unknown_pipeline = decoded.clone();
-        let Command::Dispatch1d(first) = &mut unknown_pipeline.commands[0];
+        let Command::Dispatch1d(first) = &mut unknown_pipeline.commands[0] else {
+            panic!("expected a 1D dispatch")
+        };
         first.pipeline_id = u64::MAX;
         let reply = transport
             .submit_batch(&unknown_pipeline, &allocations)
@@ -452,6 +456,139 @@ mod tests {
                 .all(|(index, &value)| value == index as u32 + 1),
             "rejected oversized-threadgroup batch modified GPU-visible memory"
         );
+
+        transport
+            .unregister_buffer(buf_id)
+            .expect("unregister_buffer should succeed");
+    }
+
+    /// Synthetic 3D grid proof for `dispatchThreadgroups:threadsPerThreadgroup:`.
+    ///
+    /// Ignored by default because it owns the only Metal device on the host.
+    /// Run explicitly with `--ignored` on ARM64 macOS after compile-only or
+    /// CPU-wire validation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an exclusive Metal GPU; run explicitly"]
+    fn wire_batch_3d_dispatches_exact_group_grid_and_rejects_oversized_local_grid() {
+        use std::collections::HashMap;
+
+        use crate::wire::{self, BufferBinding, Command, Dispatch3d, ReplyStatus, Submission};
+
+        unsafe extern "C" {
+            fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+            fn free(ptr: *mut c_void);
+        }
+
+        const ALIGN: usize = 16384;
+        const BYTES: usize = 16384;
+        const DWORDS: usize = BYTES / 4;
+        const ALLOCATION_ID: u64 = 11;
+        const GENERATION: u32 = 4;
+        const SEQUENCE: u32 = 13;
+        // groups [5, 3, 2] x local [3, 2, 1] => exact grid [15, 6, 2].
+        const GRID_WIDTH: usize = 15;
+        const GRID_DEPTH_STRIDE: usize = 15 * 6;
+        const GRID_DWORDS: usize = 15 * 6 * 2;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+
+        let transport = crate::DirectMetalTransport::new().expect("Metal device should open");
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation into `raw`.
+        let rc = unsafe { posix_memalign(&mut raw, ALIGN, BYTES) };
+        assert_eq!(rc, 0, "posix_memalign failed");
+        assert!(!raw.is_null());
+
+        struct PageGuard(*mut c_void);
+        impl Drop for PageGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` came from `posix_memalign` and is no longer registered.
+                unsafe { free(self.0) };
+            }
+        }
+        let _guard = PageGuard(raw);
+
+        // SAFETY: `[raw, raw + BYTES)` is freshly allocated and u32-aligned.
+        let work = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u32>(), DWORDS) };
+        work.fill(SENTINEL);
+
+        // SAFETY: `raw` points to 16 KiB valid memory that outlives `unregister_buffer`.
+        let buf_id = unsafe { transport.register_zerocopy(raw.cast::<u8>(), BYTES) }
+            .expect("register_zerocopy should succeed on 16 KiB unified memory");
+
+        let msl = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void vm_dispatch3d_mark(device uint *data [[buffer(0)]],
+                                           uint3 tid [[thread_position_in_grid]]) {
+                uint index = tid.x + tid.y * 15u + tid.z * 90u;
+                data[index] = index + 1u;
+            }
+        "#;
+        let pipeline = transport
+            .compile_msl(msl, "vm_dispatch3d_mark")
+            .expect("3D guard kernel should compile");
+
+        let mut allocations = HashMap::new();
+        allocations.insert((ALLOCATION_ID, GENERATION), buf_id);
+
+        let submission = |group_counts: [u32; 3], threads_per_group: [u32; 3]| Submission {
+            sequence: SEQUENCE,
+            commands: vec![Command::Dispatch3d(Dispatch3d {
+                pipeline_id: pipeline.0,
+                group_counts,
+                threads_per_group,
+                bindings: vec![BufferBinding {
+                    allocation_id: ALLOCATION_ID,
+                    generation: GENERATION,
+                    offset: 0,
+                    length: BYTES as u64,
+                }],
+            })],
+        };
+
+        // Exercise the version-1 wire codec before the native entry point.
+        let valid = submission([5, 3, 2], [3, 2, 1]);
+        let frame = wire::encode_submission(&valid).expect("3D submission should encode");
+        assert_eq!(
+            wire::decode_submission(&frame).expect("3D submission should decode"),
+            valid
+        );
+
+        // A local threadgroup above the pipeline's hardware maximum must fail
+        // before a command buffer exists, leaving every dword untouched.
+        let device_max = transport
+            .device_info()
+            .expect("device_info should succeed")
+            .max_threads_per_threadgroup;
+        let oversized = submission([1, 1, 1], [device_max.saturating_add(1), 1, 1]);
+        let err = transport
+            .submit_batch(&oversized, &allocations)
+            .expect_err("oversized 3D local dimensions should be rejected");
+        assert!(
+            matches!(err, MetalError::InvalidArg(_)),
+            "unexpected oversized-3D error: {err:?}"
+        );
+        assert!(
+            work.iter().all(|&value| value == SENTINEL),
+            "rejected oversized 3D batch modified GPU-visible memory"
+        );
+
+        // The exact group grid executes. A total-thread reshape would map a
+        // different (x, y, z), so every expected index must match.
+        let reply = transport
+            .submit_batch(&valid, &allocations)
+            .expect("valid 3D batch should complete");
+        assert_eq!(reply.status, ReplyStatus::Ok);
+        for (index, &value) in work[..GRID_DWORDS].iter().enumerate() {
+            assert_eq!(value, index as u32 + 1, "mismatch at grid dword {index}");
+        }
+        assert!(
+            work[GRID_DWORDS..].iter().all(|&value| value == SENTINEL),
+            "3D dispatch wrote outside the exact group grid"
+        );
+        assert_eq!(GRID_DEPTH_STRIDE, 90);
+        assert_eq!(GRID_WIDTH, 15);
 
         transport
             .unregister_buffer(buf_id)

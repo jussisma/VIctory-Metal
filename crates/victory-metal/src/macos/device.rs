@@ -53,6 +53,65 @@ impl DeviceState {
     }
 }
 
+/// One resolved `(MTLBuffer, byte offset, buffer slot)` binding.
+type BoundRange = (objc::Id, usize, usize);
+
+/// A command resolved against the live pipeline and buffer registries but not
+/// yet encoded into a command buffer.
+enum PreparedDispatch {
+    OneD {
+        pipeline: objc::Id,
+        threads: usize,
+        threads_per_group: usize,
+        bindings: Vec<BoundRange>,
+    },
+    ThreeD {
+        pipeline: objc::Id,
+        group_counts: MTLSize,
+        threads_per_group: MTLSize,
+        bindings: Vec<BoundRange>,
+    },
+}
+
+/// Resolves and validates every binding against one registry snapshot.
+///
+/// Returns `None` for any unknown handle, stale generation, zero field or
+/// out-of-range span. The caller maps that to `UnknownHandle` before creating a
+/// command buffer, so a rejected batch performs no GPU work.
+fn resolve_bindings(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    bindings: &[wire::BufferBinding],
+) -> Option<Vec<BoundRange>> {
+    let mut resolved = Vec::with_capacity(bindings.len());
+    for (slot, binding) in bindings.iter().enumerate() {
+        if binding.allocation_id == 0
+            || binding.generation == 0
+            || binding.length == 0
+            || binding.length > wire::MAX_RESOURCE_LEN
+            || !binding.offset.is_multiple_of(MTL_BUFFER_OFFSET_ALIGNMENT)
+        {
+            return None;
+        }
+        let registered_id = *allocations.get(&(binding.allocation_id, binding.generation))?;
+        let registered = state.buffers.get(&registered_id.0)?;
+        let end = binding.checked_end()?;
+        let offset = usize::try_from(binding.offset).ok()?;
+        let end = usize::try_from(end).ok()?;
+        if end > registered.len {
+            return None;
+        }
+        resolved.push((registered.buffer.as_raw(), offset, slot));
+    }
+    Some(resolved)
+}
+
+fn pipeline_thread_limit(pso: &ObjcObject) -> u64 {
+    // SAFETY: `pso` is a valid `MTLComputePipelineState`.
+    unsafe { objc::msg_send_usize_0(pso.as_raw(), objc::sel(c"maxTotalThreadsPerThreadgroup")) }
+        .max(1) as u64
+}
+
 /// Native Apple Metal backend implementing [`MetalTransport`].
 pub struct DirectMetalTransport {
     device: ObjcObject,
@@ -174,10 +233,17 @@ impl DirectMetalTransport {
     ///   `offset + length <= registered_length`. `length` is a lifetime/validity
     ///   claim for the registered range, not a shader index bound: host kernels
     ///   are trusted, and Metal validates shader-specific alignment at dispatch.
-    /// * `threads_per_group` must not exceed the pipeline's
+    ///   The same resolver validates 1D and 3D commands.
+    /// * A 1D `threads_per_group` must not exceed the pipeline's
     ///   `maxTotalThreadsPerThreadgroup`; an explicit width over the limit is
     ///   rejected with [`MetalError::InvalidArg`] before GPU work. Silently
     ///   clamping would change threadgroup indices and shader semantics.
+    /// * A 3D command carries nonzero D3D threadgroup counts and nonzero local
+    ///   `x`, `y`, `z` dimensions. The checked local product must not exceed the
+    ///   pipeline's `maxTotalThreadsPerThreadgroup`; oversized local dimensions
+    ///   are rejected with [`MetalError::InvalidArg`] before GPU work. The host
+    ///   encodes the exact group grid with
+    ///   `dispatchThreadgroups:threadsPerThreadgroup:`, never a reshaped total.
     /// * One `MTLCommandBuffer` holds one compute encoder per command, so Metal's
     ///   hazard tracking orders the dispatches while keeping the batch atomic.
     /// * The state lock is held through synchronous completion, so a registered
@@ -219,6 +285,26 @@ impl DirectMetalTransport {
                         ));
                     }
                 }
+                Command::Dispatch3d(dispatch) => {
+                    if dispatch.pipeline_id == 0
+                        || dispatch.group_counts.contains(&0)
+                        || dispatch.threads_per_group.contains(&0)
+                    {
+                        return Err(MetalError::InvalidArg(
+                            "3D dispatch handle and dimensions must be nonzero",
+                        ));
+                    }
+                    if dispatch.checked_total_threads().is_none() {
+                        return Err(MetalError::InvalidArg(
+                            "3D dispatch thread count overflows u64",
+                        ));
+                    }
+                    if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
+                        return Err(MetalError::InvalidArg(
+                            "dispatch exceeds wire binding limit",
+                        ));
+                    }
+                }
             }
         }
 
@@ -242,58 +328,66 @@ impl DirectMetalTransport {
         // buffer. This is what makes a stale generation a no-op on GPU memory.
         let mut prepared = Vec::with_capacity(submission.commands.len());
         for command in &submission.commands {
-            let Command::Dispatch1d(dispatch) = command;
-            let Some(pso) = state.pipelines.get(&dispatch.pipeline_id) else {
+            let (pipeline_id, wire_bindings) = match command {
+                Command::Dispatch1d(dispatch) => (dispatch.pipeline_id, &dispatch.bindings),
+                Command::Dispatch3d(dispatch) => (dispatch.pipeline_id, &dispatch.bindings),
+            };
+            let Some(pso) = state.pipelines.get(&pipeline_id) else {
                 return Ok(reply(ReplyStatus::UnknownHandle));
             };
-
-            let mut bindings = Vec::with_capacity(dispatch.bindings.len());
-            for (slot, binding) in dispatch.bindings.iter().enumerate() {
-                if binding.allocation_id == 0
-                    || binding.generation == 0
-                    || binding.length == 0
-                    || binding.length > wire::MAX_RESOURCE_LEN
-                    || !binding.offset.is_multiple_of(MTL_BUFFER_OFFSET_ALIGNMENT)
-                {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                }
-                let Some(registered_id) = allocations
-                    .get(&(binding.allocation_id, binding.generation))
-                    .copied()
-                else {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                };
-                let Some(registered) = state.buffers.get(&registered_id.0) else {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                };
-                let Some(end) = binding.checked_end() else {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                };
-                let (Ok(offset), Ok(end)) = (usize::try_from(binding.offset), usize::try_from(end))
-                else {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                };
-                if end > registered.len {
-                    return Ok(reply(ReplyStatus::UnknownHandle));
-                }
-                bindings.push((registered.buffer.as_raw(), offset, slot));
-            }
+            let Some(bindings) = resolve_bindings(&state, allocations, wire_bindings) else {
+                return Ok(reply(ReplyStatus::UnknownHandle));
+            };
+            let max_threads = pipeline_thread_limit(pso);
 
             // Unlike the legacy single-dispatch API, do not clamp an explicit
             // wire width: that would change threadgroup indices and shader
             // semantics. Reject before the command buffer exists.
-            // SAFETY: `pso` is a valid `MTLComputePipelineState`.
-            let max_threads = unsafe {
-                objc::msg_send_usize_0(pso.as_raw(), objc::sel(c"maxTotalThreadsPerThreadgroup"))
+            match command {
+                Command::Dispatch1d(dispatch) => {
+                    let threads_per_group = dispatch.threads_per_group as usize;
+                    if threads_per_group as u64 > max_threads {
+                        return Err(MetalError::InvalidArg(
+                            "dispatch threads_per_group exceeds pipeline threadgroup maximum",
+                        ));
+                    }
+                    prepared.push(PreparedDispatch::OneD {
+                        pipeline: pso.as_raw(),
+                        threads: dispatch.threads as usize,
+                        threads_per_group,
+                        bindings,
+                    });
+                }
+                Command::Dispatch3d(dispatch) => {
+                    // `dispatchThreadgroups:` uses the group grid exactly. Its
+                    // local MTLSize must fit the pipeline's hardware total before
+                    // any command buffer is created; never clamp or reshape it.
+                    let Some(local_threads) = dispatch.checked_threads_per_group() else {
+                        return Err(MetalError::InvalidArg(
+                            "3D dispatch local thread product overflows u64",
+                        ));
+                    };
+                    if local_threads > max_threads {
+                        return Err(MetalError::InvalidArg(
+                            "3D dispatch threadgroup exceeds pipeline threadgroup maximum",
+                        ));
+                    }
+                    prepared.push(PreparedDispatch::ThreeD {
+                        pipeline: pso.as_raw(),
+                        group_counts: MTLSize {
+                            width: dispatch.group_counts[0] as usize,
+                            height: dispatch.group_counts[1] as usize,
+                            depth: dispatch.group_counts[2] as usize,
+                        },
+                        threads_per_group: MTLSize {
+                            width: dispatch.threads_per_group[0] as usize,
+                            height: dispatch.threads_per_group[1] as usize,
+                            depth: dispatch.threads_per_group[2] as usize,
+                        },
+                        bindings,
+                    });
+                }
             }
-            .max(1);
-            let threads_per_group = dispatch.threads_per_group as usize;
-            if threads_per_group > max_threads {
-                return Err(MetalError::InvalidArg(
-                    "dispatch threads_per_group exceeds pipeline threadgroup maximum",
-                ));
-            }
-            prepared.push((pso.as_raw(), dispatch.threads, threads_per_group, bindings));
         }
 
         // SAFETY: `self.queue` is a valid `MTLCommandQueue`; the returned command
@@ -305,7 +399,7 @@ impl DirectMetalTransport {
             ));
         }
 
-        for (pso, threads, threads_per_group, bindings) in &prepared {
+        for dispatch in &prepared {
             // SAFETY: `cb` is a valid uncommitted `MTLCommandBuffer`.
             let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"computeCommandEncoder")) };
             if enc.is_null() {
@@ -313,28 +407,66 @@ impl DirectMetalTransport {
                     "MTLCommandBuffer.computeCommandEncoder returned null".to_string(),
                 ));
             }
+
+            let (pipeline, bindings) = match dispatch {
+                PreparedDispatch::OneD {
+                    pipeline, bindings, ..
+                }
+                | PreparedDispatch::ThreeD {
+                    pipeline, bindings, ..
+                } => (*pipeline, bindings),
+            };
+
             // SAFETY: `enc` and every prepared pipeline/buffer are valid Metal
             // objects for the active encoder scope, and offsets were validated.
             unsafe {
-                objc::msg_send_void_1(enc, objc::sel(c"setComputePipelineState:"), *pso);
+                objc::msg_send_void_1(enc, objc::sel(c"setComputePipelineState:"), pipeline);
                 for (buf_raw, offset, slot) in bindings {
                     objc::msg_send_set_buffer(enc, *buf_raw, *offset, *slot);
                 }
-                objc::msg_send_dispatch_threads(
-                    enc,
-                    MTLSize {
-                        width: *threads as usize,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: *threads_per_group,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                objc::msg_send_void_0(enc, objc::sel(c"endEncoding"));
             }
+            match dispatch {
+                PreparedDispatch::OneD {
+                    threads,
+                    threads_per_group,
+                    ..
+                } => {
+                    // SAFETY: `enc` is valid and the 1D grid dimensions were
+                    // validated as nonzero.
+                    unsafe {
+                        objc::msg_send_dispatch_threads(
+                            enc,
+                            MTLSize {
+                                width: *threads,
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: *threads_per_group,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
+                }
+                PreparedDispatch::ThreeD {
+                    group_counts,
+                    threads_per_group,
+                    ..
+                } => {
+                    // SAFETY: `enc` is valid; the exact group grid is nonzero
+                    // and the local dimensions fit the pipeline's hardware limit.
+                    unsafe {
+                        objc::msg_send_dispatch_threadgroups(
+                            enc,
+                            *group_counts,
+                            *threads_per_group,
+                        );
+                    }
+                }
+            }
+            // SAFETY: `enc` is a valid compute encoder awaiting `endEncoding`.
+            unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
         }
 
         // SAFETY: `cb` is a valid command buffer with every encoder closed.
