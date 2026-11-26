@@ -126,6 +126,10 @@ struct List {
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The native Metal producer when `VICTORY_BACKEND=metal` (ADR-008):
+    /// this list records Wire v3 submissions instead of host D3D12 work.
+    #[cfg(windows)]
+    metal: std::sync::Mutex<Option<crate::native_metal::producer::MetalList>>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -170,6 +174,108 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     hosts.iter().take(k + 1).cloned().collect()
 }
+
+/// List identifiers for the native path; never zero.
+#[cfg(windows)]
+fn metal_list_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Relaxed)
+}
+
+/// Runs `f` on the native producer of a title list, when `VICTORY_BACKEND`
+/// selects Metal.
+///
+/// The backend is read from the cached `GpuBackend` once per call; when the
+/// backend is `D3d12` the closure never runs and the host recording below it
+/// stays untouched. A refusal is remembered by the [`MetalList`] and returns
+/// its HRESULT from `Close`; nothing falls back to D3D12/D3DMetal (ADR-008).
+#[cfg(windows)]
+pub(crate) fn with_metal(
+    this: This,
+    f: impl FnOnce(
+        &mut crate::native_metal::producer::MetalProducer,
+    ) -> Result<(), crate::native_metal::producer::ProducerError>,
+) {
+    if crate::backend::GpuBackend::from_env() != crate::backend::GpuBackend::Metal || this.is_null()
+    {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(metal) = metal.as_mut() {
+        let result = f(metal.producer_mut());
+        if let Err(error) = result {
+            metal.note_error(error);
+        }
+    }
+}
+
+/// The native submissions of a list finished by `Close`, for the queue/bridge
+/// task to carry over the wire.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn take_submissions(this: This) -> Vec<crate::native_metal::producer::SubmissionV3> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+    metal.as_mut().map(|metal| metal.take()).unwrap_or_default()
+}
+
+/// The provisional native identity of a title resource: its guest allocation
+/// base address, generation 1.
+///
+/// The IPC bridge owns the allocation registry (`WIRE-V3-HOST-BRIDGE`); until
+/// it registers a range, the guest address is the key both sides can agree
+/// on, and nonzero.
+#[cfg(windows)]
+fn metal_resource(this: This) -> Option<crate::native_metal::producer::ResourceId> {
+    use crate::native_metal::producer::ResourceId;
+    let address = match crate::resource::texture_memory(this) {
+        Some((base, _)) => base as u64,
+        None => crate::resource::buffer_bytes(this)?.0 as u64,
+    };
+    ResourceId::from_guest_address(address).ok()
+}
+
+/// Whole-resource byte length for a barrier range, when the guest knows it.
+#[cfg(windows)]
+fn metal_resource_len(this: This) -> Option<u64> {
+    if let Some((_, size)) = crate::resource::buffer_bytes(this) {
+        return Some(size.max(1));
+    }
+    let (_, desc) = crate::resource::texture_memory(this)?;
+    Some(crate::resource::texture_layout(&desc)?.size.max(1))
+}
+
+/// `crate::draw::VertexView` as the title passes it: the same `repr(C)`
+/// layout, mirrored here because its fields are private to `draw`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MetalVertexView {
+    address: u64,
+    size: u32,
+    stride: u32,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<MetalVertexView>() == size_of::<crate::draw::VertexView>());
+
+/// `crate::draw::IndexView`, mirrored the same way.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MetalIndexView {
+    address: u64,
+    size: u32,
+    format: u32,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<MetalIndexView>() == size_of::<crate::draw::IndexView>());
 
 /// Waits recorded after commands: the title list goes on in a new host
 /// list, which runs once the wait holds.
@@ -367,6 +473,9 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    let metal_selected =
+        crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal;
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -382,7 +491,10 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        hosts: std::sync::Mutex::new(
+        hosts: std::sync::Mutex::new(if metal_selected {
+            // No host D3D12 command list exists on the native path.
+            Vec::new()
+        } else {
             crate::host::host()
                 .and_then(|h| match h.new_list() {
                     Ok(list) => Some(std::sync::Arc::new(list)),
@@ -392,8 +504,8 @@ fn new_list(
                     }
                 })
                 .into_iter()
-                .collect(),
-        ),
+                .collect()
+        }),
         #[cfg(windows)]
         segment: Default::default(),
         #[cfg(windows)]
@@ -402,6 +514,18 @@ fn new_list(
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(windows)]
+        metal: std::sync::Mutex::new(if metal_selected {
+            match crate::native_metal::producer::MetalList::new(metal_list_id()) {
+                Ok(metal) => Some(metal),
+                Err(error) => {
+                    tracing::warn!(%error, "no native Metal producer for this list");
+                    None
+                }
+            }
+        } else {
+            None
+        }),
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -449,6 +573,24 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    {
+        if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+            // The native path submits nothing on refusal; Close returns the
+            // failure HRESULT instead of falling back (ADR-008).
+            if !this.is_null() {
+                // SAFETY: the title passes one of our lists.
+                let list = unsafe { &*this.cast::<List>() };
+                let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(metal) = metal.as_mut()
+                    && let Err(error) = metal.close()
+                {
+                    return error.hresult();
+                }
+            }
+            return S_OK;
+        }
+    }
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -466,7 +608,16 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     {
         let held = restart(this);
         // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let list = unsafe { &*this.cast::<List>() };
+        if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+            let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(metal) = metal.as_mut()
+                && let Err(error) = metal.reset()
+            {
+                metal.note_error(error);
+            }
+        }
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
@@ -578,6 +729,56 @@ fn read_only_transition(b: &Barrier) -> bool {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        if !barriers.is_null() && count > 0 {
+            // SAFETY: the title passes `count` barriers.
+            let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+            with_metal(this, |producer| {
+                let mut entries = Vec::with_capacity(barriers.len());
+                for barrier in barriers {
+                    // D3D12_RESOURCE_STATE_UNORDERED_ACCESS.
+                    const UNORDERED_ACCESS: u32 = 0x8;
+                    let (handle, before, after) = match barrier.kind {
+                        0 => {
+                            // A split barrier's first half records no transition.
+                            const BEGIN_ONLY: u32 = 1;
+                            if barrier.flags & BEGIN_ONLY != 0 {
+                                return producer
+                                    .refuse("ResourceBarrier: split barrier begin", None);
+                            }
+                            (
+                                barrier.first,
+                                (barrier.second >> 32) as u32,
+                                barrier.last as u32,
+                            )
+                        }
+                        1 => return producer.refuse("ResourceBarrier: aliasing barrier", None),
+                        2 if barrier.first.is_null() => {
+                            return producer.refuse("ResourceBarrier: global UAV barrier", None);
+                        }
+                        2 => (barrier.first, UNORDERED_ACCESS, UNORDERED_ACCESS),
+                        _ => return producer.refuse("ResourceBarrier: unknown barrier type", None),
+                    };
+                    let resource = metal_resource(handle).ok_or(
+                        crate::native_metal::producer::ProducerError::unsupported(
+                            "ResourceBarrier: resource without a guest allocation",
+                        ),
+                    )?;
+                    entries.push(crate::native_metal::producer::BarrierEntry {
+                        allocation_id: resource.allocation_id,
+                        generation: resource.generation,
+                        offset: 0,
+                        length: metal_resource_len(handle).unwrap_or(1),
+                        before_state: before,
+                        after_state: after,
+                    });
+                }
+                producer.resource_barrier(&entries)
+            });
+        }
+        return 0;
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -674,6 +875,32 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        with_metal(this, |producer| {
+            let (src_address, src_size) = crate::resource::buffer_bytes(src).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "CopyBufferRegion: source is not a buffer",
+                ),
+            )?;
+            let (dst_address, dst_size) = crate::resource::buffer_bytes(dst).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "CopyBufferRegion: destination is not a buffer",
+                ),
+            )?;
+            if src_offset.checked_add(len).is_none_or(|end| end > src_size)
+                || dst_offset.checked_add(len).is_none_or(|end| end > dst_size)
+            {
+                return producer.refuse("CopyBufferRegion: range outside its buffer", None);
+            }
+            let src =
+                crate::native_metal::producer::ResourceId::from_guest_address(src_address as u64)?;
+            let dst =
+                crate::native_metal::producer::ResourceId::from_guest_address(dst_address as u64)?;
+            producer.copy_buffer(src, src_offset, dst, dst_offset, len)
+        });
+        return;
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -685,6 +912,29 @@ extern "system" fn copy_buffer_region(
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        with_metal(this, |producer| {
+            if let (Some((to, to_size)), Some((from, from_size))) = (
+                crate::resource::buffer_bytes(dst),
+                crate::resource::buffer_bytes(src),
+            ) {
+                let length = to_size.min(from_size);
+                if length == 0 {
+                    return producer.refuse("CopyResource: empty buffer", None);
+                }
+                let to = crate::native_metal::producer::ResourceId::from_guest_address(to as u64)?;
+                let from =
+                    crate::native_metal::producer::ResourceId::from_guest_address(from as u64)?;
+                return producer.copy_buffer(from, 0, to, 0, length);
+            }
+            producer.refuse(
+                "CopyResource of a texture (subresource lowering not wired)",
+                None,
+            )
+        });
+        return;
+    }
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -1063,6 +1313,31 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        // SAFETY: the title passes four floats (null is tolerated).
+        let color = unsafe { color.as_ref() }.copied();
+        with_metal(this, |producer| {
+            let Some(color) = color else {
+                return producer.refuse("ClearRenderTargetView: no clear colour", None);
+            };
+            if count > 0 || !rects.is_null() {
+                return producer.refuse("ClearRenderTargetView: partial rectangles", None);
+            }
+            let record = crate::descriptor::rtv_record(handle).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "ClearRenderTargetView: no recorded view",
+                ),
+            )?;
+            let resource = metal_resource(record.resource).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "ClearRenderTargetView: no guest allocation",
+                ),
+            )?;
+            producer.clear_render_target(resource, color)
+        });
+        return;
+    }
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1112,6 +1387,26 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        with_metal(this, |producer| {
+            if count > 0 || !rects.is_null() {
+                return producer.refuse("ClearDepthStencilView: partial rectangles", None);
+            }
+            let record = crate::descriptor::dsv_record(handle).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "ClearDepthStencilView: no recorded view",
+                ),
+            )?;
+            let resource = metal_resource(record.resource).ok_or(
+                crate::native_metal::producer::ProducerError::unsupported(
+                    "ClearDepthStencilView: no guest allocation",
+                ),
+            )?;
+            producer.clear_depth_stencil(resource, flags & 1 != 0, depth, flags & 2 != 0, stencil)
+        });
+        return;
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1248,6 +1543,11 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        with_metal(this, |producer| producer.set_pipeline(pipeline as u64));
+        return;
+    }
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
@@ -1401,10 +1701,18 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, metal_resource, with_metal, with_state};
+    use crate::backend::GpuBackend;
     use crate::draw::{IndexView, VertexView};
+    use crate::native_metal::producer::{
+        DepthTarget, ProducerError, RenderTarget, VertexBufferView,
+    };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+
+    fn metal() -> bool {
+        GpuBackend::from_env() == GpuBackend::Metal
+    }
 
     /// `count` items at `items`, or none.
     fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
@@ -1416,6 +1724,10 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
+        if metal() {
+            with_metal(this, |p| p.set_topology_value(topology));
+            return;
+        }
         with_state(this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
@@ -1423,14 +1735,39 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
+        if metal() {
+            let views = items(viewports, count);
+            with_metal(this, |p| match views {
+                [view] => p.set_viewport(
+                    view.TopLeftX,
+                    view.TopLeftY,
+                    view.Width,
+                    view.Height,
+                    view.MinDepth,
+                    view.MaxDepth,
+                ),
+                _ => p.refuse("RSSetViewports: more than one viewport", None),
+            });
+            return;
+        }
         with_state(this, |list, s| s.viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+        if metal() {
+            let rects = items(rects, count);
+            with_metal(this, |p| match rects {
+                [rect] => p.set_scissor_edges(rect.left, rect.top, rect.right, rect.bottom),
+                _ => p.refuse("RSSetScissorRects: more than one rectangle", None),
+            });
+            return;
+        }
         with_state(this, |list, s| s.scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         // SAFETY: the title passes four floats or null.
-        with_state(this, |list, s| s.blend_factor(list, unsafe { factor.as_ref() }));
+        with_state(this, |list, s| {
+            s.blend_factor(list, unsafe { factor.as_ref() })
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.stencil_ref(list, reference));
@@ -1475,10 +1812,21 @@ mod state {
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
+    /// Descriptor tables and root views carry heap addresses, not allocation
+    /// ranges: the descriptor lowering task resolves them into
+    /// `DescriptorTableV3`/`RootBufferView`. Until it lands the native path
+    /// records no binding for them (and fails at the host), rather than
+    /// guessing a range.
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        if metal() {
+            with_metal(this, |p| {
+                p.set_compute_root_constants(slot, &[value], offset)
+            });
+            return;
+        }
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
@@ -1487,6 +1835,12 @@ mod state {
         value: u32,
         offset: u32,
     ) {
+        if metal() {
+            with_metal(this, |p| {
+                p.set_graphics_root_constants(slot, &[value], offset)
+            });
+            return;
+        }
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
@@ -1496,6 +1850,11 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        if metal() {
+            let values = items(values, count);
+            with_metal(this, |p| p.set_compute_root_constants(slot, values, offset));
+            return;
+        }
         with_state(this, |_, s| {
             s.set_constants(true, slot, items(values, count), offset)
         });
@@ -1507,6 +1866,13 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        if metal() {
+            let values = items(values, count);
+            with_metal(this, |p| {
+                p.set_graphics_root_constants(slot, values, offset)
+            });
+            return;
+        }
         with_state(this, |_, s| {
             s.set_constants(false, slot, items(values, count), offset)
         });
@@ -1519,6 +1885,16 @@ mod state {
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+        if metal() {
+            // SAFETY: the title passes a view or null; `MetalIndexView` has
+            // the same `repr(C)` layout.
+            let view = unsafe { view.cast::<super::MetalIndexView>().as_ref() }.copied();
+            with_metal(this, |p| match view {
+                Some(view) => p.set_index_buffer_at(view.address, view.size, view.format),
+                None => p.refuse("IASetIndexBuffer(null)", None),
+            });
+            return;
+        }
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
@@ -1528,6 +1904,23 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
+        if metal() {
+            if views.is_null() {
+                with_metal(this, |p| p.clear_vertex_buffers(start, count));
+            } else {
+                let views: Vec<VertexBufferView> =
+                    items(views.cast::<super::MetalVertexView>(), count)
+                        .iter()
+                        .map(|view| VertexBufferView {
+                            address: view.address,
+                            size: view.size,
+                            stride: view.stride,
+                        })
+                        .collect();
+                with_metal(this, |p| p.set_vertex_buffers_at(start, &views));
+            }
+            return;
+        }
         with_state(this, |_, s| {
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
@@ -1554,6 +1947,37 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        if metal() {
+            with_metal(this, |p| {
+                let mut colors = Vec::with_capacity(handles.len());
+                for &handle in &handles {
+                    let record =
+                        crate::descriptor::rtv_record(handle).ok_or(ProducerError::unsupported(
+                            "OMSetRenderTargets: render target with no recorded view",
+                        ))?;
+                    let resource =
+                        metal_resource(record.resource).ok_or(ProducerError::unsupported(
+                            "OMSetRenderTargets: render target without a guest allocation",
+                        ))?;
+                    colors.push(RenderTarget::new(resource));
+                }
+                let depth = if depth == 0 {
+                    None
+                } else {
+                    let record =
+                        crate::descriptor::dsv_record(depth).ok_or(ProducerError::unsupported(
+                            "OMSetRenderTargets: depth target with no recorded view",
+                        ))?;
+                    let resource =
+                        metal_resource(record.resource).ok_or(ProducerError::unsupported(
+                            "OMSetRenderTargets: depth target without a guest allocation",
+                        ))?;
+                    Some(DepthTarget::new(resource))
+                };
+                p.set_render_targets(&colors, depth)
+            });
+            return;
+        }
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
     }
     pub(super) extern "system" fn draw(
@@ -1564,12 +1988,20 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if metal() {
+            with_metal(this, |p| p.draw(vertices, instances, first, first_instance));
+            return;
+        }
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        if metal() {
+            with_metal(this, |p| p.dispatch(x, y, z));
+            return;
+        }
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1579,6 +2011,10 @@ mod state {
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        if metal() {
+            with_metal(this, |p| p.dispatch_mesh(x, y, z));
+            return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
@@ -1593,6 +2029,16 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
+        if metal() {
+            with_metal(this, |p| {
+                if indirect != 0 {
+                    p.refuse("DispatchMeshX: indirect mesh dispatch", None)
+                } else {
+                    p.dispatch_mesh(x, 1, 1)
+                }
+            });
+            return;
+        }
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
@@ -1609,6 +2055,12 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        if metal() {
+            with_metal(this, |p| {
+                p.draw_indexed(indices, instances, first, base, first_instance)
+            });
+            return;
+        }
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1675,6 +2127,11 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        with_metal(this, |producer| producer.refuse("ExecuteIndirect", None));
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
