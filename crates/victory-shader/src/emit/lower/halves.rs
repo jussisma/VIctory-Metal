@@ -660,11 +660,11 @@ mod lane_mask_tests {
     };
     use crate::{io, ir, resource, structure};
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
-    const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
     /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
-    const PROLOGUE: [u32; 5] = [
+    pub(super) const PROLOGUE: [u32; 5] = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -673,11 +673,11 @@ mod lane_mask_tests {
     ];
 
     /// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`.
-    const fn store(vdata: u8, offset: u32) -> [u32; 2] {
+    pub(super) const fn store(vdata: u8, offset: u32) -> [u32; 2] {
         [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
     }
 
-    const V_LSHLREV_V16_5_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
+    pub(super) const V_LSHLREV_V16_5_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
     const V_MOV_V1_S12: u32 = 0x7E02_020C; // v_mov_b32 v1, s12
     const V_MOV_V1_VCC_HI: u32 = 0x7E02_026B; // v_mov_b32 v1, vcc_hi
     const S_BCNT1_S12_VCC: u32 = 0xBE8C_106A; // s_bcnt1_i32_b64 s12, vcc
@@ -687,16 +687,16 @@ mod lane_mask_tests {
     const V_MOV_V2_1: u32 = 0x7E04_0281; // v_mov_b32 v2, 1
     const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502; // v_readfirstlane_b32 s21, v2
     const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
-    const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
-    const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
-    const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
+    pub(super) const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
+    pub(super) const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
+    pub(super) const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
 
     /// `v_cmp_gt_u32 vcc, k, v0` (the lanes below `k`), an inline constant.
-    fn cmp_below(k: u32) -> u32 {
+    pub(super) fn cmp_below(k: u32) -> u32 {
         0x7D88_0000 | (128 + k)
     }
 
-    fn native(words: &[u32], threads: u32) -> NativeProgram {
+    pub(super) fn native(words: &[u32], threads: u32) -> NativeProgram {
         let range = |kind, table_offset_dwords, dwords| UsedResource {
             kind,
             root: RootType::Table,
@@ -1041,5 +1041,927 @@ mod lane_mask_tests {
                 }
             }
         }
+    }
+}
+
+/// Buckets 2-5 of the census (`wave_audit`): LDS a one-wave group shares
+/// without barriers, whole-wave reductions and prefixes, first-lane reads and
+/// lane reads that may cross the two 32-lane halves. Each shape the lowering
+/// admits, and each adversarial shape it must still refuse, on the CPU.
+#[cfg(test)]
+mod cross_half_tests {
+    use super::lane_mask_tests::{
+        CMPX_V0_EQ_0, PROLOGUE, RESTORE_EXEC, SAVE_EXEC, S_ENDPGM, S_WAITCNT_LGKM,
+        V_LSHLREV_V16_5_V0, cmp_below, native, store,
+    };
+    use super::{FIRST_ACROSS, Lowered, Parts, lower};
+    use crate::native::StageIo;
+    use crate::{io, ir, resource, structure};
+
+    // ----- instructions the fixtures are made of ---------------------------
+
+    /// `v2` = this lane's LDS dword, `v1` its `v_mbcnt`, `v4` the dword of
+    /// the lane 32 away (the other half).
+    const LDS_ADDRESSES: [u32; 5] = [
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+    ];
+
+    /// The LDS access a one-wave group must get barriers around: a write of
+    /// this lane's dword and a read of the other half's.
+    fn lds_body() -> Vec<u32> {
+        vec![
+            0xD834_0000,
+            0x0000_0102, // ds_write_b32 v2, v1
+            S_WAITCNT_LGKM,
+            0xD8D8_0000,
+            0x0300_0004, // ds_read_b32 v3, v4
+            S_WAITCNT_LGKM,
+        ]
+    }
+
+    const V_MOV_V1_V0: u32 = 0x7E02_0300; // v_mov_b32 v1, v0
+    const V_MOV_V5_1: u32 = 0x7E0A_0281; // v_mov_b32 v5, 1
+    const V_READFIRSTLANE_S22_V5: u32 = 0x7E2C_0505; // v_readfirstlane_b32 s22, v5
+    const V_MOV_V1_S22: u32 = 0x7E02_0216; // v_mov_b32 v1, s22
+    const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
+    const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
+    const S_CMP_LT_S20_22: u32 = 0xBF0A_1614; // s_cmp_lt_u32 s20, s22
+    const S_CMP_LT_S20_2: u32 = 0xBF0A_8214; // s_cmp_lt_u32 s20, 2
+    const S_MOV_B64_EXEC_ALL: u32 = 0xBEFE_04C1; // s_mov_b64 exec, -1
+
+    /// A uniform compare of two scalars the table load wrote (`s40`, `s41`)
+    /// into a lane mask: `s_cselect_b64 s[12:13], -1, 0`.
+    const UNIFORM_COMPARE: [u32; 3] = [
+        0xBF0A_2928, // s_cmp_lt_u32 s40, s41
+        0x858C_80C1, // s_cselect_b64 s[12:13], -1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+
+    /// VOP2 opcodes of the operations the reduction fixture takes.
+    const V_ADD_U32: u32 = 0x25;
+    const V_ADD_F32: u32 = 0x03;
+    const V_MIN_U32: u32 = 0x13;
+    const V_MAX_U32: u32 = 0x14;
+    const V_MIN_I32: u32 = 0x11;
+    const V_MAX_I32: u32 = 0x12;
+    const V_AND_B32: u32 = 0x1b;
+    const V_OR_B32: u32 = 0x1c;
+    const V_XOR_B32: u32 = 0x1d;
+    /// `v_mov_b32 v3, v0` (the input the reductions fold).
+    const V_MOV_V3_V0: u32 = 0x7E06_0300;
+    /// `v_xor_b32 v3, 42, v0`: values that differ per lane without a prefix
+    /// of them summing to themselves.
+    const V_XOR_V3_42_V0: u32 = 0x3A06_00AA;
+
+    /// The console compiler's whole-wave reduction of `v3` by the VOP2
+    /// operation `op`, the inline constant `ident` in inactive lanes (the
+    /// same words as `emit::halves_tests`).
+    fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
+        let vop2 = |word: u32| word & !(0x3F << 25) | op << 25;
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            input,       // v3 from v0
+            0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+            0xD501_0001,
+            0x0032_0600 | ident, // v_cndmask_b32 v1, ident, v3, s[12:13]
+        ]);
+        for control in [0x161, 0x162, 0x164, 0x168] {
+            w.extend([
+                vop2(0x0602_02FA),
+                0xFF00_0001 | control << 8, // op v1, v1, v1 row_xmask
+            ]);
+        }
+        w.extend([
+            0xD778_0002,
+            0x0201_0101,       // v_permlanex16_b32 v2, v1, 0, 0
+            vop2(0x0602_0302), // op v1, v2, v1
+            0xD760_000E,
+            0x0001_4101,       // v_readlane_b32 s14, v1, 32
+            vop2(0x0602_020E), // op v1, s14, v1
+            0xD760_000F,
+            0x0001_0101, // v_readlane_b32 s15, v1, 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E02_020F, // v_mov_b32 v1, s15
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// Everything `reduction` adds after the prologue and address word, up to
+    /// its store and end: the whole-wave section.
+    fn reduction_section(op: u32, ident: u32, input: u32) -> Vec<u32> {
+        let r = reduction(op, ident, input);
+        r[PROLOGUE.len() + 1..r.len() - 3].to_vec()
+    }
+
+    /// The console compiler's exclusive prefix sum of the thread id
+    /// (the same words as `emit::halves_tests`).
+    fn exclusive_prefix() -> Vec<u32> {
+        const EXEC: u32 = 126;
+        let sop1 = |sdst: u32, op: u32, ssrc0: u32| 0xBE80_0000 | sdst << 16 | op << 8 | ssrc0;
+        let vop1 = |vdst: u32, src0: u32| 0x7E00_0200 | vdst << 17 | src0;
+        let add = |src0: u32| 0x4A02_0200 | src0; // v_add_nc_u32 v1, src0, v1
+        let dpp = |ctrl: u32| 0xFF00_0001 | ctrl << 8; // of v1, row and bank masks 0xf
+        let readlane = |lane: u32| [0xD760_0002, 0x0000_0101 | (128 + lane) << 9]; // s2, v1
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            sop1(0, 0x25, 193), // s_or_saveexec_b64 s[0:1], -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32 v1, 0, v0, s[0:1]
+        ]);
+        for shift in [1, 2, 4, 8] {
+            w.extend([add(0xFA), dpp(0x110 + shift)]); // v_add_nc_u32 v1, v1, v1 row_shr
+        }
+        for (last, exec_lo, exec_hi) in [
+            (15, 0xFFFF_0000, 0),
+            (31, 0, 0x0000_FFFF),
+            (47, 0, 0xFFFF_0000),
+        ] {
+            w.extend(readlane(last));
+            w.extend([
+                sop1(EXEC, 0x03, 255),
+                exec_lo,
+                sop1(EXEC + 1, 0x03, 255),
+                exec_hi,
+            ]);
+            w.push(add(2)); // v_add_nc_u32 v1, s2, v1
+        }
+        w.extend([
+            sop1(EXEC, 0x04, 193), // s_mov_b64 exec, -1
+            vop1(3, 257),          // v_mov_b32 v3, v1
+            vop1(3, 0xFA),
+            dpp(0x111), // v_mov_b32 v3, v1 row_shr:1
+        ]);
+        for (last, exec_lo, exec_hi) in [(15, 0x0001_0000, 0), (31, 0, 1), (47, 0, 0x0001_0000)] {
+            w.extend(readlane(last));
+            w.extend([
+                sop1(EXEC, 0x03, 255),
+                exec_lo,
+                sop1(EXEC + 1, 0x03, 255),
+                exec_hi,
+            ]);
+            w.push(vop1(3, 2)); // v_mov_b32 v3, s2
+        }
+        w.extend([
+            sop1(EXEC, 0x04, 193), // s_mov_b64 exec, -1
+            vop1(2, 128),          // v_mov_b32 v2, 0
+            sop1(EXEC, 0x04, 194), // s_mov_b64 exec, -2
+            vop1(2, 259),          // v_mov_b32 v2, v3
+            sop1(EXEC, 0x04, 0),   // s_mov_b64 exec, s[0:1]
+        ]);
+        w.extend(store(2, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// A `body` in a scalar loop counted to two, then the scalar `s<result>`
+    /// stored: a count every host wave computes alike.
+    fn loop_twice(body: &[u32], result: u32) -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([V_LSHLREV_V16_5_V0, S_MOV_S20_0]);
+        let back = -(body.len() as i32 + 3);
+        w.extend_from_slice(body);
+        w.extend([
+            S_ADD_S20_1,
+            S_CMP_LT_S20_2,
+            0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the body)
+            0x7E02_0200 | result,                 // v_mov_b32 v1, s<result>
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// A `body` in a scalar loop counted to a first-lane read of `v0` at
+    /// least one and up to 63: one the host halves need not share.
+    fn loop_to_first_lane(body: &[u32], result: u32) -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0x7E2A_0500, // v_readfirstlane_b32 s21, v0
+            S_MOV_S20_0,
+        ]);
+        let back = -(body.len() as i32 + 3);
+        w.extend_from_slice(body);
+        w.extend([
+            S_ADD_S20_1,
+            0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+            0x7E02_0200 | result, // v_mov_b32 v1, s<result>
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    // ----- LDS -------------------------------------------------------------
+
+    /// A one-wave group of 64 writing its dword and reading the other half's,
+    /// in one block.
+    fn lds_straight() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend(lds_body());
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The same LDS access in a loop counted to four: a count every host
+    /// wave computes alike, so the barriers go inside the loop.
+    fn lds_loop() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend([V_MOV_V1_V0, S_MOV_S20_0]);
+        let body = lds_body();
+        let back = -(body.len() as i32 + 3);
+        w.extend(body);
+        w.extend([
+            S_ADD_S20_1,
+            0xBF0A_8414, // s_cmp_lt_u32 s20, 4
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The LDS loop counted to a first-lane read under an EXEC narrowing
+    /// whose condition is an alike scalar (`s_cmp_lt_u32 s40, s41` of the
+    /// loaded table dword): both halves enter the read, so it is alike in
+    /// both and the loop is a block every lane runs together.
+    fn lds_loop_guarded_by_alike_scalar() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend([V_MOV_V5_1]);
+        w.extend(UNIFORM_COMPARE);
+        w.extend([V_READFIRSTLANE_S22_V5, S_MOV_B64_EXEC_ALL]);
+        w.extend([S_MOV_S20_0]);
+        let body = lds_body();
+        let back = -(body.len() as i32 + 3);
+        w.extend(body);
+        w.extend([
+            S_ADD_S20_1,
+            S_CMP_LT_S20_22,
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The same loop, but the first-lane read is under a lane mask
+    /// (`v_cmpx_eq_u32 exec, 0, v0` of the thread id): each half's first
+    /// active lane is its own, so the count may differ between them and the
+    /// loop keeps refusing.
+    fn lds_loop_guarded_by_lane_mask() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend([SAVE_EXEC, CMPX_V0_EQ_0]);
+        w.extend([0x7E2C_0500, RESTORE_EXEC]); // v_readfirstlane_b32 s22, v0
+        w.extend([S_MOV_S20_0]);
+        let body = lds_body();
+        let back = -(body.len() as i32 + 3);
+        w.extend(body);
+        w.extend([
+            S_ADD_S20_1,
+            S_CMP_LT_S20_22,
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// `region` run only by the lanes below `k`: a real lane branch
+    /// (`v_cmp_gt_u32 vcc, k, v0`, `s_and_saveexec_b64`, a skip over the
+    /// region, EXEC restored), whose blocks are then no blocks every lane of
+    /// both halves runs together. An EXEC narrowing with no branch would not
+    /// do: the block itself stays one all lanes reach.
+    fn lane_region(k: u32, region: &[u32]) -> Vec<u32> {
+        let skip = region.len() as u32;
+        let mut w = vec![
+            cmp_below(k),
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBF88_0000 | skip, // s_cbranch_execz over the region
+        ];
+        w.extend_from_slice(region);
+        w.push(RESTORE_EXEC); // s_mov_b64 exec, s[0:1]
+        w
+    }
+
+    /// The instructions `words` decodes to (their number, not their words).
+    fn instruction_count(words: &[u32]) -> usize {
+        let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        code.extend(S_ENDPGM.to_le_bytes());
+        crate::gfx10::decode(&code).expect("decodes").len() - 1
+    }
+
+    /// A write and a read of the other half's dword inside a lane region:
+    /// the barrier they need can go only where some lanes do not reach.
+    fn lds_accesses_in_a_lane_region() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend(lane_region(32, &lds_body()));
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// A write every lane made, the read of the other half's dword in a lane
+    /// region: the barrier goes at the end of the block every lane runs.
+    fn lds_region_read_after_a_step_write() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend([0xD834_0000, 0x0000_0102, S_WAITCNT_LGKM]); // ds_write_b32 v2, v1
+        w.extend(lane_region(
+            32,
+            &[0xD8D8_0000, 0x0300_0004, S_WAITCNT_LGKM], // ds_read_b32 v3, v4
+        ));
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The write inside a lane region, the read of it after reconvergence:
+    /// the barrier goes in the block every lane runs.
+    fn lds_write_in_a_lane_region_read_after() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(LDS_ADDRESSES);
+        w.extend(lane_region(32, &[0xD834_0000, 0x0000_0102, S_WAITCNT_LGKM]));
+        w.extend([0xD8D8_0000, 0x0300_0004, S_WAITCNT_LGKM]);
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    // ----- reductions and prefixes ----------------------------------------
+
+    /// A sum of the thread id in the entry block: a reduction every lane of
+    /// the group runs together once.
+    fn reduction_entry() -> Vec<u32> {
+        reduction(V_ADD_U32, 0x80, V_MOV_V3_V0)
+    }
+
+    /// The same reduction inside a lane region: the block is not one every
+    /// lane of both halves runs, so no group barrier can go there.
+    fn reduction_in_a_lane_region() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(lane_region(32, &reduction_section(V_ADD_U32, 0x80, V_MOV_V3_V0)));
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// A sum in a loop counted to a first-lane read of `v0`: in a group of
+    /// 128 the second console wave runs a pass and the first does not, so
+    /// the loop body is no block both halves meet in.
+    fn reduction_in_a_per_wave_loop() -> Vec<u32> {
+        let section = reduction_section(V_ADD_U32, 0x80, V_MOV_V3_V0);
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0x2C04_0086, // v_lshrrev_b32 v2, 6, v0 (the console wave)
+            0x7E2A_0502, // v_readfirstlane_b32 s21, v2
+            S_MOV_S20_0,
+        ]);
+        let back = -(section.len() as i32 + 3);
+        w.extend(section);
+        w.extend([
+            S_ADD_S20_1,
+            0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// A sum in a loop counted to a first-lane read under an EXEC narrowing
+    /// whose condition is an alike scalar: both halves enter the read, the
+    /// loop is one block every lane runs the same number of times, and the
+    /// reduction's exchange goes in it.
+    fn reduction_in_a_guarded_uniform_loop() -> Vec<u32> {
+        let section = reduction_section(V_ADD_U32, 0x80, V_MOV_V3_V0);
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend([V_MOV_V5_1]);
+        w.extend(UNIFORM_COMPARE);
+        w.extend([V_READFIRSTLANE_S22_V5, S_MOV_B64_EXEC_ALL, S_MOV_S20_0]);
+        let back = -(section.len() as i32 + 3);
+        w.extend(section);
+        w.extend([
+            S_ADD_S20_1,
+            S_CMP_LT_S20_22,
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    // ----- first-lane and lane reads --------------------------------------
+
+    /// `v_readfirstlane_b32` of the thread id, stored: the console's first
+    /// lane is in the lower half, so the two halves exchange.
+    fn first_lane_of_the_thread_id() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (console lanes)
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ]);
+        w.extend(store(2, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The first lane of `v0 >> 6` (one value per console wave, the same in
+    /// both its halves): every lane already holds it.
+    fn first_lane_alike() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x2C04_0086, // v_lshrrev_b32 v2, 6, v0
+            0x7E18_0502, // v_readfirstlane_b32 s12, v2
+            0x7E06_020C, // v_mov_b32 v3, s12
+        ]);
+        w.extend(store(3, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The first lane of the thread id inside a lane region: each half would
+    /// read its own.
+    fn first_lane_in_a_lane_region() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([V_LSHLREV_V16_5_V0, 0xD765_0001, 0x0001_00C1]);
+        w.extend(lane_region(32, &[0x7E18_0500])); // v_readfirstlane_b32 s12, v0
+        w.extend([0x7E04_020C]); // v_mov_b32 v2, s12
+        w.extend(store(2, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The first lane of the thread id in a loop counted to it: a count the
+    /// halves need not share.
+    fn first_lane_in_a_per_wave_loop() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x7E2A_0500, // v_readfirstlane_b32 s21, v0
+            S_MOV_S20_0,
+            0x7E2C_0500, // v_readfirstlane_b32 s22, v0 (in the loop)
+        ]);
+        let back = -4;
+        w.extend([
+            S_ADD_S20_1,
+            0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+            0x7E04_0216, // v_mov_b32 v2, s22
+        ]);
+        w.extend(store(2, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// `v_readlane_b32 s12, v0, 40`: a constant console lane, in the other
+    /// half for every lane of the lower one.
+    fn lane_read_constant() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0xD760_000C,
+            0x0001_5100, // v_readlane_b32 s12, v0, 40
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// `v_readlane_b32 s12, v3, s13` of a value every lane holds (`v3` = 1,
+    /// the lane in `s13`): no exchange is needed.
+    fn lane_read_uniform_source() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0x7E06_0281, // v_mov_b32 v3, 1
+            0xBE8D_03FF,
+            33, // s_mov_b32 s13, 33
+            0xD760_000C,
+            0x0001_1B03, // v_readlane_b32 s12, v3, s13
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// `v_readlane_b32 s12, v0, v1` of a per-lane index (`v1` the lane's
+    /// `v_mbcnt`): the exchange holds one dword per half, so a lane read
+    /// whose lanes ask for different console lanes keeps refusing.
+    fn lane_read_per_lane_index() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([
+            V_LSHLREV_V16_5_V0,
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0xD760_000C,
+            0x0002_0300, // v_readlane_b32 s12, v0, v1
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ]);
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// The same read inside a lane region: no block both halves meet in.
+    fn lane_read_in_a_lane_region() -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.extend([V_LSHLREV_V16_5_V0, 0xD765_0001, 0x0001_00C1]);
+        w.extend(lane_region(32, &[0xD760_000C, 0x0001_5100]));
+        w.extend([0x7E02_020C]); // v_mov_b32 v1, s12
+        w.extend(store(1, 0));
+        w.push(S_ENDPGM);
+        w
+    }
+
+    // ----- the harness -----------------------------------------------------
+
+    /// The program lowered for a host of 32-lane waves, with `lds_bytes` of
+    /// LDS declared and `narrow_waves` (D3DMetal's `split_wave_barriers`).
+    fn lower_with(
+        words: &[u32],
+        threads: u32,
+        lds_bytes: u32,
+        narrow_waves: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let mut n = native(words, threads);
+        if let StageIo::Cs(cs) = &mut n.io {
+            cs.rsrc2 |= lds_bytes.div_ceil(512) << 15;
+        }
+        let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &n).expect("io::raise");
+        lower(&Parts {
+            native: &n,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            narrow_waves,
+            host_wave32: true,
+            bvh_no_hit: false,
+        })
+    }
+
+    /// One row of an admit/refuse table: the fixture, its group, LDS bytes,
+    /// whether narrow host waves sync LDS, the refusal it keeps (or none) and
+    /// the barriers a lowered program must have placed.
+    struct Row {
+        name: &'static str,
+        words: Vec<u32>,
+        threads: u32,
+        lds_bytes: u32,
+        narrow_waves: bool,
+        refuse: Option<&'static str>,
+        barriers: usize,
+        exchanges: Option<u32>,
+    }
+
+    fn row(
+        name: &'static str,
+        words: Vec<u32>,
+        threads: u32,
+        lds_bytes: u32,
+        narrow_waves: bool,
+        refuse: Option<&'static str>,
+        barriers: usize,
+        exchanges: Option<u32>,
+    ) -> Row {
+        Row {
+            name,
+            words,
+            threads,
+            lds_bytes,
+            narrow_waves,
+            refuse,
+            barriers,
+            exchanges,
+        }
+    }
+
+    /// Asserts every row: the admitted ones lower in halves with the
+    /// barriers and exchanges they need, the refused ones keep their reason.
+    fn check(rows: Vec<Row>, want_wave: Option<u32>) {
+        for Row {
+            name,
+            words,
+            threads,
+            lds_bytes,
+            narrow_waves,
+            refuse,
+            barriers,
+            exchanges,
+        } in rows
+        {
+            match lower_with(&words, threads, lds_bytes, narrow_waves) {
+                Ok(l) => {
+                    assert!(
+                        refuse.is_none(),
+                        "{name}: expected {:?}, lowered",
+                        refuse.unwrap()
+                    );
+                    assert_eq!(l.wave_size, want_wave, "{name}: wave size");
+                    assert_eq!(l.split_barriers, barriers, "{name}: barriers");
+                    if let Some(want) = exchanges {
+                        assert_eq!(l.half_exchanges, want, "{name}: exchanges");
+                    }
+                }
+                Err(e) => {
+                    let got = e.to_string();
+                    match refuse {
+                        Some(reason) => assert!(
+                            got.contains(reason),
+                            "{name}: expected {reason:?}, got {got}"
+                        ),
+                        None => panic!("{name}: refused ({got})"),
+                    }
+                }
+            }
+        }
+    }
+
+    const LDS_WHY: &str =
+        "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
+    const REDUCTION_WHY: &str =
+        "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+    const LANE_READ_WHY: &str =
+        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)";
+
+    #[test]
+    fn lds_admit_and_refuse_table() {
+        check(
+            vec![
+                // Straight-line LDS: one barrier between the write and the
+                // read of the other half.
+                row("straight", lds_straight(), 64, 512, true, None, 1, None),
+                // A loop counted to four: a barrier before the read and one
+                // before the next pass's write.
+                row("loop", lds_loop(), 64, 512, true, None, 2, None),
+                // A loop counted to a first-lane read under an alike-scalar
+                // EXEC narrowing: the widening this task makes.
+                row(
+                    "loop on a guarded uniform count",
+                    lds_loop_guarded_by_alike_scalar(),
+                    64,
+                    512,
+                    true,
+                    None,
+                    2,
+                    None,
+                ),
+                // The same read under a lane mask: the halves may run
+                // different numbers of passes, so the loop keeps refusing.
+                row(
+                    "loop on a per-lane count",
+                    lds_loop_guarded_by_lane_mask(),
+                    64,
+                    512,
+                    true,
+                    Some(LDS_WHY),
+                    0,
+                    None,
+                ),
+                // The write and the read in a lane region: no barrier can
+                // go where only some lanes reach.
+                row(
+                    "accesses in a lane region",
+                    lds_accesses_in_a_lane_region(),
+                    64,
+                    512,
+                    true,
+                    Some(LDS_WHY),
+                    0,
+                    None,
+                ),
+                // A write every lane made, read by some: the barrier sits at
+                // the end of the block every lane runs, before the region.
+                row(
+                    "read in a region after a step write",
+                    lds_region_read_after_a_step_write(),
+                    64,
+                    512,
+                    true,
+                    None,
+                    1,
+                    None,
+                ),
+                // The write in a per-lane region, the read after it: the
+                // barrier goes in the block every lane runs.
+                row(
+                    "write in a region, read after",
+                    lds_write_in_a_lane_region_read_after(),
+                    64,
+                    512,
+                    true,
+                    None,
+                    1,
+                    None,
+                ),
+                // Without D3DMetal's narrow host waves, LDS a one-wave group
+                // shares is refused as before.
+                row(
+                    "straight, no narrow waves",
+                    lds_straight(),
+                    64,
+                    512,
+                    false,
+                    Some(LDS_WHY),
+                    0,
+                    None,
+                ),
+                // A group of 32 or fewer is one host wave: no split, no
+                // barrier, no refusal.
+                row("straight, one host wave", lds_straight(), 32, 512, false, None, 0, None),
+            ],
+            Some(32),
+        );
+    }
+
+    #[test]
+    fn reduction_admit_and_refuse_table() {
+        // A sum, the bit operations, the unsigned and signed min and max, the
+        // floats, and the exclusive prefix sum, each over the console wave.
+        let mut rows = vec![
+            row("sum", reduction_entry(), 64, 0, false, None, 0, None),
+            row("or", reduction(V_OR_B32, 0x80, V_MOV_V3_V0), 64, 0, false, None, 0, None),
+            row("and", reduction(V_AND_B32, 0xC1, V_XOR_V3_42_V0), 64, 0, false, None, 0, None),
+            row("xor", reduction(V_XOR_B32, 0x80, V_XOR_V3_42_V0), 64, 0, false, None, 0, None),
+            row("min_u32", reduction(V_MIN_U32, 0xC1, V_XOR_V3_42_V0), 64, 0, false, None, 0, None),
+            row("max_u32", reduction(V_MAX_U32, 0x80, V_XOR_V3_42_V0), 64, 0, false, None, 0, None),
+            row("prefix", exclusive_prefix(), 64, 0, false, None, 0, None),
+            // Every admitted reduction in halves passed its halves' results:
+            // at least one exchange, on a group of two host waves.
+            row("sum, two host waves", reduction_entry(), 96, 0, false, None, 0, Some(1)),
+        ];
+        for r in &mut rows {
+            if r.exchanges.is_none() {
+                r.exchanges = Some(1);
+            }
+        }
+        rows.push(row(
+            "sum, one host wave",
+            reduction_entry(),
+            32,
+            0,
+            false,
+            None,
+            0,
+            Some(0),
+        ));
+        rows.push(row(
+            "sum in a lane region",
+            reduction_in_a_lane_region(),
+            64,
+            0,
+            false,
+            Some(REDUCTION_WHY),
+            0,
+            None,
+        ));
+        rows.push(row(
+            "sum in a per-wave loop",
+            reduction_in_a_per_wave_loop(),
+            128,
+            0,
+            false,
+            Some(REDUCTION_WHY),
+            0,
+            None,
+        ));
+        // A loop on a first-lane read under an alike-scalar narrowing runs
+        // alike in both halves, so the reduction's exchange goes inside it.
+        rows.push(row(
+            "sum in a guarded uniform loop",
+            reduction_in_a_guarded_uniform_loop(),
+            64,
+            0,
+            false,
+            None,
+            0,
+            Some(1),
+        ));
+        check(rows, Some(32));
+    }
+
+    #[test]
+    fn first_lane_and_lane_read_admit_and_refuse_table() {
+        check(
+            vec![
+                // A value every lane holds: no exchange.
+                row("first lane, alike", first_lane_alike(), 128, 0, false, None, 0, Some(0)),
+                // A per-lane value: the lower half's first lane, exchanged.
+                row(
+                    "first lane, per lane",
+                    first_lane_of_the_thread_id(),
+                    64,
+                    0,
+                    false,
+                    None,
+                    0,
+                    Some(1),
+                ),
+                row(
+                    "first lane in a lane region",
+                    first_lane_in_a_lane_region(),
+                    64,
+                    0,
+                    false,
+                    Some(FIRST_ACROSS),
+                    0,
+                    None,
+                ),
+                row(
+                    "first lane in a per-wave loop",
+                    first_lane_in_a_per_wave_loop(),
+                    64,
+                    0,
+                    false,
+                    Some(FIRST_ACROSS),
+                    0,
+                    None,
+                ),
+                // A constant console lane in the other half: exchanged.
+                row("lane read, constant lane", lane_read_constant(), 64, 0, false, None, 0, Some(1)),
+                // A value every lane holds: no exchange.
+                row(
+                    "lane read, alike source",
+                    lane_read_uniform_source(),
+                    64,
+                    0,
+                    false,
+                    None,
+                    0,
+                    Some(0),
+                ),
+                // A per-lane lane index (`v_mbcnt`): the 2-dword exchange
+                // holds one value per half, so the lanes would all read the
+                // one lane that stored last. Refused, as before.
+                row(
+                    "lane read, per-lane index",
+                    lane_read_per_lane_index(),
+                    64,
+                    0,
+                    false,
+                    Some(LANE_READ_WHY),
+                    0,
+                    None,
+                ),
+                row(
+                    "lane read in a lane region",
+                    lane_read_in_a_lane_region(),
+                    64,
+                    0,
+                    false,
+                    Some(LANE_READ_WHY),
+                    0,
+                    None,
+                ),
+            ],
+            Some(32),
+        );
     }
 }
