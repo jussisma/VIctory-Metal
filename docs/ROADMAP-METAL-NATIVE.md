@@ -2,6 +2,8 @@
 
 > **Handoff Note (LLM / DeepSeek-Ready Context):** This document captures the exact measured performance state, root-cause diagnosis, reuse boundaries, host Metal/IRConverter ABIs, and step-by-step milestones so any developer or agentic LLM can resume work cleanly without repeating experiments.
 
+> The [ARM64 handoff](ARM64-RENDERER.md) supersedes the in-process Wine unixlib renderer proposal and its projected copy savings below. This document preserves the earlier baseline and Rosetta proof of concept.
+
 ---
 
 ## 1. Current Baseline (`mac-turbo` @ `619204e5`, rebased onto `origin/main` `bf99e728`)

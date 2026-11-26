@@ -20,7 +20,7 @@ architected from day one so <strong>Wine can eventually be removed completely</s
 > This repository is an active R&amp;D effort to build a direct native Metal backend and decouple VIctory from CrossOver Wine + D3DMetal.
 >
 > - **It does NOT make GTA VI playable today.** Even with our current `mac-turbo` optimizations under D3DMetal, world frames on an **Apple M4 Max** measure **~494–585 ms (~1.7–2.0 fps)**.
-> - **Native Metal is under active construction (Milestone M0–M1).** The full frame loop still runs on D3DMetal (`VICTORY_BACKEND=d3d12`, default) while the new `crates/victory-metal` backend (`VICTORY_BACKEND=metal`) is brought up piece by piece.
+> - **The game frame loop currently uses D3DMetal.** The backend selector is a parser awaiting integration. Native Metal runs in independent hardware tests, including an ARM64 renderer sharing a buffer with a Win64 client under Wine.
 > - **Zero game assets are included or ever will be.** You must own your own Xbox Series X|S copy of the game. Every commit is checked by `cargo xtask policy`.
 
 ---
@@ -31,47 +31,17 @@ On Windows with AMD/PC D3D12, forks like [`VIctory-7900XTX`](https://github.com/
 
 On macOS via **Wine + D3DMetal**, we hit a structural wall (`crates/victory-gpu/src/alias.rs`):
 
-1. **D3DMetal refuses `OpenExistingHeapFromAddress*`.** Without zero-copy heaps, VIctory must maintain shadow D3D12 buffers, arm `VirtualProtect` write-watch page guards (`watch.rs`), field Rosetta write faults, copy **~250 MB/frame** (`copies: 70–98 ms`), and spend **~200 ms/frame** inside Wine D3D12 thunks / D3DMetal translation (`preparing`), plus `~18 ms/frame` scanning for `copying back`.
+1. **D3DMetal refuses `OpenExistingHeapFromAddress*`.** Historical world samples report up to **~250 MB/frame** of copies to shadow D3D12 buffers and about **18 ms/frame** in the readback phase. About **200 ms/frame** of preparation remains unattributed in the historical release profile.
 2. **Apple Silicon already *is* unified memory.** Metal natively supports `[MTLDevice newBufferWithBytesNoCopy:length:options:MTLResourceStorageModeShared deallocator:nil]` directly over page-aligned host allocations.
 3. **Apple already ships DXIL → `.metallib`.** `victory-shader` compiles Xbox GFX10 shaders to DXIL (handling Metal hardware constraints such as Wave32 halves and the 32 KiB mesh-output limit), and Apple's `libmetalirconverter.dylib` compiles that DXIL directly into native `MTLLibrary` bitcode with **no D3D12 or D3DMetal API layer in between**.
 
 ---
 
-## Wine-Free Endgame Architecture
+## ARM64 Renderer Architecture
 
 `crates/victory-metal` is built with **strict separation from Wine and Windows**: zero Wine headers, zero `windows-sys` crates, and a clean backend trait (`MetalTransport`) paired with an `extern "C"` ABI (`libvictory_metal.dylib` / `rlib`).
 
-```mermaid
-flowchart TD
-    Title["Xbox Series X|S Binary (x86-64 under Rosetta 2)"]
-    GPU["victory-gpu + victory-shader (GFX10 -> DXIL, Wave32, 32 KiB Mesh)"]
-    Switch{"VICTORY_BACKEND"}
-
-    D3D["Legacy D3D12 + CrossOver Wine + D3DMetal (default today)"]
-
-    subgraph Phase1["Phase 1: Wine Bring-Up Bridge (Current Target)"]
-        Shim["Thin Transport Adapter: Wine unixlib (__wine_unix_call)"]
-    end
-
-    subgraph Phase2["Phase 2: Pure Native macOS Host (Wine Removed Completely)"]
-        NativeHost["Native macOS Mach-O x86_64 PE Loader + HLE"]
-        Direct["DirectMetalTransport (in-process Rust call)"]
-    end
-
-    Engine["crates/victory-metal (PURE macOS: ZERO Wine Dependencies)"]
-    Metal["Apple Metal API + newBufferWithBytesNoCopy + libmetalirconverter.dylib"]
-
-    Title --> GPU
-    GPU --> Switch
-    Switch -- "d3d12" --> D3D
-    Switch -- "metal (Phase 1)" --> Shim --> Engine
-    NativeHost --> Direct --> Engine
-    Engine --> Metal
-```
-
-Why this matters:
-- **During bring-up (Phase 1)**, CrossOver Wine keeps running the Windows PE loader and Xbox HLE stubs so we can test real game shaders and frames incrementally without rewriting the OS loader first.
-- **Once Metal rendering works (Phase 2 / M5)**, Wine is only a replaceable transport wrapper around `victory-metal`: swapping `victory-loader` / `victory-hle` to a native macOS Mach-O `x86_64` Rosetta host lets the exact same `victory-metal` engine run **with zero Wine and zero D3DMetal**.
+Wine hosts the x86-64 PE loader and HLE. A separate ARM64 process owns the Metal device, resources and command queues. The proposed boundary batches commands and references shared allocations by ID and byte range. A later loader migration can reuse that boundary. See the [ARM64 handoff](docs/ARM64-RENDERER.md) for the verified buffer path and the pending contracts.
 
 ---
 
@@ -86,6 +56,8 @@ Why this matters:
 - **Milestone M1 (Foundation) — `crates/victory-metal` & `VICTORY_BACKEND` Seam**:
   - Added pure-Rust `crates/victory-metal` (`rlib` + `cdylib`) with `VmStatus`/`VmDeviceInfo` C ABI, `MetalTransport` trait, `DirectMetalTransport` (`MTLDevice` + `newBufferWithBytesNoCopy` + MSL compute dispatch), `libmetalirconverter.dylib` loader (`x86_64`), and real Apple Silicon Metal unit tests.
   - Added `VICTORY_BACKEND=d3d12|metal` selection seam in `crates/victory-gpu/src/backend.rs`.
+- **ARM64 shared-buffer probe** passed on the M4 Max with a Rosetta client and with a Win64 client under Wine. The Win64 test writes through one file mapping, dispatches an MSL compute kernel on the ARM64 renderer, then verifies the GPU writes through a second mapping of the same file.
+- **ARM64 DXIL execution probe** passed on the M4 Max. An x86-64 converter worker serializes a synthetic shader library for a separate ARM64 renderer, which binds its UAV and verifies the GPU output.
 
 ### Measured D3DMetal Baseline Progression (Apple M4 Max, World Gameplay)
 
@@ -113,11 +85,11 @@ Full technical details, hardware constraints, verified symbol tables, and LLM ha
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | **M0** | Host PoC: `newBufferWithBytesNoCopy` compute + `libmetalirconverter.dylib` DXIL -> `MTLLibrary` under `x86_64` | **Done (verified on M4 Max)** |
-| **M1** | Wine-decoupled `victory-metal` crate + `VICTORY_BACKEND` seam -> Wine unixlib bridge + `CAMetalLayer` clear window | **In Progress (crate & tests ready; Wine bridge next)** |
+| **M1** | ARM64 renderer process, batched transport and synthetic frame presentation while Wine hosts the client | **In progress (shared buffer verified under Wine)** |
 | **M2** | Zero-copy title memory registration + IRConverter root signatures (`IRRootSignatureCreateFromDescriptor`) + compute dispatch | Planned |
 | **M3** | `MTLTexture` cache, RTV/DSV passes, `MTLMeshRenderPipelineDescriptor`, `executeIndirect` + argument buffers | Planned |
 | **M4** | `MTLSharedEvent` synchronization + `MTLBinaryArchive` pipeline warmup + world FPS benchmark vs D3DMetal | Planned |
-| **M5** | **Wine-free native macOS `x86_64` host** (replace Wine PE loader / Win32 thunks with Mach-O host + `DirectMetalTransport`) | Long-term endgame |
+| **M5** | Evaluate replacing the Wine PE loader and Win32 HLE while retaining the ARM64 renderer boundary | Long-term |
 
 ---
 
