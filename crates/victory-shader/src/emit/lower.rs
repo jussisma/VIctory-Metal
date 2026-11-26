@@ -27,7 +27,7 @@ mod halves;
 mod mesh;
 use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
-use mesh::{pack_rows, prune_signature};
+use mesh::{pack_rows, prune_signature, row_order};
 
 type Why = &'static str;
 
@@ -371,6 +371,10 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
+    /// Mesh: guest row -> row emitted in the linked signature
+    /// ([`mesh::row_order`]). Applied once lowering is done, so exports keep
+    /// resolving guest rows to their elements and channels.
+    row_map: HashMap<u32, u32>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -687,6 +691,7 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let mut row_map = HashMap::new();
         if let Some(keep) = keep {
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
@@ -695,6 +700,7 @@ impl<'a> Lower<'a> {
                 // Only mesh outputs pay for Metal's aligned layout; pixel
                 // inputs and primitives keep their pruned declaration order.
                 pack_rows(&mut s.outputs);
+                row_map = row_order(&s.outputs).unwrap_or_default();
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -900,6 +906,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             split_barriers,
             half_outputs: half_outputs(&x.native.io),
+            row_map,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1651,6 +1658,15 @@ impl<'a> Lower<'a> {
             };
             [m.written_call_blocks(name), table]
         };
+        // Mesh: emit the signature rows in the order chosen for Metal's
+        // aligned layout. Stores name their element and channel, so the
+        // guest-row linkage they resolved while lowering is unchanged.
+        let row_map = &self.row_map;
+        for e in &mut self.s.outputs {
+            if let Some(emitted) = e.row.and_then(|row| row_map.get(&row).copied()) {
+                e.row = Some(emitted);
+            }
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
