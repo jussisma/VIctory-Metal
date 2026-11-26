@@ -410,6 +410,31 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    if crate::watch::guard_bench_enabled() {
+        let reports = crate::watch::guard_wait_report();
+        let waits: u64 = reports.iter().map(|r| r.waits).sum();
+        let sum: u64 = reports.iter().map(|r| r.sum_us).sum();
+        let threads: Vec<String> = reports
+            .iter()
+            .map(|r| {
+                format!(
+                    "#{} {} waits, {:.1} ms total, p50 {} us, p99 {} us, max {} us",
+                    r.slot,
+                    r.waits,
+                    r.sum_us as f64 / 1e3,
+                    r.p50_us,
+                    r.p99_us,
+                    r.max_us
+                )
+            })
+            .collect();
+        tracing::info!(
+            "  guard wait per submitting thread (VICTORY_GUARD_BENCH): {} waits, {:.1} ms total; {}",
+            waits,
+            sum as f64 / 1e3,
+            threads.join(", ")
+        );
+    }
     tracing::info!(
         "  heap blocks of {} KiB or more per frame: {:.0} made ({:.1} MB) in {:.2} ms, {:.0} freed ({:.1} MB) \
          in {:.2} ms, {:.0} resized ({:.1} MB) in {:.2} ms",
