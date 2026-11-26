@@ -101,14 +101,24 @@ impl std::fmt::Display for Failure {
 }
 
 /// A guest range resolved to a share file, section offset and length.
+///
+/// The caller's range is a byte range and need not be page aligned; the
+/// share mapping is: `offset` is the page containing the range's start and
+/// `[offset, offset + length)` covers every page the range touches. The
+/// caller still knows the bytes it asked for, so the exact subrange is
+/// `[at - offset, at - offset + len)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Range {
     pub(crate) id: u64,
     pub(crate) generation: u64,
-    /// Byte offset in the share file; always 64 KiB aligned.
+    /// Byte offset in the share file of the first covered page; always
+    /// 64 KiB aligned.
     pub(crate) offset: u64,
-    /// Length in bytes; always a non-zero multiple of 64 KiB.
+    /// Length in bytes covering the requested range; always a non-zero
+    /// multiple of 64 KiB.
     pub(crate) length: u64,
+    /// The share file's total length, for guest registration.
+    pub(crate) file_size: u64,
 }
 
 /// A resolved range that keeps the section, and with it the backing file,
@@ -126,6 +136,11 @@ impl Lease {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The share file's total length, for guest registration.
+    pub(crate) fn file_size(&self) -> u64 {
+        self.range.file_size
+    }
 }
 
 impl std::fmt::Debug for Lease {
@@ -142,9 +157,7 @@ impl std::fmt::Debug for Lease {
 pub(crate) enum ResolveError {
     /// Zero length.
     Empty,
-    /// Not aligned to 64 KiB pages.
-    Unaligned,
-    /// `at + len` or the section boundary does not fit.
+    /// `at + len` or the rounded page boundary does not fit.
     OutOfBounds,
     /// Not every page of the range is shown by a tracked view.
     NotMapped,
@@ -158,7 +171,6 @@ impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             ResolveError::Empty => "the range is empty",
-            ResolveError::Unaligned => "the range is not 64 KiB aligned",
             ResolveError::OutOfBounds => "the range leaves its section",
             ResolveError::NotMapped => "the range is not mapped by tracked views",
             ResolveError::NotContiguous => "the range is not one contiguous section run",
@@ -243,28 +255,36 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
     Err(Failure::Exhausted)
 }
 
-/// Resolves the guest range `[at, at + len)` to a share file, offset and
+/// Resolves the guest byte range `[at, at + len)` to a share file, offset and
 /// length.
 ///
-/// The range must be covered by the existing tracked views and show one
-/// contiguous run of pages of one section, all within the section. This takes
-/// the physical-page lock only to inspect and clone what the views already
-/// hold; the returned lease keeps the section (and its file) alive with an
-/// `Arc`.
+/// `at` and `len` need not be 64 KiB aligned: the result starts at the page
+/// containing `at` and covers every page the range touches, so the host can
+/// map it. The whole rounded span must be shown by the existing tracked
+/// views and be one contiguous run of pages of one section, all within the
+/// section. In particular, a range whose last byte is mapped is still
+/// refused if rounding it would reach an unmapped or foreign page: never
+/// grant a page the guest did not map.
+///
+/// This takes the physical-page lock only to inspect and clone what the
+/// views already hold; the returned lease keeps the section (and its file)
+/// alive with an `Arc`.
 pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, ResolveError> {
     if len == 0 {
         return Err(ResolveError::Empty);
     }
-    if !at.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
-        return Err(ResolveError::Unaligned);
-    }
     let end = at.checked_add(len).ok_or(ResolveError::OutOfBounds)?;
+    // The page containing the first byte and the page boundary after the
+    // last: a byte range may share pages with bytes the caller does not own,
+    // so rounding must not wrap either.
+    let start = at & !(PAGE - 1);
+    let stop = end.checked_add(PAGE - 1).ok_or(ResolveError::OutOfBounds)? & !(PAGE - 1);
     let physical = super::physical();
     let mut section: Option<Arc<Section>> = None;
     let mut first_index = None;
     let mut next_index = None;
-    let mut cursor = at;
-    while cursor < end {
+    let mut cursor = start;
+    while cursor < stop {
         let Some((base, size, slice)) = view_at(&physical, cursor) else {
             return Err(ResolveError::NotMapped);
         };
@@ -287,14 +307,19 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
         }
         next_index = index.checked_add(1);
         let view_end = base.checked_add(size).ok_or(ResolveError::OutOfBounds)?;
-        cursor = view_end.min(end);
+        cursor = view_end.min(stop);
     }
     let section = section.ok_or(ResolveError::NotMapped)?;
     let offset = first_index
         .ok_or(ResolveError::NotMapped)?
         .checked_mul(PAGE)
         .ok_or(ResolveError::OutOfBounds)?;
-    let end_offset = offset.checked_add(len).ok_or(ResolveError::OutOfBounds)?;
+    let length = stop.checked_sub(start).ok_or(ResolveError::OutOfBounds)?;
+    // Even though every page is shown by a view, check the whole rounded
+    // span lies in the section: no view may grant a page outside it.
+    let end_offset = offset
+        .checked_add(length)
+        .ok_or(ResolveError::OutOfBounds)?;
     if end_offset > section.size {
         return Err(ResolveError::OutOfBounds);
     }
@@ -305,7 +330,8 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
             id: backing.id,
             generation: backing.generation,
             offset: offset as u64,
-            length: len as u64,
+            length: length as u64,
+            file_size: section.size as u64,
         },
         path: backing.path.clone(),
         _section: section,
@@ -389,6 +415,7 @@ mod tests {
         assert_eq!(first.range.generation, GENERATION);
         assert_eq!(first.range.offset, 0);
         assert_eq!(first.range.length, PAGE as u64);
+        assert_eq!(first.file_size(), (2 * PAGE) as u64);
         let name = format!("{:016x}.bin", first.range.id);
         assert_eq!(first.path().parent(), Some(directory.as_path()));
         assert_eq!(
@@ -440,13 +467,14 @@ mod tests {
             resolve_guest_range(at as usize, 0).unwrap_err(),
             ResolveError::Empty
         );
+        // Byte ranges are accepted: this one stays inside page 0 and this
+        // one reaches the start of page 1, which is mapped.
+        let inside = resolve_guest_range(at as usize + 1, PAGE - 2).expect("a byte subrange");
+        assert_eq!((inside.range.offset, inside.range.length), (0, PAGE as u64));
+        let reached = resolve_guest_range(at as usize, PAGE + 1).expect("a range ending in page 1");
         assert_eq!(
-            resolve_guest_range(at as usize + 1, PAGE).unwrap_err(),
-            ResolveError::Unaligned
-        );
-        assert_eq!(
-            resolve_guest_range(at as usize, PAGE + 1).unwrap_err(),
-            ResolveError::Unaligned
+            (reached.range.offset, reached.range.length),
+            (0, (2 * PAGE) as u64)
         );
         assert_eq!(
             resolve_guest_range(at as usize + 2 * PAGE, PAGE).unwrap_err(),
@@ -484,6 +512,126 @@ mod tests {
         // Dropping the leases and sections leaves every registered file.
         assert!(first_path.exists(), "a backing file must not be unlinked");
         assert!(next_path.exists(), "a backing file must not be unlinked");
+    }
+
+    /// A compute view hands the resolver a byte range, not pages. A range
+    /// may cross adjacent tracked views of one section, but rounding it to
+    /// pages must never grant an unmapped page, a page gap or another
+    /// section.
+    #[test]
+    fn byte_ranges_cross_adjacent_views_and_refuse_rounding_grants() {
+        if cfg!(feature = "diagnostics") {
+            eprintln!("skipped: diagnostic heaps keep the pagefile path");
+            return;
+        }
+        let Ok(directory) = std::env::var(DIRECTORY) else {
+            eprintln!("skipped: {DIRECTORY} is not set");
+            return;
+        };
+        if directory.is_empty() {
+            eprintln!("skipped: {DIRECTORY} is empty");
+            return;
+        }
+        let directory = PathBuf::from(directory);
+
+        // Four pages of one section, shown as two adjacent two-page views.
+        let pages = allocate(4);
+        let at = reserve(4 * PAGE);
+        let second_view = at
+            .cast::<u8>()
+            .wrapping_add(2 * PAGE)
+            .cast::<std::ffi::c_void>();
+        assert_eq!(XMemMapPhysicalPages(at, 2, pages.as_ptr()), at);
+        assert_eq!(
+            XMemMapPhysicalPages(second_view, 2, pages[2..].as_ptr()),
+            second_view
+        );
+
+        // A byte range starting in the first view and ending in the second:
+        // both pages the rounded span touches are mapped, adjacent and of
+        // one section.
+        let crossing = resolve_guest_range(at as usize + 2 * PAGE - 0x80, 0x200)
+            .expect("a range across adjacent views");
+        assert_eq!(
+            (crossing.range.offset, crossing.range.length),
+            (PAGE as u64, (2 * PAGE) as u64)
+        );
+        assert_eq!(crossing.file_size(), (4 * PAGE) as u64);
+        assert_eq!(crossing.path().parent(), Some(directory.as_path()));
+
+        // Unaligned one-page subranges: the requested bytes fit in one
+        // mapped page, so the mapping is that whole page.
+        let subrange = resolve_guest_range(at as usize + 0x123, 0x456)
+            .expect("an unaligned one-page subrange");
+        assert_eq!(
+            (subrange.range.offset, subrange.range.length),
+            (0, PAGE as u64)
+        );
+        let tail = resolve_guest_range(at as usize + 3 * PAGE + 0x10, 0x20)
+            .expect("an unaligned subrange of the last page");
+        assert_eq!(
+            (tail.range.offset, tail.range.length),
+            ((3 * PAGE) as u64, PAGE as u64)
+        );
+
+        // Page index 0 then 2 is a gap in the section, even though both
+        // pages are mapped at adjacent addresses.
+        let gap = reserve(2 * PAGE);
+        let gap_next = gap
+            .cast::<u8>()
+            .wrapping_add(PAGE)
+            .cast::<std::ffi::c_void>();
+        assert_eq!(XMemMapPhysicalPages(gap, 1, pages.as_ptr()), gap);
+        assert_eq!(
+            XMemMapPhysicalPages(gap_next, 1, pages[2..].as_ptr()),
+            gap_next
+        );
+        assert_eq!(
+            resolve_guest_range(gap as usize, 2 * PAGE).unwrap_err(),
+            ResolveError::NotContiguous,
+            "a page gap must not resolve"
+        );
+
+        // Adjacent pages of two sections are not one run either.
+        let other = allocate(1);
+        let mixed = reserve(2 * PAGE);
+        let mixed_next = mixed
+            .cast::<u8>()
+            .wrapping_add(PAGE)
+            .cast::<std::ffi::c_void>();
+        assert_eq!(XMemMapPhysicalPages(mixed, 1, pages.as_ptr()), mixed);
+        assert_eq!(
+            XMemMapPhysicalPages(mixed_next, 1, other.as_ptr()),
+            mixed_next
+        );
+        assert_eq!(
+            resolve_guest_range(mixed as usize, 2 * PAGE).unwrap_err(),
+            ResolveError::NotContiguous,
+            "pages of two sections must not resolve"
+        );
+
+        // Arithmetic and rounding are checked, never wrapped.
+        assert_eq!(
+            resolve_guest_range(usize::MAX - 0x10, 0x20).unwrap_err(),
+            ResolveError::OutOfBounds
+        );
+        assert_eq!(
+            resolve_guest_range(usize::MAX, 1).unwrap_err(),
+            ResolveError::OutOfBounds,
+            "rounding the last byte up would overflow"
+        );
+        // The byte past the last mapped page is not granted by rounding.
+        assert_eq!(
+            resolve_guest_range(at as usize + 4 * PAGE - 1, 2).unwrap_err(),
+            ResolveError::NotMapped
+        );
+
+        drop((crossing, subrange, tail));
+        assert_eq!(XMemMapPhysicalPages(at, 4, std::ptr::null()), at);
+        assert_eq!(XMemMapPhysicalPages(gap, 2, std::ptr::null()), gap);
+        assert_eq!(XMemMapPhysicalPages(mixed, 2, std::ptr::null()), mixed);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
     }
 
     /// A section without host-visible backing (the pagefile fallback, or a
