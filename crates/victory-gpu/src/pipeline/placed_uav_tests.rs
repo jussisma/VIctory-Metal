@@ -77,6 +77,8 @@ fn store_shader() -> Arc<Shader> {
     let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
     Arc::new(Shader {
         stage: "compute",
+        #[cfg(victory_dxc_ambient)]
+        ambient_resolve: false,
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
         full_hash: *blake3::hash(&native.code).as_bytes(),
         size: container.len(),

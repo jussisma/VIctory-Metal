@@ -61,6 +61,8 @@ pub(crate) struct ComputeHead {
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
+    #[cfg(victory_dxc_ambient)]
+    pub(crate) ambient_resolve: bool,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     #[cfg(windows)]
@@ -167,6 +169,8 @@ impl Shader {
     fn with_hash(stage: &'static str, bytes: &[u8], digest: blake3::Hash) -> Shader {
         Shader {
             stage,
+            #[cfg(victory_dxc_ambient)]
+            ambient_resolve: stage == "compute" && crate::ambient::resolve_shader(bytes),
             hash: digest.to_hex()[..16].to_owned(),
             #[cfg(windows)]
             full_hash: *digest.as_bytes(),
@@ -371,6 +375,8 @@ impl Shader {
         let _ = cell.set(Some(translated));
         Arc::new(Shader {
             stage: self.stage,
+            #[cfg(victory_dxc_ambient)]
+            ambient_resolve: self.ambient_resolve,
             hash: self.hash.clone(),
             full_hash: self.full_hash,
             size: self.size,

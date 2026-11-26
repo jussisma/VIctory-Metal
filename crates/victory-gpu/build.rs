@@ -4,10 +4,16 @@ use std::{env, path::PathBuf, process::Command};
 // so the DXC path is not built or tested there: it is checked by hand with the
 // ignored test `hardware_uses_precompiled_clamp` (see docs/macos.md).
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(victory_dxc_clamp)");
     println!("cargo:rerun-if-env-changed=VICTORY_HELPER_DXC");
     println!("cargo:rerun-if-env-changed=DXC_EXE");
-    println!("cargo:rerun-if-changed=src/indirect-clamp.hlsl");
+    let helpers = [
+        ("indirect-clamp", "victory_dxc_clamp"),
+        ("ambient-floor", "victory_dxc_ambient"),
+    ];
+    for (name, cfg) in helpers {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+        println!("cargo:rerun-if-changed=src/{name}.hlsl");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -21,16 +27,15 @@ fn main() {
     if let Some(exe) = env::var_os("DXC_EXE") {
         println!("cargo:rerun-if-changed={}", PathBuf::from(exe).display());
     }
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("indirect-clamp.dxil");
-    let status = Command::new(compiler)
-        .args(["-T", "cs_6_0", "-E", "main", "-Fo"])
-        .arg(out)
-        .arg("src/indirect-clamp.hlsl")
-        .status()
-        .expect("start the configured DXC compiler");
-    assert!(
-        status.success(),
-        "DXC failed for the indirect argument clamp"
-    );
-    println!("cargo:rustc-cfg=victory_dxc_clamp");
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    for (name, cfg) in helpers {
+        let status = Command::new(&compiler)
+            .args(["-T", "cs_6_0", "-E", "main", "-Fo"])
+            .arg(out.join(format!("{name}.dxil")))
+            .arg(format!("src/{name}.hlsl"))
+            .status()
+            .expect("start the configured DXC compiler");
+        assert!(status.success(), "DXC failed for {name}");
+        println!("cargo:rustc-cfg={cfg}");
+    }
 }

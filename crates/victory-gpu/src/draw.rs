@@ -68,6 +68,9 @@ pub(crate) struct State {
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
+    /// Remapped byte offset of the resolve shader's light table, if copied.
+    #[cfg(victory_dxc_ambient)]
+    ambient_table: Option<u32>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -754,6 +757,13 @@ impl State {
                     .and_then(|h| h.view_addresses());
             }
             let made = self.tables(list, &t.used, compute);
+            #[cfg(victory_dxc_ambient)]
+            if stage.shader.ambient_resolve {
+                self.ambient_table = made
+                    .iter()
+                    .find(|(slot, _)| *slot == crate::ambient::LIGHT.0)
+                    .map(|(_, offset)| *offset);
+            }
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1197,6 +1207,64 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(victory_dxc_ambient)]
+        if p.stages.first().is_some_and(|stage| stage.shader.ambient_resolve)
+            && self.raise_indirect_light(list, p).is_some()
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    /// Finds the exact UAV used by this variant of the resolve shader.
+    #[cfg(victory_dxc_ambient)]
+    fn raise_indirect_light(&self, list: &HostList, p: &HostPipeline) -> Option<()> {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+        let level = crate::ambient::level()?;
+        let (slot, dwords) = crate::ambient::LIGHT;
+        let shader = p.stages.first()?.translated();
+        if !shader.used.iter().any(|usage| {
+            usage.kind == ResourceType::Uav
+                && usage.root == RootType::Table
+                && usage.slot == slot
+                && usage.table_offset_dwords == dwords
+        }) {
+            return None;
+        }
+        let Root::Table(table) = *self.roots_ref(true).get(usize::from(slot))? else {
+            return None;
+        };
+        let heap = self.heap_of(table)?.host()?;
+        let delta = 4 * dwords;
+        let view = crate::descriptor::view(table + u64::from(delta))?;
+        let View::Unordered(resource, 0, Some(desc)) = *view else {
+            return None;
+        };
+        if desc[0] != DXGI_FORMAT_R32_UINT.0 as u32
+            || desc[1] != D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32
+            || desc[2] != 0
+        {
+            return None;
+        }
+        let texture = crate::resource::host_resource(resource as This)?;
+        // SAFETY: the view pins the resource, and the host handle is live.
+        let dimensions = unsafe { texture.GetDesc() };
+        let start = self
+            .ambient_table
+            .unwrap_or_else(|| self.user_value(true, slot, RootType::Table, 0));
+        let index = start.checked_add(delta)? / 32;
+        if self.ambient_table.is_none() && index >= heap.count() {
+            return None;
+        }
+        crate::ambient::raise(
+            list,
+            heap.gpu(index),
+            u32::try_from(dimensions.Width).ok()?,
+            dimensions.Height,
+            level,
+        )
+        .then_some(())
     }
 
     /// What a draw or dispatch runs, for the device-removed report

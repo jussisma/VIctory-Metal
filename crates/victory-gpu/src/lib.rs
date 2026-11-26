@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod alias;
+#[cfg(all(windows, victory_dxc_ambient))]
+mod ambient;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
