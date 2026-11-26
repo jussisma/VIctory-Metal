@@ -1307,6 +1307,11 @@ impl MetalProducer {
         })
     }
 
+    /// Encodes a submission with the canonical version 3 codec.
+    pub fn encode(submission: &SubmissionV3) -> Result<Vec<u8>, WireError> {
+        victory_metal::wire_v3::encode_submission_v3(submission)
+    }
+
     /// Flushes and carries the submission to `sink`, checking its reply.
     pub fn submit<S: WireV3Sink + ?Sized>(&mut self, sink: &mut S) -> Result<Reply, ProducerError> {
         let submission = self.flush()?;
@@ -1974,6 +1979,199 @@ mod tests {
         list.reset().expect("reset");
         assert_eq!(list.generation(), 2);
         assert_eq!(list.failures(), 1);
+    }
+
+    #[test]
+    fn emitted_opcodes_match_the_wire_constants_and_round_trip() {
+        use victory_metal::wire_v3::{decode_submission_v3, DescriptorKind};
+
+        let mut producer = MetalProducer::new(21, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer
+            .set_viewport(0.0, 0.0, 640.0, 360.0, 0.0, 1.0)
+            .expect("viewport");
+        producer
+            .set_scissor_edges(0, 0, 640, 360)
+            .expect("scissor");
+        producer
+            .set_topology(PrimitiveTopology::TriangleList)
+            .expect("topology");
+        producer.set_pipeline(0x900).expect("pipeline");
+        producer
+            .set_vertex_buffers_at(
+                0,
+                &[VertexBufferView {
+                    address: 0x10_0000,
+                    size: 4096,
+                    stride: 32,
+                }],
+            )
+            .expect("vertex buffer");
+        producer
+            .set_index_buffer_at(0x20_0000, 1024, 57)
+            .expect("index buffer");
+        producer
+            .set_graphics_root_constants(0, &[1, 2, 3, 4], 0)
+            .expect("root constants");
+        producer
+            .set_graphics_root_buffer_view(RootBufferView {
+                slot: 1,
+                allocation_id: 0x30_0000,
+                generation: 1,
+                offset: 0,
+                length: 64,
+            })
+            .expect("root view");
+        producer
+            .set_graphics_descriptor_table(DescriptorTableV3 {
+                set: 0,
+                base_register: 2,
+                kind: DescriptorKind::Cbv,
+                bindings: vec![victory_metal::wire::BufferBinding {
+                    allocation_id: 0x40_0000,
+                    generation: 1,
+                    offset: 0,
+                    length: 256,
+                }],
+            })
+            .expect("descriptor table");
+        record_draw(&mut producer);
+        producer
+            .resource_barrier(&[BarrierEntry {
+                allocation_id: 0x2000,
+                generation: 1,
+                offset: 0,
+                length: 64,
+                before_state: 0x4,
+                after_state: 0x20,
+            }])
+            .expect("barrier");
+        producer
+            .copy_buffer(resource(0x4000), 0, resource(0x5000), 0, 256)
+            .expect("copy buffer");
+        producer
+            .copy_texture(resource(0x6000), 0, 0, resource(0x7000), 0, 0, 64, 64, 1)
+            .expect("copy texture");
+        producer
+            .set_compute_threadgroup_size([8, 8, 1])
+            .expect("compute threadgroup");
+        producer.set_compute_pipeline(0x901).expect("compute pipeline");
+        producer.dispatch(2, 3, 4).expect("dispatch");
+        producer.present(3, 1).expect("present");
+        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
+        producer.dispatch_mesh(1, 1, 1).expect("mesh dispatch");
+
+        let submission = producer.flush().expect("flush");
+        let expected = [
+            (CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: Vec::new(),
+                depth_stencil: None,
+            }), OP_BEGIN_RENDER_PASS),
+            (CommandV3::SetViewport(Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+                near: 0.0,
+                far: 0.0,
+            }), OP_SET_VIEWPORT),
+            (CommandV3::SetScissor(ScissorRect { x: 0, y: 0, width: 0, height: 0 }), OP_SET_SCISSOR),
+            (CommandV3::SetPrimitiveTopology(PrimitiveTopology::PointList), OP_SET_PRIMITIVE_TOPOLOGY),
+            (CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id: 1 }), OP_SET_GRAPHICS_PIPELINE),
+            (CommandV3::SetVertexBuffers(VertexBufferSet { start_slot: 0, buffers: Vec::new() }), OP_SET_VERTEX_BUFFERS),
+            (CommandV3::SetIndexBuffer(IndexBufferBinding {
+                allocation_id: 1,
+                generation: 1,
+                offset: 0,
+                length: 1,
+                format: IndexFormat::Uint16,
+            }), OP_SET_INDEX_BUFFER),
+            (CommandV3::SetRootConstants(RootConstantsV3 { slot: 0, bytes: Vec::new() }), OP_ROOT_CONSTANTS),
+            (CommandV3::SetRootBufferView(RootBufferView {
+                slot: 0,
+                allocation_id: 1,
+                generation: 1,
+                offset: 0,
+                length: 1,
+            }), OP_SET_ROOT_BUFFER_VIEW),
+            (CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Cbv,
+                bindings: Vec::new(),
+            }), OP_DESCRIPTOR_TABLE),
+            (CommandV3::DrawIndexedInstanced(DrawIndexedInstanced {
+                index_count_per_instance: 1,
+                instance_count: 1,
+                start_index: 0,
+                base_vertex: 0,
+                start_instance: 0,
+            }), OP_DRAW_INDEXED_INSTANCED),
+            (CommandV3::EndRenderPass, OP_END_RENDER_PASS),
+            (CommandV3::ResourceBarrier(ResourceBarrier { entries: Vec::new() }), OP_RESOURCE_BARRIER),
+            (CommandV3::CopyBuffer(CopyBuffer {
+                src_allocation_id: 1,
+                src_generation: 1,
+                src_offset: 0,
+                dst_allocation_id: 1,
+                dst_generation: 1,
+                dst_offset: 0,
+                length: 1,
+            }), OP_COPY_BUFFER),
+            (CommandV3::CopyTexture(CopyTexture {
+                src_allocation_id: 1,
+                src_generation: 1,
+                src_mip: 0,
+                src_slice: 0,
+                dst_allocation_id: 1,
+                dst_generation: 1,
+                dst_mip: 0,
+                dst_slice: 0,
+                width: 1,
+                height: 1,
+                depth: 1,
+            }), OP_COPY_TEXTURE),
+            (CommandV3::SetComputePipeline(PipelineRef { pipeline_id: 1 }), OP_SET_COMPUTE_PIPELINE),
+            (CommandV3::Dispatch3d(Dispatch3d {
+                pipeline_id: 1,
+                group_counts: [1, 1, 1],
+                threads_per_group: [1, 1, 1],
+                bindings: Vec::new(),
+            }), OP_DISPATCH_3D),
+            (CommandV3::Present(Present { surface_id: 1, sync_interval: 0 }), OP_PRESENT),
+            (CommandV3::SetMeshPipeline(PipelineRef { pipeline_id: 1 }), OP_SET_MESH_PIPELINE),
+            (CommandV3::DispatchMesh(DispatchMesh {
+                pipeline_id: 1,
+                group_counts: [1, 1, 1],
+                bindings: Vec::new(),
+            }), OP_DISPATCH_MESH),
+        ];
+
+        assert_eq!(
+            submission.commands.len(),
+            expected.len(),
+            "the recorded stream should exercise every emitted command"
+        );
+        for (command, (shape, opcode)) in submission.commands.iter().zip(expected.iter()) {
+            assert_eq!(
+                core::mem::discriminant(command),
+                core::mem::discriminant(shape),
+                "unexpected command {command:?}"
+            );
+            assert_eq!(
+                command.opcode(),
+                *opcode,
+                "opcode for {command:?} differs from wire_v3"
+            );
+        }
+        // Keep the compile-time link to the constants explicit: an opcode the
+        // producer can emit but the wire does not define would not build.
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        let decoded = decode_submission_v3(&bytes).expect("decode");
+        assert_eq!(decoded, submission, "the frame must round-trip exactly");
     }
 
     #[test]
