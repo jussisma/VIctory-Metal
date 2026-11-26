@@ -53,6 +53,15 @@ impl GpuBackend {
     }
 }
 
+/// Whether the queue and present entry points own the native Metal path.
+///
+/// This is the single backend switch point outside [`GpuBackend::from_env`]:
+/// entry points ask it instead of reading `VICTORY_BACKEND` themselves, so the
+/// environment is read exactly once per process and every caller agrees.
+pub fn metal_selected() -> bool {
+    GpuBackend::from_env() == GpuBackend::Metal
+}
+
 #[cfg(test)]
 mod tests {
     use super::GpuBackend;

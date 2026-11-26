@@ -117,6 +117,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     #[cfg(windows)]
+    if crate::backend::metal_selected() {
+        // The native path carries the lists' finished Wire v3 submissions to
+        // the host over the native queue. Host D3D12 work is never enqueued
+        // here, and there is no fallback to it (ADR-010).
+        crate::native_metal::queue::execute_native(count, lists);
+        return;
+    }
+    #[cfg(windows)]
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -619,6 +627,35 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    if crate::backend::metal_selected() {
+        // The frame is complete on the guest: the registered native swapchain
+        // hands its own surface to the host presenter. No D3D12 swapchain,
+        // held-work pump or plane translation runs on this path, and a
+        // refusal is an explicit HRESULT (ADR-010).
+        let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(feature = "diagnostics")]
+        crate::frame::presented();
+        return match crate::native_metal::queue::present_registered() {
+            Ok(presented) => {
+                tracing::debug!(
+                    frame,
+                    surface = presented.surface_id,
+                    index = presented.frame_index,
+                    "native frame presented"
+                );
+                S_OK
+            }
+            Err(error) => {
+                tracing::warn!(
+                    frame,
+                    %error,
+                    "VICTORY_BACKEND=metal: the native present refused the frame"
+                );
+                error.hresult()
+            }
+        };
+    }
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
