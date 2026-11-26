@@ -25,7 +25,9 @@
 //! | 2 | guest to host | `allocation_id: u64 LE`, `byte_len: u64 LE` |
 //! | 3 | guest to host | one complete encoded [`crate::wire::Submission`] |
 //! | 3 | host to guest | one complete encoded [`crate::wire::Reply`] |
+//! | 4 | guest to host | `ticket: u64 LE`, `entry_len: u16 LE`, entry bytes |
 //! | 128 | host to guest | one byte: 0 = accepted, 1 = rejected |
+//! | 129 | host to guest | one byte status, then `pipeline_id: u64 LE` on success |
 //!
 //! Kind 128 acknowledges authentication and registration only. A rejected
 //! authentication or registration frame is followed by connection close. GPU
@@ -33,6 +35,25 @@
 //! the session. Submission sequences start at 1 and increase by exactly one.
 //! Any other kind, malformed envelope, wire decode failure or out-of-order
 //! sequence is a protocol failure and closes the connection.
+//!
+//! # Pipeline files
+//!
+//! Kind 4 is opt-in: it loads the launcher-provided file
+//! `<canonical share dir>/<ticket:016x>.metallib` and asks the executor to
+//! register `entry` as a compute pipeline. Pipeline files deliberately share
+//! the canonical launcher directory with allocation `.bin` files; the fixed
+//! suffix keeps the two namespaces disjoint. The ticket must be nonzero and
+//! strictly greater than every previously accepted ticket, and the entry name
+//! must be a bounded ASCII Metal identifier. Neither a path nor arbitrary bytes
+//! cross the wire, so the guest cannot select another file. The file must be a
+//! regular file opened without following a final symlink, nonzero and at most
+//! [`MAX_METALLIB_BYTES`].
+//!
+//! The host answers kind 4 with kind 129. Status 0 carries the native pipeline
+//! id; status 1 is an explicit rejection (bad ticket or entry, missing or
+//! invalid file, or a failed Metal load) and leaves the session open. The
+//! loaded pipeline is registered in the same native table used by kind 3
+//! submissions.
 //!
 //! # Allocation files
 //!
@@ -76,7 +97,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::abi::VmBufferId;
+use crate::abi::{VmBufferId, VmPipelineId};
+use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::device::DirectMetalTransport;
 use crate::transport::MetalError;
 use crate::wire::{
@@ -91,19 +113,36 @@ pub const KIND_AUTH: u8 = 1;
 pub const KIND_REGISTER: u8 = 2;
 /// Frame kind for a submission request and its reply.
 pub const KIND_SUBMISSION: u8 = 3;
+/// Frame kind for an opt-in precompiled pipeline registration.
+pub const KIND_PIPELINE: u8 = 4;
 /// Frame kind for an authentication or registration acknowledgement.
 pub const KIND_ACK: u8 = 128;
+/// Frame kind for a pipeline registration reply.
+pub const KIND_PIPELINE_REPLY: u8 = 129;
 /// Exact length of the shared session secret.
 pub const SECRET_LEN: usize = 32;
 /// Exact length of a registration payload.
 pub const REGISTER_PAYLOAD_LEN: usize = 16;
 /// Generation assigned to every registered allocation in transport v1.
 pub const BASE_GENERATION: u32 = 1;
+/// Fixed ticket and entry-length prefix of a pipeline registration payload.
+pub const PIPELINE_HEADER_LEN: usize = 10;
+/// Largest `.metallib` accepted from the launcher-owned directory.
+pub const MAX_METALLIB_BYTES: u64 = 16 * 1024 * 1024;
+/// Status byte of a successful pipeline registration reply.
+pub const PIPELINE_REPLY_OK: u8 = 0;
+/// Status byte of an explicitly rejected pipeline registration.
+pub const PIPELINE_REPLY_REJECTED: u8 = 1;
+/// Exact length of a successful pipeline reply: status plus `u64` id.
+pub const PIPELINE_REPLY_OK_LEN: usize = 1 + 8;
 
 const ENVELOPE_LEN: usize = 5;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Darwin `O_NOFOLLOW`: reject a final path component that is a symlink.
 const O_NOFOLLOW: i32 = 0x0100;
+/// Darwin `O_NONBLOCK`: a path swapped to a FIFO after the metadata check
+/// cannot block the open before the descriptor is revalidated.
+const O_NONBLOCK: i32 = 0x0004;
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 /// Darwin `MAP_SHARED`. GPU writes must reach the guest-visible file, so this
@@ -219,6 +258,16 @@ pub trait BatchExecutor {
         submission: &Submission,
         allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Result<Reply, MetalError>;
+    /// Loads a precompiled `.metallib` and registers `entry` as a compute
+    /// pipeline, returning the native id used by later submissions.
+    ///
+    /// The default deliberately refuses the request, so pipeline registration
+    /// is opt-in for an executor that can validate and load off-line libraries.
+    fn load_pipeline(&self, _metallib: &[u8], _entry: &str) -> Result<VmPipelineId, MetalError> {
+        Err(MetalError::NotSupported(
+            "pipeline registration is not enabled by this executor",
+        ))
+    }
 }
 
 impl BatchExecutor for DirectMetalTransport {
@@ -245,6 +294,10 @@ impl BatchExecutor for DirectMetalTransport {
         allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Result<Reply, MetalError> {
         DirectMetalTransport::submit_batch(self, submission, allocations)
+    }
+
+    fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
+        DirectMetalTransport::load_metallib(self, metallib, entry)
     }
 }
 
@@ -353,6 +406,55 @@ impl Drop for FileMapping {
     }
 }
 
+/// Reads `{ticket:016x}.metallib` from the canonical share directory.
+///
+/// The path is derived only from the validated numeric ticket. The final
+/// component must be a regular file and is opened `O_NOFOLLOW`; size and type
+/// are rechecked on the open descriptor before reading, so replacing the path
+/// with a symlink or growing the file cannot smuggle other bytes in.
+fn read_pipeline_file(share_dir: &Path, ticket: u64) -> Result<Vec<u8>, HostError> {
+    let path = share_dir.join(format!("{ticket:016x}.metallib"));
+    let before = std::fs::symlink_metadata(&path)?;
+    if !before.file_type().is_file() {
+        return Err(HostError::Protocol(
+            "pipeline backing must be a regular file",
+        ));
+    }
+    let announced = before.len();
+    if announced == 0 || announced > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol(
+            "pipeline backing is empty or exceeds the 16 MiB limit",
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(HostError::Protocol(
+            "pipeline backing is not a regular file",
+        ));
+    }
+    if metadata.len() != announced || metadata.len() > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol(
+            "pipeline backing changed size while opening",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(announced as usize);
+    let read = (&mut file)
+        .take(MAX_METALLIB_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if read as u64 != announced || bytes.is_empty() || bytes.len() as u64 > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol(
+            "pipeline backing changed size while reading",
+        ));
+    }
+    Ok(bytes)
+}
+
 struct RegisteredAllocation {
     /// Logical length from the registration frame; bindings are checked
     /// against this, not the page-rounded mapping length.
@@ -386,6 +488,7 @@ pub struct IpcHost<E: BatchExecutor> {
     executor: E,
     allocations: BTreeMap<u64, RegisteredAllocation>,
     last_allocation_id: u64,
+    last_pipeline_ticket: u64,
     next_sequence: u32,
     submissions: u64,
 }
@@ -418,6 +521,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             executor,
             allocations: BTreeMap::new(),
             last_allocation_id: 0,
+            last_pipeline_ticket: 0,
             next_sequence: 1,
             submissions: 0,
         })
@@ -468,6 +572,10 @@ impl<E: BatchExecutor> IpcHost<E> {
                     write_frame(&mut stream, KIND_ACK, &[0])?;
                 }
                 KIND_SUBMISSION => self.submit(&mut stream, &payload)?,
+                KIND_PIPELINE => {
+                    let reply = self.register_pipeline(&payload);
+                    write_frame(&mut stream, KIND_PIPELINE_REPLY, &reply)?;
+                }
                 _ => {
                     return Err(HostError::Protocol(
                         "unexpected frame kind after authentication",
@@ -589,6 +697,34 @@ impl<E: BatchExecutor> IpcHost<E> {
             binding_within_allocation(binding, &self.allocations)
         })
     }
+
+    /// Handles one kind 4 request and returns the kind 129 reply payload.
+    ///
+    /// Every request-level failure is an explicit status-1 reply, not a
+    /// connection close: the file contents never reach the error path and the
+    /// peer may retry the failed ticket or a later one.
+    fn register_pipeline(&mut self, payload: &[u8]) -> Vec<u8> {
+        let Some((ticket, entry)) = decode_pipeline_request(payload) else {
+            return vec![PIPELINE_REPLY_REJECTED];
+        };
+        if ticket <= self.last_pipeline_ticket {
+            return vec![PIPELINE_REPLY_REJECTED];
+        }
+        let metallib = match read_pipeline_file(&self.share_dir, ticket) {
+            Ok(metallib) => metallib,
+            Err(_) => return vec![PIPELINE_REPLY_REJECTED],
+        };
+        let pipeline = match self.executor.load_pipeline(&metallib, entry) {
+            Ok(pipeline) if pipeline.0 != 0 => pipeline,
+            _ => return vec![PIPELINE_REPLY_REJECTED],
+        };
+
+        self.last_pipeline_ticket = ticket;
+        let mut reply = Vec::with_capacity(PIPELINE_REPLY_OK_LEN);
+        reply.push(PIPELINE_REPLY_OK);
+        reply.extend_from_slice(&pipeline.0.to_le_bytes());
+        reply
+    }
 }
 
 impl<E: BatchExecutor> Drop for IpcHost<E> {
@@ -617,6 +753,26 @@ fn read_u64(payload: &[u8], offset: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&payload[offset..offset + 8]);
     u64::from_le_bytes(bytes)
+}
+
+/// Decodes a kind 4 payload into a ticket and a validated entry name.
+fn decode_pipeline_request(payload: &[u8]) -> Option<(u64, &str)> {
+    if payload.len() < PIPELINE_HEADER_LEN {
+        return None;
+    }
+    let ticket = read_u64(payload, 0);
+    if ticket == 0 {
+        return None;
+    }
+    let entry_len = u16::from_le_bytes([payload[8], payload[9]]) as usize;
+    if entry_len == 0
+        || entry_len > MAX_PIPELINE_ENTRY_LEN
+        || payload.len() != PIPELINE_HEADER_LEN + entry_len
+    {
+        return None;
+    }
+    let entry = std::str::from_utf8(&payload[PIPELINE_HEADER_LEN..]).ok()?;
+    valid_pipeline_entry(entry).then_some((ticket, entry))
 }
 
 fn reject_ack(stream: &mut TcpStream) {
@@ -696,9 +852,11 @@ mod tests {
     #[derive(Default)]
     struct StubState {
         next_buffer: u64,
+        next_pipeline: u64,
         live: HashMap<u64, (usize, usize)>,
         unregistered: Vec<u64>,
         submissions: Vec<Submission>,
+        pipelines: Vec<(Vec<u8>, String)>,
         write_marker: Option<u8>,
     }
 
@@ -713,6 +871,7 @@ mod tests {
                 page_size,
                 state: Mutex::new(StubState {
                     next_buffer: 1,
+                    next_pipeline: 100,
                     ..StubState::default()
                 }),
             }
@@ -765,6 +924,19 @@ mod tests {
                 status: ReplyStatus::Ok,
             })
         }
+
+        fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
+            let mut state = self.state();
+            if entry == "vm_fail" {
+                return Err(MetalError::CompileFailed(
+                    "synthetic pipeline failure".into(),
+                ));
+            }
+            let id = state.next_pipeline;
+            state.next_pipeline += 1;
+            state.pipelines.push((metallib.to_vec(), entry.to_string()));
+            Ok(VmPipelineId(id))
+        }
     }
 
     struct TestDir(PathBuf);
@@ -788,6 +960,11 @@ mod tests {
 
         fn read_allocation(&self, id: u64) -> Vec<u8> {
             std::fs::read(self.0.join(format!("{id:016x}.bin"))).expect("read allocation file")
+        }
+
+        fn write_pipeline(&self, ticket: u64, bytes: &[u8]) {
+            std::fs::write(self.0.join(format!("{ticket:016x}.metallib")), bytes)
+                .expect("write pipeline file");
         }
     }
 
@@ -842,6 +1019,34 @@ mod tests {
         payload[..8].copy_from_slice(&id.to_le_bytes());
         payload[8..].copy_from_slice(&len.to_le_bytes());
         payload
+    }
+
+    fn pipeline_request(ticket: u64, entry: &str) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(PIPELINE_HEADER_LEN + entry.len());
+        payload.extend_from_slice(&ticket.to_le_bytes());
+        payload.extend_from_slice(&(entry.len() as u16).to_le_bytes());
+        payload.extend_from_slice(entry.as_bytes());
+        payload
+    }
+
+    fn read_pipeline_reply(client: &mut TcpStream) -> (u8, Option<u64>) {
+        let (kind, payload) = read_frame(client)
+            .expect("read pipeline reply")
+            .expect("pipeline reply frame");
+        assert_eq!(kind, KIND_PIPELINE_REPLY);
+        match payload.first().copied() {
+            Some(PIPELINE_REPLY_OK) => {
+                assert_eq!(payload.len(), PIPELINE_REPLY_OK_LEN);
+                let mut id = [0u8; 8];
+                id.copy_from_slice(&payload[1..]);
+                (PIPELINE_REPLY_OK, Some(u64::from_le_bytes(id)))
+            }
+            Some(PIPELINE_REPLY_REJECTED) => {
+                assert_eq!(payload.len(), 1);
+                (PIPELINE_REPLY_REJECTED, None)
+            }
+            other => panic!("unexpected pipeline reply: {other:?} / {payload:?}"),
+        }
     }
 
     fn submission(sequence: u32, binding: BufferBinding) -> Submission {
@@ -1147,6 +1352,151 @@ mod tests {
         let state = host.executor.state();
         assert_eq!(state.submissions.len(), 1, "rejected batch reached GPU");
         assert_eq!(state.submissions[0].sequence, 2);
+    }
+
+    #[test]
+    fn pipeline_registration_returns_native_id_and_preserves_old_frames() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        dir.write_pipeline(5, b"synthetic metallib bytes");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        write_frame(
+            &mut client,
+            KIND_PIPELINE,
+            &pipeline_request(5, "vm_test_affine"),
+        )
+        .expect("send pipeline request");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(100))
+        );
+
+        // Existing registration and submission frames still work in the same
+        // session after the new opcode.
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+        let request = submission(1, full_binding(BYTES as u64));
+        write_frame(
+            &mut client,
+            KIND_SUBMISSION,
+            &wire::encode_submission(&request).expect("encode submission"),
+        )
+        .expect("send submission");
+        let (kind, payload) = read_frame(&mut client)
+            .expect("read submission reply")
+            .expect("submission reply frame");
+        assert_eq!(kind, KIND_SUBMISSION);
+        assert_eq!(
+            wire::decode_reply(&payload).expect("decode reply"),
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        assert_eq!(
+            result.expect("session succeeds"),
+            SessionSummary {
+                submissions: 1,
+                allocations: 1,
+                bytes_mapped: BYTES as u64,
+            }
+        );
+        assert_eq!(
+            host.executor.state().pipelines,
+            vec![(
+                b"synthetic metallib bytes".to_vec(),
+                "vm_test_affine".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn pipeline_registration_rejects_bad_inputs_without_silent_loads() {
+        let dir = TestDir::new();
+        dir.write_pipeline(7, b"valid synthetic metallib");
+        dir.write_pipeline(8, b"valid synthetic metallib");
+        dir.write_pipeline(99, b"symlink target");
+        std::os::unix::fs::symlink(
+            dir.0.join("0000000000000063.metallib"),
+            dir.0.join("0000000000000006.metallib"),
+        )
+        .expect("create pipeline symlink");
+        let oversized = std::fs::File::create(dir.0.join("0000000000000004.metallib"))
+            .expect("create oversized pipeline file");
+        oversized
+            .set_len(MAX_METALLIB_BYTES + 1)
+            .expect("extend oversized pipeline file");
+
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        for (label, request) in [
+            ("zero ticket", pipeline_request(0, "vm_entry")),
+            ("invalid entry", pipeline_request(3, "../vm_entry")),
+            ("missing file", pipeline_request(5, "vm_entry")),
+            ("oversized file", pipeline_request(4, "vm_entry")),
+            ("symlinked file", pipeline_request(6, "vm_entry")),
+            ("native load failure", pipeline_request(7, "vm_fail")),
+        ] {
+            write_frame(&mut client, KIND_PIPELINE, &request).expect("send rejected request");
+            assert_eq!(
+                read_pipeline_reply(&mut client),
+                (PIPELINE_REPLY_REJECTED, None),
+                "{label}"
+            );
+        }
+
+        // A rejected load does not consume the ticket, and the session stays
+        // usable when the same file is asked for a valid entry.
+        write_frame(&mut client, KIND_PIPELINE, &pipeline_request(7, "vm_entry"))
+            .expect("retry pipeline request");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(100))
+        );
+
+        for request in [
+            pipeline_request(7, "vm_entry"),
+            pipeline_request(6, "vm_entry"),
+        ] {
+            write_frame(&mut client, KIND_PIPELINE, &request).expect("send nonmonotonic request");
+            assert_eq!(
+                read_pipeline_reply(&mut client),
+                (PIPELINE_REPLY_REJECTED, None),
+                "ticket must be strictly increasing"
+            );
+        }
+
+        write_frame(
+            &mut client,
+            KIND_PIPELINE,
+            &pipeline_request(8, "vm_entry_b"),
+        )
+        .expect("send later pipeline request");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(101))
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(
+            host.executor.state().pipelines,
+            vec![
+                (b"valid synthetic metallib".to_vec(), "vm_entry".to_string()),
+                (b"valid synthetic metallib".to_vec(), "vm_entry_b".to_string()),
+            ],
+            "only tickets 7 and 8 reached the executor"
+        );
     }
 
     #[test]

@@ -32,13 +32,21 @@
 //! | 1 | guest to host | exactly [`SECRET_LEN`] secret bytes |
 //! | 2 | guest to host | `allocation_id: u64 LE`, `byte_len: u64 LE` |
 //! | 3 | both | [`crate::wire::encode_submission`] / [`crate::wire::encode_reply`] |
+//! | 4 | guest to host | `ticket: u64 LE`, `entry_len: u16 LE`, entry bytes |
 //! | 128 | host to guest | exactly one byte: 0 accepted, 1 rejected |
+//! | 129 | host to guest | one byte status, then `pipeline_id: u64 LE` on success |
 //!
 //! Kinds 1 and 2 are acknowledged with kind 128. A rejection, a malformed
 //! acknowledgement or any transport failure closes the connection: there is
 //! no partial-success state and no retry. Kind 3 execution outcomes stay in
 //! the encoded [`crate::wire::Reply`]; `UnknownHandle` and `ExecutionFailed`
 //! are valid replies and leave the session open.
+//!
+//! Kind 4 is the opt-in precompiled pipeline request. The ticket is nonzero and
+//! strictly increasing, and the entry must be a bounded ASCII Metal identifier.
+//! The host maps the ticket to its own private `{ticket:016x}.metallib`; no path
+//! crosses the wire. A status-1 reply is an explicit rejection and leaves the
+//! session open, while a malformed kind 129 reply poisons it.
 //!
 //! # Registration and ordering
 //!
@@ -66,6 +74,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::abi::VmPipelineId;
 use crate::wire::{self, Command, Reply, Submission, WireError};
 
 /// Frame kind for the first guest frame carrying the authentication secret.
@@ -74,8 +83,12 @@ pub const KIND_HELLO: u8 = 1;
 pub const KIND_REGISTER: u8 = 2;
 /// Frame kind carrying an encoded submission or reply.
 pub const KIND_SUBMIT: u8 = 3;
+/// Frame kind carrying an opt-in precompiled pipeline registration.
+pub const KIND_PIPELINE: u8 = 4;
 /// Frame kind for the one-byte authentication or registration acknowledgement.
 pub const KIND_ACK: u8 = 128;
+/// Frame kind for a pipeline registration reply.
+pub const KIND_PIPELINE_REPLY: u8 = 129;
 
 /// Fixed boundary of the version 1 transport envelope.
 pub const ENVELOPE_LEN: usize = 5;
@@ -85,10 +98,38 @@ pub const MAX_FRAME_PAYLOAD: usize = 65_536;
 pub const SECRET_LEN: usize = 32;
 /// Exact encoded size of a registration payload.
 pub const REGISTER_PAYLOAD_LEN: usize = 16;
+/// Fixed ticket and entry-length prefix of a pipeline registration payload.
+pub const PIPELINE_HEADER_LEN: usize = 10;
+/// Largest Metal entry-point identifier accepted for pipeline registration.
+pub const MAX_PIPELINE_ENTRY_LEN: usize = 256;
+/// Status byte of a successful pipeline registration reply.
+pub const PIPELINE_REPLY_OK: u8 = 0;
+/// Status byte of an explicitly rejected pipeline registration.
+pub const PIPELINE_REPLY_REJECTED: u8 = 1;
+/// Exact length of a successful pipeline reply: status plus `u64` id.
+pub const PIPELINE_REPLY_OK_LEN: usize = 1 + 8;
 /// The only allocation generation in transport version 1.
 pub const REGISTRATION_GENERATION: u32 = 1;
 /// Default bound applied to connecting, each read and each write.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns whether `entry` is a bounded, path-free Metal function identifier.
+///
+/// The accepted grammar is an ASCII letter or underscore followed by ASCII
+/// letters, digits or underscores. It excludes path separators, dots, NUL,
+/// non-ASCII bytes and over-long names, so it can only name a function inside
+/// an already-selected library.
+pub fn valid_pipeline_entry(entry: &str) -> bool {
+    if entry.is_empty() || entry.len() > MAX_PIPELINE_ENTRY_LEN {
+        return false;
+    }
+    let mut bytes = entry.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
 
 /// One allocation registered for the lifetime of the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +237,26 @@ pub enum GuestIpcError {
         /// Rejected ID.
         id: u64,
     },
+    /// Pipeline ticket zero is reserved.
+    #[error("pipeline ticket must be nonzero")]
+    ZeroPipelineTicket,
+    /// A pipeline registration reused or went backwards in ticket space.
+    #[error("pipeline ticket {ticket} must be greater than previous ticket {previous}")]
+    NonMonotonicPipelineTicket {
+        /// Most recently accepted ticket.
+        previous: u64,
+        /// Rejected ticket.
+        ticket: u64,
+    },
+    /// The entry name was empty, too long or not a bounded Metal identifier.
+    #[error("pipeline entry must be a bounded ASCII Metal identifier")]
+    InvalidPipelineEntry,
+    /// A kind 129 reply had a status and length combination the protocol forbids.
+    #[error("malformed pipeline reply with {length} payload byte(s)")]
+    MalformedPipelineReply {
+        /// Actual reply payload length.
+        length: usize,
+    },
     /// The connection was already poisoned or explicitly closed.
     #[error("IPC session is closed")]
     Closed,
@@ -233,6 +294,7 @@ pub struct GuestIpcClient {
     timeout: Duration,
     next_sequence: u32,
     allocations: Vec<RegisteredAllocation>,
+    last_pipeline_ticket: u64,
     closed: bool,
 }
 
@@ -279,6 +341,7 @@ impl GuestIpcClient {
             timeout,
             next_sequence: 1,
             allocations: Vec::new(),
+            last_pipeline_ticket: 0,
             closed: false,
         };
         client.hello(secret)?;
@@ -335,6 +398,75 @@ impl GuestIpcClient {
         };
         self.allocations.push(allocation);
         Ok(allocation)
+    }
+
+    /// Registers a precompiled library in the host's private directory.
+    ///
+    /// The host maps `ticket` to `{ticket:016x}.metallib`; no path or library
+    /// bytes cross the wire. Tickets must be nonzero and strictly increasing,
+    /// and `entry` must satisfy [`valid_pipeline_entry`]. On success the host's
+    /// native pipeline id is returned and can be used in later submissions.
+    /// An explicit host rejection leaves the session open; a malformed reply
+    /// poisons it.
+    pub fn register_pipeline(
+        &mut self,
+        ticket: u64,
+        entry: &str,
+    ) -> Result<VmPipelineId, GuestIpcError> {
+        self.ensure_open()?;
+        if ticket == 0 {
+            return Err(GuestIpcError::ZeroPipelineTicket);
+        }
+        if ticket <= self.last_pipeline_ticket {
+            return Err(GuestIpcError::NonMonotonicPipelineTicket {
+                previous: self.last_pipeline_ticket,
+                ticket,
+            });
+        }
+        if !valid_pipeline_entry(entry) {
+            return Err(GuestIpcError::InvalidPipelineEntry);
+        }
+        let entry_len =
+            u16::try_from(entry.len()).expect("entry length is bounded by MAX_PIPELINE_ENTRY_LEN");
+        let mut payload = Vec::with_capacity(PIPELINE_HEADER_LEN + entry.len());
+        payload.extend_from_slice(&ticket.to_le_bytes());
+        payload.extend_from_slice(&entry_len.to_le_bytes());
+        payload.extend_from_slice(entry.as_bytes());
+
+        self.write_frame(KIND_PIPELINE, &payload, "pipeline registration")?;
+        let (kind, reply) = self.read_frame("pipeline registration reply")?;
+        if kind != KIND_PIPELINE_REPLY {
+            let error = GuestIpcError::UnexpectedKind {
+                expected: KIND_PIPELINE_REPLY,
+                actual: kind,
+            };
+            return Err(self.poison(error));
+        }
+
+        match (reply.first().copied(), reply.len()) {
+            (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
+                let mut id = [0u8; 8];
+                id.copy_from_slice(&reply[1..]);
+                let pipeline = VmPipelineId(u64::from_le_bytes(id));
+                if pipeline.0 == 0 {
+                    let error = GuestIpcError::MalformedPipelineReply {
+                        length: reply.len(),
+                    };
+                    return Err(self.poison(error));
+                }
+                self.last_pipeline_ticket = ticket;
+                Ok(pipeline)
+            }
+            (Some(PIPELINE_REPLY_REJECTED), 1) => Err(GuestIpcError::Rejected {
+                operation: "pipeline registration",
+            }),
+            _ => {
+                let error = GuestIpcError::MalformedPipelineReply {
+                    length: reply.len(),
+                };
+                Err(self.poison(error))
+            }
+        }
     }
 
     /// The sequence the next submission must carry.
@@ -632,6 +764,29 @@ mod tests {
             KIND_SUBMIT,
             &wire::encode_reply(&reply).expect("test reply encodes"),
         );
+    }
+
+    fn send_pipeline_reply(stream: &mut TcpStream, status: u8, pipeline_id: Option<u64>) {
+        let mut payload = vec![status];
+        if let Some(id) = pipeline_id {
+            payload.extend_from_slice(&id.to_le_bytes());
+        }
+        write_frame(stream, KIND_PIPELINE_REPLY, &payload);
+    }
+
+    fn expect_pipeline_request(stream: &mut TcpStream, ticket: u64, entry: &str) {
+        let (kind, payload) = read_frame(stream);
+        assert_eq!(kind, KIND_PIPELINE, "expected a pipeline request");
+        assert_eq!(payload.len(), PIPELINE_HEADER_LEN + entry.len());
+        assert_eq!(
+            u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+            ticket
+        );
+        assert_eq!(
+            u16::from_le_bytes(payload[8..10].try_into().unwrap()) as usize,
+            entry.len()
+        );
+        assert_eq!(&payload[PIPELINE_HEADER_LEN..], entry.as_bytes());
     }
 
     #[test]
@@ -1028,6 +1183,143 @@ mod tests {
             "unexpected ack error: {error}"
         );
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn pipeline_registration_returns_native_id_and_enforces_local_contract() {
+        let (port, server) = spawn_server(|mut stream| {
+            expect_hello(&mut stream);
+            send_ack(&mut stream, true);
+            expect_pipeline_request(&mut stream, 3, "vm_entry");
+            send_pipeline_reply(&mut stream, PIPELINE_REPLY_OK, Some(0x55));
+            expect_eof(&mut stream);
+        });
+
+        let mut client =
+            GuestIpcClient::connect_with_timeout(port, &SECRET, TEST_TIMEOUT).expect("connect");
+        assert_eq!(
+            client
+                .register_pipeline(3, "vm_entry")
+                .expect("pipeline registration"),
+            VmPipelineId(0x55)
+        );
+
+        // Locally rejected requests must not reach the wire.
+        assert!(matches!(
+            client.register_pipeline(0, "vm_entry"),
+            Err(GuestIpcError::ZeroPipelineTicket)
+        ));
+        assert!(matches!(
+            client.register_pipeline(3, "vm_entry"),
+            Err(GuestIpcError::NonMonotonicPipelineTicket {
+                previous: 3,
+                ticket: 3
+            })
+        ));
+        assert!(matches!(
+            client.register_pipeline(2, "vm_entry"),
+            Err(GuestIpcError::NonMonotonicPipelineTicket {
+                previous: 3,
+                ticket: 2
+            })
+        ));
+        for entry in ["", "../vm_entry", "9lives", "vm entry", "vm_entry.1"] {
+            assert!(
+                matches!(
+                    client.register_pipeline(4, entry),
+                    Err(GuestIpcError::InvalidPipelineEntry)
+                ),
+                "entry {entry:?} should be rejected"
+            );
+        }
+        let too_long = "a".repeat(MAX_PIPELINE_ENTRY_LEN + 1);
+        assert!(matches!(
+            client.register_pipeline(4, &too_long),
+            Err(GuestIpcError::InvalidPipelineEntry)
+        ));
+        assert!(!client.is_closed());
+
+        client.close();
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn explicit_pipeline_rejection_keeps_the_session_open() {
+        let (port, server) = spawn_server(|mut stream| {
+            expect_hello(&mut stream);
+            send_ack(&mut stream, true);
+            expect_pipeline_request(&mut stream, 4, "vm_fail");
+            send_pipeline_reply(&mut stream, PIPELINE_REPLY_REJECTED, None);
+            expect_pipeline_request(&mut stream, 5, "vm_ok");
+            send_pipeline_reply(&mut stream, PIPELINE_REPLY_OK, Some(9));
+            expect_eof(&mut stream);
+        });
+
+        let mut client =
+            GuestIpcClient::connect_with_timeout(port, &SECRET, TEST_TIMEOUT).expect("connect");
+        let error = client
+            .register_pipeline(4, "vm_fail")
+            .expect_err("host rejection must be explicit");
+        assert!(
+            matches!(
+                error,
+                GuestIpcError::Rejected {
+                    operation: "pipeline registration"
+                }
+            ),
+            "unexpected rejection: {error}"
+        );
+        assert!(!client.is_closed());
+        assert_eq!(
+            client.register_pipeline(5, "vm_ok").expect("retry success"),
+            VmPipelineId(9)
+        );
+        client.close();
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn malformed_pipeline_reply_poisons_the_session() {
+        let (port, server) = spawn_server(|mut stream| {
+            expect_hello(&mut stream);
+            send_ack(&mut stream, true);
+            expect_pipeline_request(&mut stream, 6, "vm_entry");
+            send_pipeline_reply(&mut stream, PIPELINE_REPLY_OK, None);
+            expect_eof(&mut stream);
+        });
+
+        let mut client =
+            GuestIpcClient::connect_with_timeout(port, &SECRET, TEST_TIMEOUT).expect("connect");
+        let error = client
+            .register_pipeline(6, "vm_entry")
+            .expect_err("short success reply must fail");
+        assert!(
+            matches!(error, GuestIpcError::MalformedPipelineReply { length: 1 }),
+            "unexpected malformed reply: {error}"
+        );
+        assert!(client.is_closed());
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn pipeline_entry_validation_is_bounded_and_path_free() {
+        for entry in ["a", "_", "vm_entry", "_9", "A0_z"] {
+            assert!(valid_pipeline_entry(entry), "{entry:?} should be valid");
+        }
+        for entry in [
+            "",
+            "9lives",
+            "vm-entry",
+            "vm.entry",
+            "vm/entry",
+            "vm\\entry",
+            "vm\0",
+        ] {
+            assert!(!valid_pipeline_entry(entry), "{entry:?} should be invalid");
+        }
+        assert!(!valid_pipeline_entry(
+            &"a".repeat(MAX_PIPELINE_ENTRY_LEN + 1)
+        ));
     }
 
     #[test]
