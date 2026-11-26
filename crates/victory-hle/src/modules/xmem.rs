@@ -1378,6 +1378,134 @@ mod tests {
         drop(file);
     }
 
+    /// Opt-in cross-process proof: the actual XMem path writes a payload
+    /// through a `map_alias` view of a file-backed physical page whose
+    /// section offset is 64 KiB, flushes it, then publishes an atomic
+    /// marker. `tools/macos/metal-poc/xmem-arm64.sh` runs a native arm64
+    /// process that waits for the marker and reads the same file through a
+    /// no-copy Metal buffer. Without both variables the test does nothing,
+    /// so the default suite is unchanged.
+    #[test]
+    fn external_fixture_alias_write_for_native_gpu() {
+        use windows_sys::Win32::System::Memory::FlushViewOfFile;
+
+        const OFFSET: usize = PAGE; // 64 KiB from the start of the fixture.
+        const GUARD: usize = 0x200; // Original page-1 bytes, left untouched.
+        const PAYLOAD: usize = 0x400;
+        const WORDS: usize = 1024;
+        const SENTINEL_AT: usize = 0x2000;
+        const SENTINEL: u32 = 0xC0DE_D00D;
+
+        let Ok(fixture) = std::env::var("VICTORY_XMEM_GPU_FIXTURE") else {
+            eprintln!("skipped: VICTORY_XMEM_GPU_FIXTURE is not set");
+            return;
+        };
+        let marker =
+            std::env::var("VICTORY_XMEM_GPU_MARKER").expect("a marker for the native GPU process");
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fixture)
+            .expect("the fixture file");
+        let length = file.metadata().expect("fixture metadata").len() as usize;
+        assert!(length >= 2 * PAGE, "the fixture needs two 64 KiB pages");
+        let original = std::fs::read(&fixture).expect("the fixture bytes");
+        assert_eq!(&original[..16], [0xA5; 16], "page 0 is the sentinel page");
+        let page1 = &original[OFFSET..OFFSET + PAGE];
+        assert_ne!(&page1[..16], &original[..16], "page 1 is not page 0");
+        // The driver fills page 1 with a known byte pattern; the guard word
+        // must still be that pattern after the HLE write.
+        let guard: Vec<u8> = (0..4).map(|i| 0x80 | ((GUARD + i) as u8 & 0x3f)).collect();
+        assert_eq!(&page1[GUARD..GUARD + 4], guard);
+
+        // Make the next physical-page allocation in this thread use the
+        // fixture, then map its second page (section offset 64 KiB).
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = Some(file.try_clone().expect("a copy")));
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1,
+            "an allocation from the fixture"
+        );
+        SECTION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(n, 2);
+
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        let view =
+            |at: *mut c_void| unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE).to_vec() };
+        // The view shows section offset 64 KiB, not the file's first page.
+        assert_eq!(&view(a)[GUARD..GUARD + 4], guard);
+
+        // The GPU's page-mapping copy, then a write through the alias.
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        let payload: Vec<u8> = (0..WORDS)
+            .flat_map(|i| {
+                let word = 0x51E3_0000u32 ^ (i as u32).wrapping_mul(0x9E37_79B9);
+                word.to_le_bytes()
+            })
+            .collect();
+        let alias = unsafe { std::slice::from_raw_parts_mut(b.cast::<u8>(), PAGE) };
+        alias[PAYLOAD..PAYLOAD + payload.len()].copy_from_slice(&payload);
+        alias[SENTINEL_AT..SENTINEL_AT + 4].copy_from_slice(&SENTINEL.to_le_bytes());
+        // The source view and the untouched guard see the alias write.
+        assert_eq!(&view(a)[PAYLOAD..PAYLOAD + payload.len()], payload);
+        assert_eq!(
+            &view(a)[SENTINEL_AT..SENTINEL_AT + 4],
+            SENTINEL.to_le_bytes()
+        );
+        assert_eq!(&view(a)[GUARD..GUARD + 4], guard);
+        // SAFETY: the whole page is a live mapped view of the section.
+        assert_ne!(unsafe { FlushViewOfFile(b.cast(), PAGE) }, 0);
+        file.sync_all().expect("flushing the fixture");
+
+        // The bytes are in the file itself, at the identified offset.
+        let on_disk = std::fs::read(&fixture).expect("the fixture after the write");
+        assert_eq!(&on_disk[..OFFSET], &original[..OFFSET]);
+        assert_eq!(
+            &on_disk[OFFSET + PAYLOAD..OFFSET + PAYLOAD + payload.len()],
+            payload
+        );
+        assert_eq!(
+            &on_disk[OFFSET + SENTINEL_AT..OFFSET + SENTINEL_AT + 4],
+            SENTINEL.to_le_bytes()
+        );
+        assert_eq!(&on_disk[OFFSET + GUARD..OFFSET + GUARD + 4], guard);
+
+        // Atomic handoff: the native process only maps the file after the
+        // marker appears, so it cannot observe a partial write.
+        let temporary = format!("{marker}.tmp");
+        std::fs::write(&temporary, format!("offset={OFFSET}\n")).expect("the marker");
+        std::fs::rename(&temporary, &marker).expect("publishing the marker");
+
+        let sum = payload.chunks_exact(4).fold(0u32, |sum, w| {
+            sum.wrapping_add(u32::from_le_bytes(w.try_into().unwrap()))
+        });
+        let xor = payload.chunks_exact(4).fold(0u32, |xor, w| {
+            xor ^ u32::from_le_bytes(w.try_into().unwrap())
+        });
+        println!(
+            "HLE_WROTE offset={OFFSET} page={} sum={sum:#010x} xor={xor:#010x} sentinel={SENTINEL:#010x}",
+            pages[1]
+        );
+
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
