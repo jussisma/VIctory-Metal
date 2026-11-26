@@ -1,214 +1,162 @@
-<p align="center"><img src="docs/images/banner.svg" alt="VIctory for macOS: a neon tropical sunset with palm trees, a coastal skyline and a MacBook on the shore"></p>
+<p align="center"><img src="docs/images/banner.svg" alt="VIctory-Metal: Experimental native Apple Metal backend for Xbox Series X|S on Apple Silicon"></p>
 
-<h1 align="center">VIctory for macOS</h1>
+<h1 align="center">VIctory-Metal</h1>
 
 <p align="center">
-Grand Theft Auto VI is only out on consoles. This project runs the Xbox Series build on Apple Silicon Macs, from a copy of the game that you own.<br>
-It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which does the same on Windows, and it brings that work to the Mac through Wine and Metal.
+<strong>Experimental direct Apple Metal backend for <a href="https://github.com/pragyaangaur/VIctory-macOS">VIctory-macOS</a> &amp; <a href="https://github.com/Marvisak/VIctory">VIctory</a></strong><br>
+Replacing D3DMetal with true zero-copy Apple Silicon Unified Memory (<code>newBufferWithBytesNoCopy</code> + <code>libmetalirconverter.dylib</code>),<br>
+architected from day one so <strong>Wine can eventually be removed completely</strong>.
 </p>
 
 <p align="center">
+<img alt="Status: Experimental WIP" src="https://img.shields.io/badge/status-experimental%20WIP-d97706">
 <img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="701 tests passed" src="https://img.shields.io/badge/tests-701%20passed-2ea44f">
-<img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
-</p>
-
-<p align="center">
-If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTRIBUTING.md">CONTRIBUTING.md</a>. Help is welcome at every level.
+<img alt="GPL-3.0-or-later licence" src="https://img.shields.io/badge/licence-GPL--3.0--or--later-lightgrey">
 </p>
 
 > [!WARNING]
-> **A note from the maintainer.** I am a student, and I run this project with Claude on a free Claude Pro plan from Anthropic. Reviewing pull requests, answering issues and fixing bugs today used up half of my weekly Claude limit in a single day. My limit resets on Saturday, 28 November, so until then I will be slower to review, reply and merge. Thank you for your patience, and please keep sending reports and pull requests in the meantime.
+> **HIGHLY EXPERIMENTAL / NOT PLAYABLE YET.**
+> This repository is an active R&amp;D effort to build a direct native Metal backend and decouple VIctory from CrossOver Wine + D3DMetal.
 >
-> If you would like to help, a sponsored Claude Pro or Max subscription or some Anthropic API credits would let me keep up with the project at its current pace. I would be very grateful for either. Please reach out on email if you can help: pragyaangaur12@gmail.com
+> - **It does NOT make GTA VI playable today.** Even with our current `mac-turbo` optimizations under D3DMetal, world frames on an **Apple M4 Max** measure **~494–585 ms (~1.7–2.0 fps)**.
+> - **Native Metal is under active construction (Milestone M0–M1).** The full frame loop still runs on D3DMetal (`VICTORY_BACKEND=d3d12`, default) while the new `crates/victory-metal` backend (`VICTORY_BACKEND=metal`) is brought up piece by piece.
+> - **Zero game assets are included or ever will be.** You must own your own Xbox Series X|S copy of the game. Every commit is checked by `cargo xtask policy`.
 
-> [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** On testers' Macs the game starts, plays its intro and audio, shows its loading screens, and on 25 November the game world appeared on two Macs (#50). Nobody has reached gameplay yet. The loading freezes testers hit on 25 November were two deadlocks inside Wine, found by LakshanSivakumar and fixed in #72, #75 and #78. With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` the game now loads into the world without freezing on an M5 Pro and an M3 Max, and stays there for over 20 minutes. It is still far too slow to play, but getting faster: #111 cut world frames from about 4.5 seconds to 2.4 to 2.9 seconds on an M5 Pro (#50). With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1`, loading now runs at about 26 to 30 fps instead of 8 (#59, #60). VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+---
 
-## What works today
+## Why Native Metal?
 
-Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite passes on a MacBook with an M4 chip.
+On Windows with AMD/PC D3D12, forks like [`VIctory-7900XTX`](https://github.com/avatarmanz/VIctory-7900XTX) reach **16–22 fps** largely because desktop D3D12 allows `ID3D12Device3::OpenExistingHeapFromAddress` — letting the GPU read Xbox unified memory directly with zero copies.
 
-| Part | What it does | On the Mac |
+On macOS via **Wine + D3DMetal**, we hit a structural wall (`crates/victory-gpu/src/alias.rs`):
+
+1. **D3DMetal refuses `OpenExistingHeapFromAddress*`.** Without zero-copy heaps, VIctory must maintain shadow D3D12 buffers, arm `VirtualProtect` write-watch page guards (`watch.rs`), field Rosetta write faults, copy **~250 MB/frame** (`copies: 70–98 ms`), and spend **~200 ms/frame** inside Wine D3D12 thunks / D3DMetal translation (`preparing`), plus `~18 ms/frame` scanning for `copying back`.
+2. **Apple Silicon already *is* unified memory.** Metal natively supports `[MTLDevice newBufferWithBytesNoCopy:length:options:MTLResourceStorageModeShared deallocator:nil]` directly over page-aligned host allocations.
+3. **Apple already ships DXIL → `.metallib`.** `victory-shader` compiles Xbox GFX10 shaders to DXIL (handling Metal hardware constraints such as Wave32 halves and the 32 KiB mesh-output limit), and Apple's `libmetalirconverter.dylib` compiles that DXIL directly into native `MTLLibrary` bitcode with **no D3D12 or D3DMetal API layer in between**.
+
+---
+
+## Wine-Free Endgame Architecture
+
+`crates/victory-metal` is built with **strict separation from Wine and Windows**: zero Wine headers, zero `windows-sys` crates, and a clean backend trait (`MetalTransport`) paired with an `extern "C"` ABI (`libvictory_metal.dylib` / `rlib`).
+
+```mermaid
+flowchart TD
+    Title["Xbox Series X|S Binary (x86-64 under Rosetta 2)"]
+    GPU["victory-gpu + victory-shader (GFX10 -> DXIL, Wave32, 32 KiB Mesh)"]
+    Switch{"VICTORY_BACKEND"}
+
+    D3D["Legacy D3D12 + CrossOver Wine + D3DMetal (default today)"]
+
+    subgraph Phase1["Phase 1: Wine Bring-Up Bridge (Current Target)"]
+        Shim["Thin Transport Adapter: Wine unixlib (__wine_unix_call)"]
+    end
+
+    subgraph Phase2["Phase 2: Pure Native macOS Host (Wine Removed Completely)"]
+        NativeHost["Native macOS Mach-O x86_64 PE Loader + HLE"]
+        Direct["DirectMetalTransport (in-process Rust call)"]
+    end
+
+    Engine["crates/victory-metal (PURE macOS: ZERO Wine Dependencies)"]
+    Metal["Apple Metal API + newBufferWithBytesNoCopy + libmetalirconverter.dylib"]
+
+    Title --> GPU
+    GPU --> Switch
+    Switch -- "d3d12" --> D3D
+    Switch -- "metal (Phase 1)" --> Shim --> Engine
+    NativeHost --> Direct --> Engine
+    Engine --> Metal
+```
+
+Why this matters:
+- **During bring-up (Phase 1)**, CrossOver Wine keeps running the Windows PE loader and Xbox HLE stubs so we can test real game shaders and frames incrementally without rewriting the OS loader first.
+- **Once Metal rendering works (Phase 2 / M5)**, Wine is only a replaceable transport wrapper around `victory-metal`: swapping `victory-loader` / `victory-hle` to a native macOS Mach-O `x86_64` Rosetta host lets the exact same `victory-metal` engine run **with zero Wine and zero D3DMetal**.
+
+---
+
+## Current Status & Verified Results
+
+### Native Metal Milestones Verified So Far
+
+- **Milestone M0 — Host Zero-Copy & IRConverter PoC (`tools/macos/metal-poc/build-and-run.sh`): PASS**
+  Tested directly under Rosetta 2 (`x86_64`) on **Apple M4 Max** (`unified=1`, `maxThreadsPerGroup=1024`):
+  - **Zero-copy compute**: `posix_memalign(16384)` -> `newBufferWithBytesNoCopy` -> Metal compute kernel -> direct host read (`ptr=0x7fe848018000 len=65536 verified=1024 dwords host[0]=10 host[1023]=3079`, **0 `memcpy`**).
+  - **IRConverter**: `dlopen(libmetalirconverter.dylib)` -> converted a real cached DXIL compute shader (`dxil_bytes=4288 stage=8 metallib_bytes=6748 functions=[main]`) to a runnable `MTLLibrary`.
+- **Milestone M1 (Foundation) — `crates/victory-metal` & `VICTORY_BACKEND` Seam**:
+  - Added pure-Rust `crates/victory-metal` (`rlib` + `cdylib`) with `VmStatus`/`VmDeviceInfo` C ABI, `MetalTransport` trait, `DirectMetalTransport` (`MTLDevice` + `newBufferWithBytesNoCopy` + MSL compute dispatch), `libmetalirconverter.dylib` loader (`x86_64`), and real Apple Silicon Metal unit tests.
+  - Added `VICTORY_BACKEND=d3d12|metal` selection seam in `crates/victory-gpu/src/backend.rs`.
+
+### Measured D3DMetal Baseline Progression (Apple M4 Max, World Gameplay)
+
+This fork starts from `pragyaangaur/VIctory-macOS` (`main` @ `bf99e728`) plus local improvements on top:
+
+| Run | Configuration | Frame Time (FPS) | Preparing / Copies | GPU Time | Refused >32 KiB Mesh / Dropped Indirects |
+| --- | --- | --- | --- | --- | --- |
+| `v0` | Older baseline | ~7,000 ms (~0.14 fps) | — | — | World unusable |
+| `v2` | Rebased base + `VICTORY_AMBIENT` + `VICTORY_BVH_NO_HIT=1` (`1920x1080`) | 629–645 ms (1.6 fps) | 332–338 ms | 274–289 ms | 207–239 dropped without pipeline |
+| `v3` | Series X `1280x720` + `ATOMIC_UMAX=1` + `ActivateRays` skip + thin LTO | **494–508 ms (2.0 fps)** | 266–286 ms (`copies 70–78 ms / ~196 MB`) | 189–215 ms | **46** refused mesh, **111** untranslated CS (~270 indirect/frame) |
+| `v4` | `--console series-s` + `ntdll` patch + `PORT_DESCRIPTORS=1` | 1,019–1,292 ms (0.8–1.0 fps) | 696–889 ms (`copies 688–1,134 ms`) | 184–253 ms | Intro ran at 30 fps, but Series S blew up texture traffic (`6,913` textures / 5.05 GB) |
+| `v5` | Series X `1280x720` + `render scale 0.5` + `PORT_DESCRIPTORS=1` + Metal mesh-align fix | **544–585 ms (1.7–1.8 fps)** | 286–332 ms (`copies 80–98 ms / 253–264 MB`) | 234–251 ms | Refused mesh **halved (46 -> 25)**, dropped indirects **cut 62% (270 -> 101/frame)** |
+
+Included baseline additions above `VIctory-macOS`:
+- **Metal-aligned mesh output linking trigger** (`crates/victory-gpu/src/pipeline.rs`): catches pipelines whose Metal-padded output exceeds 32,768 bytes (`46 -> 25` refused pipelines, `-62%` dropped indirects).
+- **Title descriptor-store hooks** (`VICTORY_PORT_DESCRIPTORS=1`, ported from `VIctory-7900XTX`): fast slot updates (`~0.33 ms/frame`, `0` draw-table misses).
+- **Experimental shader/lighting knobs**: `VICTORY_AMBIENT` indirect floor (adapted from `VIctory-Belobug-AMD`) and opt-in `VICTORY_BVH_NO_HIT=1` + `CS_ScreenProbes_ActivateRays` skip.
+
+---
+
+## Roadmap
+
+Full technical details, hardware constraints, verified symbol tables, and LLM handoff context live in [docs/ROADMAP-METAL-NATIVE.md](docs/ROADMAP-METAL-NATIVE.md).
+
+| Milestone | Scope | Status |
 | --- | --- | --- |
-| Loader | Maps the game's executable and DLLs into one process and runs its code unchanged | Works |
-| Console runtime | Stands in for the Xbox: memory, files, saves, input, audio and network rules | Works |
-| GPU layer | Turns the console's Direct3D 12.X into desktop Direct3D 12 | Works on Metal through D3DMetal |
-| Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
-| Test suite | 711 tests across every crate | 701 passed, 0 failed, 10 ignored |
+| **M0** | Host PoC: `newBufferWithBytesNoCopy` compute + `libmetalirconverter.dylib` DXIL -> `MTLLibrary` under `x86_64` | **Done (verified on M4 Max)** |
+| **M1** | Wine-decoupled `victory-metal` crate + `VICTORY_BACKEND` seam -> Wine unixlib bridge + `CAMetalLayer` clear window | **In Progress (crate & tests ready; Wine bridge next)** |
+| **M2** | Zero-copy title memory registration + IRConverter root signatures (`IRRootSignatureCreateFromDescriptor`) + compute dispatch | Planned |
+| **M3** | `MTLTexture` cache, RTV/DSV passes, `MTLMeshRenderPipelineDescriptor`, `executeIndirect` + argument buffers | Planned |
+| **M4** | `MTLSharedEvent` synchronization + `MTLBinaryArchive` pipeline warmup + world FPS benchmark vs D3DMetal | Planned |
+| **M5** | **Wine-free native macOS `x86_64` host** (replace Wine PE loader / Win32 thunks with Mach-O host + `DirectMetalTransport`) | Long-term endgame |
 
-<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 701 passed and 0 failed"></p>
+---
 
-This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
+## Building & Running Tests
 
-Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
-
-## What testers see in the game
-
-Several people who own the game have run it on their Macs and reported back in the issues. The game starts, plays its audio and runs its menus, and on current main the picture shows on Series X. Here is what they have seen so far.
-
-| Mac | What happened | Issue |
-| --- | --- | --- |
-| M5 MacBook Air | Got past the early Rosetta hang. The intro animation and the menu appeared with a local workaround that showed the game's 3840x2160 image directly, and the first scene's audio played. Without the workaround the window stays black. | #1, #15 |
-| M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
-| M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
-| M2 Max, 32 GB, Series X | On 25 and 26 November, with CrossOver 26.3 and D3DMetal 4.0 beta 3, #167, #178 and local unmerged patches (mesh output counting and linking, and an opt-out of the wave32 path), the game reached the in-world prologue cinematics and the opening credits, with `VICTORY_KEYS` passing the prompts. In one earlier run the gameplay HUD appeared on screen; that player control responds has not been verified. Compiler disconnects fell to 0 and one mesh-size rejection remained. Heavy frames took about 2 to 10 s. Some runs ended in the game's heartbeat check, at different times in the world, and others reached a 30-minute cap. In the two runs that held A for 30 s during the opening cinematic, the picture went almost empty, which the runs without that hold did not do. | #28 |
-| M2 Pro, 32 GB, Series X | On 25 and 26 November the game reached the world, the opening credits and the prologue's first gameplay prompt ("Move around / Move the camera"), and the camera followed input from the keyboard stand-in pad, at about 2 s per world frame. One run lasted almost 35 minutes before the game's watchdog stopped it. On main `b6dd0b1` with fault tracking the prologue yard drew recognisably (fence, guard tower, sky, figures), where a day earlier it was red and neon smears. Lighting is still broken and some layers are stale. | #50, #131 |
-| M4, 16 GB | The game reached the world with its HUD (the minimap and the street panel) and the opening credits at 1280x720, at about 2.4 to 3.6 s per frame and 1,000 to 2,000 draws per frame. Turning on the atomic lock rounds (#257) took a world frame from 2.9 s to 0.88 s. | #240 |
-| M4 Pro | The same build with only `VICTORY_ATOMIC_LOCK_ROUNDS` changed took a world frame from 5.29 s to 0.71 s and stopped the GPU resets (32 or more queue recoveries before, none after). That is why the rounds are now on by default under Wine (#307). | #240 |
-| M5 Pro, 24 GB, Series X | On 25 November, with the store patch and fault tracking on, the account picker, the setup screens and the legal notices ran at 25 to 30 fps. About three minutes in, the game reached the "Vice City, two years ago" title card at 2 to 5 seconds per frame and stayed alive there. | #65 |
-| M5 Pro, Series X | On 25 November, with no variables set, the game ran its intro and loading at 25 to 30 fps, then its draw count jumped to 3,000 to 3,900 per frame, which suggests it was drawing the world, though the screen stayed grey at 0.1 fps. A later run with `VICTORY_PATCH_MASKED=all` only went on into the world and drew a dark city skyline, still at 0.1 fps. After the freeze fixes, plain main with `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` loaded into the world with up to 5,400 draws per frame and no freeze, at 0.2 fps. With #111 (fewer memory mappings under Wine's one memory lock) world frames fell from 4.5 s to about 2.4 to 2.9 s while it copied 57 to 83 GB of memory per frame. With the store patch and fault tracking on, copies stayed under a few MB per frame through loading, and it froze about three minutes in. That freeze led to #63. | #50 |
-| M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds, most of it copying memory. With the store patch from #59 and #60 and fault tracking on, loading ran at 26 fps instead of 8 and copies fell from 158.7 MB to under 1 MB per frame, until a freeze about three minutes in. After the freeze fixes, plain main stayed in the world for over 20 minutes without freezing, at 0.1 to 0.2 fps, with far fewer shader compiler crashes (37 against about 150). With today's speed changes frames there were 14% faster, and a later run stayed in the world for 11 minutes before the game's own timing checks gave up at about 12 seconds per frame. | #50 |
-
-<p align="center"><img loading="lazy" src="https://github.com/user-attachments/assets/02bc86ef-2b66-4b39-91de-4d8d398833d6" width="480" alt="The prologue yard of the game on an M2 Pro under VIctory"><br><sub>The prologue yard on cocobailey's M2 Pro on main <code>b6dd0b1</code>, 26 November 2026 (#50).</sub></p>
-
-<p align="center">More screenshots and videos from testers are in <a href="docs/gallery.md">docs/gallery.md</a>.</p>
-
-The black screen from #15 is solved: VIctory now shows the larger of the images the game presents, and `VICTORY_PRESENT_COMPOSITE=1` also draws the Series S overlay on top. Loading used to crawl because VIctory copied all of the game's memory on every submission, since tracking which pages changed hangs Rosetta on the game's AVX stores. #59 and #60 rewrite those 1,234 stores at load time so tracking can run. The loading freeze is fixed: Wine's file metadata calls from our shader cache (#72, #75) and write guards that reached the process heap (#78) caused two deadlocks. The open problems now are the game's speed in the world (about 2 to 3 seconds per frame on most Macs, and under 1 second with the atomic lock rounds from #257, which are now the default under Wine; the time is split between preparing copies, the GPU, copying back and memory protection changes), lighting that is still broken in the world (#15) and crashes in Apple's shader compiler while the game builds its world shaders.
-
-## How it works
-
-<p align="center"><img src="docs/images/stack.svg" width="720" alt="The layers between the game and the Mac: the game's code, VIctory, CrossOver Wine and D3DMetal, Rosetta 2 and Metal, and the Apple Silicon Mac at the bottom"></p>
-
-The Xbox Series version of the game is x86-64 code, like a Windows program. VIctory loads that code and supplies everything the console would have supplied. On a Mac, VIctory itself runs as a Windows program:
-
-- **Rosetta 2** runs the x86-64 code, including the AVX2 instructions that the game uses.
-- **CrossOver Wine** provides Windows. The setup builds it from the source that CodeWeavers publishes, because Apple's D3DMetal only works with that branch of Wine.
-- **D3DMetal**, from Apple's Game Porting Toolkit, turns Direct3D 12 into Metal.
-
-## Set it up in three steps
-
-You need an Apple Silicon Mac (M1 or newer) on macOS 15 Sequoia or newer, [Homebrew](https://brew.sh), and about 15 GB of free space.
-
-**1. Get the code.**
+Requirements: Apple Silicon Mac (M1+), macOS 15+, Rust toolchain (`rustup`), Xcode Command Line Tools (`clang` + Metal/Foundation SDKs). Cross-compiling the Windows/Wine targets also uses `x86_64-pc-windows-gnullvm` + `llvm-mingw` (`./setup.sh` sets this up from [docs/macos.md](docs/macos.md)).
 
 ```bash
-git clone https://github.com/pragyaangaur/VIctory-macOS.git
-cd VIctory-macOS
-```
+# Run strict asset & text-smuggling policy check (must always pass before commits)
+cargo xtask policy
 
-**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it. Use version 4.0 beta 3 or newer: every tester who has reached the game world used it, and the D3DMetal 3.0 that CrossOver bundles cannot keep compiled pipelines (#30). One tester with 4.0 beta 3 still stops at an early start-up check of the game, so the version is not the whole story there (#24).
-
-**3. Run the setup.**
-
-```bash
-./setup.sh
-```
-
-The setup installs what it needs with Homebrew. It then builds the x86_64 libraries and CrossOver Wine, adds D3DMetal from the toolkit, and builds VIctory. The first run takes about an hour, almost all of it spent building Wine. If anything stops it, fix what it says and run it again, because finished steps are skipped.
-
-When it says **Setup finished**, you can check that VIctory starts:
-
-```bash
-tools/macos/victory.sh --version
-```
-
-Once `game_dir` in `victory.toml` points at your copy of the game (below), `tools/macos/victory.sh config` checks your paths too.
-
-## Running the game
-
-Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it. Every package's files must sit directly in that folder, so `appdata0.rpf` is at `<game_dir>/appdata0.rpf` and not in an `appdata0` subfolder. With one subfolder per package the title asserts early at `+0x2237178`, and `victory` now stops before that and says which file is misplaced (#24).
-
-```bash
-tools/macos/victory.sh run --execute <the game's executable>
-```
-
-For now this gets as far as VIctory does on Windows, as the note at the top explains.
-
-Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
-display. This requires two extended displays. If VIctory cannot select a single
-secondary display, it leaves the game window hidden. With more than one extra display,
-`VICTORY_WINDOW_SECONDARY=x,y` picks the one that holds that desktop point instead.
-`VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
-can further limit the window size without changing the render target.
-
-## Running the tests
-
-These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.
-
-```bash
+# Run host macOS unit & Metal tests (including zero-copy Metal compute on your GPU!)
 cargo test --workspace
+cargo test -p victory-metal -- --nocapture
+
+# Run the standalone M0 Rosetta x86_64 PoC (requires GPTK/D3DMetal libmetalirconverter.dylib installed)
+tools/macos/metal-poc/build-and-run.sh
+
+# Cross-check Windows/Wine workspace build & clippy
+cargo clippy --target x86_64-pc-windows-gnullvm --workspace --all-targets
 ```
 
-```bash
-WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
-```
+> [!NOTE]
+> For D3DMetal runs (`VICTORY_BACKEND=d3d12`, still the default), you still need CrossOver Wine + Apple Game Porting Toolkit (`setup.sh`) and a folder containing your own Xbox Series X|S copy pointed to by `victory.toml` (`victory.example.toml`). Keep `victory.toml` untracked and never commit game files.
 
-## Help test on your Mac
+---
 
-The project needs test results from as many Macs as possible. The [Mac test fleet](docs/fleet.md) runs both test suites on your Mac and reports the counts to this repository. It uses only the project's own tests, never a game. Paste this into an AI coding agent on your Mac, such as Claude Code, Codex or Cursor:
+## Strict Asset Policy
 
-```text
-Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/fleet-join.md and follow it to help test VIctory on my Mac. Ask me once before installing or posting anything, then keep going until I say stop.
-```
+This repository contains **zero proprietary game files, shaders, binaries, keys, or captures**. `cargo xtask policy` (`xtask/src/policy.rs`) enforces an allowlist of small text/source files (`<= 512 KiB`, no binary headers, no long hex/base64 runs). Contributions must keep `cargo xtask policy` green and keep `crates/victory-shader/src/emit/lower.rs <= 524,288` bytes.
 
-Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run the fleet by hand with `tools/fleet/fleet.sh`.
+---
 
-## Debugging switches
+## Acknowledgements & Licence
 
-These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ...`) and are for chasing problems, not for playing.
+Built directly upon the work of:
+- **[VIctory](https://github.com/Marvisak/VIctory)** by **Marvisak** (the core loader, console runtime, GPU translation layer, and RDNA2/GFX10-to-DXIL shader recompiler).
+- **[VIctory-macOS](https://github.com/pragyaangaur/VIctory-macOS)** by **Pragyaan Gaur** and contributors (bringing VIctory to macOS, Wine/Rosetta memory fixes, Wave32 lowering, and 32 KiB mesh linking).
+- **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** (`AvatarManz`) and **[VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (`Belobug`) for descriptor-porting and ambient lighting experiments.
+- **CodeWeavers / Wine** and **Apple Game Porting Toolkit / Metal Shader Converter**.
 
-A diagnostics build also logs one bounded line per submission that refreshes title memory: the total range count and bytes, then the eight largest ranges' title start/length and host GPU address. It logs no memory contents. A batch combines requests from several lists, view heaps and page tables, so a range is not attributed to an individual descriptor or view.
-
-| Variable | What it does |
-| --- | --- |
-| `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |
-| `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
-| `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
-| `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
-
-### Every variable
-
-The on/off switches below (`...=1`) are off when unset or set to `0`.
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-## Where things are
-
-| Path | What it holds |
-| --- | --- |
-| `setup.sh` | The one-step setup |
-| `tools/macos/` | The Wine build, the library build, the launcher and the test runner |
-| `tools/fleet/` | The Mac test fleet: the worker, the issue queue and its tests ([docs/fleet.md](docs/fleet.md)) |
-| `docs/macos.md` | The full story of the port, the problems found and how each was fixed |
-| `crates/` | VIctory's runtime: loader, console runtime, GPU layer, shader recompiler and formats |
-| `docs/architecture.md` | How VIctory itself is put together |
-
-## Acknowledgement
-
-This project is built on top of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak. The loader, the console runtime, the GPU layer and the shader recompiler all come from VIctory, and its full history is kept in this repository. This project adds the macOS side: the Mac build, the Wine and D3DMetal setup, and the fixes that the Mac needed. VIctory is licensed under GPL-3.0, so this project is too.
-
-Thanks also go to CodeWeavers for publishing CrossOver's source, to the Wine project, and to Apple for the Game Porting Toolkit.
-
-## Legal
-
-This project is not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft or Apple. Grand Theft Auto is a trademark of Take-Two Interactive. This repository contains no game files, keys or code from the game, and it never will. It only runs a copy that you own. D3DMetal is not included, and each user downloads it from Apple under Apple's terms.
-
-The code is licensed under the [GNU General Public License v3.0](LICENSE).
+Licensed under the **[GNU General Public License v3.0 or later](LICENSE)** (`GPL-3.0-or-later`), matching upstream VIctory. Not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft, or Apple.

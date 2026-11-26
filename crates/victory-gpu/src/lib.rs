@@ -20,6 +20,7 @@
 mod alias;
 #[cfg(all(windows, victory_dxc_ambient))]
 mod ambient;
+pub mod backend;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]

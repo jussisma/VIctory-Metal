@@ -1,0 +1,20 @@
+[package]
+name = "victory-metal"
+description = "Wine-decoupled native Apple Metal backend for VIctory (zero-copy unified memory and DXIL-to-MetalLib compilation)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# Built both as an rlib (for a direct Wine-free native macOS host) and a cdylib
+# (for the Phase 1 Wine unixlib / C ABI bridge).
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
