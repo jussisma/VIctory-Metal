@@ -1,37 +1,60 @@
 #!/bin/sh
-# End-to-end frame gate: a real Win64 Wine guest records one graphics list
-# (indexed triangle) and one compute dispatch, the native ARM64 Metal host
-# executes both through the same IPC session, and the run verifies:
+# Production-path Wire v3 gate: a real Win64 Wine guest and the native ARM64
+# Metal host.
 #
-#   * the host drew the triangle into its render target (centre pixel and the
-#     number of pixels matching it),
-#   * the guest's compute constant is visible through its own alias,
-#   * a replay of the same list identity is refused as AlreadyExecuted,
-#   * the guest alias is byte-identical after the refused replay.
+# Two parts, run one after the other on an exclusive GPU:
 #
-# This is one synthetic frame, not a benchmark: no FPS claim is made.
+# 1. Guest ring (`metal-worker --guest-v3`): a real Win64 process creates a
+#    file-backed allocation in the session share directory, authenticates to
+#    the native host, registers the allocation, and sends Wire v3
+#    (`KIND_SUBMISSION_V3`) compute lists over loopback. It asserts:
+#      * the alias-visible compute result,
+#      * a replay of the same list identity is refused as AlreadyExecuted and
+#        the alias is byte-identical,
+#      * an unknown allocation is UnknownHandle,
+#      * an unsupported opcode is an explicit ExecutionFailed,
+#      * no D3DMetal module is loaded in the guest process (psapi module scan).
+#
+# 2. Host gate (`producer_e2e`): the real `submit_v3` mixed encoder path with
+#    MRT + depth graphics into IOSurface targets, exact pixels, host present,
+#    and a Rosetta-converted DXIL compute shader whose output is read back
+#    through the guest-visible allocation.
+#
+# Known missing links (reported as PARTIAL, never as pass):
+#   * `victory-gpu`'s native queue installs `DisconnectedSink`; the producer does
+#     not yet carry its v3 submissions over IPC.
+#   * `victory_metal::guest_ipc::GuestIpcClient` has no version 3 encoder, so the
+#     guest probe frames the same bytes itself.
+#   * `ipc_host` cannot register render-target textures, so a v3 BeginRenderPass
+#     over the wire is refused UnknownHandle; the graphics pass runs through
+#     `DirectMetalTransport::submit_v3` directly.
+#   * there is no graphics pipeline constructor from converted DXIL metallibs,
+#     and `submit_v3` does not build the IRConverter top-level argument buffer,
+#     so the graphics pass is MSL and the DXIL compute uses the verified MSC
+#     single-UAV binder (`dispatch_msc_uav_1d`).
 #
 # Usage: tools/macos/metal-poc/synthetic-frame.sh
 #
-# The launcher creates a private temporary share directory, 32-byte secret and
-# Wine prefix, and removes them on exit (KEEP=1 keeps them). Nothing here
-# launches the title.
-#
-# Hardware note: this is the only GPU consumer of the run. Do not run it
-# concurrently with another Metal benchmark or test.
+# The launcher creates a private temporary share directory, 32-byte secret,
+# Wine prefix and native host, and removes them on exit (KEEP=1 keeps them).
+# Nothing here launches the title. This is one frame, not a benchmark.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-# Homebrew's rustup is keg-only; test-wine.sh expects it first on PATH too.
+# Homebrew's rustup is keg-only; put it first like the other macOS harnesses.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 if [ -z "${WINE:-}" ]; then
     for wine in "$ROOT/target/wine-cx/bin/wine" \
+        "$ROOT/../VIctory-macOS/target/wine-cx/bin/wine" \
         "$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine"; do
         [ -x "$wine" ] && { WINE="$wine"; break; }
     done
 fi
 WINE="${WINE:-$(command -v wine || true)}"
 export WINE
+
+IRCONVERTER_LIB="${VICTORY_METAL_IRCONVERTER:-$(cd "$(dirname "${WINE:-/usr/local/bin/wine}")/.." 2>/dev/null && pwd)/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib}"
+export VICTORY_METAL_IRCONVERTER="$IRCONVERTER_LIB"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/victory-frame-gate.XXXXXXXX")"
 SHARE="$WORK/share"
@@ -42,7 +65,6 @@ GUEST_LOG="$WORK/guest.log"
 HOST_PID=""
 PORT=""
 COMPUTE_PIPELINE=""
-GRAPHICS_PIPELINE=""
 
 cleanup() {
     if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
@@ -72,12 +94,24 @@ if [ -z "${WINE:-}" ] || [ ! -x "$WINE" ]; then
     echo "FAIL: no Wine executable found (set WINE=...)" >&2
     exit 1
 fi
+[ -f "$IRCONVERTER_LIB" ] || {
+    echo "FAIL: missing libmetalirconverter.dylib at $IRCONVERTER_LIB" >&2
+    exit 1
+}
 
-echo "Building the native ARM64 host worker..."
+echo "Building the native ARM64 host worker, the x86_64 IRConverter worker and the Win64 guest probe..."
 cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
+cargo build --locked --quiet -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter
+cargo build --locked --quiet -p victory-metal --target x86_64-pc-windows-gnullvm --bin metal-worker
 WORKER="$ROOT/target/aarch64-apple-darwin/debug/metal-worker"
-[ -x "$WORKER" ] || { echo "FAIL: $WORKER is missing" >&2; exit 1; }
+IRCONVERTER="$ROOT/target/x86_64-apple-darwin/debug/victory-irconverter"
+GUEST="$ROOT/target/x86_64-pc-windows-gnullvm/debug/metal-worker.exe"
+for artifact in "$WORKER" "$IRCONVERTER" "$GUEST"; do
+    [ -x "$artifact" ] || { echo "FAIL: $artifact is missing" >&2; exit 1; }
+done
+export VICTORY_IRCONVERTER_WORKER="$IRCONVERTER"
 
+# --- Part 1: Win64 guest drives the v3 ring ---------------------------------
 : >"$HOST_LOG"
 : >"$HOST_ERR"
 "$WORKER" \
@@ -109,26 +143,24 @@ fi
 
 PORT="$(sed -n 's/^VICTORY_IPC_PORT=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
 COMPUTE_PIPELINE="$(sed -n 's/^VICTORY_PIPELINE_ID=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
-GRAPHICS_PIPELINE="$(sed -n 's/^VICTORY_GRAPHICS_PIPELINE_ID=\([0-9][0-9]*\)$/\1/p' "$HOST_LOG" | tail -1)"
 [ -n "$PORT" ] || { echo "FAIL: no host port was published" >&2; exit 1; }
 [ -n "$COMPUTE_PIPELINE" ] || { echo "FAIL: no compute pipeline was published" >&2; exit 1; }
-[ -n "$GRAPHICS_PIPELINE" ] || { echo "FAIL: no graphics pipeline was published" >&2; exit 1; }
 
 export WINEPREFIX="$WORK/wineprefix"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 export VICTORY_METAL_SHARE_DIR="$(winpath "$SHARE")"
 export VICTORY_IPC_PORT="$PORT"
 export VICTORY_IPC_PIPELINE_ID="$COMPUTE_PIPELINE"
-export VICTORY_IPC_GRAPHICS_PIPELINE_ID="$GRAPHICS_PIPELINE"
 export VICTORY_IPC_SECRET_FILE="$(winpath "$SECRET")"
 
-echo "Host ready: port=$PORT compute=$COMPUTE_PIPELINE graphics=$GRAPHICS_PIPELINE"
-echo "Running the Wine guest frame-gate test..."
+"$WINE" wineboot -i >/dev/null 2>&1 || true
+echo "Host ready: port=$PORT compute=$COMPUTE_PIPELINE"
+echo "Running the Wine Win64 guest v3 probe..."
 guest_rc=0
-"$ROOT/tools/macos/test-wine.sh" --locked -p victory-hle --lib \
-    xmem::e2e::wine_guest_draws_and_computes_through_native_frame_gate \
-    -- --test-threads=1 --nocapture 2>&1 | tee "$GUEST_LOG" || guest_rc=$?
+"$WINE" "$GUEST" --guest-v3 2>&1 | tee "$GUEST_LOG" || guest_rc=$?
 if [ "$guest_rc" -ne 0 ]; then
-    echo "FAIL: the Wine guest test exited with $guest_rc" >&2
+    echo "FAIL: the Wine guest probe exited with $guest_rc" >&2
     cat "$HOST_LOG" "$HOST_ERR" >&2 || true
     exit 1
 fi
@@ -150,20 +182,38 @@ fail() {
     exit 1
 }
 
-grep -q 'kind=draw centre=0,255,0,255 pixels=4096' "$HOST_LOG" \
-    || fail "the host did not report a full-target green draw"
-grep -q 'kind=compute value=25' "$HOST_LOG" \
-    || fail "the host did not report the computed constant 25"
-grep -q 'session complete submissions=3 allocations=1' "$HOST_ERR" \
-    || fail "unexpected host session summary"
-grep -q 'replay=AlreadyExecuted' "$GUEST_LOG" \
+grep -q 'GUEST_V3_PASS' "$GUEST_LOG" || fail "the guest did not report a v3 pass"
+grep -q 'replay=AlreadyExecuted alias_unchanged=1' "$GUEST_LOG" \
     || fail "the guest did not observe the refused replay"
-grep -q 'alias_unchanged=1' "$GUEST_LOG" \
-    || fail "the guest did not confirm the alias was unchanged"
+grep -q 'unknown_allocation=UnknownHandle' "$GUEST_LOG" \
+    || fail "the guest did not observe the unknown-allocation refusal"
+grep -q 'unsupported_opcode=ExecutionFailed' "$GUEST_LOG" \
+    || fail "the guest did not observe the unsupported-opcode refusal"
+grep -q 'd3dmetal_modules=0' "$GUEST_LOG" \
+    || fail "the guest process loaded D3DMetal"
+grep -q 'kind=compute value=10' "$HOST_LOG" \
+    || fail "the host did not report the v3 compute result"
+grep -q 'session complete submissions=4 allocations=1' "$HOST_ERR" \
+    || fail "unexpected host session summary"
 
-draw_line="$(grep 'kind=draw' "$HOST_LOG" | head -1)"
+guest_line="$(grep 'GUEST_V3_PASS' "$GUEST_LOG" | head -1)"
 compute_line="$(grep 'kind=compute' "$HOST_LOG" | head -1)"
 summary_line="$(grep 'session complete' "$HOST_ERR" | head -1)"
-echo "PASS synthetic-frame wine-guest=1 draw=\"$draw_line\" compute=\"$compute_line\""
-echo "PASS synthetic-frame host=\"$summary_line\" replay=AlreadyExecuted alias_unchanged=1 frame=1"
-echo "NOTE one synthetic frame; this is not an FPS measurement."
+echo "PASS synthetic-frame mode=wire-v3 guest=\"$guest_line\""
+echo "PASS synthetic-frame host=\"$compute_line\" host=\"$summary_line\""
+
+# --- Part 2: host mixed encoder, MRT/depth graphics and converted DXIL ------
+echo "Running the host producer gate (MRT/depth graphics, converted DXIL compute)..."
+gate_rc=0
+cargo test --locked -p victory-metal --target aarch64-apple-darwin --test producer_e2e \
+    -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$WORK/producer_e2e.log" || gate_rc=$?
+if [ "$gate_rc" -ne 0 ]; then
+    echo "FAIL: the host producer gate exited with $gate_rc" >&2
+    exit 1
+fi
+grep -q 'producer_e2e PASS' "$WORK/producer_e2e.log" \
+    || fail "the host producer gate did not print its PASS line"
+
+echo "PASS synthetic-frame mode=host-v3 graphics=MRT+depth dxil=rosetta pixels=1024"
+echo "PARTIAL synthetic-frame wine-guest-consumes-victory-gpu=0 reason=\"victory-gpu installs DisconnectedSink and GuestIpcClient has no v3 encoder\""
+echo "NOTE one frame; this is not an FPS measurement."
