@@ -48,6 +48,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use super::{PAGE, Section};
 
+use victory_gpu::backend::GpuBackend;
+use victory_gpu::native_metal::bindings::{
+    self as bindings, GuestRange, GuestRangeResolver, ResolveError as SeamError,
+};
+
 /// Names the session's directory for host-visible XMem backing.
 pub(crate) const DIRECTORY: &str = "VICTORY_METAL_SHARE_DIR";
 
@@ -534,6 +539,7 @@ fn next_id() -> Option<u64> {
 /// created before a later failure remains on disk for harness cleanup (it is
 /// never reused, because ids are not).
 pub(crate) fn section(size: usize) -> Result<Arc<Section>, Failure> {
+    install_if_metal();
     let Some(directory) = directory() else {
         return Err(Failure::Unconfigured);
     };
@@ -600,6 +606,7 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
 /// views already hold; the returned lease keeps the section (and its file)
 /// alive with an `Arc`.
 pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, ResolveError> {
+    install_if_metal();
     if len == 0 {
         return Err(ResolveError::Empty);
     }
@@ -685,6 +692,160 @@ fn view_at(
         .next_back()
         .filter(|(base, (size, _))| at < base.wrapping_add(*size))
         .map(|(base, (size, slice))| (*base, *size, slice))
+}
+
+// ---------------------------------------------------------------- the seam
+
+/// The lease behind a range this resolver returned, kept until the retain
+/// that pins it (a [`Lease`] keeps the section, and with it the share file's
+/// handle and mapping, alive on its own).
+///
+/// Keyed by the range exactly as [`ShareResolver::resolve`] returned it: the
+/// wire binding needs the page window, the registry needs its identity, and
+/// the caller passes back what it was given.
+static PENDING: LazyLock<Mutex<HashMap<GuestRange, Vec<Lease>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolved-but-not-yet-retained ranges are transient; this bounds a caller
+/// that resolves and never pins (a rejected descriptor, a refused table).
+const PENDING_LIMIT: usize = 4096;
+
+/// Pins taken through the seam; a token is a registry submission id.
+///
+/// High enough that it cannot collide with the small submission numbers the
+/// queue uses for its own fences, and monotonic for the whole process.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 32);
+
+fn next_token() -> Result<u64, SeamError> {
+    NEXT_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            token.checked_add(1)
+        })
+        .map_err(|_| SeamError::Retain("the pin token counter is exhausted"))
+}
+
+fn remember(range: GuestRange, lease: Lease) {
+    let mut pending = crate::modules::lock(&PENDING);
+    if pending.len() >= PENDING_LIMIT && !pending.contains_key(&range) {
+        // A caller that resolved without retaining cannot pin anything with
+        // these; dropping the leases only closes already-unused sections.
+        pending.clear();
+    }
+    pending.entry(range).or_default().push(lease);
+}
+
+/// The share provider as the native backend's [`GuestRangeResolver`].
+///
+/// A range that is not shown by tracked views, leaves its section, spans two
+/// sections, or lives in a pagefile-backed section is an explicit error. The
+/// pagefile path itself is untouched: nothing here runs unless the native
+/// backend asks, and the provider stays off when
+/// `VICTORY_METAL_SHARE_DIR` is unset.
+pub(crate) struct ShareResolver;
+
+impl GuestRangeResolver for ShareResolver {
+    fn resolve(&self, guest_address: u64, len: u64) -> Result<GuestRange, SeamError> {
+        if guest_address == 0 {
+            return Err(SeamError::Invalid("the guest address is zero"));
+        }
+        let at = usize::try_from(guest_address).map_err(|_| SeamError::Unmapped {
+            address: guest_address,
+            len,
+        })?;
+        let size = usize::try_from(len).map_err(|_| SeamError::Unmapped {
+            address: guest_address,
+            len,
+        })?;
+        let lease = resolve_guest_range(at, size)
+            .map_err(|error| seam_resolve_error(error, guest_address, len))?;
+        let generation = u32::try_from(lease.range.generation).map_err(|_| {
+            SeamError::Invalid("the allocation generation does not fit the wire field")
+        })?;
+        let range = GuestRange {
+            allocation_id: lease.range.id,
+            generation,
+            byte_offset: lease.range.offset,
+            size: lease.range.length,
+        };
+        remember(range, lease);
+        Ok(range)
+    }
+
+    fn retain(&self, range: &GuestRange) -> Result<u64, SeamError> {
+        let lease = {
+            let mut pending = crate::modules::lock(&PENDING);
+            let leases = pending.get_mut(range).ok_or(SeamError::Retain(
+                "the range was not resolved by this process, or was already pinned",
+            ))?;
+            let lease = leases.pop().ok_or(SeamError::Retain(
+                "the range was not resolved by this process, or was already pinned",
+            ))?;
+            if leases.is_empty() {
+                pending.remove(range);
+            }
+            lease
+        };
+        let token = next_token()?;
+        lease.retain(token).map_err(seam_retain_error)?;
+        Ok(token)
+    }
+
+    fn retire(&self, token: u64) -> Result<(), SeamError> {
+        retire(token).map(|_| ()).map_err(seam_retire_error)
+    }
+}
+
+fn seam_resolve_error(error: ResolveError, address: u64, len: u64) -> SeamError {
+    match error {
+        ResolveError::Empty => SeamError::Invalid("the guest range is empty"),
+        ResolveError::OutOfBounds | ResolveError::NotMapped => SeamError::Unmapped { address, len },
+        ResolveError::NotContiguous => {
+            SeamError::Invalid("the range is not one contiguous shared allocation")
+        }
+        ResolveError::Stale => {
+            SeamError::Invalid("the range's backing is stale or not this session's")
+        }
+        ResolveError::Pagefile => {
+            SeamError::Unsupported("the range's section has no host-visible backing")
+        }
+    }
+}
+
+fn seam_retain_error(error: RegistryError) -> SeamError {
+    match error {
+        RegistryError::StaleGeneration { .. } => {
+            SeamError::Invalid("the range's backing generation is stale")
+        }
+        RegistryError::ZeroId => SeamError::Invalid("the range names no share allocation"),
+        RegistryError::InvalidRange { .. } => {
+            SeamError::Invalid("the range is unaligned or leaves its share file")
+        }
+        RegistryError::Retired(_) => SeamError::Retain("the pin's submission already retired"),
+        _ => SeamError::Retain("the share registry refused the range"),
+    }
+}
+
+fn seam_retire_error(error: RegistryError) -> SeamError {
+    match error {
+        RegistryError::Retired(_) => SeamError::Retire("the pin was already retired"),
+        RegistryError::UnknownSubmission(_) => SeamError::Retire("the pin was never retained"),
+        _ => SeamError::Retire("the share registry refused the retirement"),
+    }
+}
+
+/// Installs [`ShareResolver`] as the process-wide guest range resolver when
+/// `VICTORY_BACKEND=metal`.
+///
+/// Idempotent and read once: the backend switch is fixed for the process.
+/// With the default backend nothing is installed and the pagefile path is
+/// exactly as before.
+pub(crate) fn install_if_metal() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        if GpuBackend::from_env() == GpuBackend::Metal {
+            bindings::set_resolver(ShareResolver);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1312,5 +1473,114 @@ mod tests {
             release(key, SUB_A).unwrap_err(),
             RegistryError::Retired(SUB_A)
         );
+    }
+
+    /// The seam over the real share provider: an unaligned guest address
+    /// resolves to the page window that holds it, retaining pins the range in
+    /// the registry until the token retires, and a second retirement is
+    /// refused. No GPU work.
+    #[test]
+    fn share_resolver_pins_unaligned_ranges_until_retire() {
+        let share = SyntheticShare::new(2);
+        let view = FakeView::install(
+            FAKE,
+            2 * PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 0,
+            },
+        );
+        let resolver = ShareResolver;
+
+        let range = resolver
+            .resolve(FAKE as u64 + 0x123, 0x456)
+            .expect("an unaligned guest address");
+        assert_eq!(range.allocation_id, share.section.share.as_ref().unwrap().id);
+        assert_eq!(range.generation, 1);
+        assert_eq!(range.byte_offset, 0, "the containing page is the window");
+        assert_eq!(range.size, PAGE as u64);
+        let key = RangeKey {
+            id: range.allocation_id,
+            generation: GENERATION,
+            offset: range.byte_offset,
+            length: range.size,
+        };
+
+        let token = resolver.retain(&range).expect("retain the range");
+        assert!(is_retained(key), "the pin must register the range");
+        // Retaining a range that was not resolved here is refused, not
+        // silently accepted.
+        assert!(matches!(
+            resolver.retain(&range),
+            Err(SeamError::Retain(_)),
+        ));
+
+        resolver.retire(token).expect("retire the pin");
+        assert!(!is_retained(key), "the pin must release the range");
+        assert!(
+            matches!(resolver.retire(token), Err(SeamError::Retire(_))),
+            "a second retirement is refused"
+        );
+
+        // A range reaching into the second page resolves to both pages.
+        let spanning = resolver
+            .resolve(FAKE as u64 + PAGE as u64 - 0x10, 0x20)
+            .expect("a page-spanning range");
+        assert_eq!((spanning.byte_offset, spanning.size), (0, 2 * PAGE as u64));
+        let token = resolver.retain(&spanning).expect("retain the span");
+        resolver.retire(token).expect("retire the span");
+
+        // The byte past the mapped view is not granted.
+        assert!(matches!(
+            resolver.resolve(FAKE as u64 + 2 * PAGE as u64, 1),
+            Err(SeamError::Unmapped { .. }),
+        ));
+        assert!(matches!(
+            resolver.resolve(0, 1),
+            Err(SeamError::Invalid(_)),
+        ));
+        drop(view);
+    }
+
+    /// A pagefile-backed section has no host-visible backing: the seam
+    /// reports it instead of naming a file that does not exist.
+    #[test]
+    fn share_resolver_reports_pagefile_and_stale_backing() {
+        let file = tempfile::tempfile().expect("a temporary file");
+        file.set_len(PAGE as u64).expect("one page");
+        let section = super::super::file_section(&file, PAGE, None).expect("a pagefile section");
+        let view = FakeView::install(
+            FAKE,
+            PAGE,
+            super::super::Slice {
+                section: section.clone(),
+                index: 0,
+            },
+        );
+        assert!(
+            matches!(
+                ShareResolver.resolve(FAKE as u64, 0x10),
+                Err(SeamError::Unsupported(_))
+            ),
+            "a pagefile-backed range must not resolve"
+        );
+        drop(view);
+
+        // A backing with another generation is stale, not reused.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let (section, _path) = share_section(&directory, "stale.bin", 1, 7, GENERATION + 1);
+        let view = FakeView::install(
+            FAKE + PAGE,
+            PAGE,
+            super::super::Slice { section, index: 0 },
+        );
+        assert!(
+            matches!(
+                ShareResolver.resolve((FAKE + PAGE) as u64, 0x10),
+                Err(SeamError::Invalid(_))
+            ),
+            "a stale generation must be refused"
+        );
+        drop(view);
     }
 }

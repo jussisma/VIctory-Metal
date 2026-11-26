@@ -130,6 +130,11 @@ struct List {
     /// this list records Wire v3 submissions instead of host D3D12 work.
     #[cfg(windows)]
     metal: std::sync::Mutex<Option<crate::native_metal::producer::MetalList>>,
+    /// Guest backing pins taken for this list's native bindings, retired by
+    /// the queue after the GPU completion that runs them
+    /// ([`take_retained`]).
+    #[cfg(windows)]
+    metal_retained: std::sync::Mutex<Vec<u64>>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -224,6 +229,243 @@ pub(crate) fn take_submissions(this: This) -> Vec<crate::native_metal::producer:
     let list = unsafe { &*this.cast::<List>() };
     let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
     metal.as_mut().map(|metal| metal.take()).unwrap_or_default()
+}
+
+/// The guest backing pins this list's native bindings hold, for the queue to
+/// retire ([`crate::native_metal::bindings::GuestRangeResolver::retire`])
+/// after the GPU completion that ran them.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn take_retained(this: This) -> Vec<u64> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    std::mem::take(&mut *list.metal_retained.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Remembers pins a recorded native binding holds until the queue retires
+/// them.
+#[cfg(windows)]
+fn retain_on_list(this: This, tokens: &[u64]) {
+    if tokens.is_empty() || this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.metal_retained
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend_from_slice(tokens);
+}
+
+/// Refuses a native binding that could not be resolved, with the precise
+/// reason in the log and a fixed operation name on the wire path.
+#[cfg(windows)]
+fn refuse_binding(this: This, why: &'static str, error: impl std::fmt::Display) {
+    tracing::warn!(error = %error, "{why}");
+    with_metal(this, |producer| producer.refuse(why, None));
+}
+
+/// Resolves and records a graphics root CBV/SRV/UAV as a Wire v3 root buffer
+/// view, pinning its guest backing until the queue retires the list.
+///
+/// The guest call carries only the GPU virtual address (the root signature
+/// declares the extent), so the view covers the rest of the page window the
+/// address resolves into. The Wire root view's offset is the exact
+/// in-allocation byte offset of the address; the host binds that offset.
+#[cfg(windows)]
+fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
+    use crate::native_metal::bindings;
+    let Ok(slot) = u16::try_from(slot) else {
+        refuse_binding(
+            this,
+            "a root view slot does not fit the wire",
+            "slot exceeds 65535",
+        );
+        return;
+    };
+    let Some(resolver) = bindings::resolver() else {
+        refuse_binding(
+            this,
+            "a root view needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let resolved = match bindings::root_buffer_view_page(&*resolver, slot, address) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            refuse_binding(this, "a root view could not be resolved", error);
+            return;
+        }
+    };
+    let (view, tokens) = resolved.into_parts();
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_graphics_root_buffer_view(view);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
+}
+
+/// One descriptor table entry as the guest's descriptor memory describes it.
+#[cfg(windows)]
+fn table_entry(
+    handle: u64,
+) -> Result<
+    (
+        victory_metal::wire_v3::DescriptorKind,
+        crate::native_metal::bindings::GuestBinding,
+    ),
+    &'static str,
+> {
+    use crate::descriptor::View;
+    use crate::native_metal::bindings::GuestBinding;
+    use victory_metal::wire_v3::DescriptorKind;
+
+    let view = crate::descriptor::view(handle)
+        .ok_or("the descriptor slot holds no live view this process recorded")?;
+    match &*view {
+        View::Constant(address, size) => {
+            if *address == 0 || *size == 0 {
+                return Err("a constant buffer descriptor is null");
+            }
+            Ok((
+                DescriptorKind::Cbv,
+                GuestBinding {
+                    address: *address,
+                    len: u64::from(*size),
+                },
+            ))
+        }
+        View::Shader(resource, _) => buffer_entry(*resource, DescriptorKind::Srv),
+        View::Unordered(resource, _, _) => buffer_entry(*resource, DescriptorKind::Uav),
+        View::Sampler(_) | View::ConsoleSampler(_) => {
+            Err("sampler descriptor tables have no buffer binding")
+        }
+        View::Placed(..) => Err("a placed view is not a buffer descriptor"),
+    }
+}
+
+/// A buffer resource's guest range as a descriptor table entry.
+#[cfg(windows)]
+fn buffer_entry(
+    resource: usize,
+    kind: victory_metal::wire_v3::DescriptorKind,
+) -> Result<
+    (
+        victory_metal::wire_v3::DescriptorKind,
+        crate::native_metal::bindings::GuestBinding,
+    ),
+    &'static str,
+> {
+    let this = resource as This;
+    let Some((base, size)) = crate::resource::buffer_bytes(this) else {
+        return Err("a texture descriptor cannot be carried by a buffer table");
+    };
+    if base.is_null() || size == 0 {
+        return Err("a buffer descriptor is empty");
+    }
+    Ok((
+        kind,
+        crate::native_metal::bindings::GuestBinding {
+            address: base as u64,
+            len: size,
+        },
+    ))
+}
+
+/// Resolves and records a graphics descriptor table, pinning every referenced
+/// buffer's guest backing until the queue retires the list.
+///
+/// `base_register` is the table's root parameter slot: this backend's local
+/// convention (root views and root constants already use the root parameter
+/// slot as the Metal buffer index). Only a one-entry table is recorded: a
+/// table's descriptor count and register assignment come from the root
+/// signature, which the native path does not track yet, so a table that
+/// visibly reaches a second same-kind descriptor is refused instead of
+/// mis-bound. Sampler and texture tables are refused for the same reason
+/// (Wire v3 tables carry buffer ranges only). Compute tables are refused
+/// because the producer has no compute root binding yet.
+#[cfg(windows)]
+fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
+    use crate::native_metal::bindings;
+    let Ok(slot) = u16::try_from(slot) else {
+        refuse_binding(
+            this,
+            "a descriptor table slot does not fit the wire",
+            "slot exceeds 65535",
+        );
+        return;
+    };
+    if handle == 0 {
+        refuse_binding(
+            this,
+            "a descriptor table handle is zero",
+            "SetGraphicsRootDescriptorTable(null)",
+        );
+        return;
+    }
+    let Some(resolver) = bindings::resolver() else {
+        refuse_binding(
+            this,
+            "a descriptor table needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let (kind, descriptor) = match table_entry(handle) {
+        Ok(entry) => entry,
+        Err(why) => {
+            refuse_binding(this, "a descriptor table entry is not expressible", why);
+            return;
+        }
+    };
+    // A second same-kind slot at the next descriptor address means this may
+    // be a multi-entry table; its register assignment is not known.
+    if let Some(next_handle) = handle.checked_add(32)
+        && let Ok((next_kind, next)) = table_entry(next_handle)
+        && next_kind == kind
+        && next.address != 0
+    {
+        refuse_binding(
+            this,
+            "a multi-entry descriptor table has no tracked register layout",
+            "root signature table layout is not tracked by the native path",
+        );
+        return;
+    }
+    let resolved = match bindings::descriptor_table(
+        &*resolver,
+        handle,
+        slot,
+        slot,
+        kind,
+        &[descriptor],
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            refuse_binding(this, "a descriptor table could not be resolved", error);
+            return;
+        }
+    };
+    let (table, tokens) = resolved.into_parts();
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_graphics_descriptor_table(table);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
 }
 
 /// The provisional native identity of a title resource: its guest allocation
@@ -526,6 +768,8 @@ fn new_list(
         } else {
             None
         }),
+        #[cfg(windows)]
+        metal_retained: Default::default(),
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -1810,14 +2054,30 @@ mod state {
         });
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        if metal() {
+            // The producer has no compute root table binding yet, so the
+            // guest call is refused explicitly rather than recorded with no
+            // effect (ADR-008).
+            with_metal(this, |p| {
+                p.refuse(
+                    "SetComputeRootDescriptorTable: no compute root table binding",
+                    Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
+                )
+            });
+            return;
+        }
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
-    /// Descriptor tables and root views carry heap addresses, not allocation
-    /// ranges: the descriptor lowering task resolves them into
-    /// `DescriptorTableV3`/`RootBufferView`. Until it lands the native path
-    /// records no binding for them (and fails at the host), rather than
-    /// guessing a range.
+    /// Descriptor tables and root views carry guest GPU addresses; the
+    /// native path resolves them through the installed
+    /// `crate::native_metal::bindings` resolver, pins the backing ranges and
+    /// records the Wire v3 entry. A table whose layout cannot be determined
+    /// is refused, never guessed.
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        if metal() {
+            super::bind_graphics_descriptor_table(this, slot, handle);
+            return;
+        }
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
@@ -1879,9 +2139,22 @@ mod state {
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        if metal() {
+            with_metal(this, |p| {
+                p.refuse(
+                    "SetComputeRoot*View: no compute root view binding",
+                    Some(victory_metal::wire_v3::OP_SET_ROOT_BUFFER_VIEW),
+                )
+            });
+            return;
+        }
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        if metal() {
+            super::bind_graphics_root_view(this, slot, address);
+            return;
+        }
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
