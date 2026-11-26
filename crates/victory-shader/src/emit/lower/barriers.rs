@@ -155,6 +155,12 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
 /// every lane holds. Only the console wave's uniformity is needed here
 /// because the group is that one wave; a group of several waves must use
 /// [`in_step`], where such a read is not alike.
+///
+/// "Unguarded" is about EXEC divergence (`Structured::guards`): a scalar
+/// branch on alike values does not diverge EXEC, so the instruction has no
+/// guard and its block stays [`in_step`]; one on a value that may differ
+/// between host waves drops the block from `step`. A guard left by a
+/// lane-dependent branch is therefore still refused with the reason it had.
 pub(super) fn in_step_one_wave(
     p: &Program,
     st: &Structured,
@@ -243,10 +249,11 @@ fn in_step_impl(
                 // A first-lane read of a vector every lane of the console
                 // wave holds gives both host waves the console's value, but
                 // only where every lane runs together: under a lane-dependent
-                // guard the halves read different first lanes. Only for a
-                // one-wave group (`wave_unif`): a group of several console
-                // waves has one such value per wave. (`v_readlane` with a
-                // constant lane is not admitted.)
+                // guard the halves read different first lanes. A guard on
+                // alike scalars is fine: every lane enters or none does. Only
+                // for a one-wave group (`wave_unif`): a group of several
+                // console waves has one such value per wave. (`v_readlane`
+                // with a constant lane is handled below.)
                 let first = wave_unif.is_some_and(|unif| {
                     inst.name() == "v_readfirstlane_b32"
                         && entered
@@ -264,10 +271,11 @@ fn in_step_impl(
                 // (a constant one, or one the host waves compute alike), or
                 // the source is a value every lane of the console wave holds,
                 // so whichever lane each half reads is the same. Unguarded,
-                // where every lane runs together, it is alike in both host
-                // halves of a one-wave group; a group of several waves has one
-                // such value per wave. The source may come from a lane: a
-                // constant lane reads the one console lane by itself.
+                // or guarded only by alike scalars, where every lane runs
+                // together, it is alike in both host halves of a one-wave
+                // group; a group of several waves has one such value per wave.
+                // The source may come from a lane: a constant lane reads the
+                // one console lane by itself.
                 let lane_read = wave_unif.is_some_and(|unif| {
                     if inst.name() != "v_readlane_b32"
                         || !entered
