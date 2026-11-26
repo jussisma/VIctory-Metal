@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
 use crate::macos::irconverter;
+use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
 use crate::macos::msc::{self, MscUavDispatch};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::render::{
@@ -96,6 +97,10 @@ pub(crate) struct DeviceState {
     /// graphics commands consult `render_pipelines` only. Neither lookup can
     /// fall through to the other table and silently accept a mismatched id.
     render_pipelines: HashMap<u64, GraphicsPipeline>,
+    /// Mesh render pipeline states. v3 `SetMeshPipeline` and `DispatchMesh`
+    /// resolve here; ids share [`DeviceState::alloc_id`] with every other
+    /// pipeline family.
+    mesh_pipelines: HashMap<u64, MeshPipeline>,
     /// Lazily created 64x64 RGBA8 host render target for graphics batches.
     host_target: Option<RenderTarget>,
     pub(crate) textures: HashMap<u64, ObjcObject>,
@@ -469,6 +474,7 @@ impl DirectMetalTransport {
                 buffers: HashMap::new(),
                 pipelines: HashMap::new(),
                 render_pipelines: HashMap::new(),
+                mesh_pipelines: HashMap::new(),
                 host_target: None,
                 textures: HashMap::new(),
                 surfaces: HashMap::new(),
@@ -589,6 +595,67 @@ impl DirectMetalTransport {
         Ok(VmPipelineId(id))
     }
 
+    /// Registers an already-compiled mesh pipeline state.
+    ///
+    /// The returned [`VmPipelineId`] is what a v3 `SetMeshPipeline` names and
+    /// what its following `DispatchMesh` must repeat. Mesh ids share the same
+    /// allocator as compute and graphics pipelines, so a handle from one family
+    /// can never resolve in another.
+    pub fn register_mesh_pipeline(
+        &self,
+        pipeline: MeshPipeline,
+    ) -> Result<VmPipelineId, MetalError> {
+        let mut state = self.lock_state()?;
+        let id = state.alloc_id();
+        state.mesh_pipelines.insert(id, pipeline);
+        Ok(VmPipelineId(id))
+    }
+
+    /// Compiles and registers a mesh pipeline from MSL source.
+    ///
+    /// The fragment stage is required; the object stage is optional. Budgets
+    /// and attachment formats are validated by [`MeshPipelineSpec`] before any
+    /// library or pipeline object is created.
+    pub fn register_mesh_pipeline_msl(
+        &self,
+        source: &str,
+        mesh_entry: &str,
+        object_entry: Option<&str>,
+        fragment_entry: &str,
+        spec: &MeshPipelineSpec,
+    ) -> Result<VmPipelineId, MetalError> {
+        let pipeline =
+            MeshPipeline::compile_msl(self, source, mesh_entry, object_entry, fragment_entry, spec)?;
+        self.register_mesh_pipeline(pipeline)
+    }
+
+    /// Loads precompiled mesh/object/fragment metallibs and registers the
+    /// resulting mesh pipeline.
+    ///
+    /// This is the native bridge for bytes produced by the Rosetta IRConverter
+    /// worker, mirroring [`Self::load_metallib`] for compute.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_mesh_pipeline_metallibs(
+        &self,
+        mesh_library: &[u8],
+        mesh_entry: &str,
+        object_library: Option<(&[u8], &str)>,
+        fragment_library: &[u8],
+        fragment_entry: &str,
+        spec: &MeshPipelineSpec,
+    ) -> Result<VmPipelineId, MetalError> {
+        let pipeline = MeshPipeline::from_metallibs(
+            self,
+            mesh_library,
+            mesh_entry,
+            object_library,
+            fragment_library,
+            fragment_entry,
+            spec,
+        )?;
+        self.register_mesh_pipeline(pipeline)
+    }
+
     /// Creates the shared 64x64 RGBA8 host render target on first use.
     fn ensure_host_target(&self) -> Result<(), MetalError> {
         let _pool = AutoreleasePool::new();
@@ -621,6 +688,29 @@ impl DirectMetalTransport {
         let target = state.host_target.as_ref().ok_or_else(|| {
             MetalError::InternalError("host render target was not created".to_string())
         })?;
+        let bytes = read_back_render_target(self, target)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect())
+    }
+
+    /// Reads a colour render target back as RGBA8 pixels, row-major from the
+    /// top-left corner.
+    ///
+    /// Diagnostic/test helper: it blits the private texture into a shared
+    /// buffer and waits, holding the state lock so no other submission can use
+    /// the target concurrently. It is never part of the present path.
+    pub fn read_render_target_rgba8(
+        &self,
+        target: &RenderTarget,
+    ) -> Result<Vec<[u8; 4]>, MetalError> {
+        if !target.pixel_format().is_color() {
+            return Err(MetalError::InvalidArg(
+                "readback target must use a colour pixel format",
+            ));
+        }
+        let _state = self.lock_state()?;
         let bytes = read_back_render_target(self, target)?;
         Ok(bytes
             .chunks_exact(4)
@@ -1640,6 +1730,14 @@ enum PreparedRenderOp {
         instance_count: usize,
         base_instance: usize,
     },
+    /// One mesh draw with the per-stage threadgroup sizes recorded on the
+    /// registered mesh pipeline.
+    DispatchMesh {
+        group_counts: MTLSize,
+        threads_per_object_threadgroup: MTLSize,
+        threads_per_mesh_threadgroup: MTLSize,
+        bindings: Vec<BoundRange>,
+    },
 }
 
 /// One validated blit-segment command.
@@ -1960,11 +2058,11 @@ fn prepare_compute_segment(
                 }));
             }
             CommandV3::DispatchMesh(_) => {
-                // No mesh pipeline can be registered on this transport, so a
-                // mesh dispatch never has validated work to run. Refuse it
-                // loudly instead of silently skipping the command.
-                return Err(MetalError::NotSupported(
-                    "mesh-shader pipelines are not registered; DispatchMesh is refused",
+                // Mesh draws are render-encoder work; the planner only puts
+                // them inside a render pass. Reaching a compute segment means
+                // the plan and executor disagree, which is a structural error.
+                return Err(MetalError::InvalidArg(
+                    "mesh dispatch is only valid inside a render pass",
                 )
                 .into());
             }
@@ -2130,6 +2228,7 @@ fn prepare_render_segment(
     let descriptor = build_mrt_render_pass_descriptor(&colors, depth.as_ref())?;
 
     let mut ops = Vec::new();
+    let mut mesh_pipeline: Option<u64> = None;
     let mut current_pipeline = false;
     let mut index_binding: Option<(objc::Id, usize, IndexType, u64)> = None;
     let mut topology = PrimitiveType::Triangle;
@@ -2158,6 +2257,7 @@ fn prepare_render_segment(
                     depth_state: graphics.depth_state_raw(),
                 });
                 current_pipeline = true;
+                mesh_pipeline = None;
             }
             CommandV3::SetPipeline(pipeline) => {
                 let graphics = state
@@ -2181,12 +2281,31 @@ fn prepare_render_segment(
                     depth_state: graphics.depth_state_raw(),
                 });
                 current_pipeline = true;
+                mesh_pipeline = None;
             }
-            CommandV3::SetMeshPipeline(_) => {
-                return Err(MetalError::NotSupported(
-                    "mesh-shader pipelines are not registered; SetMeshPipeline is refused",
-                )
-                .into());
+            CommandV3::SetMeshPipeline(pipeline) => {
+                let mesh = state
+                    .mesh_pipelines
+                    .get(&pipeline.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if mesh.color_formats() != color_formats.as_slice() {
+                    return Err(MetalError::InvalidArg(
+                        "mesh pipeline colour formats do not match the render pass",
+                    )
+                    .into());
+                }
+                if mesh.depth_format() != depth_format {
+                    return Err(MetalError::InvalidArg(
+                        "mesh pipeline depth format does not match the render pass",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::Pipeline {
+                    state: mesh.state_raw(),
+                    depth_state: mesh.depth_state_raw(),
+                });
+                current_pipeline = true;
+                mesh_pipeline = Some(pipeline.pipeline_id);
             }
             CommandV3::SetViewport(viewport) => {
                 ops.push(PreparedRenderOp::Viewport(validate_viewport(
@@ -2313,8 +2432,46 @@ fn prepare_render_segment(
                 }
                 ops.push(PreparedRenderOp::Barrier);
             }
+            CommandV3::DispatchMesh(dispatch) => {
+                let mesh = state
+                    .mesh_pipelines
+                    .get(&dispatch.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if mesh_pipeline != Some(dispatch.pipeline_id) {
+                    return Err(MetalError::InvalidArg(
+                        "mesh dispatch requires a selected mesh pipeline in its render pass",
+                    )
+                    .into());
+                }
+                if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
+                    return Err(MetalError::InvalidArg(
+                        "mesh dispatch exceeds the wire binding limit",
+                    )
+                    .into());
+                }
+                let group_counts = dispatch.checked_group_count().ok_or(
+                    MetalError::InvalidArg("mesh dispatch group counts overflow u64"),
+                )?;
+                let limit = mesh.max_total_threadgroups_per_mesh_grid();
+                if limit != 0 && group_counts > limit as u64 {
+                    return Err(MetalError::InvalidArg(
+                        "mesh dispatch exceeds maxTotalThreadgroupsPerMeshGrid",
+                    )
+                    .into());
+                }
+                ops.push(PreparedRenderOp::DispatchMesh {
+                    group_counts: MTLSize {
+                        width: dispatch.group_counts[0] as usize,
+                        height: dispatch.group_counts[1] as usize,
+                        depth: dispatch.group_counts[2] as usize,
+                    },
+                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
+                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
+                    bindings: resolve_binding_slots(state, allocations, &dispatch.bindings, 0)?,
+                });
+            }
             CommandV3::Draw(draw) => {
-                if !current_pipeline {
+                if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
                     )
@@ -2335,7 +2492,7 @@ fn prepare_render_segment(
                 });
             }
             CommandV3::DrawInstanced(draw) => {
-                if !current_pipeline {
+                if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
                     )
@@ -2358,7 +2515,7 @@ fn prepare_render_segment(
             CommandV3::DrawIndexed(draw) => {
                 let (buffer, offset, index_type, index_count) =
                     prepare_indexed_draw(&index_binding, draw.index_count, draw.start_index)?;
-                if !current_pipeline {
+                if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
                     )
@@ -2386,7 +2543,7 @@ fn prepare_render_segment(
                     draw.index_count_per_instance,
                     draw.start_index,
                 )?;
-                if !current_pipeline {
+                if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
                     )
@@ -2689,9 +2846,13 @@ impl DirectMetalTransport {
     ///   [`ReplyStatus::AlreadyExecuted`] with no GPU work, mirroring
     ///   [`crate::cmdlist::ListLedger`]. A validation refusal does not consume
     ///   the identity, so the caller may retry a corrected submission.
-    /// * `DispatchMesh` and `SetMeshPipeline` return
-    ///   [`MetalError::NotSupported`] because no mesh pipeline can be
-    ///   registered on this transport; nothing is silently skipped.
+    /// * `DispatchMesh` is render-encoder work: it must appear inside a
+    ///   `BeginRenderPass`/`EndRenderPass` pair and after a `SetMeshPipeline`
+    ///   naming a pipeline registered through
+    ///   [`Self::register_mesh_pipeline`]. The per-stage threadgroup sizes come
+    ///   from that registered pipeline; the wire only carries group counts.
+    ///   A mesh dispatch outside a pass, without a mesh pipeline, or naming an
+    ///   unknown handle fails before any command buffer exists.
     pub fn submit_v3_with_stats(
         &self,
         submission: &SubmissionV3,
@@ -2952,6 +3113,24 @@ impl DirectMetalTransport {
                                         *base_instance,
                                     )?;
                                 }
+                            }
+                            PreparedRenderOp::DispatchMesh {
+                                group_counts,
+                                threads_per_object_threadgroup,
+                                threads_per_mesh_threadgroup,
+                                bindings,
+                            } => {
+                                for (buffer, offset, slot) in bindings {
+                                    // SAFETY: registry-held buffer, validated range.
+                                    unsafe {
+                                        encoder.set_mesh_buffer(*buffer, *offset, *slot)?;
+                                    }
+                                }
+                                encoder.draw_mesh_threadgroups(
+                                    *group_counts,
+                                    *threads_per_object_threadgroup,
+                                    *threads_per_mesh_threadgroup,
+                                )?;
                             }
                         }
                     }
@@ -4717,7 +4896,7 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
     }
 
     #[test]
-    fn v3_mesh_dispatch_is_refused_explicitly() {
+    fn v3_mesh_dispatch_outside_a_render_pass_is_rejected() {
         let transport = DirectMetalTransport::new().expect("Metal device should open");
         let submission = SubmissionV3 {
             sequence: 5,
@@ -4730,10 +4909,51 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
         };
         let error = transport
             .submit_v3(&submission, &HashMap::new())
-            .expect_err("mesh dispatches must be refused, never skipped");
+            .expect_err("a mesh dispatch without a render pass must be refused");
         assert!(
-            matches!(error, MetalError::NotSupported(message) if message.contains("mesh")),
+            matches!(error, MetalError::InvalidArg(message) if message.contains("open render pass")),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn v3_unknown_mesh_pipeline_returns_unknown_handle_without_encoders() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let target = transport
+            .create_render_target_2d(4, 4, PixelFormat::Rgba8Unorm)
+            .expect("mesh target should be created");
+        let target_id = transport
+            .register_render_target(&target)
+            .expect("mesh target should register");
+        let mut allocations = HashMap::new();
+        allocations.insert((1u64, 1u32), VmBufferId(target_id.0));
+        let submission = SubmissionV3 {
+            sequence: 6,
+            list: None,
+            commands: vec![
+                CommandV3::BeginRenderPass(BeginRenderPass {
+                    colors: vec![v3_color_attachment(1, LoadOp::Clear)],
+                    depth_stencil: None,
+                }),
+                CommandV3::SetMeshPipeline(PipelineRef {
+                    pipeline_id: 999_999,
+                }),
+                CommandV3::DispatchMesh(wire::DispatchMesh {
+                    pipeline_id: 999_999,
+                    group_counts: [1, 1, 1],
+                    bindings: Vec::new(),
+                }),
+                CommandV3::EndRenderPass,
+            ],
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&submission, &allocations)
+            .expect("an unknown mesh pipeline should still return a reply");
+        assert_eq!(reply.status, ReplyStatus::UnknownHandle);
+        assert_eq!(
+            stats,
+            EncoderStats::default(),
+            "a refused mesh submission must not create a command buffer"
         );
     }
 

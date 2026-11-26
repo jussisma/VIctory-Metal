@@ -28,7 +28,7 @@ use std::ops::Range;
 
 use crate::abi::VmBufferId;
 use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
-use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
+use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::texture::VmTextureId;
 use crate::transport::MetalError;
 use crate::wire_v3::{CommandV3, MAX_COLOR_ATTACHMENTS};
@@ -164,7 +164,7 @@ impl PixelFormat {
         }
     }
 
-    const fn mtl_pixel_format(self) -> usize {
+    pub(crate) const fn mtl_pixel_format(self) -> usize {
         match self {
             Self::Bgra8Unorm => MTL_PIXEL_FORMAT_BGRA8_UNORM,
             Self::Rgba8Unorm => MTL_PIXEL_FORMAT_RGBA8_UNORM,
@@ -830,7 +830,9 @@ impl GraphicsPipeline {
 }
 
 /// Builds a depth-stencil state with `MTLCompareFunctionLess` and writes on.
-fn new_less_depth_state(transport: &DirectMetalTransport) -> Result<ObjcObject, MetalError> {
+pub(crate) fn new_less_depth_state(
+    transport: &DirectMetalTransport,
+) -> Result<ObjcObject, MetalError> {
     /// `MTLCompareFunctionLess`.
     const MTL_COMPARE_FUNCTION_LESS: usize = 1;
     let class = objc::class(c"MTLDepthStencilDescriptor");
@@ -1089,6 +1091,21 @@ impl<'a> RenderEncoder<'a> {
         self.bind_buffer(buffer, offset, index, BufferStage::Fragment)
     }
 
+    /// Binds an `MTLBuffer` for the mesh stage at `index`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must be a live `id<MTLBuffer>` (or null) whose backing storage
+    /// stays valid until the pass's command buffer completes.
+    pub unsafe fn set_mesh_buffer(
+        &mut self,
+        buffer: *mut c_void,
+        offset: usize,
+        index: usize,
+    ) -> Result<(), MetalError> {
+        self.bind_buffer(buffer, offset, index, BufferStage::Mesh)
+    }
+
     fn bind_buffer(
         &mut self,
         buffer: *mut c_void,
@@ -1108,6 +1125,7 @@ impl<'a> RenderEncoder<'a> {
         let selector = match stage {
             BufferStage::Vertex => objc::sel(c"setVertexBuffer:offset:atIndex:"),
             BufferStage::Fragment => objc::sel(c"setFragmentBuffer:offset:atIndex:"),
+            BufferStage::Mesh => objc::sel(c"setMeshBuffer:offset:atIndex:"),
         };
         // SAFETY: `self.enc` is a live render encoder, `buffer` is a caller-
         // provided live `MTLBuffer` (non-null, per the check above), and the
@@ -1147,6 +1165,7 @@ impl<'a> RenderEncoder<'a> {
         let selector = match stage {
             BufferStage::Vertex => objc::sel(c"setVertexBytes:length:atIndex:"),
             BufferStage::Fragment => objc::sel(c"setFragmentBytes:length:atIndex:"),
+            BufferStage::Mesh => objc::sel(c"setMeshBytes:length:atIndex:"),
         };
         // SAFETY: `self.enc` is a live render encoder, `bytes` is valid for
         // `bytes.len()` bytes during the call, and Metal copies it immediately.
@@ -1216,6 +1235,50 @@ impl<'a> RenderEncoder<'a> {
                 vertex_count,
                 instance_count,
                 base_instance,
+            );
+        }
+        Ok(())
+    }
+
+    /// Encodes a mesh draw: `threadgroups_per_grid` mesh threadgroups, each
+    /// split into object and mesh stage threadgroups.
+    ///
+    /// The render encoder must already have a mesh pipeline selected (see
+    /// `SetMeshPipeline`); a zero dimension in any argument returns
+    /// [`MetalError::InvalidArg`] before the command buffer is created.
+    pub(crate) fn draw_mesh_threadgroups(
+        &mut self,
+        threadgroups_per_grid: MTLSize,
+        threads_per_object_threadgroup: MTLSize,
+        threads_per_mesh_threadgroup: MTLSize,
+    ) -> Result<(), MetalError> {
+        for (label, size) in [
+            ("threadgroups_per_grid", threadgroups_per_grid),
+            (
+                "threads_per_object_threadgroup",
+                threads_per_object_threadgroup,
+            ),
+            ("threads_per_mesh_threadgroup", threads_per_mesh_threadgroup),
+        ] {
+            if size.width == 0 || size.height == 0 || size.depth == 0 {
+                return Err(MetalError::InvalidArg(match label {
+                    "threadgroups_per_grid" => "mesh threadgroup count must be nonzero",
+                    "threads_per_object_threadgroup" => {
+                        "object threadgroup dimensions must be nonzero"
+                    }
+                    _ => "mesh threadgroup dimensions must be nonzero",
+                }));
+            }
+        }
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder with a mesh pipeline
+        // selected and every size has nonzero dimensions.
+        unsafe {
+            objc::msg_send_draw_mesh_threadgroups(
+                self.enc,
+                threadgroups_per_grid,
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
             );
         }
         Ok(())
@@ -1442,6 +1505,7 @@ impl Drop for RenderEncoder<'_> {
 enum BufferStage {
     Vertex,
     Fragment,
+    Mesh,
 }
 
 /// Builds an autoreleased `MTLRenderPassDescriptor` for `pass`.
@@ -1991,10 +2055,14 @@ fn plan_error(message: &'static str) -> MetalError {
 ///   [`SegmentKind::Render`], including every draw and state command inside it
 ///   and any state recorded immediately before the `Begin`.
 /// * Consecutive copies share one [`SegmentKind::Blit`].
+/// * `DispatchMesh` is render-encoder work: it needs an open render pass and a
+///   preceding `SetMeshPipeline`, and it shares the pass's
+///   [`SegmentKind::Render`].
 /// * Compute, copy and present commands inside an open pass, a second `Begin`
 ///   without `End`, `End` without `Begin`, a draw without a graphics pipeline,
-///   and any command after `Present` are explicit [`MetalError::InvalidArg`]
-///   errors instead of being silently dropped.
+///   a mesh dispatch without an open pass or a mesh pipeline, and any command
+///   after `Present` are explicit [`MetalError::InvalidArg`] errors instead of
+///   being silently dropped.
 ///
 /// A trailing open pass or a state command that is never followed by work is
 /// also an error; nothing is skipped without the caller knowing.
@@ -2004,6 +2072,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
     let mut pass_open: Option<usize> = None;
     let mut pass_count = 0usize;
     let mut graphics_pipeline_selected = false;
+    let mut mesh_pipeline_selected = false;
     let mut cursor = 0usize;
     let mut pending_work_state = 0usize;
     let mut presented = false;
@@ -2071,26 +2140,31 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                 pending_work_state = 0;
             }
             CommandV3::DispatchMesh(mesh) => {
-                if pass_open.is_some() {
-                    return Err(plan_error("mesh dispatch inside an open render pass"));
+                if pass_open.is_none() {
+                    return Err(plan_error("mesh dispatch requires an open render pass"));
                 }
-                if mesh.pipeline_id == 0 || mesh.group_counts.contains(&0) {
+                if mesh.pipeline_id == 0 {
+                    return Err(plan_error("mesh dispatch pipeline handle must be nonzero"));
+                }
+                if mesh.group_counts.contains(&0) {
                     return Err(plan_error(
-                        "mesh dispatch pipeline handle and group counts must be nonzero",
+                        "mesh dispatch group counts must be nonzero",
                     ));
                 }
-                match current {
-                    Some((WorkKind::Compute, segment_index)) => {
-                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
-                            range.end = index + 1;
-                        }
+                if mesh.checked_group_count().is_none() {
+                    return Err(plan_error("mesh dispatch group counts overflow u64"));
+                }
+                if !mesh_pipeline_selected {
+                    return Err(plan_error("mesh dispatch requires a preceding SetMeshPipeline"));
+                }
+                if let Some((WorkKind::Render, segment_index)) = current {
+                    if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind
+                        && range.end < index + 1
+                    {
+                        range.end = index + 1;
                     }
-                    _ => {
-                        segments.push(Segment {
-                            kind: SegmentKind::Compute(cursor..index + 1),
-                        });
-                        current = Some((WorkKind::Compute, segments.len() - 1));
-                    }
+                } else {
+                    return Err(plan_error("mesh dispatch outside a render pass"));
                 }
                 cursor = index + 1;
                 pending_work_state = 0;
@@ -2217,6 +2291,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error("graphics pipeline handle must be nonzero"));
                 }
                 graphics_pipeline_selected = true;
+                mesh_pipeline_selected = false;
                 if pass_open.is_none() {
                     // Pipeline selection before Begin is host-side state; it is
                     // still part of the pending run so the render range covers
@@ -2230,8 +2305,10 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error("mesh pipeline handle must be nonzero"));
                 }
                 // A mesh pipeline cannot serve a normal draw; a following draw
-                // must re-select a graphics pipeline.
+                // must re-select a graphics pipeline. Likewise a mesh dispatch
+                // must select a mesh pipeline again.
                 graphics_pipeline_selected = false;
+                mesh_pipeline_selected = true;
                 if pass_open.is_none() {
                     continue;
                 }
@@ -2241,6 +2318,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error("pipeline handle must be nonzero"));
                 }
                 graphics_pipeline_selected = true;
+                mesh_pipeline_selected = false;
                 if pass_open.is_none() {
                     continue;
                 }
