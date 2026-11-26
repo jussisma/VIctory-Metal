@@ -242,7 +242,9 @@ fn two_ordered_host_dispatches_write_the_real_guest_alias() {
     let mut stale = submission.clone();
     stale.sequence = 2;
     for command in &mut stale.commands {
-        let Command::Dispatch1d(dispatch) = command;
+        let Command::Dispatch1d(dispatch) = command else {
+            panic!("the fixture submits only 1D dispatches");
+        };
         dispatch.bindings[0].generation += 1;
     }
     let reply = client
