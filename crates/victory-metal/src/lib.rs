@@ -10,6 +10,9 @@
 //! - On macOS (`target_os = "macos"`), [`macos::device::DirectMetalTransport`]
 //!   provides real `MTLDevice`, `newBufferWithBytesNoCopy` unified-memory buffers,
 //!   compute dispatch, `libmetalirconverter.dylib` DXIL compilation, and [`macos::c_api`].
+//! - [`macos::msc`] is the opt-in typed binder for the verified Metal Shader
+//!   Converter `UAV(u0)` argument-buffer shape; see
+//!   `crates/victory-metal/docs/IR-BRIDGE-CONTRACT.md`.
 
 pub mod abi;
 #[cfg(target_os = "macos")]

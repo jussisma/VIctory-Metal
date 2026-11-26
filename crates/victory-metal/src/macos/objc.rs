@@ -265,6 +265,24 @@ pub(crate) unsafe fn msg_send_nocopy_buffer(
     }
 }
 
+pub(crate) unsafe fn msg_send_new_buffer(device: Id, len: usize, options: usize) -> Id {
+    type Fn = unsafe extern "C" fn(Id, Sel, usize, usize) -> Id;
+    // SAFETY: Caller supplies a valid `MTLDevice` and a nonzero length.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(device, sel(c"newBufferWithLength:options:"), len, options)
+    }
+}
+
+pub(crate) unsafe fn msg_send_ptr_0(target: Id, s: Sel) -> *mut c_void {
+    type Fn = unsafe extern "C" fn(Id, Sel) -> *mut c_void;
+    // SAFETY: Caller supplies a valid Objective-C receiver and selector returning a pointer.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(target, s)
+    }
+}
+
 pub(crate) unsafe fn msg_send_u8_0(target: Id, s: Sel) -> u8 {
     type Fn = unsafe extern "C" fn(Id, Sel) -> u8;
     // SAFETY: Caller supplies a valid Objective-C receiver and selector returning `BOOL` (`u8`).
@@ -352,6 +370,15 @@ pub(crate) unsafe fn msg_send_set_buffer(enc: Id, buf: Id, offset: usize, index:
     unsafe {
         let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
         f(enc, sel(c"setBuffer:offset:atIndex:"), buf, offset, index);
+    }
+}
+
+pub(crate) unsafe fn msg_send_use_resource(enc: Id, resource: Id, usage: usize) {
+    type Fn = unsafe extern "C" fn(Id, Sel, Id, usize);
+    // SAFETY: Caller supplies a valid `MTLComputeCommandEncoder` and a live Metal resource.
+    unsafe {
+        let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(enc, sel(c"useResource:usage:"), resource, usage);
     }
 }
 
