@@ -20,6 +20,7 @@
 //!   `crates/victory-metal/docs/IR-BRIDGE-CONTRACT.md`.
 
 pub mod abi;
+pub mod cmdlist;
 pub mod guest_ipc;
 #[cfg(target_os = "macos")]
 pub mod ipc_host;

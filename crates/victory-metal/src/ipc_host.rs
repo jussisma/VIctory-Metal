@@ -692,10 +692,13 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn bindings_within_logical_lengths(&self, command: &Command) -> bool {
-        let Command::Dispatch1d(dispatch) = command;
-        dispatch.bindings.iter().all(|binding| {
-            binding_within_allocation(binding, &self.allocations)
-        })
+        let bindings = match command {
+            Command::Dispatch1d(dispatch) => &dispatch.bindings,
+            Command::Dispatch3d(dispatch) => &dispatch.bindings,
+        };
+        bindings
+            .iter()
+            .all(|binding| binding_within_allocation(binding, &self.allocations))
     }
 
     /// Handles one kind 4 request and returns the kind 129 reply payload.

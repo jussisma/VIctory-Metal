@@ -853,7 +853,9 @@ mod tests {
         // A codec rejection happens before the frame is written, so it must
         // leave both the session and the sequence untouched.
         let mut invalid = dispatch(1);
-        let Command::Dispatch1d(dispatch_cmd) = &mut invalid.commands[0];
+        let Command::Dispatch1d(dispatch_cmd) = &mut invalid.commands[0] else {
+            panic!("expected a 1D dispatch command");
+        };
         dispatch_cmd.pipeline_id = 0;
         let error = client.submit(&invalid).expect_err("invalid submission");
         assert!(
