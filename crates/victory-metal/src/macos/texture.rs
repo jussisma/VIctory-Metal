@@ -277,6 +277,25 @@ impl DirectMetalTransport {
             .ok_or_else(|| MetalError::NotFound(format!("texture {}", texture.0)))
     }
 
+    /// Retains the `MTLTexture` behind a [`VmTextureId`] for a residency set.
+    ///
+    /// The retain happens while the registry lock is held, so the returned
+    /// object stays valid independently of a later
+    /// [`Self::destroy_texture_2d`]. This is an additive host-side accessor: it
+    /// does not change the existing texture API.
+    pub(crate) fn retain_texture_2d(&self, texture: VmTextureId) -> Result<ObjcObject, MetalError> {
+        let state = self.lock_state()?;
+        let texture = state
+            .textures
+            .get(&texture.0)
+            .ok_or_else(|| MetalError::NotFound(format!("texture {}", texture.0)))?;
+        // SAFETY: `texture` is a live `MTLTexture`; `retain` returns the same
+        // object with an additional +1 reference owned by the result.
+        let raw = unsafe { objc::msg_send_id_0(texture.as_raw(), objc::sel(c"retain")) };
+        ObjcObject::from_retained(raw)
+            .ok_or_else(|| MetalError::InternalError("MTLTexture retain returned null".to_string()))
+    }
+
     /// Blits a registered buffer region into level 0 of a private texture.
     ///
     /// The region is validated for format, row pitch, offset and checked exact
