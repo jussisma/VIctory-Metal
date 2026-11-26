@@ -926,6 +926,66 @@ fn first_lane_alike() -> Vec<u32> {
     w
 }
 
+/// `v_cmp_gt_u32 vcc, k, v0` (the lanes whose thread id is below `k`).
+fn cmp_below(k: u32) -> u32 {
+    0x7D88_0000 | (128 + k)
+}
+
+/// A lane mask written in a loop whose count is one value per console wave
+/// (`v0 >> 6`'s first lane), read after the loop: the console wave's 64-bit
+/// mask, counted, at `l * 32`. The write's block is the loop, which the two
+/// host halves need not reach the same number of times; the block the read
+/// starts in is one every lane runs, so that is where the halves' ballots
+/// are exchanged.
+fn mask_after_a_per_wave_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x2C04_0086, // v_lshrrev_b32 v2, 6, v0
+        0x7E2A_0502, // v_readfirstlane_b32 s21, v2
+        0xBE94_0380, // s_mov_b32 s20, 0
+        cmp_below(40), // header: v_cmp_gt_u32 vcc, 40, v0 (the mask)
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_1514, // s_cmp_lt_u32 s20, s21
+        0xBF85_FFFC, // s_cbranch_scc1 (back to the compare)
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The live mask (EXEC) of a full console wave read as data, at `l * 32`: 64.
+fn live_mask_read() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE8C_107E, // s_bcnt1_i32_b64 s12, exec
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A literal lane mask (`s[20:21] = -4`, 62 of 64 bits), used as a
+/// `v_cndmask` predicate and read as data, at `l * 32`.
+fn literal_mask_read() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE94_04C4, // s_mov_b64 s[20:21], -4
+        0xD501_0006,
+        0x0051_0280, // v_cndmask_b32 v6, 0, 1, s[20:21]
+        0xBE8C_1014, // s_bcnt1_i32_b64 s12, s[20:21]
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// The CPU lowering must emit DXIL for every fixture (no translation refusal).
 #[test]
 fn lowered_wave_fixtures_emit_dxil() {
@@ -941,6 +1001,9 @@ fn lowered_wave_fixtures_emit_dxil() {
         ("prefix", exclusive_prefix(), 64, 0),
         ("lds", lds_across_halves(), 64, 256),
         ("first_lane", first_lane_alike(), 128, 0),
+        ("mask_after_loop", mask_after_a_per_wave_loop(), 128, 0),
+        ("live_mask", live_mask_read(), 64, 0),
+        ("literal_mask", literal_mask_read(), 64, 0),
     ] {
         let dxil = lowered_dxil(&words, threads, lds, lds > 0);
         assert!(dxil.len() > 4, "{name}: no DXIL");
@@ -1021,5 +1084,38 @@ fn lowered_wave_patterns_run_like_the_console_on_metal() {
         &run(&first_lane_alike(), threads, 0, false),
         &want,
         2,
+    );
+
+    // A mask written in a per-wave-count loop, read after it: each console
+    // wave's mask as a count. Wave 0 (threads 0-63) has the lanes below 40;
+    // wave 1 (64-127) none.
+    let threads = 128;
+    let want: Vec<u32> = (0..threads)
+        .map(|l| if l < 64 { 40 } else { 0 })
+        .collect();
+    assert_lanes(
+        "mask after loop",
+        &run(&mask_after_a_per_wave_loop(), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // The live mask of a full console wave, read as data: 64.
+    let threads = 64;
+    let want: Vec<u32> = vec![64; threads as usize];
+    assert_lanes(
+        "live mask",
+        &run(&live_mask_read(), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // A literal mask (62 of 64 bits) read as its number: 62.
+    let want: Vec<u32> = vec![62; threads as usize];
+    assert_lanes(
+        "literal mask",
+        &run(&literal_mask_read(), threads, 0, false),
+        &want,
+        1,
     );
 }

@@ -137,8 +137,8 @@ impl Lower<'_> {
     }
 
     /// Whether every console wave of the group is a full 64 lanes (the group
-    /// is a positive multiple of 64). Only then is every wave's live lane
-    /// mask all 64 bits, which a wave-uniform `true` mask read as data is.
+    /// is a positive multiple of 64). Only then is the live mask of every
+    /// wave all 64 bits, which a wave-uniform `true` mask read as data is.
     pub(super) fn full_console_waves(&self) -> bool {
         self.s
             .threads
@@ -648,12 +648,13 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     }
 }
 
-/// Lane masks read as data across the two 32-lane halves (`Lower::mask_dword`,
-/// [`Lower::exchange_halves`]): where the console wave's 64-bit mask is
-/// recombined, and where it must still stay refused.
+/// Lane masks read as data across the two 32-lane halves
+/// ([`Lower::mask_dword`], [`Lower::exchange_halves`]): which shapes are
+/// admitted and where, and which still refuse. The hardware proof of the
+/// admitted shapes is `victory-metal`'s `tests/wave_lower_gpu.rs`.
 #[cfg(test)]
 mod lane_mask_tests {
-    use super::super::{Lowered, Parts, lower};
+    use super::{Lowered, MASK_ACROSS, Parts, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -677,9 +678,23 @@ mod lane_mask_tests {
     }
 
     const V_LSHLREV_V16_5_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
-    const S_BCNT1_S12_VCC: u32 = 0xBE8C_106A; // s_bcnt1_i32_b64 s12, vcc
     const V_MOV_V1_S12: u32 = 0x7E02_020C; // v_mov_b32 v1, s12
-    const V_MBCNT_LO_V1: [u32; 2] = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
+    const V_MOV_V1_VCC_HI: u32 = 0x7E02_026B; // v_mov_b32 v1, vcc_hi
+    const S_BCNT1_S12_VCC: u32 = 0xBE8C_106A; // s_bcnt1_i32_b64 s12, vcc
+    const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
+    const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
+    const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
+    const V_MOV_V2_1: u32 = 0x7E04_0281; // v_mov_b32 v2, 1
+    const READFIRSTLANE_S21_V2: u32 = 0x7E2A_0502; // v_readfirstlane_b32 s21, v2
+    const V_LSHRREV_V2_6_V0: u32 = 0x2C04_0086; // v_lshrrev_b32 v2, 6, v0
+    const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
+    const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
+    const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
+
+    /// `v_cmp_gt_u32 vcc, k, v0` (the lanes below `k`), an inline constant.
+    fn cmp_below(k: u32) -> u32 {
+        0x7D88_0000 | (128 + k)
+    }
 
     fn native(words: &[u32], threads: u32) -> NativeProgram {
         let range = |kind, table_offset_dwords, dwords| UsedResource {
@@ -745,16 +760,89 @@ mod lane_mask_tests {
         })
     }
 
-    fn refusal(words: &[u32], threads: u32) -> String {
+    /// `lower_halves`'s outcome as the refusal string (`translated` when it
+    /// lowers), the form the admit/refuse table asserts.
+    fn outcome(words: &[u32], threads: u32) -> String {
         match lower_halves(words, threads) {
             Ok(_) => "translated".into(),
             Err(e) => e.to_string(),
         }
     }
 
-    /// `v_cmp_gt_u32 vcc, k, v0` (the lanes below `k`), an inline constant.
-    fn cmp_below(k: u32) -> u32 {
-        0x7D88_0000 | (128 + k)
+    /// A `before`/`body`/`after` loop on `s20 < s21` (`s21` set by `before`),
+    /// with the mask `vcc = lanes < 40` compared in `body`, each pass ended by
+    /// `S_ADD_S20_1`, `S_CMP_LT_S20_S21` and a branch back to `body`.
+    fn looped(before: &[u32], body: &[u32], after: &[u32]) -> Vec<u32> {
+        let mut w = PROLOGUE.to_vec();
+        w.push(V_LSHLREV_V16_5_V0);
+        w.extend(before);
+        w.push(S_MOV_S20_0);
+        w.extend(body);
+        let back = -(body.len() as i32 + 3);
+        w.extend([
+            S_ADD_S20_1,
+            S_CMP_LT_S20_S21,
+            0xBF85_0000 | (back as u32 & 0xFFFF),
+        ]);
+        w.extend(after);
+        w.push(S_ENDPGM);
+        w
+    }
+
+    /// `body` of a loop: the mask, then its high dword stored as data.
+    fn mask_body() -> Vec<u32> {
+        vec![cmp_below(40), V_MOV_V1_VCC_HI]
+    }
+
+    /// A one-wave group (64 threads) whose loop count is a uniform first lane
+    /// (1): the loop body is `in_step`, so the ballot goes there.
+    fn uniform_count_loop_reading_inside() -> Vec<u32> {
+        let mut after = Vec::new();
+        after.extend(store(1, 0));
+        looped(&[V_MOV_V2_1, READFIRSTLANE_S21_V2], &mask_body(), &after)
+    }
+
+    /// The same, with the first-lane read under a lane-dependent mask: each
+    /// half's first lane differs, so the loop is not `in_step`.
+    fn guarded_count_loop_reading_inside() -> Vec<u32> {
+        let mut after = Vec::new();
+        after.extend(store(1, 0));
+        looped(
+            &[
+                V_MOV_V2_1,
+                SAVE_EXEC,
+                CMPX_V0_EQ_0,
+                READFIRSTLANE_S21_V2,
+                RESTORE_EXEC,
+            ],
+            &mask_body(),
+            &after,
+        )
+    }
+
+    /// A group of two console waves (128 threads) whose loop count is one
+    /// value per console wave: the waves run different numbers of passes, so
+    /// no group barrier can meet in the loop.
+    fn per_wave_count_loop_reading_inside() -> Vec<u32> {
+        let mut after = Vec::new();
+        after.extend(store(1, 0));
+        looped(
+            &[V_LSHRREV_V2_6_V0, READFIRSTLANE_S21_V2],
+            &mask_body(),
+            &after,
+        )
+    }
+
+    /// The same per-wave-count loop, but the mask is read only after it: every
+    /// lane runs the block the read starts in once, so the ballot goes there.
+    fn per_wave_count_loop_reading_after() -> Vec<u32> {
+        let mut after = vec![S_BCNT1_S12_VCC, V_MOV_V1_S12];
+        after.extend(store(1, 0));
+        looped(
+            &[V_LSHRREV_V2_6_V0, READFIRSTLANE_S21_V2],
+            &[cmp_below(40)],
+            &after,
+        )
     }
 
     /// A mask computed in a per-lane region and read after reconvergence.
@@ -762,7 +850,7 @@ mod lane_mask_tests {
     /// ```text
     /// v_cmp_gt_u32 vcc, 32, v0      ; vcc = lanes < 32
     /// s_and_saveexec_b64 s[0:1], vcc ; EXEC = lanes < 32
-    /// s_cbranch_execz skip          ; no lane: nothing to do (none here)
+    /// s_cbranch_execz skip          ; no lane to run: skip the region
     ///   v_cmp_gt_u32 vcc, 16, v0    ; region: vcc = lanes < 16 in EXEC
     /// skip:
     /// s_mov_b64 exec, s[0:1]        ; every lane again
@@ -770,9 +858,8 @@ mod lane_mask_tests {
     /// ```
     ///
     /// The region block is a per-lane branch's (`in_step` is false there), so
-    /// the ballot cannot be taken there. The join block every lane reaches is
-    /// where the mask's phi is, and the ballot goes there.
-    fn divergent_ballot_after_join() -> Vec<u32> {
+    /// the ballot cannot be taken there; the join every lane reaches is.
+    fn region_mask_read_after_the_join() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -789,67 +876,8 @@ mod lane_mask_tests {
         w
     }
 
-    #[test]
-    fn a_mask_defined_in_a_per_lane_region_reads_after_the_join() {
-        let w = divergent_ballot_after_join();
-        let p = ir::build(
-            &w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
-            true,
-            32,
-        )
-        .unwrap();
-        let st = structure::structure(&p).unwrap();
-        let step = super::super::barriers::in_step(&p, &st);
-        // The region is not group-convergent; the join every lane reaches is.
-        let region = (1..p.blocks.len())
-            .find(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "v_cmp_gt_u32"))
-            .expect("region");
-        assert!(!step[region], "the region is per-lane");
-        assert!(step[0], "the entry runs in every lane");
-        assert!(
-            (0..p.blocks.len()).any(|b| b != region && step[b] && b != 0),
-            "a later block every lane runs"
-        );
-        let l = lower_halves(&w, 64).expect("the joined mask is balloted at the join");
-        assert_eq!(l.wave_size, Some(32));
-        assert!(l.wave_ops, "the joined mask crossed the halves");
-        assert!(l.half_exchanges > 0, "the halves passed their ballots");
-    }
-
-    /// The lanes below 40 as data, the mask defined and read in a loop whose
-    /// count is one value per host wave: the halves run different numbers of
-    /// passes, so no group barrier can meet there.
-    fn lanes_below_in_a_lane_loop() -> Vec<u32> {
-        let mut w = PROLOGUE.to_vec();
-        w.extend([
-            V_LSHLREV_V16_5_V0,
-            V_MBCNT_LO_V1[0],
-            V_MBCNT_LO_V1[1],
-            0xBE94_0380, // s_mov_b32 s20, 0
-            0x7E2A_0500, // v_readfirstlane_b32 s21, v0
-            cmp_below(40),
-            S_BCNT1_S12_VCC,
-            0x8014_8114, // s_add_u32 s20, s20, 1
-            0xBF0A_1514, // s_cmp_lt_u32 s20, s21
-            0xBF85_FFFB, // s_cbranch_scc1 (back to the compare)
-            V_MOV_V1_S12,
-        ]);
-        w.extend(store(1, 0));
-        w.push(S_ENDPGM);
-        w
-    }
-
-    #[test]
-    fn a_lane_dependent_loop_still_refuses_its_mask() {
-        let why = refusal(&lanes_below_in_a_lane_loop(), 64);
-        assert!(
-            why.contains("a lane mask read as data (wave64 on a 32-lane host)"),
-            "{why}"
-        );
-    }
-
-    /// `s_bcnt1_i32_b64 s12, exec`: every lane of a full console wave, 64.
-    fn live_mask_read_as_data() -> Vec<u32> {
+    /// `s_bcnt1_i32_b64 s12, exec`: a full console wave's live mask, 64.
+    fn live_mask_read() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -861,19 +889,9 @@ mod lane_mask_tests {
         w
     }
 
-    #[test]
-    fn a_wave_uniform_mask_needs_no_ballot_or_exchange() {
-        // A group of 64 is one full console wave: its live mask (EXEC) is
-        // all-ones in every lane, so reading it needs no ballot and no
-        // exchange at all.
-        let l = lower_halves(&live_mask_read_as_data(), 64).expect("the live mask");
-        assert_eq!(l.wave_size, Some(32));
-        assert_eq!(l.half_exchanges, 0, "no exchange for a wave-uniform mask");
-    }
-
     /// A literal lane mask kept in `other` (used as a `v_cndmask` predicate)
     /// and read as data: 0xFFFF_FFFF_FFFF_FFFC has 62 bits set.
-    fn literal_mask_read_as_data() -> Vec<u32> {
+    fn literal_mask_read() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -889,46 +907,139 @@ mod lane_mask_tests {
     }
 
     #[test]
-    fn a_literal_mask_register_reads_as_its_number() {
-        // A literal mask does not depend on the lanes, so the program needs no
-        // console wave size (no halves): it reads the register's own number.
-        let l = lower_halves(&literal_mask_read_as_data(), 64).expect("a literal mask");
-        assert_eq!(l.wave_size, None, "a literal mask is wave-size independent");
-        assert!(!l.wave_ops);
+    fn a_per_wave_count_loop_reads_its_mask_after_it() {
+        // The mask's block is the loop (not `in_step`: the waves run
+        // different numbers of passes), but the block the read starts in is
+        // (`once_per_lane`), so the ballot of both halves' bits goes there.
+        let w = per_wave_count_loop_reading_after();
+        let l = lower_halves(&w, 128).expect("the mask is balloted where read");
+        assert_eq!(l.wave_size, Some(32), "a console wave in halves");
+        assert!(l.wave_ops);
+        assert!(l.half_exchanges > 0, "the halves passed their ballots");
     }
 
-    /// The admit/refuse table: outcome and, on refusal, the unchanged reason.
+    #[test]
+    fn a_mask_read_inside_a_per_wave_count_loop_still_refuses() {
+        // The read starts in the loop body itself, which the two host halves
+        // need not reach the same number of times: no barrier there.
+        let why = outcome(&per_wave_count_loop_reading_inside(), 128);
+        assert!(why.contains(MASK_ACROSS), "{why}");
+    }
+
+    #[test]
+    fn a_guarded_first_lane_count_still_refuses_the_loop_ballot() {
+        // The first-lane read is under a lane-dependent mask, so the loop is
+        // not `in_step`: the same refusal as the per-wave count.
+        let why = outcome(&guarded_count_loop_reading_inside(), 64);
+        assert!(why.contains(MASK_ACROSS), "{why}");
+    }
+
+    #[test]
+    fn a_uniform_count_loop_ballots_in_the_loop() {
+        // A one-wave group's loop on a uniform first lane is `in_step`: the
+        // ballot goes in the loop, where both halves meet.
+        let l = lower_halves(&uniform_count_loop_reading_inside(), 64).expect("the loop is step");
+        assert_eq!(l.wave_size, Some(32));
+        assert!(l.wave_ops);
+        assert!(l.half_exchanges > 0, "the halves passed their ballots");
+    }
+
+    #[test]
+    fn a_region_mask_read_after_the_join_ballots_at_the_join() {
+        let w = region_mask_read_after_the_join();
+        let p = ir::build(
+            &w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+            true,
+            32,
+        )
+        .unwrap();
+        let st = structure::structure(&p).unwrap();
+        let step = super::super::barriers::in_step(&p, &st);
+        let region = (1..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "v_cmp_gt_u32"))
+            .expect("region");
+        assert!(!step[region], "the region is per-lane");
+        assert!(step[0], "the entry runs in every lane");
+        assert!(
+            (0..p.blocks.len()).any(|b| b != region && step[b] && b != 0),
+            "a later block every lane runs"
+        );
+        let l = lower_halves(&w, 64).expect("the joined mask is balloted at the join");
+        assert_eq!(l.wave_size, Some(32));
+        assert!(l.wave_ops);
+        assert!(l.half_exchanges > 0, "the halves passed their ballots");
+    }
+
+    #[test]
+    fn a_full_wave_live_mask_reads_without_an_exchange() {
+        // A group of 64 is one full console wave: EXEC is all 64 bits in
+        // every lane, so its number needs no ballot and no exchange.
+        let l = lower_halves(&live_mask_read(), 64).expect("the live mask");
+        assert_eq!(l.wave_size, Some(32));
+        assert_eq!(l.half_exchanges, 0, "no exchange for a wave-uniform mask");
+    }
+
+    #[test]
+    fn a_literal_mask_register_reads_as_its_number() {
+        // A literal mask does not depend on the lanes, so the program needs
+        // no console wave size (no halves): it reads the register's own
+        // number (62 bits set in -4).
+        let l = lower_halves(&literal_mask_read(), 64).expect("a literal mask");
+        assert_eq!(l.wave_size, None, "a literal mask is wave-size independent");
+        assert!(!l.wave_ops);
+        assert_eq!(l.half_exchanges, 0);
+    }
+
+    /// The admit/refuse table for lane masks read as data, and the reason
+    /// each refusal keeps. The checkpoint's other four cases are the
+    /// pre-existing `lower::tests`: a cross-half ballot in a one-wave loop on
+    /// a uniform first-lane read (admitted), a guarded first-lane count
+    /// (refused), a mask joined with data at a per-lane loop (refused) and a
+    /// per-console-wave first-lane count (refused).
     #[test]
     fn lane_mask_read_admit_and_refuse_table() {
         let table: Vec<(&str, Vec<u32>, u32, Option<&str>)> = vec![
             (
-                "mask joined after a per-lane region",
-                divergent_ballot_after_join(),
+                "region mask read after the join",
+                region_mask_read_after_the_join(),
                 64,
                 None,
             ),
             (
-                "mask in a loop on a per-lane count",
-                lanes_below_in_a_lane_loop(),
-                64,
-                Some("a lane mask read as data (wave64 on a 32-lane host)"),
-            ),
-            ("live mask of a full wave", live_mask_read_as_data(), 64, None),
-            (
-                "literal mask register",
-                literal_mask_read_as_data(),
+                "uniform count loop read inside",
+                uniform_count_loop_reading_inside(),
                 64,
                 None,
+            ),
+            (
+                "per-wave count loop read after",
+                per_wave_count_loop_reading_after(),
+                128,
+                None,
+            ),
+            ("full wave live mask", live_mask_read(), 64, None),
+            ("literal mask register", literal_mask_read(), 64, None),
+            (
+                "per-wave count loop read inside",
+                per_wave_count_loop_reading_inside(),
+                128,
+                Some(MASK_ACROSS),
+            ),
+            (
+                "guarded first-lane count loop",
+                guarded_count_loop_reading_inside(),
+                64,
+                Some(MASK_ACROSS),
             ),
         ];
         for (name, words, threads, want) in table {
-            match (refusal(&words, threads), want) {
-                (why, None) => assert_eq!(why, "translated", "{name}: {why}"),
-                (why, Some(reason)) => {
-                    assert!(why.contains(reason), "{name}: expected {reason:?}, got {why}")
+            let got = outcome(&words, threads);
+            match want {
+                None => assert_eq!(got, "translated", "{name}: {got}"),
+                Some(reason) => {
+                    assert!(got.contains(reason), "{name}: expected {reason:?}, got {got}")
                 }
             }
         }
     }
 }
-
