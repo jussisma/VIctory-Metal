@@ -154,6 +154,13 @@ pub struct FrameTelemetry {
     presents_refused: AtomicU64,
     /// Unsupported producer calls, by the wire opcode they needed.
     refusals: Mutex<BTreeMap<u16, u64>>,
+    /// Unsupported producer calls by operation name, with or without a wire
+    /// opcode.
+    ///
+    /// The refusal histogram keys unnamed calls under [`NO_OPCODE`], which
+    /// would otherwise merge every one into a single bucket; this map keeps
+    /// each refused operation countable by name (ADR-030).
+    named_refusals: Mutex<BTreeMap<&'static str, u64>>,
     /// Host allocation registrations the host accepted (kind 2).
     buffers_registered: AtomicU64,
     /// Pipeline registrations the host accepted (kind 4/129).
@@ -323,6 +330,28 @@ impl FrameTelemetry {
             .clone()
     }
 
+    /// Records one refusal by the operation name it carries.
+    ///
+    /// Unlike the opcode histogram this keeps calls that share no wire opcode
+    /// distinct: `DiscardResource` and a shading-rate hint never share a
+    /// bucket. It is recorded alongside the opcode histogram, not instead of
+    /// it.
+    pub fn note_named_refusal(&self, operation: &'static str) {
+        let mut refusals = self
+            .named_refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *refusals.entry(operation).or_insert(0) += 1;
+    }
+
+    /// Refusals recorded by operation name.
+    pub fn named_refusal_histogram(&self) -> BTreeMap<&'static str, u64> {
+        self.named_refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// A native submission batch the host answered successfully.
     pub fn note_submit_ok(&self) {
         self.submits_ok.fetch_add(1, Ordering::Relaxed);
@@ -438,6 +467,7 @@ impl FrameTelemetry {
             fps: self.fps(),
             opcodes: self.unsupported_opcode_histogram(),
             refusals: self.refusal_histogram(),
+            named_refusals: self.named_refusal_histogram(),
             d3dmetal_fallback_count: self.d3dmetal_fallback_count(),
             submits_ok,
             submits_refused,
@@ -467,6 +497,10 @@ impl FrameTelemetry {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        self.named_refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         snapshot
     }
 
@@ -479,6 +513,10 @@ impl FrameTelemetry {
         window.opcodes.clear();
         window.recorded = 0;
         self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.named_refusals
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
@@ -506,6 +544,9 @@ pub struct TelemetrySnapshot {
     pub opcodes: BTreeMap<u16, u64>,
     /// Refused producer calls by opcode ([`NO_OPCODE`] when none applies).
     pub refusals: BTreeMap<u16, u64>,
+    /// Refused producer calls by operation name, including those without a
+    /// wire opcode.
+    pub named_refusals: BTreeMap<&'static str, u64>,
     /// The session's hard D3DMetal fallback count.
     pub d3dmetal_fallback_count: u64,
     /// Native submission batches the host answered successfully.
@@ -561,7 +602,18 @@ impl std::fmt::Display for TelemetrySnapshot {
             self.compute_dispatches_without_bindings
         )?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
-        write!(f, "{}", opcode_list(&self.refusals, "refusals"))
+        write!(f, "{}", opcode_list(&self.refusals, "refusals"))?;
+        if self.named_refusals.is_empty() {
+            return write!(f, ", named_refusals=[]");
+        }
+        write!(f, ", named_refusals=[")?;
+        for (index, (operation, count)) in self.named_refusals.iter().enumerate() {
+            if index > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, "{operation}={count}")?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -704,6 +756,16 @@ pub fn note_unsupported_opcode(opcode: Option<u16>) {
 /// The process-wide refusal histogram.
 pub fn refusal_histogram() -> BTreeMap<u16, u64> {
     global().refusal_histogram()
+}
+
+/// Records one refused producer call by its operation name.
+pub fn note_named_refusal(operation: &'static str) {
+    global().note_named_refusal(operation);
+}
+
+/// The process-wide refusal histogram by operation name.
+pub fn named_refusal_histogram() -> BTreeMap<&'static str, u64> {
+    global().named_refusal_histogram()
 }
 
 /// Records one successful native submission batch.
@@ -995,6 +1057,37 @@ mod tests {
         assert_eq!(after.refusals, BTreeMap::new());
         assert_eq!((after.submits_ok, after.submits_refused), (1, 1));
         assert_eq!((after.presents_ok, after.presents_refused), (1, 2));
+    }
+
+    /// ADR-030: a refusal without a wire opcode is still counted by the
+    /// operation name, so two different console states never share a bucket.
+    #[test]
+    fn unnamed_refusals_are_counted_by_operation_name() {
+        let telemetry = telemetry();
+        telemetry.note_unsupported_opcode(None);
+        telemetry.note_named_refusal("DiscardResource: a partial discard");
+        telemetry.note_named_refusal("DiscardResource: a partial discard");
+        telemetry.note_named_refusal("SetShadingRate: no Wire v3 command");
+
+        assert_eq!(
+            telemetry.named_refusal_histogram(),
+            BTreeMap::from([
+                ("DiscardResource: a partial discard", 2),
+                ("SetShadingRate: no Wire v3 command", 1),
+            ])
+        );
+        // The opcode histogram keeps its own unchanged view.
+        assert_eq!(telemetry.refusal_histogram(), BTreeMap::from([(NO_OPCODE, 1)]));
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.named_refusals.len(), 2);
+        assert!(
+            snapshot.to_string().contains("named_refusals=["),
+            "{snapshot}"
+        );
+
+        telemetry.snapshot_and_reset();
+        assert_eq!(telemetry.named_refusal_histogram(), BTreeMap::new());
     }
 
     #[test]

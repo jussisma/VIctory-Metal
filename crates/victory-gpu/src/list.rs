@@ -216,6 +216,9 @@ pub(crate) fn with_metal(
             // HRESULT and the list submits nothing, so waiting until
             // `ExecuteCommandLists` would lose the opcode.
             crate::native_metal::telemetry::note_unsupported_opcode(error.opcode());
+            if let Some(operation) = error.operation() {
+                crate::native_metal::telemetry::note_named_refusal(operation);
+            }
             metal.note_error(error);
         }
     }
@@ -1783,6 +1786,92 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+/// One `CopyTextureRegion` buffer-footprint upload lowered to the wire's
+/// pitched copy: the first source row, its pitch and the destination box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UploadCopy {
+    source: crate::native_metal::producer::ResourceId,
+    destination: victory_metal::wire_v3::TextureSubresource,
+    offset: u64,
+    bytes_per_row: u32,
+    extent: [u32; 3],
+    origin: [u32; 3],
+}
+
+/// Lowers a guest buffer footprint (`D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
+/// source) into Wire v3's single-slice pitched copy.
+///
+/// `source_box` is the guest `[left, top, front, right, bottom, back]` box in
+/// footprint texels; `None` copies the whole footprint. A box outside the
+/// footprint, deeper than the one slice a wire command carries, or whose
+/// first row is not 4-byte aligned is refused with a name instead of being
+/// approximated.
+fn upload_copy(
+    source: crate::native_metal::producer::ResourceId,
+    destination: victory_metal::wire_v3::TextureSubresource,
+    destination_extent: [u32; 3],
+    destination_origin: [u32; 3],
+    footprint: &crate::resource::PlacedFootprint,
+    source_box: Option<[u32; 6]>,
+) -> Result<UploadCopy, &'static str> {
+    if footprint.row_pitch == 0
+        || footprint.width == 0
+        || footprint.height == 0
+        || footprint.depth == 0
+    {
+        return Err("CopyTextureRegion: an empty buffer footprint");
+    }
+    let (at, size) = match source_box {
+        Some([left, top, front, right, bottom, back]) => {
+            let (Some(width), Some(height), Some(depth)) = (
+                right.checked_sub(left),
+                bottom.checked_sub(top),
+                back.checked_sub(front),
+            ) else {
+                return Err("CopyTextureRegion: an inverted buffer-upload box");
+            };
+            ([left, top, front], [width, height, depth])
+        }
+        None => (
+            [0, 0, 0],
+            [footprint.width, footprint.height, footprint.depth],
+        ),
+    };
+    if size.contains(&0) {
+        return Err("CopyTextureRegion: an empty buffer-upload box");
+    }
+    if size[2] != 1 {
+        return Err("CopyTextureRegion: a buffer upload of more than one depth slice");
+    }
+    let rows = footprint
+        .rows(at, size)
+        .ok_or("CopyTextureRegion: the upload box is outside its footprint")?;
+    let Some(&(first, _)) = rows.first() else {
+        return Err("CopyTextureRegion: the upload box is outside its footprint");
+    };
+    let offset = footprint
+        .offset
+        .checked_add(first)
+        .ok_or("CopyTextureRegion: the upload offset overflows")?;
+    if !offset.is_multiple_of(4) {
+        return Err("CopyTextureRegion: the upload offset is not 4-byte aligned");
+    }
+    for ((start, extent), limit) in destination_origin.into_iter().zip(size).zip(destination_extent)
+    {
+        if start.checked_add(extent).is_none_or(|end| end > limit) {
+            return Err("CopyTextureRegion: the upload box is outside its destination subresource");
+        }
+    }
+    Ok(UploadCopy {
+        source,
+        destination,
+        offset,
+        bytes_per_row: footprint.row_pitch,
+        extent: size,
+        origin: destination_origin,
+    })
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission; texture to buffer through readback memory
 /// ([`read_back`]).
@@ -1806,11 +1895,59 @@ extern "system" fn copy_texture_region(
             ProducerError::unsupported_opcode(why, victory_metal::wire_v3::OP_COPY_TEXTURE_REGION)
         };
         with_metal(this, |producer| {
-            // A buffer footprint is an upload or a readback: the wire carries
-            // only texture-to-texture boxes.
+            // A buffer footprint is an upload (buffer -> texture) or a
+            // readback (texture -> buffer). The upload has a Wire v3 command;
+            // a readback still does not.
+            if src.kind == 1 && dst.kind == 0 {
+                let (address, size) = crate::resource::buffer_bytes(src.resource).ok_or(
+                    copy_refused("CopyTextureRegion: an upload source is not a buffer"),
+                )?;
+                let source = crate::native_metal::producer::ResourceId::from_guest_address(
+                    address as u64,
+                )?;
+                let to = metal_subresource(dst.resource, dst.footprint.offset as u32)?;
+                let to_extent =
+                    crate::resource::texture_subresource(dst.resource, dst.footprint.offset as u32)
+                        .map(|(_, _, _, extent)| extent)
+                        .ok_or(copy_refused("CopyTextureRegion: destination subresource"))?;
+                let footprint = src.footprint;
+                let needed = footprint
+                    .bytes()
+                    .ok_or(copy_refused("CopyTextureRegion: an upload footprint's format"))?;
+                if footprint.offset.checked_add(needed).is_none_or(|end| end > size) {
+                    return producer.refuse(
+                        "CopyTextureRegion: the upload footprint is outside its buffer",
+                        Some(victory_metal::wire_v3::OP_COPY_BUFFER_TO_TEXTURE),
+                    );
+                }
+                // SAFETY: the title passes a source box or null.
+                let copy = upload_copy(
+                    source,
+                    to,
+                    to_extent,
+                    [x, y, z],
+                    &footprint,
+                    unsafe { source_box.as_ref() }.copied(),
+                )
+                .map_err(|why| {
+                    ProducerError::unsupported_opcode(
+                        why,
+                        victory_metal::wire_v3::OP_COPY_BUFFER_TO_TEXTURE,
+                    )
+                })?;
+                return producer.copy_buffer_to_texture(
+                    copy.source,
+                    copy.destination,
+                    copy.offset,
+                    copy.bytes_per_row,
+                    copy.extent,
+                    copy.origin,
+                );
+            }
+            // A buffer readback (texture -> buffer) has no wire command yet.
             if dst.kind != 0 || src.kind != 0 {
                 return Err(copy_refused(
-                    "CopyTextureRegion: a buffer footprint is not expressible",
+                    "CopyTextureRegion: a buffer footprint (readback) is not expressible",
                 ));
             }
             let to = metal_subresource(dst.resource, dst.footprint.offset as u32)?;
@@ -2657,9 +2794,14 @@ unsafe impl Send for Upload {}
 pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// Draw state the host has no use for (depth bounds, depth order and shading
+/// rate hints): any arguments, nothing returned.
+///
+/// Every table slot that used to point here is now wired to a named handler
+/// or refused by name; the stub remains only as the sentinel the table audit
+/// ([`tests::no_list_slot_is_a_silent_state_drop`]) asserts against, so a
+/// silent drop added later fails the suite.
+#[allow(dead_code)]
 extern "system" fn ignored_state(_: This) {}
 
 extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
@@ -2676,7 +2818,9 @@ mod state {
     use super::{This, metal_resource, with_metal, with_state};
     use crate::backend::GpuBackend;
     use crate::draw::{IndexView, VertexView};
-    use crate::native_metal::producer::{DepthTarget, ProducerError, RenderTarget};
+    use crate::native_metal::producer::{
+        DepthTarget, ProducerError, RenderTarget, RootSignatureStage,
+    };
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
@@ -2750,6 +2894,126 @@ mod state {
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+    }
+
+    /// `SetComputeRootSignature(root signature)`: recorded on the producer.
+    ///
+    /// Wire v3 has no root-signature command: the host binds the PSO's own
+    /// root signature when it registers that PSO, so the commit is carried as
+    /// producer state (a later PSO comparison can see it). A null pointer
+    /// unbinds the signature, as D3D12 allows.
+    pub(super) extern "system" fn compute_root_signature(this: This, signature: This) {
+        if metal() {
+            with_metal(this, |p| {
+                p.commit_root_signature(RootSignatureStage::Compute, signature as usize as u64)
+            });
+        }
+    }
+
+    /// `SetGraphicsRootSignature(root signature)`: the graphics twin of
+    /// [`compute_root_signature`].
+    pub(super) extern "system" fn graphics_root_signature(this: This, signature: This) {
+        if metal() {
+            with_metal(this, |p| {
+                p.commit_root_signature(RootSignatureStage::Graphics, signature as usize as u64)
+            });
+        }
+    }
+
+    /// `D3D12_DISCARD_REGION`: rectangles, then the subresource range.
+    #[repr(C)]
+    pub(super) struct DiscardRegion {
+        rects: u32,
+        rectangles: *const RECT,
+        first_subresource: u32,
+        subresources: u32,
+    }
+
+    /// `DiscardResource(resource, region)`: discarded contents are undefined,
+    /// so clearing the bound target to zero is a valid outcome and reuses the
+    /// existing clear lowering. A partial discard (rectangles or a subresource
+    /// range) has no Wire v3 equivalent and is refused by name.
+    pub(super) extern "system" fn discard_resource(
+        this: This,
+        resource: This,
+        region: *const DiscardRegion,
+    ) {
+        if !metal() {
+            let _ = (this, resource, region);
+            return;
+        }
+        with_metal(this, |producer| {
+            use victory_metal::wire_v3::OP_BEGIN_RENDER_PASS;
+            let discard_refused = |why: &'static str| {
+                ProducerError::unsupported_opcode(why, OP_BEGIN_RENDER_PASS)
+            };
+            if resource.is_null() {
+                return producer.refuse("DiscardResource: no resource", Some(OP_BEGIN_RENDER_PASS));
+            }
+            // SAFETY: the title passes a region description or null.
+            if let Some(region) = unsafe { region.as_ref() } {
+                // D3D12's "all subresources" is `-1`; a range that names the
+                // only subresource is the same discard.
+                let whole_range = region.first_subresource == 0
+                    && (region.subresources == u32::MAX
+                        || (region.subresources == 1
+                            && crate::resource::texture_subresource(resource, 1).is_none()));
+                if region.rects != 0 || !region.rectangles.is_null() || !whole_range {
+                    return Err(discard_refused(
+                        "DiscardResource: a partial discard (rectangles or subresources)",
+                    ));
+                }
+            }
+            let target = metal_resource(resource)
+                .ok_or(discard_refused("DiscardResource: no guest allocation"))?;
+            match producer.clear_render_target(target, [0.0; 4]) {
+                Ok(()) => Ok(()),
+                Err(_) => producer
+                    .clear_depth_stencil(target, true, 1.0, true, 0)
+                    .map_err(|_| discard_refused(
+                        "DiscardResource: the resource is not a bound render target",
+                    )),
+            }
+        });
+    }
+
+    /// 0x248: a pixel-shader depth-order hint. Wire v3 carries no command for
+    /// it, so it is refused by name instead of silently dropped.
+    pub(super) extern "system" fn pixel_depth_order(this: This, _order: u32) {
+        if metal() {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "SetPixelShaderDepthOrder: no Wire v3 command for the depth-order hint",
+                    None,
+                )
+            });
+        }
+    }
+
+    /// 0x3e0: a shading-rate hint. Wire v3 carries no command for it, so it is
+    /// refused by name instead of silently dropped.
+    pub(super) extern "system" fn shading_rate(this: This, _flags: u32) {
+        if metal() {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "SetShadingRate: no Wire v3 command for shading-rate hints",
+                    None,
+                )
+            });
+        }
+    }
+
+    /// 0x470 `(u64)` on newer lists: an unknown state flush. Wire v3 has no
+    /// command for it, so it is refused by name instead of silently dropped.
+    pub(super) extern "system" fn unknown_state_flush(this: This, _value: u64) {
+        if metal() {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "SetStateX (0x470): unknown state with no Wire v3 command",
+                    None,
+                )
+            });
+        }
     }
     /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
     /// values, rectangle count, rectangles)`.
@@ -3064,7 +3328,7 @@ mod state {
     }
 }
 
-/// Without a host GPU every draw state call is ignored.
+/// Without a host GPU every draw state call is a distinct no-op entry point.
 #[cfg(not(windows))]
 mod state {
     pub(super) use super::dispatch;
@@ -3072,25 +3336,45 @@ mod state {
     pub(super) use super::draw as draw_indexed;
     pub(super) use super::draw as dispatch_mesh;
     pub(super) use super::draw as dispatch_mesh_x;
-    pub(super) use super::ignored_state as blend_factor;
-    pub(super) use super::ignored_state as clear_unordered_float;
-    pub(super) use super::ignored_state as clear_unordered_uint;
-    pub(super) use super::ignored_state as compute_constant;
-    pub(super) use super::ignored_state as compute_constants;
-    pub(super) use super::ignored_state as compute_table;
-    pub(super) use super::ignored_state as compute_view;
-    pub(super) use super::ignored_state as graphics_constant;
-    pub(super) use super::ignored_state as graphics_constants;
-    pub(super) use super::ignored_state as graphics_table;
-    pub(super) use super::ignored_state as graphics_view;
-    pub(super) use super::ignored_state as heaps;
-    pub(super) use super::ignored_state as index_buffer;
-    pub(super) use super::ignored_state as scissors;
-    pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as targets;
-    pub(super) use super::ignored_state as topology;
-    pub(super) use super::ignored_state as vertex_buffers;
-    pub(super) use super::ignored_state as viewports;
+
+    /// One named entry point per state method, so no slot aliases the
+    /// `ignored_state` sentinel: the table audit can tell a wired slot from a
+    /// silent one on every platform. These are never called: the guest calls
+    /// only exist on Windows.
+    macro_rules! no_op_state {
+        ($($name:ident),* $(,)?) => {
+            $(
+                pub(super) extern "system" fn $name(_: super::This) {}
+            )*
+        };
+    }
+    no_op_state!(
+        blend_factor,
+        clear_unordered_float,
+        clear_unordered_uint,
+        compute_constant,
+        compute_constants,
+        compute_root_signature,
+        compute_table,
+        compute_view,
+        discard_resource,
+        graphics_constant,
+        graphics_constants,
+        graphics_root_signature,
+        graphics_table,
+        graphics_view,
+        heaps,
+        index_buffer,
+        pixel_depth_order,
+        scissors,
+        shading_rate,
+        stencil_ref,
+        targets,
+        topology,
+        unknown_state_flush,
+        vertex_buffers,
+        viewports,
+    );
 }
 
 fn count_draw() {
@@ -3371,8 +3655,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
     (32, state::heaps as *const ()),              // 0x100
-    (33, ignored_state as *const ()),             // 0x108 compute root signature
-    (34, ignored_state as *const ()),             // 0x110 graphics root signature
+    (33, state::compute_root_signature as *const ()), // 0x108 compute root signature
+    (34, state::graphics_root_signature as *const ()), // 0x110 graphics root signature
     (35, state::compute_table as *const ()),      // 0x118
     (36, state::graphics_table as *const ()),     // 0x120
     (37, state::compute_constant as *const ()),   // 0x128
@@ -3397,17 +3681,17 @@ const METHODS: [(usize, *const ()); 52] = [
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
     (72, wait64 as *const ()),                    // 0x240 (newer 0x250)
-    (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
+    (73, state::pixel_depth_order as *const ()),  // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
-    (124, ignored_state as *const ()),            // 0x3e0 shading rate
+    (124, state::shading_rate as *const ()),      // 0x3e0 shading rate
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
-    (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
+    (55, state::discard_resource as *const ()),     // 0x1b8 DiscardResource
     (28, query_mark as *const ()),                  // 0xe0 BeginQuery
     (29, query_mark as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
@@ -3435,10 +3719,10 @@ const fn newer_slot(slot: usize) -> usize {
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
 /// called from Grand Theft Auto VI's state flush with its result unused.
-/// shortcut: 0x470's purpose is unknown; ignored until a title shows it
-/// matters.
+/// shortcut: 0x470's purpose is unknown and Wire v3 has no command for it, so
+/// it is refused by name (never silently ignored).
 const NEWER_METHODS: [(usize, *const ()); 3] = [
-    (142, ignored_state as *const ()),
+    (142, state::unknown_state_flush as *const ()),
     (146, barrier_groups as *const ()),
     (148, allocate_upload as *const ()),
 ];
@@ -3587,8 +3871,152 @@ mod tests {
                 table.0[0x1b0 / 8],
                 state::clear_unordered_float as *const ()
             );
-            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+            assert_eq!(table.0[0x1b8 / 8], state::discard_resource as *const ());
         }
+    }
+
+    /// ADR-030: no list slot may be the silent `ignored_state` stub. A future
+    /// method wired to it (a state drop with no translation and no refusal)
+    /// fails here instead of disappearing at runtime.
+    #[test]
+    fn no_list_slot_is_a_silent_state_drop() {
+        for (layout, table) in [
+            ("legacy", &LIST_FUNCTIONS),
+            ("newer", &NEWER_LIST_FUNCTIONS),
+        ] {
+            for (slot, method) in table.0.iter().enumerate() {
+                assert_ne!(
+                    *method,
+                    ignored_state as *const (),
+                    "{layout} list slot {slot:#x} is the silent ignored_state stub"
+                );
+            }
+        }
+    }
+
+    /// Every state once dropped silently now names its handler: root
+    /// signatures are recorded, DiscardResource reuses the clear path, and the
+    /// remaining console hints are refused by name.
+    #[test]
+    fn former_ignored_slots_bind_their_named_handlers() {
+        for (layout, table, newer) in [
+            ("legacy", &LIST_FUNCTIONS, false),
+            ("newer", &NEWER_LIST_FUNCTIONS, true),
+        ] {
+            let slot = |legacy: usize| if newer { newer_slot(legacy) } else { legacy };
+            assert_eq!(
+                table.0[0x108 / 8],
+                state::compute_root_signature as *const (),
+                "{layout}: compute root signature"
+            );
+            assert_eq!(
+                table.0[0x110 / 8],
+                state::graphics_root_signature as *const (),
+                "{layout}: graphics root signature"
+            );
+            assert_eq!(
+                table.0[0x1b8 / 8],
+                state::discard_resource as *const (),
+                "{layout}: DiscardResource"
+            );
+            assert_eq!(
+                table.0[slot(73)],
+                state::pixel_depth_order as *const (),
+                "{layout}: pixel-shader depth order at {:#x}",
+                slot(73) * 8
+            );
+            assert_eq!(
+                table.0[slot(124)],
+                state::shading_rate as *const (),
+                "{layout}: shading rate at {:#x}",
+                slot(124) * 8
+            );
+        }
+        assert_eq!(
+            NEWER_LIST_FUNCTIONS.0[142],
+            state::unknown_state_flush as *const (),
+            "0x470 state flush"
+        );
+    }
+
+    /// A guest buffer footprint lowers to one pitched wire copy: the first
+    /// row's byte offset (footprint offset plus rows and texels), the row
+    /// pitch, the texel box and the destination mip/slice/origin. Boxes the
+    /// wire cannot carry are refused by name.
+    #[test]
+    fn a_buffer_footprint_lowers_to_one_pitched_copy() {
+        use crate::native_metal::producer::ResourceId;
+        use victory_metal::wire_v3::TextureSubresource;
+
+        let source = ResourceId::new(0x1000, 1).expect("source identity");
+        let destination = TextureSubresource {
+            allocation_id: 0x2000,
+            generation: 1,
+            mip_level: 1,
+            slice: 2,
+        };
+        // 64x32 R8G8B8A8 rows at a 256-byte pitch, starting 0x100 into the
+        // staging buffer.
+        let footprint = crate::resource::PlacedFootprint::new(0x100, 28, 64, 32, 256);
+        let copy = upload_copy(
+            source,
+            destination,
+            [64, 32, 1],
+            [0, 0, 0],
+            &footprint,
+            None,
+        )
+        .expect("the whole footprint");
+        assert_eq!(copy.offset, 0x100);
+        assert_eq!(copy.bytes_per_row, 256);
+        assert_eq!(copy.extent, [64, 32, 1]);
+        assert_eq!(copy.origin, [0, 0, 0]);
+        assert_eq!(copy.destination, destination);
+        assert_eq!(copy.source, source);
+
+        // A box at texel (8, 4): four pitched rows plus eight RGBA texels.
+        let boxed = upload_copy(
+            source,
+            destination,
+            [32, 16, 1],
+            [0, 0, 0],
+            &footprint,
+            Some([8, 4, 0, 24, 20, 1]),
+        )
+        .expect("a boxed upload");
+        assert_eq!(boxed.offset, 0x100 + 4 * 256 + 8 * 4);
+        assert_eq!(boxed.extent, [16, 16, 1]);
+
+        // A volume footprint needs one command per slice.
+        let volume = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 8,
+            height: 8,
+            depth: 2,
+            row_pitch: 32,
+        };
+        assert_eq!(
+            upload_copy(source, destination, [8, 8, 1], [0, 0, 0], &volume, None),
+            Err("CopyTextureRegion: a buffer upload of more than one depth slice")
+        );
+        // A box outside the footprint is refused, not clipped.
+        assert_eq!(
+            upload_copy(
+                source,
+                destination,
+                [64, 32, 1],
+                [0, 0, 0],
+                &footprint,
+                Some([60, 0, 0, 68, 4, 1]),
+            ),
+            Err("CopyTextureRegion: the upload box is outside its footprint")
+        );
+        // The destination subresource bounds are checked too.
+        assert_eq!(
+            upload_copy(source, destination, [32, 16, 1], [8, 0, 0], &footprint, None),
+            Err("CopyTextureRegion: the upload box is outside its destination subresource")
+        );
     }
 
     #[test]
