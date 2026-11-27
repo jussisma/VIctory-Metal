@@ -9,6 +9,8 @@
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
+#[cfg(any(windows, test, target_os = "macos"))]
+use crate::native_metal::telemetry::{self, call_names};
 
 #[cfg(windows)]
 pub(crate) mod host;
@@ -540,6 +542,21 @@ impl RtvRecord {
     }
 }
 
+/// Records a view creation that wrote nothing because its handle was zero.
+///
+/// The export's documented behaviour does not change; the latch makes the
+/// silent zero output visible once per name.
+fn note_view_failure(name: &'static str, handle: u64, resource: This) {
+    #[cfg(any(windows, test, target_os = "macos"))]
+    telemetry::note_call_failure(
+        name,
+        crate::object::S_OK,
+        [handle, resource as usize as u64, 0],
+    );
+    #[cfg(not(any(windows, test, target_os = "macos")))]
+    let _ = (name, handle, resource);
+}
+
 /// Device method: records the view at `handle` (descriptor memory).
 pub(crate) extern "system" fn create_rtv(
     _: This,
@@ -548,6 +565,7 @@ pub(crate) extern "system" fn create_rtv(
     handle: u64,
 ) {
     if handle == 0 {
+        note_view_failure(call_names::CREATE_RENDER_TARGET_VIEW, handle, resource);
         return;
     }
     // SAFETY: the title passes a description or null.
@@ -569,11 +587,13 @@ pub(crate) extern "system" fn create_dsv(
     desc: *const [u32; 6],
     handle: u64,
 ) {
-    create_rtv(this, resource, desc, handle);
-    if handle != 0 {
-        // SAFETY: just written by `create_rtv`.
-        unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
+    if handle == 0 {
+        note_view_failure(call_names::CREATE_DEPTH_STENCIL_VIEW, handle, resource);
+        return;
     }
+    create_rtv(this, resource, desc, handle);
+    // SAFETY: just written by `create_rtv`.
+    unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
@@ -829,6 +849,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 /// `CreateConstantBufferView` with a null description. Leaving the slot
 /// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    if handle == 0 {
+        note_view_failure(call_names::CREATE_CONSTANT_BUFFER_VIEW, handle, std::ptr::null());
+    }
     let view = match words(desc) {
         Some([lo, hi, size, _]) => {
             let address = u64::from(lo) | u64::from(hi) << 32;
@@ -846,6 +869,9 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    if handle == 0 {
+        note_view_failure(call_names::CREATE_SHADER_RESOURCE_VIEW, handle, resource);
+    }
     record(handle, View::Shader(resource as usize, words(desc)));
 }
 
@@ -857,6 +883,9 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    if handle == 0 {
+        note_view_failure(call_names::CREATE_UNORDERED_ACCESS_VIEW, handle, resource);
+    }
     let view = View::Unordered(resource as usize, counter as usize, words(desc));
     record(handle, view);
 }
@@ -870,6 +899,13 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    if resource.is_null() || desc.is_null() || handle == 0 {
+        note_view_failure(
+            call_names::CREATE_SHADER_RESOURCE_VIEW,
+            handle,
+            std::ptr::null(),
+        );
+    }
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
@@ -881,6 +917,13 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    if resource.is_null() || desc.is_null() || handle == 0 {
+        note_view_failure(
+            call_names::CREATE_UNORDERED_ACCESS_VIEW,
+            handle,
+            std::ptr::null(),
+        );
+    }
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
@@ -903,9 +946,23 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let Some(step) = increment(kind).map(u64::from) else {
+        #[cfg(any(windows, test, target_os = "macos"))]
+        telemetry::note_call_failure(
+            call_names::COPY_DESCRIPTORS_SIMPLE,
+            E_INVALIDARG,
+            [u64::from(kind), u64::from(count), 0],
+        );
         return;
     };
     let len = u64::from(count) * step;
+    if dst == 0 || src == 0 {
+        #[cfg(any(windows, test, target_os = "macos"))]
+        telemetry::note_call_failure(
+            call_names::COPY_DESCRIPTORS_SIMPLE,
+            crate::object::S_OK,
+            [dst, src, u64::from(count)],
+        );
+    }
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
@@ -988,6 +1045,41 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
 
 /// Device method.
 pub(crate) extern "system" fn create_heap(
+    this: This,
+    desc_ptr: *const HeapDesc,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let result = create_heap_impl(this, desc_ptr, iid, out);
+    #[cfg(any(windows, test, target_os = "macos"))]
+    {
+        // SAFETY: read only to name the failing arguments; null is tolerated.
+        let (kind, count, flags) = unsafe { desc_ptr.as_ref() }
+            .map(|desc| {
+                (
+                    u64::from(desc.kind),
+                    u64::from(desc.count),
+                    u64::from(desc.flags),
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        telemetry::note_call_result(
+            call_names::CREATE_DESCRIPTOR_HEAP,
+            result,
+            [kind, count, flags],
+        );
+        if result == crate::object::S_OK && out.is_null() {
+            telemetry::note_call_failure(
+                call_names::CREATE_DESCRIPTOR_HEAP,
+                result,
+                [kind, count, flags],
+            );
+        }
+    }
+    result
+}
+
+fn create_heap_impl(
     _: This,
     desc_ptr: *const HeapDesc,
     iid: *const Iid,
@@ -1066,8 +1158,23 @@ extern "system" fn desc(this: This, out: *mut HeapDesc) {
     }
 }
 /// The same address for the CPU and the GPU start.
-extern "system" fn start(this: This) -> u64 {
-    heap(this).start
+fn start_checked(this: This, name: &'static str) -> u64 {
+    let start = heap(this).start;
+    #[cfg(any(windows, test, target_os = "macos"))]
+    if start == 0 {
+        telemetry::note_call_failure(name, crate::object::S_OK, [0, 0, 0]);
+    }
+    #[cfg(not(any(windows, test, target_os = "macos")))]
+    let _ = name;
+    start
+}
+
+extern "system" fn cpu_start(this: This) -> u64 {
+    start_checked(this, call_names::GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START)
+}
+
+extern "system" fn gpu_start(this: This) -> u64 {
+    start_checked(this, call_names::GET_GPU_DESCRIPTOR_HANDLE_FOR_HEAP_START)
 }
 
 /// IUnknown 3, object 4, device child 1, heap 3.
@@ -1077,8 +1184,8 @@ static FUNCTIONS: Table<24> = {
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = desc as *const (); // 0x40
-    f[9] = start as *const (); // 0x48 CPU
-    f[10] = start as *const (); // 0x50 GPU
+    f[9] = cpu_start as *const (); // 0x48 CPU
+    f[10] = gpu_start as *const (); // 0x50 GPU
     Table(f)
 };
 
