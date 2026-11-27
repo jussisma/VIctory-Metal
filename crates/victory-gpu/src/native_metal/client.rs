@@ -91,6 +91,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use std::collections::BTreeSet;
@@ -158,6 +159,269 @@ pub const MAX_PIPELINE_STATE_BYTES: usize = 4 * 1024;
 pub const MAX_PIPELINE_ABI_BYTES: usize = 16 * 1024;
 /// Largest raw root-signature bytes.
 pub const MAX_ROOT_SIGNATURE_BYTES: usize = 16 * 1024;
+/// First four bytes of the version 3 kind 4 request (`ipc_host`).
+///
+/// The version 3 frame names content-hashed DXIL stage files inside the share
+/// directory instead of carrying metallibs or DXIL bytes on the wire, so a
+/// 16 MiB stage never has to fit the 64 KiB transport frame.
+pub const PIPELINE_FRAME_MAGIC_V3: [u8; 4] = *b"VP3\0";
+/// Version byte of the version 3 pipeline frame.
+pub const PIPELINE_FRAME_VERSION_V3: u8 = 1;
+/// Fixed header length of a version 3 pipeline frame.
+pub const PIPELINE_V3_HEADER_LEN: usize = 24;
+/// Exact length of a share-directory stage name: `stages/<64 hex>.bin`.
+pub const MAX_STAGE_FILE_NAME_LEN: usize = "stages/".len() + 64 + ".bin".len();
+/// Largest converter rejection reason the host may put in a kind 129 reply.
+pub const MAX_PIPELINE_REJECTION_REASON: usize = 256;
+
+/// One `(stage, file, entry)` of a version 3 pipeline request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vp3Stage<'a> {
+    /// Wire stage code ([`PIPELINE_STAGE_VERTEX`] to [`PIPELINE_STAGE_COMPUTE`]).
+    pub stage: u8,
+    /// Share-relative DXIL file name (`stages/<blake3 hex>.bin`).
+    pub file: &'a str,
+    /// Entry point the host's converter and Metal library both name.
+    pub entry: &'a str,
+}
+
+/// Whether `name` is the one shape a version 3 stage reference may take.
+///
+/// Only `stages/<64 lowercase hex digits>.bin` is accepted: no absolute path,
+/// `..`, backslash, separator beyond the fixed one or symlink name can be
+/// expressed, and the host revalidates the same grammar before opening.
+pub fn valid_stage_file_name(name: &str) -> bool {
+    let Some(hash) = name
+        .strip_prefix("stages/")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Builds one version 3 kind 4 payload.
+///
+/// | offset | size | field |
+/// | ---: | ---: | --- |
+/// | 0 | 4 | magic `VP3\0` |
+/// | 4 | 1 | frame version, `1` |
+/// | 5 | 1 | pipeline kind: 0 compute, 1 graphics, 2 mesh |
+/// | 6 | 1 | stage count, 1..=4 |
+/// | 7 | 1 | reserved, zero |
+/// | 8 | 4 | encoded `PipelineState` length |
+/// | 12 | 2 | root-signature file-name length, 0 or 75 |
+/// | 14 | 2 | reserved, zero |
+/// | 16 | 4 | reserved, zero |
+/// | 20 | 4 | reserved, zero |
+/// | 24 | N | stage entries: `stage u8, name_len u16, name, entry_len u16, entry` |
+/// | ... | S | encoded `PipelineState` |
+/// | ... | R | root-signature file name |
+pub fn encode_pipeline_v3_request(
+    kind: u8,
+    stages: &[Vp3Stage<'_>],
+    state: &[u8],
+    root_signature_file: Option<&str>,
+) -> Result<Vec<u8>, NativeQueueError> {
+    if !matches!(
+        kind,
+        PIPELINE_KIND_COMPUTE | PIPELINE_KIND_GRAPHICS | PIPELINE_KIND_MESH
+    ) {
+        return Err(NativeQueueError::Refused(format!(
+            "pipeline kind {kind} is not compute, graphics or mesh"
+        )));
+    }
+    if stages.is_empty() || stages.len() > PIPELINE_V2_MAX_STAGES {
+        return Err(NativeQueueError::Refused(format!(
+            "pipeline registration needs 1..={PIPELINE_V2_MAX_STAGES} stages, got {}",
+            stages.len()
+        )));
+    }
+    if state.len() > MAX_PIPELINE_STATE_BYTES {
+        return Err(NativeQueueError::Refused(
+            "pipeline state exceeds its limit".to_string(),
+        ));
+    }
+    let root_len = root_signature_file.map_or(0, str::len);
+    if root_len != 0
+        && (root_len > MAX_STAGE_FILE_NAME_LEN
+            || !root_signature_file.is_some_and(valid_stage_file_name))
+    {
+        return Err(NativeQueueError::Refused(
+            "the root-signature file name is not a share-relative stage name".to_string(),
+        ));
+    }
+    let mut seen = Vec::with_capacity(stages.len());
+    let mut payload = Vec::with_capacity(
+        PIPELINE_V3_HEADER_LEN
+            + stages
+                .iter()
+                .map(|stage| 1 + 2 + stage.file.len() + 2 + stage.entry.len())
+                .sum::<usize>()
+            + state.len()
+            + root_len,
+    );
+    payload.extend_from_slice(&PIPELINE_FRAME_MAGIC_V3);
+    payload.push(PIPELINE_FRAME_VERSION_V3);
+    payload.push(kind);
+    payload.push(u8::try_from(stages.len()).expect("stage count is bounded"));
+    payload.push(0);
+    payload.extend_from_slice(
+        &u32::try_from(state.len())
+            .expect("state length is bounded")
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(
+        &u16::try_from(root_len)
+            .expect("root file name is bounded")
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    for stage in stages {
+        if !matches!(
+            stage.stage,
+            PIPELINE_STAGE_VERTEX
+                | PIPELINE_STAGE_PIXEL
+                | PIPELINE_STAGE_MESH
+                | PIPELINE_STAGE_OBJECT
+                | PIPELINE_STAGE_COMPUTE
+        ) || seen.contains(&stage.stage)
+        {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline stage {} is unknown or repeated",
+                stage.stage
+            )));
+        }
+        if !valid_stage_file_name(stage.file) {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline stage {} does not name a share-relative stage file",
+                stage.stage
+            )));
+        }
+        if !valid_pipeline_entry(stage.entry) {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline entry `{}` is not a bounded ASCII Metal identifier",
+                stage.entry
+            )));
+        }
+        payload.push(stage.stage);
+        payload.extend_from_slice(
+            &u16::try_from(stage.file.len())
+                .expect("stage name length is bounded")
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(stage.file.as_bytes());
+        payload.extend_from_slice(
+            &u16::try_from(stage.entry.len())
+                .expect("entry length is bounded")
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(stage.entry.as_bytes());
+        seen.push(stage.stage);
+    }
+    payload.extend_from_slice(state);
+    if let Some(name) = root_signature_file {
+        payload.extend_from_slice(name.as_bytes());
+    }
+    if payload.len() > MAX_PAYLOAD_LEN as usize {
+        return Err(NativeQueueError::Refused(format!(
+            "pipeline registration is {} bytes, over the {MAX_PAYLOAD_LEN}-byte transport limit",
+            payload.len()
+        )));
+    }
+    Ok(payload)
+}
+
+/// A decoded version 3 kind 4 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPipelineV3 {
+    /// Pipeline kind (0 compute, 1 graphics, 2 mesh).
+    pub kind: u8,
+    /// Stage entries in frame order.
+    pub stages: Vec<(u8, String, String)>,
+    /// Encoded `PipelineState`.
+    pub state: Vec<u8>,
+    /// Root-signature file name, empty when the frame carried none.
+    pub root_signature_file: String,
+}
+
+/// Decodes a version 3 kind 4 payload, rejecting every malformed field.
+pub fn decode_pipeline_v3_request(payload: &[u8]) -> Option<DecodedPipelineV3> {
+    if payload.len() < PIPELINE_V3_HEADER_LEN || payload[..4] != PIPELINE_FRAME_MAGIC_V3 {
+        return None;
+    }
+    let version = payload[4];
+    let kind = payload[5];
+    let stage_count = payload[6];
+    if version != PIPELINE_FRAME_VERSION_V3
+        || kind > PIPELINE_KIND_MESH
+        || stage_count == 0
+        || usize::from(stage_count) > PIPELINE_V2_MAX_STAGES
+        || payload[7] != 0
+        || payload[14] != 0
+        || payload[15] != 0
+        || payload[16..20] != [0u8; 4]
+        || payload[20..24] != [0u8; 4]
+    {
+        return None;
+    }
+    let state_len = usize::try_from(u32::from_le_bytes(payload[8..12].try_into().ok()?)).ok()?;
+    let root_len = usize::from(u16::from_le_bytes(payload[12..14].try_into().ok()?));
+    if state_len > MAX_PIPELINE_STATE_BYTES || root_len > MAX_STAGE_FILE_NAME_LEN {
+        return None;
+    }
+    let mut offset = PIPELINE_V3_HEADER_LEN;
+    let mut stages = Vec::with_capacity(usize::from(stage_count));
+    for _ in 0..stage_count {
+        let stage = *payload.get(offset)?;
+        offset = offset.checked_add(1)?;
+        let name_len = usize::from(u16::from_le_bytes(
+            payload.get(offset..offset + 2)?.try_into().ok()?,
+        ));
+        offset = offset.checked_add(2)?;
+        let name = std::str::from_utf8(payload.get(offset..offset.checked_add(name_len)?)?).ok()?;
+        offset = offset.checked_add(name_len)?;
+        let entry_len = usize::from(u16::from_le_bytes(
+            payload.get(offset..offset + 2)?.try_into().ok()?,
+        ));
+        offset = offset.checked_add(2)?;
+        let entry =
+            std::str::from_utf8(payload.get(offset..offset.checked_add(entry_len)?)?).ok()?;
+        offset = offset.checked_add(entry_len)?;
+        if !matches!(
+            stage,
+            PIPELINE_STAGE_VERTEX
+                | PIPELINE_STAGE_PIXEL
+                | PIPELINE_STAGE_MESH
+                | PIPELINE_STAGE_OBJECT
+                | PIPELINE_STAGE_COMPUTE
+        ) || !valid_stage_file_name(name)
+            || !valid_pipeline_entry(entry)
+        {
+            return None;
+        }
+        stages.push((stage, name.to_string(), entry.to_string()));
+    }
+    let state_end = offset.checked_add(state_len)?;
+    let state = payload.get(offset..state_end)?.to_vec();
+    let root_end = state_end.checked_add(root_len)?;
+    let root = std::str::from_utf8(payload.get(state_end..root_end)?).ok()?;
+    if root_end != payload.len() || (root_len != 0 && !valid_stage_file_name(root)) {
+        return None;
+    }
+    Some(DecodedPipelineV3 {
+        kind,
+        stages,
+        state,
+        root_signature_file: root.to_string(),
+    })
+}
+
 /// Frame kind registering the shared completion fence page (`ipc_host`).
 pub const KIND_FENCE_PAGE: u8 = 6;
 /// Frame kind registering a host texture (`ipc_host`).
@@ -641,11 +905,15 @@ impl LiveConfig {
 
     /// Opens an authenticated session with an explicit bounded timeout.
     pub fn connect_with_timeout(&self, timeout: Duration) -> Result<WireV3Client, TransportError> {
-        WireV3Client::open(
+        let client = WireV3Client::open(
             self.endpoint.clone(),
             Secret::new(self.secret.bytes())?,
             timeout,
-        )
+        )?;
+        // The queue owns the client; a pipeline worker borrows this weak view so
+        // host-side DXIL translation sends on the same authenticated session.
+        publish_live_pipeline_session(client.pipeline_session());
+        Ok(client)
     }
 }
 
@@ -658,7 +926,14 @@ pub struct WireV3Client {
     endpoint: Endpoint,
     secret: Secret,
     timeout: Duration,
-    stream: Option<TcpStream>,
+    /// The single session socket, shared with the pipeline-translation seam.
+    ///
+    /// The guest may create a PSO on a worker thread while the render thread
+    /// submits; both use the same authenticated host session, so they share
+    /// this mutex and every frame exchange holds it across write and read. A
+    /// second socket would be a second host session, which the host does not
+    /// serve.
+    stream: Arc<Mutex<Option<TcpStream>>>,
     reconnects: u32,
     transport_errors: u64,
     /// The shared completion page, when the guest mapped one and the host
@@ -748,7 +1023,7 @@ impl WireV3Client {
             endpoint,
             secret,
             timeout,
-            stream: None,
+            stream: Arc::new(Mutex::new(None)),
             reconnects: 0,
             transport_errors: 0,
             fence_page: None,
@@ -763,8 +1038,48 @@ impl WireV3Client {
         };
         let mut stream = client.handshake()?;
         client.register_fence_page(&mut stream, client.fence_page_path.clone());
-        client.stream = Some(stream);
+        *client
+            .stream
+            .lock()
+            .unwrap_or_else(|failure| failure.into_inner()) = Some(stream);
         Ok(client)
+    }
+
+    /// The socket lock, with a poisoned mutex recovered.
+    fn stream_slot(&self) -> std::sync::MutexGuard<'_, Option<TcpStream>> {
+        self.stream
+            .lock()
+            .unwrap_or_else(|failure| failure.into_inner())
+    }
+
+    /// Runs one frame exchange on the open socket while holding the shared
+    /// stream lock.
+    ///
+    /// Holding the lock across the write and the read keeps the session in
+    /// step when a pipeline registration and a submission are issued from
+    /// different guest threads.
+    fn with_stream<T>(
+        &self,
+        exchange: impl FnOnce(&mut TcpStream) -> Result<T, TransportError>,
+    ) -> Result<T, NativeQueueError> {
+        let mut slot = self.stream_slot();
+        let Some(stream) = slot.as_mut() else {
+            return Err(NativeQueueError::Transport(
+                TransportError::NotConnected.to_string(),
+            ));
+        };
+        exchange(stream).map_err(|error| NativeQueueError::Transport(error.to_string()))
+    }
+
+    /// A handle that can send a version 3 pipeline request on this session.
+    ///
+    /// The handle shares the authenticated socket but holds no registration
+    /// state of its own, so it is safe to keep on a pipeline worker thread.
+    pub fn pipeline_session(&self) -> PipelineTranslateSession {
+        PipelineTranslateSession {
+            stream: Arc::downgrade(&self.stream),
+            timeout: self.timeout,
+        }
     }
 
     /// Maps the given shared fence page and registers it (kind 6).
@@ -813,7 +1128,7 @@ impl WireV3Client {
 
     /// Whether a stream is open (a client is live until a failure closes it).
     pub fn is_connected(&self) -> bool {
-        self.stream.is_some()
+        self.stream_slot().is_some()
     }
 
     /// Successful reconnects so far.
@@ -898,14 +1213,14 @@ impl WireV3Client {
         self.pipelines.clear();
         let page = self.fence_page_path.clone();
         self.register_fence_page(&mut stream, page);
-        self.stream = Some(stream);
+        *self.stream_slot() = Some(stream);
         self.reconnects = self.reconnects.saturating_add(1);
         Ok(())
     }
 
     /// Closes the socket. Later sends fail explicitly until `reconnect`.
     pub fn close(&mut self) {
-        if let Some(stream) = self.stream.take() {
+        if let Some(stream) = self.stream_slot().take() {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -1165,23 +1480,19 @@ impl WireV3Client {
         payload.extend_from_slice(&entry_len.to_le_bytes());
         payload.extend_from_slice(entry.as_bytes());
 
-        let Some(mut stream) = self.stream.take() else {
-            return Err(NativeQueueError::Transport(
-                TransportError::NotConnected.to_string(),
-            ));
-        };
-        let result = write_frame(&mut stream, KIND_PIPELINE, &payload, "register pipeline", self.timeout)
-            .and_then(|()| {
-                read_frame(
-                    &mut stream,
-                    "register pipeline",
-                    MAX_PAYLOAD_LEN as usize,
-                    self.timeout,
-                )
-            });
+        let result = self.with_stream(|stream| {
+            write_frame(stream, KIND_PIPELINE, &payload, "register pipeline", self.timeout)
+                .and_then(|()| {
+                    read_frame(
+                        stream,
+                        "register pipeline",
+                        MAX_PAYLOAD_LEN as usize,
+                        self.timeout,
+                    )
+                })
+        });
         match result {
             Ok((KIND_PIPELINE_REPLY, reply)) => {
-                self.stream = Some(stream);
                 match (reply.first().copied(), reply.len()) {
                     (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
                         let id = u64::from_le_bytes(
@@ -1206,7 +1517,7 @@ impl WireV3Client {
                 }
             }
             Ok((actual, _)) => {
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
                 Err(NativeQueueError::Transport(
                     TransportError::UnexpectedKind {
@@ -1217,9 +1528,9 @@ impl WireV3Client {
                 ))
             }
             Err(error) => {
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
-                Err(NativeQueueError::Transport(error.to_string()))
+                Err(error)
             }
         }
     }
@@ -1345,29 +1656,25 @@ impl WireV3Client {
             )));
         }
 
-        let Some(mut stream) = self.stream.take() else {
-            return Err(NativeQueueError::Transport(
-                TransportError::NotConnected.to_string(),
-            ));
-        };
-        let result = write_frame(
-            &mut stream,
-            KIND_PIPELINE,
-            &payload,
-            "register pipeline v2",
-            self.timeout,
-        )
-        .and_then(|()| {
-            read_frame(
-                &mut stream,
+        let result = self.with_stream(|stream| {
+            write_frame(
+                stream,
+                KIND_PIPELINE,
+                &payload,
                 "register pipeline v2",
-                MAX_PAYLOAD_LEN as usize,
                 self.timeout,
             )
+            .and_then(|()| {
+                read_frame(
+                    stream,
+                    "register pipeline v2",
+                    MAX_PAYLOAD_LEN as usize,
+                    self.timeout,
+                )
+            })
         });
         match result {
             Ok((KIND_PIPELINE_REPLY, reply)) => {
-                self.stream = Some(stream);
                 match (reply.first().copied(), reply.len()) {
                     (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
                         let id =
@@ -1393,7 +1700,7 @@ impl WireV3Client {
                 }
             }
             Ok((actual, _)) => {
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
                 Err(NativeQueueError::Transport(
                     TransportError::UnexpectedKind {
@@ -1404,11 +1711,53 @@ impl WireV3Client {
                 ))
             }
             Err(error) => {
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
-                Err(NativeQueueError::Transport(error.to_string()))
+                Err(error)
             }
         }
+    }
+
+    /// Registers a pipeline whose DXIL stages the host translates itself
+    /// (kind 4 version 3).
+    ///
+    /// The frame carries only share-relative `stages/<blake3>.bin` names, the
+    /// wire stage codes, the entry points, the encoded `PipelineState` and an
+    /// optional root-signature file name. The host owns the Rosetta
+    /// `victory-irconverter --stdio` pool, derives the per-stage ABI from the
+    /// converter reflection it receives and answers with the native id. A
+    /// rejected frame answers status 1 and, unlike the older frames, an
+    /// optional bounded UTF-8 reason.
+    pub fn register_pipeline_v3(
+        &self,
+        kind: u8,
+        stages: &[Vp3Stage<'_>],
+        state: &[u8],
+        root_signature_file: Option<&str>,
+    ) -> Result<u64, NativeQueueError> {
+        let payload = encode_pipeline_v3_request(kind, stages, state, root_signature_file)?;
+        self.round_trip_pipeline_v3(&payload)
+    }
+
+    fn round_trip_pipeline_v3(&self, payload: &[u8]) -> Result<u64, NativeQueueError> {
+        let result = self.with_stream(|stream| {
+            write_frame(
+                stream,
+                KIND_PIPELINE,
+                payload,
+                "register pipeline v3",
+                self.timeout,
+            )
+            .and_then(|()| {
+                read_frame(
+                    stream,
+                    "register pipeline v3",
+                    MAX_PAYLOAD_LEN as usize,
+                    self.timeout,
+                )
+            })
+        });
+        decode_pipeline_v3_reply(result)
     }
 
     /// The native pipeline id a ticket registered, if any.
@@ -1433,21 +1782,15 @@ impl WireV3Client {
         payload: &[u8],
         operation: &'static str,
     ) -> Result<u8, NativeQueueError> {
-        let Some(mut stream) = self.stream.take() else {
-            return Err(NativeQueueError::Transport(
-                TransportError::NotConnected.to_string(),
-            ));
-        };
-        let result = write_frame(&mut stream, kind, payload, operation, self.timeout).and_then(|()| {
-            read_frame(&mut stream, operation, MAX_PAYLOAD_LEN as usize, self.timeout)
+        let result = self.with_stream(|stream| {
+            write_frame(stream, kind, payload, operation, self.timeout).and_then(|()| {
+                read_frame(stream, operation, MAX_PAYLOAD_LEN as usize, self.timeout)
+            })
         });
         match result {
-            Ok((KIND_ACK, status)) if status.len() == 1 => {
-                self.stream = Some(stream);
-                Ok(status[0])
-            }
+            Ok((KIND_ACK, status)) if status.len() == 1 => Ok(status[0]),
             Ok((actual, _)) => {
-                self.stream = Some(stream);
+                self.close();
                 Err(NativeQueueError::Transport(
                     TransportError::UnexpectedKind {
                         expected: KIND_ACK,
@@ -1457,9 +1800,9 @@ impl WireV3Client {
                 ))
             }
             Err(error) => {
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
-                Err(NativeQueueError::Transport(error.to_string()))
+                Err(error)
             }
         }
     }
@@ -1537,26 +1880,16 @@ impl WireV3Client {
 
     /// One request/reply round trip on the open stream.
     fn exchange(&mut self, request: &Request) -> Result<ReplyStatus, NativeQueueError> {
-        let Some(mut stream) = self.stream.take() else {
-            return Err(NativeQueueError::Transport(
-                TransportError::NotConnected.to_string(),
-            ));
-        };
-        match self.round_trip(&mut stream, request) {
-            Outcome::Status(status) => {
-                self.stream = Some(stream);
-                Ok(status)
-            }
-            Outcome::Refused(why) => {
-                // The host answered a complete frame: the session is still in
-                // step, so the stream stays open.
-                self.stream = Some(stream);
-                Err(NativeQueueError::Refused(why))
-            }
+        let outcome = self.with_stream(|stream| Ok(self.round_trip(stream, request)))?;
+        match outcome {
+            Outcome::Status(status) => Ok(status),
+            // The host answered a complete frame: the session is still in step,
+            // so the stream stays open.
+            Outcome::Refused(why) => Err(NativeQueueError::Refused(why)),
             Outcome::Broken(error) => {
                 // The stream may be desynchronised: close it so the next send
                 // must reconnect instead of reading a stale reply.
-                let _ = stream.shutdown(Shutdown::Both);
+                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
                 Err(error)
             }
@@ -1629,6 +1962,141 @@ impl WireV3Client {
             }
         }
     }
+}
+
+/// Decodes one kind 129 reply to a version 3 pipeline request.
+///
+/// Status 0 carries the `u64` native id. Status 1 carries either the legacy
+/// bare rejection byte or `reason_len u16` + at most
+/// [`MAX_PIPELINE_REJECTION_REASON`] UTF-8 bytes, so a failed host translation
+/// names its category without ever carrying a title path or shader bytes.
+fn decode_pipeline_v3_reply(
+    result: Result<(u8, Vec<u8>), NativeQueueError>,
+) -> Result<u64, NativeQueueError> {
+    match result {
+        Ok((KIND_PIPELINE_REPLY, reply)) => match (reply.first().copied(), reply.len()) {
+            (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
+                let id = u64::from_le_bytes(reply[1..].try_into().expect("eight bytes"));
+                if id == 0 {
+                    return Err(NativeQueueError::Transport(
+                        "the host answered pipeline registration with id zero".to_string(),
+                    ));
+                }
+                Ok(id)
+            }
+            (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
+                "the host rejected the version 3 pipeline registration".to_string(),
+            )),
+            (Some(PIPELINE_REPLY_REJECTED), len) if len >= 3 => {
+                let reason_len = usize::from(u16::from_le_bytes(
+                    reply[1..3].try_into().expect("two bytes"),
+                ));
+                if reason_len == 0
+                    || reason_len > MAX_PIPELINE_REJECTION_REASON
+                    || reply.len() != 3 + reason_len
+                {
+                    return Err(NativeQueueError::Transport(format!(
+                        "malformed version 3 pipeline rejection of {} byte(s)",
+                        reply.len()
+                    )));
+                }
+                let reason = std::str::from_utf8(&reply[3..]).map_err(|_| {
+                    NativeQueueError::Transport(
+                        "the version 3 pipeline rejection reason is not UTF-8".to_string(),
+                    )
+                })?;
+                Err(NativeQueueError::Refused(reason.to_string()))
+            }
+            _ => Err(NativeQueueError::Transport(format!(
+                "malformed kind 129 reply of {} byte(s)",
+                reply.len()
+            ))),
+        },
+        Ok((actual, _)) => Err(NativeQueueError::Transport(
+            TransportError::UnexpectedKind {
+                expected: KIND_PIPELINE_REPLY,
+                actual,
+            }
+            .to_string(),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// A borrowed view of the live session's socket for host-side pipeline
+/// translation.
+///
+/// It holds a weak reference: when the session client is dropped or closed the
+/// handle still upgrades, but the socket slot is `None`, so a registration
+/// fails explicitly instead of keeping a dead connection alive.
+#[derive(Clone)]
+pub struct PipelineTranslateSession {
+    stream: Weak<Mutex<Option<TcpStream>>>,
+    timeout: Duration,
+}
+
+impl PipelineTranslateSession {
+    /// Registers a pipeline whose stages the host translates (kind 4 version 3).
+    pub fn register_pipeline_v3(
+        &self,
+        kind: u8,
+        stages: &[Vp3Stage<'_>],
+        state: &[u8],
+        root_signature_file: Option<&str>,
+    ) -> Result<u64, NativeQueueError> {
+        let payload = encode_pipeline_v3_request(kind, stages, state, root_signature_file)?;
+        let Some(stream) = self.stream.upgrade() else {
+            return Err(NativeQueueError::Transport(
+                TransportError::NotConnected.to_string(),
+            ));
+        };
+        let result = {
+            let mut slot = stream.lock().unwrap_or_else(|failure| failure.into_inner());
+            let Some(stream) = slot.as_mut() else {
+                return Err(NativeQueueError::Transport(
+                    TransportError::NotConnected.to_string(),
+                ));
+            };
+            write_frame(
+                stream,
+                KIND_PIPELINE,
+                &payload,
+                "register pipeline v3",
+                self.timeout,
+            )
+            .and_then(|()| {
+                read_frame(
+                    stream,
+                    "register pipeline v3",
+                    MAX_PAYLOAD_LEN as usize,
+                    self.timeout,
+                )
+            })
+            .map_err(|error| NativeQueueError::Transport(error.to_string()))
+        };
+        decode_pipeline_v3_reply(result)
+    }
+}
+
+/// The most recent session opened through [`LiveConfig`].
+///
+/// The queue owns the `WireV3Client`; a pipeline worker borrows this weak
+/// session view so both send on the one authenticated socket instead of opening
+/// a second connection the host would never serve.
+static LIVE_PIPELINE_SESSION: Mutex<Option<PipelineTranslateSession>> = Mutex::new(None);
+
+/// The live session a pipeline worker may use, when a client has connected.
+pub fn live_pipeline_session() -> Option<PipelineTranslateSession> {
+    LIVE_PIPELINE_SESSION
+        .lock()
+        .unwrap_or_else(|failure| failure.into_inner())
+        .clone()
+}
+
+fn publish_live_pipeline_session(session: PipelineTranslateSession) {
+    *LIVE_PIPELINE_SESSION
+        .lock()
+        .unwrap_or_else(|failure| failure.into_inner()) = Some(session);
 }
 
 impl V3Sink for WireV3Client {
@@ -2665,5 +3133,65 @@ mod tests {
             &payload[PIPELINE_V2_HEADER_LEN + entries_len..][..state_len],
             b"VPS1state"
         );
+    }
+
+    /// The version 3 control frame names share-relative DXIL files only, so it
+    /// stays far under the 64 KiB transport frame and round-trips exactly.
+    #[test]
+    fn a_version_3_pipeline_frame_round_trips_and_rejects_paths() {
+        let vertex = "stages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin";
+        let pixel = "stages/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bin";
+        let root = "stages/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.bin";
+        let stages = [
+            Vp3Stage {
+                stage: PIPELINE_STAGE_VERTEX,
+                file: vertex,
+                entry: "vs_main",
+            },
+            Vp3Stage {
+                stage: PIPELINE_STAGE_PIXEL,
+                file: pixel,
+                entry: "ps_main",
+            },
+        ];
+        let payload = encode_pipeline_v3_request(
+            PIPELINE_KIND_GRAPHICS,
+            &stages,
+            b"VPS1state",
+            Some(root),
+        )
+        .expect("encode version 3 frame");
+        assert!(payload.len() < MAX_PAYLOAD_LEN as usize);
+        let decoded = decode_pipeline_v3_request(&payload).expect("decode version 3 frame");
+        assert_eq!(decoded.kind, PIPELINE_KIND_GRAPHICS);
+        assert_eq!(decoded.state, b"VPS1state");
+        assert_eq!(decoded.root_signature_file, root);
+        assert_eq!(
+            decoded.stages,
+            vec![
+                (PIPELINE_STAGE_VERTEX, vertex.to_string(), "vs_main".to_string()),
+                (PIPELINE_STAGE_PIXEL, pixel.to_string(), "ps_main".to_string()),
+            ]
+        );
+
+        for bad in [
+            "/stages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            "stages/../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            "stages\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            "stages/AAAA.bin",
+        ] {
+            let error = encode_pipeline_v3_request(
+                PIPELINE_KIND_COMPUTE,
+                &[Vp3Stage {
+                    stage: PIPELINE_STAGE_COMPUTE,
+                    file: bad,
+                    entry: "main",
+                }],
+                &[],
+                None,
+            )
+            .expect_err("a path is not a stage reference");
+            assert!(matches!(error, NativeQueueError::Refused(_)), "{bad}");
+        }
     }
 }
