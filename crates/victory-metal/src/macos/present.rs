@@ -42,6 +42,8 @@ use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
 
 /// `MTLPixelFormatBGRA8Unorm`, matching the IOSurface `'BGRA'` format below.
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
+/// `MTLPixelFormatRGBA8Unorm`, the AAA frame colour-target format.
+const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
 /// `MTLStorageModeShared`; IOSurface-backed textures are CPU/GPU shared.
 const MTL_STORAGE_MODE_SHARED: usize = 0;
 /// `MTLTextureUsageShaderRead`.
@@ -181,6 +183,323 @@ impl PresentSink for RecordingSink {
         self.frames.push(frame);
         Ok(())
     }
+}
+
+/// A `CAMetalLayer` drawable pool driven by the native window presenter.
+///
+/// This is the only type in the module that talks to the window server. It
+/// owns the retained layer and the transport queue, acquires drawables with
+/// `nextDrawable` and presents them with `presentDrawable:`. Pixels never
+/// pass through the CPU: a finished frame is copied into the drawable's
+/// texture with a GPU blit when both textures are BGRA8 and the same size;
+/// otherwise the drawable is cleared to a diagnostic colour. Either way the
+/// drawable texture is the surface the window server presents.
+///
+/// The type is deliberately not part of the headless `PresentSink` path: the
+/// headless presenter never constructs one, so a windowless session cannot
+/// depend on AppKit or on a window server.
+pub struct NativeSwapchain {
+    layer: ObjcObject,
+    queue: ObjcObject,
+    current: Option<ObjcObject>,
+    serial: u64,
+    presented: u64,
+    width: u32,
+    height: u32,
+}
+
+impl NativeSwapchain {
+    /// Wraps a retained `CAMetalLayer` and retains `queue` for presentation.
+    ///
+    /// `queue` is normally the transport's queue, so the blit that fills the
+    /// drawable is ordered after the frame's render work once that work has
+    /// completed. Returns `None` when the queue cannot be retained.
+    pub(crate) fn new(layer: ObjcObject, queue: objc::Id, width: u32, height: u32) -> Option<Self> {
+        // SAFETY: `queue` is a live `MTLCommandQueue`; `retain` returns it +1.
+        let retained = unsafe { objc::msg_send_id_0(queue, objc::sel(c"retain")) };
+        let queue = ObjcObject::from_retained(retained)?;
+        Some(Self {
+            layer,
+            queue,
+            current: None,
+            serial: 0,
+            presented: 0,
+            width,
+            height,
+        })
+    }
+
+    /// Sets the layer's drawable pixel format before the next acquisition.
+    ///
+    /// The window opens with BGRA8 (the documented default); a present surface
+    /// may be RGBA8, in which case the host switches the layer so the GPU blit
+    /// can copy it without a CPU swizzle. No drawable is in flight between
+    /// frames, so changing the format is safe.
+    pub(crate) fn set_pixel_format(&mut self, format: usize) {
+        // SAFETY: `layer` is a live `CAMetalLayer` and `format` is a valid
+        // `MTLPixelFormat` value chosen by the caller.
+        unsafe {
+            msg_send_void_usize(self.layer.as_raw(), objc::sel(c"setPixelFormat:"), format);
+        }
+    }
+
+    /// Drawables acquired so far.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Drawables presented so far.
+    pub fn presented(&self) -> u64 {
+        self.presented
+    }
+
+    /// Acquires the next drawable and retains it until [`Self::present`].
+    ///
+    /// Returns the monotonic drawable serial, or `None` when the layer cannot
+    /// supply a drawable (for example a zero-sized layer).
+    pub fn next_drawable(&mut self) -> Option<u64> {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: `layer` is a live `CAMetalLayer`; `nextDrawable` returns an
+        // autoreleased `id<CAMetalDrawable>` or nil.
+        let raw = unsafe { objc::msg_send_id_0(self.layer.as_raw(), objc::sel(c"nextDrawable")) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is a live drawable; `retain` keeps it alive until the
+        // matching release in `present`/`Drop`.
+        let retained = unsafe { objc::msg_send_id_0(raw, objc::sel(c"retain")) };
+        self.current = ObjcObject::from_retained(retained);
+        self.current.as_ref()?;
+        self.serial = self.serial.wrapping_add(1);
+        Some(self.serial)
+    }
+
+    /// Presents the acquired drawable, optionally copying `source` into it.
+    ///
+    /// The blit is GPU-only. A format or extent mismatch falls back to a
+    /// diagnostic clear so the window still shows live, non-black content
+    /// instead of stale memory.
+    pub fn present(&mut self, source: Option<objc::Id>) -> Result<(), PresentError> {
+        let drawable = self.current.take().ok_or_else(|| {
+            PresentError::Metal("no CAMetalLayer drawable was acquired".to_string())
+        })?;
+        let _pool = AutoreleasePool::new();
+
+        // SAFETY: `drawable` is a live `CAMetalDrawable`; `texture` returns its
+        // live `id<MTLTexture>`.
+        let target = unsafe { objc::msg_send_id_0(drawable.as_raw(), objc::sel(c"texture")) };
+        if target.is_null() {
+            return Err(PresentError::Metal("drawable texture is nil".to_string()));
+        }
+
+        // SAFETY: `queue` is the retained transport queue; `commandBuffer`
+        // returns an autoreleased buffer that lives in this pool.
+        let command_buffer =
+            unsafe { objc::msg_send_id_0(self.queue.as_raw(), objc::sel(c"commandBuffer")) };
+        if command_buffer.is_null() {
+            return Err(PresentError::Metal(
+                "MTLCommandQueue.commandBuffer returned null".to_string(),
+            ));
+        }
+
+        let mut filled = false;
+        if let Some(source) = source {
+            // SAFETY: `source` is a live `MTLTexture` retained by the caller;
+            // the accessors only read immutable properties.
+            let (source_format, target_format, source_width, source_height) = unsafe {
+                (
+                    objc::msg_send_usize_0(source, objc::sel(c"pixelFormat")),
+                    objc::msg_send_usize_0(target, objc::sel(c"pixelFormat")),
+                    objc::msg_send_usize_0(source, objc::sel(c"width")),
+                    objc::msg_send_usize_0(source, objc::sel(c"height")),
+                )
+            };
+            // BGRA8 is the layer default; RGBA8 is accepted after
+            // `set_pixel_format` switched the layer to match the surface.
+            if source_format == target_format
+                && matches!(
+                    source_format,
+                    MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM
+                )
+                && source_width == self.width as usize
+                && source_height == self.height as usize
+            {
+                encode_drawable_blit(command_buffer, source, target, self.width, self.height)?;
+                filled = true;
+            }
+        }
+        if !filled {
+            encode_drawable_clear(command_buffer, target)?;
+        }
+
+        // SAFETY: `command_buffer` is an uncommitted buffer carrying either one
+        // blit or one clear pass into the drawable texture; `drawable` is the
+        // acquired window-server drawable.
+        unsafe {
+            objc::msg_send_void_1(
+                command_buffer,
+                objc::sel(c"presentDrawable:"),
+                drawable.as_raw(),
+            );
+            objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
+        }
+
+        // SAFETY: The command buffer completed via `waitUntilCompleted`.
+        let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
+        if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            // SAFETY: `[command_buffer error]` is null or an autoreleased `NSError *`.
+            let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
+            // SAFETY: `error` is null or a live `NSError *` inside this pool.
+            let message = unsafe { objc::nserror_message(error) };
+            return Err(PresentError::Metal(format!(
+                "drawable present failed (status={status}): {message}"
+            )));
+        }
+
+        self.presented = self.presented.wrapping_add(1);
+        Ok(())
+    }
+}
+
+/// `MTLOrigin` (`NSUInteger x, y, z`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MTLOrigin {
+    x: usize,
+    y: usize,
+    z: usize,
+}
+
+/// Copies a same-format texture into the drawable texture on the GPU.
+fn encode_drawable_blit(
+    command_buffer: objc::Id,
+    source: objc::Id,
+    target: objc::Id,
+    width: u32,
+    height: u32,
+) -> Result<(), PresentError> {
+    // SAFETY: `command_buffer` is a live uncommitted buffer; `blitCommandEncoder`
+    // returns an autoreleased encoder.
+    let encoder = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder")) };
+    if encoder.is_null() {
+        return Err(PresentError::Metal(
+            "MTLCommandBuffer.blitCommandEncoder returned null".to_string(),
+        ));
+    }
+    let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+    let size = objc::MTLSize {
+        width: width as usize,
+        height: height as usize,
+        depth: 1,
+    };
+    // SAFETY: Both textures are live, single-slice level-0 BGRA8 textures with
+    // exactly `width x height` pixels, which the selector's origin/size
+    // arguments describe.
+    unsafe {
+        type Fn = unsafe extern "C" fn(
+            objc::Id,
+            objc::Sel,
+            objc::Id,
+            usize,
+            usize,
+            MTLOrigin,
+            objc::MTLSize,
+            objc::Id,
+            usize,
+            usize,
+            MTLOrigin,
+        );
+        let send: Fn = mem::transmute(objc::msg_send_entry());
+        send(
+            encoder,
+            objc::sel(
+                c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+            ),
+            source,
+            0,
+            0,
+            origin,
+            size,
+            target,
+            0,
+            0,
+            origin,
+        );
+        objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+    }
+    Ok(())
+}
+
+/// Clears the drawable texture to an opaque diagnostic colour.
+fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<(), PresentError> {
+    let class = objc::class(c"MTLRenderPassDescriptor");
+    if class.is_null() {
+        return Err(PresentError::Metal(
+            "MTLRenderPassDescriptor class unavailable".to_string(),
+        ));
+    }
+    // SAFETY: `class` is the descriptor class and `renderPassDescriptor` is its
+    // documented factory, returning an autoreleased descriptor.
+    let descriptor = unsafe { objc::msg_send_id_0(class, objc::sel(c"renderPassDescriptor")) };
+    if descriptor.is_null() {
+        return Err(PresentError::Metal(
+            "MTLRenderPassDescriptor creation returned null".to_string(),
+        ));
+    }
+    // SAFETY: `descriptor` is a live render pass descriptor; index 0 is a
+    // colour attachment slot.
+    let attachments = unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"colorAttachments")) };
+    let attachment =
+        unsafe { msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0) };
+    if attachment.is_null() {
+        return Err(PresentError::Metal(
+            "drawable colour attachment 0 is null".to_string(),
+        ));
+    }
+    // SAFETY: `attachment` is a live colour attachment descriptor.
+    unsafe {
+        objc::msg_send_void_1(attachment, objc::sel(c"setTexture:"), texture);
+        msg_send_void_usize(
+            attachment,
+            objc::sel(c"setLoadAction:"),
+            MTL_LOAD_ACTION_CLEAR,
+        );
+        msg_send_void_usize(
+            attachment,
+            objc::sel(c"setStoreAction:"),
+            MTL_STORE_ACTION_STORE,
+        );
+        msg_send_void_clear_color(
+            attachment,
+            objc::sel(c"setClearColor:"),
+            MTLClearColor {
+                red: 0.05,
+                green: 0.10,
+                blue: 0.20,
+                alpha: 1.0,
+            },
+        );
+    }
+    // SAFETY: `command_buffer` is uncommitted and `descriptor` is a fully
+    // populated render pass descriptor targeting the drawable texture.
+    let encoder = unsafe {
+        objc::msg_send_id_1(
+            command_buffer,
+            objc::sel(c"renderCommandEncoderWithDescriptor:"),
+            descriptor,
+        )
+    };
+    if encoder.is_null() {
+        return Err(PresentError::Metal(
+            "drawable renderCommandEncoderWithDescriptor: returned null".to_string(),
+        ));
+    }
+    // SAFETY: `encoder` is an active render encoder; ending it records the clear.
+    unsafe {
+        objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+    }
+    Ok(())
 }
 
 /// An opaque clear colour used by the present render pass.

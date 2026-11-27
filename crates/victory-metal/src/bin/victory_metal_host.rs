@@ -92,6 +92,9 @@ usage: victory-metal-host (--secret-hex <hex> | --secret-file <path>) [options]
                              MRT+depth graphics pipeline ids before the banner
   --aaa-frame                like --frame-gate, and report graphics/present
                              status plus the present texture checksum
+  --window                   open an NSWindow and present the registered
+                             surface with a CAMetalLayer (also enabled by
+                             VICTORY_METAL_WINDOW=1 or <width>x<height>)
   --telemetry-json <path>    write session telemetry JSON on shutdown
   -h, --help
 
@@ -207,6 +210,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut once = false;
     let mut frame_gate = false;
     let mut aaa_frame = false;
+    let mut window = false;
     let mut telemetry_json = None;
 
     let mut args = env::args().skip(1);
@@ -244,6 +248,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 aaa_frame = true;
                 frame_gate = true;
             }
+            "--window" => window = true,
             "--telemetry-json" => {
                 telemetry_json = Some(PathBuf::from(next_value(&mut args, "--telemetry-json")?));
             }
@@ -258,6 +263,22 @@ fn parse_args() -> Result<Option<Args>, String> {
             .map(PathBuf::from)
     });
 
+    // `--window` opens the default geometry; `VICTORY_METAL_WINDOW` may still
+    // select a size. Without `--window`, a window is opened only when the
+    // environment asks for one, so the headless default is unchanged.
+    let window = match (window, WindowConfig::from_env()) {
+        (_, Some(Err(()))) => {
+            return Err(format!(
+                "invalid {} value",
+                victory_metal::macos::window::WINDOW_ENV
+            ));
+        }
+        (true, Some(Ok(config))) => Some(config),
+        (true, None) => Some(WindowConfig::default()),
+        (false, Some(Ok(config))) => Some(config),
+        (false, None) => None,
+    };
+
     Ok(Some(Args {
         port,
         secret,
@@ -265,6 +286,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         once,
         frame_gate,
         aaa_frame,
+        window,
         telemetry_json,
     }))
 }
@@ -319,6 +341,8 @@ use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat};
 #[cfg(target_os = "macos")]
+use victory_metal::macos::window::{NativeWindow, WindowConfig};
+#[cfg(target_os = "macos")]
 use victory_metal::wire::{Reply, ReplyStatus};
 #[cfg(target_os = "macos")]
 use victory_metal::wire_v3::{CommandV3, SubmissionV3};
@@ -333,6 +357,7 @@ struct Args {
     once: bool,
     frame_gate: bool,
     aaa_frame: bool,
+    window: Option<WindowConfig>,
     telemetry_json: Option<PathBuf>,
 }
 
@@ -434,6 +459,12 @@ struct Stats {
     present_texture_id: Option<u64>,
     /// FNV-1a 64 of the present texture read back as RGBA8.
     present_checksum: Option<u64>,
+    /// Drawables presented by the opt-in native window.
+    window_presented: u64,
+    /// Drawables acquired by the opt-in native window.
+    window_drawables: u64,
+    /// First native-window error, if any.
+    window_error: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -453,6 +484,9 @@ impl Default for Stats {
             present_status: -1,
             present_texture_id: None,
             present_checksum: None,
+            window_presented: 0,
+            window_drawables: 0,
+            window_error: None,
         }
     }
 }
@@ -461,12 +495,74 @@ impl Default for Stats {
 struct DaemonExecutor {
     transport: Arc<DirectMetalTransport>,
     stats: Arc<Mutex<Stats>>,
+    window: Option<Arc<Mutex<NativeWindow>>>,
 }
 
 #[cfg(target_os = "macos")]
 impl DaemonExecutor {
-    fn new(transport: Arc<DirectMetalTransport>, stats: Arc<Mutex<Stats>>) -> Self {
-        Self { transport, stats }
+    fn new(
+        transport: Arc<DirectMetalTransport>,
+        stats: Arc<Mutex<Stats>>,
+        window: Option<Arc<Mutex<NativeWindow>>>,
+    ) -> Self {
+        Self {
+            transport,
+            stats,
+            window,
+        }
+    }
+
+    /// Presents one frame on the opt-in native window.
+    ///
+    /// Only a successful submission whose command stream contains a `Present`
+    /// reaches the window, and the drawable is acquired after the transport's
+    /// submission has completed, so the registered surface is final. All
+    /// AppKit/Metal calls stay on the main thread the daemon runs on.
+    fn present_window_frame(&self, submission: &SubmissionV3, result: &Result<Reply, MetalError>) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(surface_id) = submission
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                CommandV3::Present(present) => Some(present.surface_id),
+                _ => None,
+            })
+        else {
+            return;
+        };
+
+        let mut window = window.lock().unwrap_or_else(|poison| poison.into_inner());
+        window.pump_events();
+        if !matches!(result, Ok(reply) if reply.status == ReplyStatus::Ok) {
+            return;
+        }
+
+        let outcome = window
+            .set_present_surface(&self.transport, surface_id)
+            .and_then(|()| match window.next_drawable() {
+                Some(_) => Ok(()),
+                None => Err(victory_metal::macos::window::WindowError::Metal(
+                    "CAMetalLayer.nextDrawable returned nil".to_string(),
+                )),
+            })
+            .and_then(|()| window.present());
+        let presented = window.presented();
+        let drawables = window.drawable_serial();
+        drop(window);
+
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        stats.window_presented = presented;
+        stats.window_drawables = drawables;
+        if stats.window_error.is_none() {
+            if let Err(error) = outcome {
+                stats.window_error = Some(error.to_string());
+            }
+        }
     }
 
     fn record(&self, started: Instant, result: &Result<Reply, MetalError>) {
@@ -590,6 +686,7 @@ impl BatchExecutor for DaemonExecutor {
         let result =
             DirectMetalTransport::submit_v3(self.transport.as_ref(), submission, allocations);
         self.record_v3(started, submission, &result);
+        self.present_window_frame(submission, &result);
         result
     }
 
@@ -637,6 +734,7 @@ fn build_executor(
     share: &Path,
     frame_gate: bool,
     stats: &Arc<Mutex<Stats>>,
+    window: Option<Arc<Mutex<NativeWindow>>>,
 ) -> Result<(DaemonExecutor, Arc<DirectMetalTransport>), String> {
     let transport = Arc::new(
         DirectMetalTransport::new()
@@ -670,7 +768,7 @@ fn build_executor(
             ("graphics".to_string(), graphics.0),
         ];
     }
-    let executor = DaemonExecutor::new(Arc::clone(&transport), Arc::clone(stats));
+    let executor = DaemonExecutor::new(Arc::clone(&transport), Arc::clone(stats), window);
     Ok((executor, transport))
 }
 
@@ -765,6 +863,10 @@ fn write_telemetry(
         .map(|name| format!("\"{}\"", json_escape(name)))
         .collect::<Vec<_>>()
         .join(", ");
+    let window_error = stats.window_error.as_deref().map_or_else(
+        || "null".to_string(),
+        |message| format!("\"{}\"", json_escape(message)),
+    );
 
     let json = format!(
         concat!(
@@ -787,6 +889,9 @@ fn write_telemetry(
             "  \"graphics_status\": {graphics_status},\n",
             "  \"present_status\": {present_status},\n",
             "  \"present_checksum\": {present_checksum},\n",
+            "  \"window_presented\": {window_presented},\n",
+            "  \"window_drawables\": {window_drawables},\n",
+            "  \"window_error\": {window_error},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0\n",
@@ -811,6 +916,9 @@ fn write_telemetry(
         present_checksum = stats
             .present_checksum
             .map_or_else(|| "-1".to_string(), |value| value.to_string()),
+        window_presented = stats.window_presented,
+        window_drawables = stats.window_drawables,
+        window_error = window_error,
         images = images,
         loaded = !d3dmetal.is_empty(),
     );
@@ -845,9 +953,26 @@ fn run(args: Args) -> Result<(), String> {
     let share = prepare_share(args.share_dir.clone())?;
     let stats = Arc::new(Mutex::new(Stats::default()));
 
+    // ADR-020: on-screen presentation is opt-in. Opening the window before the
+    // banner means a requested window that cannot open is a startup failure,
+    // never a silent fallback to headless.
+    let window = match args.window.clone() {
+        Some(config) => {
+            let open = NativeWindow::open(config)
+                .map_err(|error| format!("cannot open the native window: {error}"))?;
+            Some(Arc::new(Mutex::new(open)))
+        }
+        None => None,
+    };
+
     // Build the first session's executor (and its frame-gate pipeline ids)
     // before the banner, so a launcher that waits for `ready` can read them.
-    let mut prepared = Some(build_executor(&share.path, args.frame_gate, &stats)?);
+    let mut prepared = Some(build_executor(
+        &share.path,
+        args.frame_gate,
+        &stats,
+        window.clone(),
+    )?);
 
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, args.port)))
         .map_err(|error| format!("cannot bind 127.0.0.1:{}: {error}", args.port))?;
@@ -866,8 +991,11 @@ fn run(args: Args) -> Result<(), String> {
             pipeline_id(&stats, "graphics"),
         )
     };
+    let window_field = args.window.as_ref().map_or_else(String::new, |config| {
+        format!(" window={}x{}", config.width, config.height)
+    });
     println!(
-        "victory-metal-host: ready port={port} pid={} compute_pipeline={compute_pipeline} graphics_pipeline={graphics_pipeline}",
+        "victory-metal-host: ready port={port} pid={} compute_pipeline={compute_pipeline} graphics_pipeline={graphics_pipeline}{window_field}",
         process::id()
     );
     io::stdout()
@@ -891,7 +1019,7 @@ fn run(args: Args) -> Result<(), String> {
 
         let (executor, transport) = match prepared.take() {
             Some(pair) => pair,
-            None => match build_executor(&share.path, args.frame_gate, &stats) {
+            None => match build_executor(&share.path, args.frame_gate, &stats, window.clone()) {
                 Ok(pair) => pair,
                 Err(error) => {
                     outcome = Err(error);
@@ -934,6 +1062,15 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
 
+    // `--once` teardown must not hang: closing the window is a synchronous
+    // orderOut/close with no nested run loop.
+    if let Some(window) = &window {
+        window
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .close();
+    }
+
     let loaded = d3dmetal_images();
     if !loaded.is_empty() && outcome.is_ok() {
         outcome = Err(format!(
@@ -974,6 +1111,9 @@ impl Clone for Stats {
             present_status: self.present_status,
             present_texture_id: self.present_texture_id,
             present_checksum: self.present_checksum,
+            window_presented: self.window_presented,
+            window_drawables: self.window_drawables,
+            window_error: self.window_error.clone(),
         }
     }
 }
