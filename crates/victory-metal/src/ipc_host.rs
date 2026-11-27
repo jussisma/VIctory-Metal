@@ -217,13 +217,14 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::abi::{VmBufferId, VmPipelineId};
 use crate::cmdlist::{ListLedger, RingError};
+use crate::compiler_pool::{CompileJob, CompilerPool, PoolError, PoolStats};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::bindings::RootSignatureLayout;
@@ -345,6 +346,19 @@ pub const MAX_PIPELINE_ABI_BYTES: usize = 16 * 1024;
 pub const MAX_ROOT_SIGNATURE_BYTES: usize = 16 * 1024;
 /// Magic of the per-stage ABI container carried in a version 2 frame.
 pub const PIPELINE_ABI_MAGIC: [u8; 4] = *b"VAB1";
+/// First four bytes of a version 3 kind 4 request. The frame names
+/// content-hashed DXIL stage files instead of carrying libraries or shader
+/// bytes, so a 16 MiB stage travels through the share directory, never the
+/// 64 KiB transport frame.
+pub const PIPELINE_FRAME_MAGIC_V3: [u8; 4] = *b"VP3\0";
+/// Version byte of the version 3 pipeline frame.
+pub const PIPELINE_FRAME_VERSION_V3: u8 = 1;
+/// Fixed header length of a version 3 pipeline frame.
+pub const PIPELINE_V3_HEADER_LEN: usize = 24;
+/// Exact length of a share-relative stage name: `stages/<64 lowercase hex>.bin`.
+pub const STAGE_FILE_NAME_LEN: usize = "stages/".len() + 64 + ".bin".len();
+/// Largest converter rejection reason a version 3 reply may carry.
+pub const MAX_PIPELINE_REJECTION_REASON: usize = 256;
 
 /// One stage of a version 2 registration: the stage's own library and the entry
 /// point resolved inside it.
@@ -959,6 +973,94 @@ fn read_pipeline_file(share_dir: &Path, ticket: u64) -> Result<Vec<u8>, HostErro
     Ok(bytes)
 }
 
+/// Whether `name` is the only shape a version 3 stage reference may take:
+/// `stages/<64 lowercase hex digits>.bin`.
+///
+/// An absolute path, `..`, backslash, extra separator or symlink target cannot
+/// be expressed, and the host re-joins it under the canonical share directory.
+fn valid_stage_file_name(name: &str) -> bool {
+    let Some(hash) = name
+        .strip_prefix("stages/")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Reads one `stages/<blake3>.bin` DXIL stage from the canonical share dir.
+///
+/// The name is validated before the join and the final component is opened
+/// `O_NOFOLLOW`; the descriptor's own metadata is rechecked so a path swapped
+/// to a symlink or FIFO after the first stat cannot smuggle bytes in. A stage
+/// may be up to 16 MiB, which is exactly why it never travels in the control
+/// frame.
+fn read_stage_file(share_dir: &Path, name: &str) -> Result<Vec<u8>, HostError> {
+    if !valid_stage_file_name(name) {
+        return Err(HostError::Protocol(
+            "stage file name is not a share-relative content hash",
+        ));
+    }
+    let path = share_dir.join(name);
+    let before = std::fs::symlink_metadata(&path)?;
+    if !before.file_type().is_file() {
+        return Err(HostError::Protocol("stage backing must be a regular file"));
+    }
+    let announced = before.len();
+    if announced == 0 || announced > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol(
+            "stage backing is empty or exceeds the 16 MiB limit",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != announced || metadata.len() > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol("stage backing changed while opening"));
+    }
+    let mut bytes = Vec::with_capacity(announced as usize);
+    let read = (&mut file)
+        .take(MAX_METALLIB_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if read as u64 != announced || bytes.is_empty() || bytes.len() as u64 > MAX_METALLIB_BYTES {
+        return Err(HostError::Protocol("stage backing changed while reading"));
+    }
+    Ok(bytes)
+}
+
+/// One process-wide translator pool, created on the first host-translated
+/// pipeline (ADR-038).
+///
+/// The Win64 guest cannot run the x86_64 macOS converter, so the ARM64 daemon
+/// owns the bounded Rosetta `--stdio` pool. Creating it lazily keeps a boot
+/// that never needs a host translation from starting any worker.
+static SHARED_COMPILER_POOL: OnceLock<Arc<CompilerPool>> = OnceLock::new();
+
+fn shared_compiler_pool() -> Arc<CompilerPool> {
+    Arc::clone(
+        SHARED_COMPILER_POOL.get_or_init(|| Arc::new(CompilerPool::from_env())),
+    )
+}
+
+/// The shared pool's statistics, without creating it.
+pub fn shared_pool_stats() -> Option<PoolStats> {
+    SHARED_COMPILER_POOL.get().map(|pool| pool.stats())
+}
+
+/// Stable `pool_status` string for host telemetry.
+pub fn shared_pool_status() -> &'static str {
+    match SHARED_COMPILER_POOL.get() {
+        Some(pool) if pool.worker_program().is_some() => "ready",
+        Some(_) => "cache-only",
+        None => "skipped",
+    }
+}
+
 struct RegisteredAllocation {
     /// Logical length from the registration frame; bindings are checked
     /// against this, not the page-rounded mapping length.
@@ -1005,6 +1107,21 @@ pub struct SessionStats {
     pub bytes_mapped: u64,
     /// Bounded reason for the last refusal or GPU failure.
     pub last_error: Option<String>,
+    /// Successfully host-translated stages per wire stage kind, in the order
+    /// vertex, pixel, mesh, object, compute.
+    pub host_translated_stages: [u64; 5],
+    /// Host-translated pipelines registered on the native device.
+    pub host_pipeline_translations_ok: u64,
+    /// Host-side translation or registration refusals.
+    pub host_pipeline_translations_refused: u64,
+    /// Stages answered from the host pool's content-hashed disk cache.
+    pub host_pipeline_cache_hits: u64,
+    /// Last bounded host-translation refusal reason.
+    pub host_translation_reason: Option<String>,
+    /// Pool status: `ready`, `cache-only` or `skipped`.
+    pub pool_status: &'static str,
+    /// Shared pool counters (all zero when the pool was never created).
+    pub pool: PoolStats,
 }
 
 /// Synchronous one-peer host session.
@@ -1057,6 +1174,22 @@ pub struct IpcHost<E: BatchExecutor> {
     /// Bounded reason for the last refusal or GPU failure; sticky across a
     /// later success so telemetry keeps the first diagnosable fault.
     last_error: Option<String>,
+    /// The host-owned Rosetta translator pool (ADR-038).
+    ///
+    /// `None` until the first version 3 pipeline request; `with_compiler_pool`
+    /// lets a test inject a pool with a fake worker.
+    compiler_pool: Option<Arc<CompilerPool>>,
+    /// Host-translated stages per wire stage kind (vertex, pixel, mesh, object,
+    /// compute).
+    host_translated_stages: [u64; 5],
+    /// Host-translated pipelines that registered on the native device.
+    host_pipeline_translations_ok: u64,
+    /// Host-side translation or registration refusals.
+    host_pipeline_translations_refused: u64,
+    /// Stages answered by the host pool's content-hashed disk cache.
+    host_pipeline_cache_hits: u64,
+    /// Last bounded host-translation refusal reason.
+    host_translation_reason: Option<String>,
     ledger: ListLedger,
 }
 
@@ -1100,8 +1233,28 @@ impl<E: BatchExecutor> IpcHost<E> {
             submissions: 0,
             refused_submissions: 0,
             last_error: None,
+            compiler_pool: None,
+            host_translated_stages: [0; 5],
+            host_pipeline_translations_ok: 0,
+            host_pipeline_translations_refused: 0,
+            host_pipeline_cache_hits: 0,
+            host_translation_reason: None,
             ledger: ListLedger::new(),
         })
+    }
+
+    /// Injects the translator pool a host-translated pipeline uses.
+    ///
+    /// Production leaves this unset and takes the process-wide lazy pool; tests
+    /// inject a pool with a fake worker so translation needs no hardware.
+    pub fn with_compiler_pool(mut self, pool: Arc<CompilerPool>) -> Self {
+        self.compiler_pool = Some(pool);
+        self
+    }
+
+    /// The pool this host is using, if a host translation asked for one.
+    pub fn compiler_pool(&self) -> Option<&Arc<CompilerPool>> {
+        self.compiler_pool.as_ref()
     }
 
     /// Overrides the per-read/per-write socket timeout.
@@ -1135,6 +1288,24 @@ impl<E: BatchExecutor> IpcHost<E> {
                 .map(|allocation| allocation.byte_len)
                 .sum(),
             last_error: self.last_error.clone(),
+            host_translated_stages: self.host_translated_stages,
+            host_pipeline_translations_ok: self.host_pipeline_translations_ok,
+            host_pipeline_translations_refused: self.host_pipeline_translations_refused,
+            host_pipeline_cache_hits: self.host_pipeline_cache_hits,
+            host_translation_reason: self.host_translation_reason.clone(),
+            // A host that never used its own pool reports the process-wide
+            // state: a later session in the same daemon sees the live pool.
+            pool_status: match self.compiler_pool.as_ref() {
+                Some(pool) if pool.worker_program().is_some() => "ready",
+                Some(_) => "cache-only",
+                None => shared_pool_status(),
+            },
+            pool: self
+                .compiler_pool
+                .as_ref()
+                .map(|pool| pool.stats())
+                .or_else(shared_pool_stats)
+                .unwrap_or_default(),
         }
     }
 
@@ -1959,7 +2130,16 @@ impl<E: BatchExecutor> IpcHost<E> {
                 self.register_compute_pipeline_v1(ticket, entry)
             }
             Some(PipelineRequest::V2(request)) => self.register_pipeline_v2(&request),
-            None => vec![PIPELINE_REPLY_REJECTED],
+            Some(PipelineRequest::V3(request)) => self.register_pipeline_v3(&request),
+            None => {
+                if payload.len() >= PIPELINE_FRAME_MAGIC_V3.len()
+                    && payload[..PIPELINE_FRAME_MAGIC_V3.len()] == PIPELINE_FRAME_MAGIC_V3
+                {
+                    self.reject_host_translation("version 3 pipeline frame failed validation")
+                } else {
+                    vec![PIPELINE_REPLY_REJECTED]
+                }
+            }
         }
     }
 
@@ -2087,6 +2267,160 @@ impl<E: BatchExecutor> IpcHost<E> {
         self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
         pipeline_reply_ok(id)
     }
+
+    /// Version 3: the guest uploaded real DXIL stages to the share directory and
+    /// the host translates them with its own Rosetta pool (ADR-038).
+    ///
+    /// Every field and file is validated before any GPU work. Translation runs
+    /// concurrently across the stage set through the owned [`CompilerPool`]; a
+    /// failed stage is a bounded refusal naming only its stage kind and the
+    /// converter failure category. The per-stage ABI is derived from the
+    /// `VMRES2` reflection, never from a guest claim, and the resulting in-memory
+    /// metallibs reuse the existing per-stage registry path.
+    fn register_pipeline_v3(&mut self, request: &PipelineRequestV3) -> Vec<u8> {
+        self.last_pipeline_rejection = None;
+        if let Err(reason) = validate_pipeline_v3(request) {
+            return self.reject_host_translation(reason);
+        }
+        if let Some(name) = request.root_signature_file.as_deref()
+            && read_stage_file(&self.share_dir, name).is_err()
+        {
+            return self
+                .reject_host_translation("the root-signature file is missing or unreadable");
+        }
+        let mut dxil = Vec::with_capacity(request.stages.len());
+        for stage in &request.stages {
+            match read_stage_file(&self.share_dir, &stage.file) {
+                Ok(bytes) => dxil.push(bytes),
+                Err(_) => {
+                    return self.reject_host_translation(format!(
+                        "the {} stage file is missing or unreadable",
+                        pipeline_stage_label(stage.stage)
+                    ));
+                }
+            }
+        }
+
+        let pool = self
+            .compiler_pool
+            .get_or_insert_with(shared_compiler_pool)
+            .clone();
+        let before = pool.stats();
+        let results: Vec<Result<crate::compiler_pool::CompiledShader, PoolError>> =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(request.stages.len());
+                for (stage, bytes) in request.stages.iter().zip(&dxil) {
+                    let pool = pool.as_ref();
+                    handles.push(scope.spawn(move || {
+                        let job = CompileJob {
+                            id: stage_job_id(stage.stage, &stage.entry, bytes),
+                            stage: converter_stage_code(stage.stage),
+                            entry: &stage.entry,
+                            dxil: bytes,
+                        };
+                        pool.compile_with_reflection(&job)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or(Err(PoolError::Closed)))
+                    .collect()
+            });
+        let cache_hits = pool.stats().cache_hits.saturating_sub(before.cache_hits);
+
+        if let Some((stage, error)) = request
+            .stages
+            .iter()
+            .zip(&results)
+            .find_map(|(stage, result)| result.as_ref().err().map(|error| (stage, error)))
+        {
+            return self.reject_host_translation(format!(
+                "{} stage translation failed: {}",
+                pipeline_stage_label(stage.stage),
+                pool_error_category(error)
+            ));
+        }
+        let reflections: Vec<&[u8]> = results
+            .iter()
+            .map(|result| {
+                result
+                    .as_ref()
+                    .expect("every stage translation succeeded")
+                    .reflection
+                    .as_slice()
+            })
+            .collect();
+        let abi = match abi_from_converter_reflections(request, &reflections) {
+            Ok(abi) => abi,
+            Err(reason) => return self.reject_host_translation(reason),
+        };
+
+        let stages: Vec<PipelineStageLibrary<'_>> = request
+            .stages
+            .iter()
+            .zip(&results)
+            .map(|(stage, result)| PipelineStageLibrary {
+                stage: stage.stage,
+                metallib: result
+                    .as_ref()
+                    .expect("every stage translation succeeded")
+                    .metallib
+                    .as_slice(),
+                entry: &stage.entry,
+            })
+            .collect();
+        let handle = self.next_content_pipeline;
+        let outcome = match request.kind {
+            PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            PIPELINE_KIND_GRAPHICS => self.executor.register_graphics_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            PIPELINE_KIND_MESH => self.executor.register_mesh_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            _ => {
+                return self.reject_host_translation("unknown pipeline kind");
+            }
+        };
+        if let Err(error) = outcome {
+            return self.reject_host_translation(format!(
+                "{} pipeline registration failed: {error}",
+                pipeline_kind_label(request.kind)
+            ));
+        }
+
+        self.host_pipeline_translations_ok = self.host_pipeline_translations_ok.saturating_add(1);
+        self.host_pipeline_cache_hits = self.host_pipeline_cache_hits.saturating_add(cache_hits);
+        for stage in &request.stages {
+            if let Some(index) = stage_kind_index(stage.stage) {
+                self.host_translated_stages[index] =
+                    self.host_translated_stages[index].saturating_add(1);
+            }
+        }
+        self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
+        pipeline_reply_ok(handle)
+    }
+
+    /// Records and answers one version 3 refusal with a bounded category.
+    fn reject_host_translation(&mut self, reason: impl AsRef<str>) -> Vec<u8> {
+        let reason = bounded_gpu_reason(reason.as_ref());
+        self.host_pipeline_translations_refused =
+            self.host_pipeline_translations_refused.saturating_add(1);
+        self.host_translation_reason = Some(reason.clone());
+        self.last_pipeline_rejection = Some(reason.clone());
+        pipeline_reply_rejected(&reason)
+    }
 }
 
 fn pipeline_reply_ok(id: u64) -> Vec<u8> {
@@ -2094,6 +2428,125 @@ fn pipeline_reply_ok(id: u64) -> Vec<u8> {
     reply.push(PIPELINE_REPLY_OK);
     reply.extend_from_slice(&id.to_le_bytes());
     reply
+}
+
+/// One version 3 rejection: status byte, bounded reason length and reason.
+///
+/// The older v1/v2 frames keep their one-byte rejection; only the new frame
+/// carries a reason, so no existing guest decodes a different shape.
+fn pipeline_reply_rejected(reason: &str) -> Vec<u8> {
+    let reason = bounded_gpu_reason(reason);
+    let bytes = reason.as_bytes();
+    let len = bytes.len().min(MAX_PIPELINE_REJECTION_REASON);
+    let mut reply = Vec::with_capacity(1 + 2 + len);
+    reply.push(PIPELINE_REPLY_REJECTED);
+    reply.extend_from_slice(&u16::try_from(len).expect("reason is bounded").to_le_bytes());
+    reply.extend_from_slice(&bytes[..len]);
+    reply
+}
+
+/// The converter's own stage code for a wire stage code.
+fn converter_stage_code(stage: u8) -> u32 {
+    match stage {
+        PIPELINE_STAGE_VERTEX => 1,
+        PIPELINE_STAGE_PIXEL => 2,
+        PIPELINE_STAGE_MESH => 5,
+        PIPELINE_STAGE_OBJECT => 6,
+        _ => 8,
+    }
+}
+
+/// The telemetry bucket of a wire stage code.
+fn stage_kind_index(stage: u8) -> Option<usize> {
+    Some(match stage {
+        PIPELINE_STAGE_VERTEX => 0,
+        PIPELINE_STAGE_PIXEL => 1,
+        PIPELINE_STAGE_MESH => 2,
+        PIPELINE_STAGE_OBJECT => 3,
+        PIPELINE_STAGE_COMPUTE => 4,
+        _ => return None,
+    })
+}
+
+/// A stable, non-proprietary category for a pool failure.
+///
+/// It never contains a worker path, a file name, reflection text or shader
+/// bytes: the boot telemetry only needs to say which converter stage failed.
+fn pool_error_category(error: &PoolError) -> &'static str {
+    match error {
+        PoolError::NoWorkerProgram => "no converter worker",
+        PoolError::InvalidJob(_) => "invalid conversion job",
+        PoolError::Spawn { .. } => "converter worker unavailable",
+        PoolError::WorkerWrite { .. } | PoolError::WorkerRead { .. } => {
+            "converter worker I/O failed"
+        }
+        PoolError::WorkerExited { .. } => "converter worker exited",
+        PoolError::SequenceMismatch { .. } | PoolError::IdMismatch { .. } => {
+            "converter protocol mismatch"
+        }
+        PoolError::WorkerFailed { .. } => "converter rejected the shader",
+        PoolError::Protocol { .. } => "converter protocol error",
+        PoolError::Timeout { .. } => "converter timed out",
+        PoolError::Closed => "converter pool closed",
+    }
+}
+
+/// A stable job id for one stage, matching the guest's own derivation.
+fn stage_job_id(stage: u8, entry: &str, dxil: &[u8]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&converter_stage_code(stage).to_le_bytes());
+    hasher.update(entry.as_bytes());
+    hasher.update(dxil);
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight bytes"))
+}
+
+/// Builds the per-stage [`PipelineAbi`] from the converter reflection JSON.
+///
+/// This is the host-side equivalent of the guest's `VAB1` decoder: the host
+/// just received the reflection itself, so it derives the layout directly
+/// instead of trusting a guest blob. An empty or unparsable reflection, or one
+/// whose entry point disagrees with the frame, is an explicit bounded refusal.
+fn abi_from_converter_reflections(
+    request: &PipelineRequestV3,
+    reflections: &[&[u8]],
+) -> Result<PipelineAbi, String> {
+    let mut abi = PipelineAbi::default();
+    for (stage, reflection) in request.stages.iter().zip(reflections) {
+        let label = pipeline_stage_label(stage.stage);
+        let text = std::str::from_utf8(reflection)
+            .map_err(|_| format!("the {label} stage reflection is not UTF-8"))?;
+        if text.trim().is_empty() {
+            return Err(format!("the {label} stage reflection is empty"));
+        }
+        let layout = RootSignatureLayout::from_converter_reflection_json(text)
+            .map_err(|_| format!("the {label} stage reflection is not a usable root layout"))?;
+        if !layout.entry_point().is_empty() && layout.entry_point() != stage.entry {
+            return Err(format!(
+                "the {label} stage reflection names a different entry point"
+            ));
+        }
+        match stage.stage {
+            PIPELINE_STAGE_VERTEX if request.kind == PIPELINE_KIND_GRAPHICS => {
+                abi.vertex = Some(layout)
+            }
+            PIPELINE_STAGE_PIXEL if request.kind != PIPELINE_KIND_COMPUTE => {
+                abi.fragment = Some(layout)
+            }
+            PIPELINE_STAGE_MESH if request.kind == PIPELINE_KIND_MESH => abi.mesh = Some(layout),
+            PIPELINE_STAGE_OBJECT if request.kind == PIPELINE_KIND_MESH => abi.object = Some(layout),
+            PIPELINE_STAGE_COMPUTE if request.kind == PIPELINE_KIND_COMPUTE => {
+                abi.compute = Some(layout)
+            }
+            _ => {
+                return Err(format!(
+                    "the {label} stage cannot appear in a {} pipeline",
+                    pipeline_kind_label(request.kind)
+                ));
+            }
+        }
+    }
+    Ok(abi)
 }
 
 /// Human-readable name of a version 2 pipeline kind.
@@ -2299,6 +2752,8 @@ enum PipelineRequest<'a> {
     V1 { ticket: u64, entry: &'a str },
     /// The versioned multi-stage request.
     V2(PipelineRequestV2),
+    /// The versioned share-dir DXIL request the host translates itself.
+    V3(PipelineRequestV3),
 }
 
 /// One `(stage, ticket, entry)` of a version 2 request.
@@ -2319,8 +2774,30 @@ struct PipelineRequestV2 {
     root_signature: Vec<u8>,
 }
 
+/// One `(stage, share-relative DXIL file, entry)` of a version 3 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineStageFile {
+    stage: u8,
+    file: String,
+    entry: String,
+}
+
+/// A fully decoded version 3 kind 4 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineRequestV3 {
+    kind: u8,
+    stages: Vec<PipelineStageFile>,
+    state: Vec<u8>,
+    root_signature_file: Option<String>,
+}
+
 /// Decodes a kind 4 payload into a ticket and a validated entry name.
 fn decode_pipeline_request(payload: &[u8]) -> Option<PipelineRequest<'_>> {
+    if payload.len() >= PIPELINE_FRAME_MAGIC_V3.len()
+        && payload[..PIPELINE_FRAME_MAGIC_V3.len()] == PIPELINE_FRAME_MAGIC_V3
+    {
+        return decode_pipeline_request_v3(payload).map(PipelineRequest::V3);
+    }
     if payload.len() >= PIPELINE_FRAME_MAGIC.len()
         && payload[..PIPELINE_FRAME_MAGIC.len()] == PIPELINE_FRAME_MAGIC
     {
@@ -2437,6 +2914,196 @@ fn decode_pipeline_request_v2(payload: &[u8]) -> Option<PipelineRequestV2> {
         abi,
         root_signature,
     })
+}
+
+/// Decodes the version 3 frame.
+///
+/// | offset | size | field |
+/// | ---: | ---: | --- |
+/// | 0 | 4 | magic `VP3\0` |
+/// | 4 | 1 | frame version, `1` |
+/// | 5 | 1 | pipeline kind: 0 compute, 1 graphics, 2 mesh |
+/// | 6 | 1 | stage count, 1..=4 |
+/// | 7 | 1 | reserved, zero |
+/// | 8 | 4 | encoded `PipelineState` length |
+/// | 12 | 2 | root-signature file-name length, 0 or 75 |
+/// | 14 | 2 | reserved, zero |
+/// | 16 | 4 | reserved, zero |
+/// | 20 | 4 | reserved, zero |
+/// | 24 | N | stage entries: `stage u8, name_len u16, name, entry_len u16, entry` |
+/// | ... | S | encoded `PipelineState` |
+/// | ... | R | root-signature file name (optional) |
+fn decode_pipeline_request_v3(payload: &[u8]) -> Option<PipelineRequestV3> {
+    if payload.len() < PIPELINE_V3_HEADER_LEN || payload[..4] != PIPELINE_FRAME_MAGIC_V3 {
+        return None;
+    }
+    let version = payload[4];
+    let kind = payload[5];
+    let stage_count = payload[6];
+    if version != PIPELINE_FRAME_VERSION_V3
+        || kind > PIPELINE_KIND_MESH
+        || stage_count == 0
+        || usize::from(stage_count) > PIPELINE_V2_MAX_STAGES
+        || payload[7] != 0
+        || read_u16_checked(payload, 14)? != 0
+        || read_u32_checked(payload, 16)? != 0
+        || read_u32_checked(payload, 20)? != 0
+    {
+        return None;
+    }
+    let state_len = usize::try_from(read_u32_checked(payload, 8)?).ok()?;
+    let root_len = usize::from(read_u16_checked(payload, 12)?);
+    if state_len > MAX_PIPELINE_STATE_BYTES || root_len > STAGE_FILE_NAME_LEN {
+        return None;
+    }
+
+    let mut offset = PIPELINE_V3_HEADER_LEN;
+    let mut stages = Vec::with_capacity(usize::from(stage_count));
+    for _ in 0..stage_count {
+        let stage = *payload.get(offset)?;
+        offset = offset.checked_add(1)?;
+        let name_len = usize::from(read_u16_checked(payload, offset)?);
+        offset = offset.checked_add(2)?;
+        if name_len != STAGE_FILE_NAME_LEN {
+            return None;
+        }
+        let name_end = offset.checked_add(name_len)?;
+        let file = std::str::from_utf8(payload.get(offset..name_end)?).ok()?;
+        if !valid_stage_file_name(file) {
+            return None;
+        }
+        offset = name_end;
+        let entry_len = usize::from(read_u16_checked(payload, offset)?);
+        offset = offset.checked_add(2)?;
+        if entry_len == 0 || entry_len > MAX_PIPELINE_ENTRY_LEN {
+            return None;
+        }
+        let entry_end = offset.checked_add(entry_len)?;
+        let entry = std::str::from_utf8(payload.get(offset..entry_end)?).ok()?;
+        if !valid_pipeline_entry(entry) {
+            return None;
+        }
+        offset = entry_end;
+        stages.push(PipelineStageFile {
+            stage,
+            file: file.to_string(),
+            entry: entry.to_string(),
+        });
+    }
+
+    let state_end = offset.checked_add(state_len)?;
+    let state = payload.get(offset..state_end)?.to_vec();
+    let root_end = state_end.checked_add(root_len)?;
+    let root = std::str::from_utf8(payload.get(state_end..root_end)?).ok()?;
+    if root_end != payload.len() || (root_len != 0 && !valid_stage_file_name(root)) {
+        return None;
+    }
+
+    Some(PipelineRequestV3 {
+        kind,
+        stages,
+        state,
+        root_signature_file: (root_len != 0).then(|| root.to_string()),
+    })
+}
+
+/// Validates a version 3 request before any file is opened or GPU work exists.
+fn validate_pipeline_v3(request: &PipelineRequestV3) -> Result<(), &'static str> {
+    let mut seen = Vec::with_capacity(request.stages.len());
+    for stage in &request.stages {
+        if !matches!(
+            stage.stage,
+            PIPELINE_STAGE_VERTEX
+                | PIPELINE_STAGE_PIXEL
+                | PIPELINE_STAGE_MESH
+                | PIPELINE_STAGE_OBJECT
+                | PIPELINE_STAGE_COMPUTE
+        ) || seen.contains(&stage.stage)
+            || !valid_stage_file_name(&stage.file)
+        {
+            return Err("version 3 pipeline frame failed validation");
+        }
+        seen.push(stage.stage);
+    }
+
+    let index_of = |stage_code: u8| {
+        request
+            .stages
+            .iter()
+            .position(|stage| stage.stage == stage_code)
+    };
+    let stage_count = request.stages.len();
+    match request.kind {
+        PIPELINE_KIND_COMPUTE => {
+            if stage_count != 1 {
+                return Err("a compute pipeline needs exactly one stage");
+            }
+            index_of(PIPELINE_STAGE_COMPUTE).ok_or("a compute pipeline needs a compute stage")?;
+            if !request.state.is_empty()
+                && PipelineState::decode_for(&request.state, RegistryPipelineStage::Compute)
+                    .is_err()
+            {
+                return Err("the compute pipeline state is not a valid VPS1 blob");
+            }
+        }
+        PIPELINE_KIND_GRAPHICS => {
+            if stage_count != 2
+                || !request.stages.iter().all(|stage| {
+                    matches!(stage.stage, PIPELINE_STAGE_VERTEX | PIPELINE_STAGE_PIXEL)
+                })
+            {
+                return Err("a graphics pipeline needs vertex and pixel stages");
+            }
+            index_of(PIPELINE_STAGE_VERTEX).ok_or("a graphics pipeline needs a vertex stage")?;
+            let pixel = index_of(PIPELINE_STAGE_PIXEL)
+                .ok_or("a graphics pipeline needs a pixel stage")?;
+            let state =
+                PipelineState::decode_for(&request.state, RegistryPipelineStage::Graphics)
+                    .map_err(|_| "the graphics pipeline state is not a valid VPS1 blob")?;
+            if state.fragment_entry.as_deref() != Some(request.stages[pixel].entry.as_str())
+                || state.object_entry.is_some()
+                || state.color_formats.is_empty()
+                || state.color_formats.len() > 8
+            {
+                return Err("the graphics pipeline state does not match the pixel stage");
+            }
+        }
+        PIPELINE_KIND_MESH => {
+            if !(2..=3).contains(&stage_count)
+                || !request.stages.iter().all(|stage| {
+                    matches!(
+                        stage.stage,
+                        PIPELINE_STAGE_MESH | PIPELINE_STAGE_PIXEL | PIPELINE_STAGE_OBJECT
+                    )
+                })
+            {
+                return Err("a mesh pipeline needs mesh and pixel stages, optionally object");
+            }
+            index_of(PIPELINE_STAGE_MESH).ok_or("a mesh pipeline needs a mesh stage")?;
+            let pixel = index_of(PIPELINE_STAGE_PIXEL)
+                .ok_or("a mesh pipeline needs a pixel stage")?;
+            let object = index_of(PIPELINE_STAGE_OBJECT);
+            let state = PipelineState::decode_for(&request.state, RegistryPipelineStage::Mesh)
+                .map_err(|_| "the mesh pipeline state is not a valid VPS1 blob")?;
+            if state.fragment_entry.as_deref() != Some(request.stages[pixel].entry.as_str()) {
+                return Err("the mesh pipeline state does not match the pixel stage");
+            }
+            match (object, state.object_entry.as_deref()) {
+                (None, None) | (Some(_), Some(_)) => {}
+                _ => return Err("the mesh pipeline state and object stage disagree"),
+            }
+            if state
+                .mesh_threadgroup
+                .iter()
+                .chain(state.object_threadgroup.iter())
+                .any(|dimension| *dimension == 0)
+            {
+                return Err("the mesh pipeline threadgroup has a zero dimension");
+            }
+        }
+        _ => return Err("unknown pipeline kind"),
+    }
+    Ok(())
 }
 
 /// Validates a version 2 request against its kind, stage set, [`PipelineState`]
@@ -5368,5 +6035,319 @@ mod tests {
             last_error.contains("sequence mismatch"),
             "unexpected reason: {last_error}"
         );
+    }
+
+    // ---- ADR-038: host-owned DXIL translation (version 3 frame) ----
+
+    use crate::compiler_pool::PoolConfig;
+
+    /// One fake `victory-irconverter --stdio` worker: it answers `VMRES2` with a
+    /// deterministic metallib and a reflection naming the request's entry point.
+    fn write_host_worker(dir: &TestDir) -> PathBuf {
+        let path = dir.0.join("host-worker.sh");
+        let script = r#"#!/bin/sh
+set -u
+while IFS=' ' read -r magic seq id stage entry_len dxil_len; do
+    [ "$magic" = "VMJOB" ] || exit 3
+    scratch="${TMPDIR:-/tmp}/victory-host-stage-$$"
+    dd bs=1 count="$entry_len" of="$scratch.entry" 2>/dev/null
+    dd bs=1 count="$dxil_len" of="$scratch.dxil" 2>/dev/null
+    entry=$(cat "$scratch.entry")
+    metallib="MTLB:$entry"
+    if [ "$entry" = "empty_reflection" ]; then
+        reflection=""
+    else
+        reflection="{\"EntryPoint\":\"$entry\",\"ShaderType\":\"Unknown\",\"TopLevelArgumentBuffer\":[]}"
+    fi
+    printf 'VMRES2 %s %s 0 %s %s\n' "$seq" "$id" "${#metallib}" "${#reflection}"
+    printf '%s' "$metallib"
+    printf '%s' "$reflection"
+    rm -f "$scratch.entry" "$scratch.dxil"
+done
+exit 0
+"#;
+        std::fs::write(&path, script).expect("write host worker");
+        let mut permissions = std::fs::metadata(&path).expect("stat worker").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod worker");
+        path
+    }
+
+    fn host_translation_pool(dir: &TestDir) -> Arc<CompilerPool> {
+        let program = write_host_worker(dir);
+        Arc::new(CompilerPool::new(
+            PoolConfig {
+                workers: 2,
+                queue_depth: 8,
+                job_timeout: Duration::from_secs(10),
+                cache_dir: None,
+                converter_version: "victory-metal-test/host-translate/1".to_string(),
+            },
+            Some(program),
+        ))
+    }
+
+    /// The exact share-relative name a stage's blake3 hash produces.
+    fn stage_name(dxil: &[u8]) -> String {
+        format!("stages/{}.bin", blake3::hash(dxil).to_hex())
+    }
+
+    fn write_stage(dir: &TestDir, dxil: &[u8]) -> String {
+        let name = stage_name(dxil);
+        let path = dir.0.join(&name);
+        std::fs::create_dir_all(path.parent().expect("stage parent"))
+            .expect("create stages dir");
+        std::fs::write(&path, dxil).expect("write stage");
+        name
+    }
+
+    /// The exact version 3 frame the guest builds.
+    fn pipeline_request_v3(
+        kind: u8,
+        stages: &[(u8, &str, &str)],
+        state: &[u8],
+        root: Option<&str>,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&PIPELINE_FRAME_MAGIC_V3);
+        payload.push(PIPELINE_FRAME_VERSION_V3);
+        payload.push(kind);
+        payload.push(stages.len() as u8);
+        payload.push(0);
+        payload.extend_from_slice(&(state.len() as u32).to_le_bytes());
+        let root = root.unwrap_or_default();
+        payload.extend_from_slice(&(root.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for (stage, file, entry) in stages {
+            payload.push(*stage);
+            payload.extend_from_slice(&(file.len() as u16).to_le_bytes());
+            payload.extend_from_slice(file.as_bytes());
+            payload.extend_from_slice(&(entry.len() as u16).to_le_bytes());
+            payload.extend_from_slice(entry.as_bytes());
+        }
+        payload.extend_from_slice(state);
+        payload.extend_from_slice(root.as_bytes());
+        payload
+    }
+
+    /// Sends one kind 4 frame and decodes a version 3 reply (status, id, reason).
+    fn send_v3_pipeline(
+        client: &mut TcpStream,
+        payload: &[u8],
+    ) -> (u8, Option<u64>, Option<String>) {
+        write_frame(client, KIND_PIPELINE, payload).expect("send v3 pipeline");
+        let (kind, reply) = read_frame(client)
+            .expect("read v3 pipeline reply")
+            .expect("v3 pipeline reply frame");
+        assert_eq!(kind, KIND_PIPELINE_REPLY);
+        match reply.first().copied() {
+            Some(PIPELINE_REPLY_OK) => {
+                assert_eq!(reply.len(), PIPELINE_REPLY_OK_LEN);
+                let id = u64::from_le_bytes(reply[1..].try_into().expect("eight bytes"));
+                (PIPELINE_REPLY_OK, Some(id), None)
+            }
+            Some(PIPELINE_REPLY_REJECTED) => {
+                if reply.len() == 1 {
+                    return (PIPELINE_REPLY_REJECTED, None, None);
+                }
+                let reason_len =
+                    usize::from(u16::from_le_bytes([reply[1], reply[2]]));
+                assert_eq!(reply.len(), 3 + reason_len);
+                let reason = String::from_utf8(reply[3..].to_vec()).expect("utf8 reason");
+                assert!(reason.len() <= MAX_PIPELINE_REJECTION_REASON);
+                (PIPELINE_REPLY_REJECTED, None, Some(reason))
+            }
+            other => panic!("unexpected v3 pipeline reply: {other:?} / {reply:?}"),
+        }
+    }
+
+    #[test]
+    fn version_1_and_version_2_pipeline_frames_still_decode() {
+        let v1 = pipeline_request(7, "vm_entry");
+        assert!(matches!(
+            decode_pipeline_request(&v1),
+            Some(PipelineRequest::V1 { ticket: 7, .. })
+        ));
+        let v2 = pipeline_request_v2(
+            PIPELINE_KIND_GRAPHICS,
+            &[(PIPELINE_STAGE_VERTEX, 1, "vs_main"), (PIPELINE_STAGE_PIXEL, 2, "ps_main")],
+            &graphics_state(),
+            &abi_container(&[(PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION)]),
+            b"{}",
+        );
+        assert!(matches!(
+            decode_pipeline_request(&v2),
+            Some(PipelineRequest::V2(_))
+        ));
+    }
+
+    #[test]
+    fn a_version_3_frame_host_translates_and_registers_a_pipeline() {
+        let dir = TestDir::new();
+        let vertex = b"vertex-dxil-for-host-translation";
+        let pixel = b"pixel-dxil-for-host-translation";
+        let vertex_name = write_stage(&dir, vertex);
+        let pixel_name = write_stage(&dir, pixel);
+        let pool = host_translation_pool(&dir);
+        let server = start(
+            host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool),
+        );
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, vertex_name.as_str(), "vs_main"),
+                (PIPELINE_STAGE_PIXEL, pixel_name.as_str(), "ps_main"),
+            ],
+            &graphics_state(),
+            None,
+        );
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_OK, "reason: {reason:?}");
+        let id = id.expect("registered pipeline id");
+        assert_ne!(id, 0, "a successful version 3 registration returns a real id");
+        assert!(reason.is_none());
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        assert!(result.is_ok(), "the session must stay healthy: {result:?}");
+        let state = host.executor.state();
+        assert_eq!(state.graphics_pipelines.len(), 1);
+        let (_, stages, _, abi) = &state.graphics_pipelines[0];
+        assert_eq!(stages[0].0, PIPELINE_STAGE_VERTEX);
+        assert_eq!(stages[0].1, b"MTLB:vs_main");
+        assert_eq!(stages[1].0, PIPELINE_STAGE_PIXEL);
+        assert_eq!(stages[1].1, b"MTLB:ps_main");
+        assert!(abi.vertex.is_some() && abi.fragment.is_some());
+        drop(state);
+
+        let stats = host.session_stats();
+        assert_eq!(stats.host_pipeline_translations_ok, 1);
+        assert_eq!(stats.host_pipeline_translations_refused, 0);
+        assert_eq!(stats.host_translated_stages[0], 1, "vertex stage counted");
+        assert_eq!(stats.host_translated_stages[1], 1, "pixel stage counted");
+        assert_eq!(stats.pool_status, "ready");
+    }
+
+    #[test]
+    fn a_malformed_version_3_frame_is_rejected_with_no_gpu_work() {
+        let dir = TestDir::new();
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        // Stage name is not the 75-byte share-relative grammar.
+        let mut request = pipeline_request_v3(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, "stages/not-a-hash.bin", "vs_main"),
+                (PIPELINE_STAGE_PIXEL, "stages/also-not-a-hash.bin", "ps_main"),
+            ],
+            &graphics_state(),
+            None,
+        );
+        // A trailing byte makes even a decodable header malformed.
+        request.push(0x7f);
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_REJECTED);
+        assert!(id.is_none());
+        assert!(reason.is_some());
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        assert!(result.is_ok());
+        assert!(host.executor.state().graphics_pipelines.is_empty());
+        assert_eq!(host.session_stats().host_pipeline_translations_ok, 0);
+        assert_eq!(host.session_stats().host_pipeline_translations_refused, 1);
+    }
+
+    #[test]
+    fn version_3_stage_names_that_escape_the_share_dir_are_rejected() {
+        let dir = TestDir::new();
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let hash = "a".repeat(64);
+        // Absolute path, parent traversal and backslash all fail the grammar
+        // before any file is opened.
+        for bad in [
+            format!("/stages/{hash}.bin"),
+            format!("stages/../{hash}.bin"),
+            format!("stages\\{hash}.bin"),
+        ] {
+            let request = pipeline_request_v3(
+                PIPELINE_KIND_COMPUTE,
+                &[(PIPELINE_STAGE_COMPUTE, bad.as_str(), "main")],
+                &[],
+                None,
+            );
+            let (status, _, _) = send_v3_pipeline(&mut client, &request);
+            assert_eq!(status, PIPELINE_REPLY_REJECTED, "accepted {bad}");
+        }
+
+        // A syntactically valid name whose final component is a symlink is
+        // rejected by the O_NOFOLLOW open even though the target is a file.
+        let outside = dir.0.join("outside.dxil");
+        std::fs::write(&outside, b"dxil-outside").expect("write outside");
+        let name = format!("stages/{hash}.bin");
+        std::fs::create_dir_all(dir.0.join("stages")).expect("stages dir");
+        let symlink = dir.0.join(&name);
+        std::os::unix::fs::symlink(&outside, &symlink).expect("create symlink");
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, name.as_str(), "main")],
+            &[],
+            None,
+        );
+        let (status, _, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_REJECTED);
+        assert!(reason.is_some());
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        assert!(result.is_ok());
+        assert!(host.executor.state().compute_pipelines.is_empty());
+        assert_eq!(host.session_stats().host_pipeline_translations_ok, 0);
+    }
+
+    #[test]
+    fn an_empty_converter_reflection_is_a_bounded_host_refusal() {
+        let dir = TestDir::new();
+        // The fake worker answers with an empty reflection for this entry, which
+        // `compile_with_reflection` refuses as a protocol error.
+        let name = write_stage(&dir, b"compute-dxil-empty-reflection");
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, name.as_str(), "empty_reflection")],
+            &[],
+            None,
+        );
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        // The pool refuses an empty reflection before the host can derive an
+        // ABI; the host answers a bounded non-proprietary reason either way.
+        assert_eq!(status, PIPELINE_REPLY_REJECTED);
+        assert!(id.is_none());
+        let reason = reason.expect("bounded refusal reason");
+        assert!(reason.len() <= MAX_PIPELINE_REJECTION_REASON);
+        assert!(!reason.contains('/'), "reason must not carry a path: {reason}");
+        assert!(!reason.contains("stages"), "reason must not name a file: {reason}");
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        assert!(result.is_ok());
+        assert!(host.executor.state().compute_pipelines.is_empty());
     }
 }

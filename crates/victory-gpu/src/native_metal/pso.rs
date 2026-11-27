@@ -157,6 +157,9 @@ pub enum PipelineError {
     Write(String),
     /// The host refused the registration.
     Refused(String),
+    /// The host owns the translator pool but refused to translate or register
+    /// the pipeline; the reason is the host's bounded category.
+    HostTranslation(String),
     /// The transport failed.
     Transport(String),
     /// The stage set cannot be expressed as one native pipeline.
@@ -186,6 +189,9 @@ impl std::fmt::Display for PipelineError {
             ),
             Self::Write(why) => write!(f, "metallib could not be written: {why}"),
             Self::Refused(why) => write!(f, "the host refused the pipeline: {why}"),
+            Self::HostTranslation(why) => {
+                write!(f, "the host could not translate the pipeline: {why}")
+            }
             Self::Transport(why) => write!(f, "pipeline transport: {why}"),
             Self::HostCannotRegister { stage, missing } => write!(
                 f,
@@ -253,6 +259,9 @@ pub enum AttemptOutcome {
     /// could be attempted. Kept apart from [`Self::Refused`]: the failure is
     /// environmental, not a shader the host rejected.
     TranslatorUnavailable,
+    /// The ARM64 host translated the DXIL with its own converter pool and
+    /// registered the pipeline (ADR-038).
+    HostTranslated,
 }
 
 /// The static part of a refusal's bucket name (the kind is the other part).
@@ -276,6 +285,8 @@ pub enum RefusalClass {
     Write,
     /// The host rejected the registration.
     HostRefused,
+    /// The host owns the translator but could not translate or register it.
+    HostTranslation,
     /// The transport to the host failed.
     Transport,
     /// The stage set cannot form one native pipeline.
@@ -301,6 +312,7 @@ impl RefusalClass {
             Self::NoShareDir => "no-share-dir",
             Self::Write => "write",
             Self::HostRefused => "host-refused",
+            Self::HostTranslation => "host-translation",
             Self::Transport => "transport",
             Self::HostCannotRegister => "host-cannot-register",
             Self::Reflection => "reflection",
@@ -320,6 +332,7 @@ impl RefusalClass {
             PipelineError::NoShareDir => Self::NoShareDir,
             PipelineError::Write(_) => Self::Write,
             PipelineError::Refused(_) => Self::HostRefused,
+            PipelineError::HostTranslation(_) => Self::HostTranslation,
             PipelineError::Transport(_) => Self::Transport,
             PipelineError::HostCannotRegister { .. } => Self::HostCannotRegister,
             PipelineError::Reflection(_) => Self::Reflection,
@@ -340,6 +353,8 @@ pub struct KindCounts {
     pub refused: u64,
     /// Attempts that could not reach a translator.
     pub translator_unavailable: u64,
+    /// Attempts the host translated with its own converter pool (ADR-038).
+    pub host_translated: u64,
 }
 
 /// The first refusal of the session, bounded and flattened.
@@ -374,6 +389,8 @@ pub struct PipelineCensusSnapshot {
     pub refused: u64,
     /// Attempts that could not reach a translator.
     pub translator_unavailable: u64,
+    /// Attempts the host translated with its own converter pool.
+    pub host_translated: u64,
     /// The per-kind counts, in `AttemptKind` order.
     pub by_kind: BTreeMap<AttemptKind, KindCounts>,
     /// Refusals by `(kind name, class name)`, in name order.
@@ -393,12 +410,14 @@ impl PipelineCensusSnapshot {
     pub fn fields(&self) -> String {
         let mut text = format!(
             "pipeline_attempts={} pipeline_created={} pipeline_refused={} \
-             pipeline_reused={} pipeline_translator_unavailable={}",
+             pipeline_reused={} pipeline_translator_unavailable={} \
+             pipeline_host_translated={}",
             self.attempts,
             self.created,
             self.refused,
             self.reused,
-            self.translator_unavailable
+            self.translator_unavailable,
+            self.host_translated
         );
         text.push_str(" pipeline_by_kind=[");
         for (index, (kind, counts)) in self.by_kind.iter().enumerate() {
@@ -515,6 +534,9 @@ impl Census {
             AttemptOutcome::TranslatorUnavailable => {
                 counts.translator_unavailable = counts.translator_unavailable.saturating_add(1)
             }
+            AttemptOutcome::HostTranslated => {
+                counts.host_translated = counts.host_translated.saturating_add(1)
+            }
         }
         if let Some(class) = class {
             *self
@@ -546,6 +568,9 @@ impl Census {
             snapshot.translator_unavailable = snapshot
                 .translator_unavailable
                 .saturating_add(counts.translator_unavailable);
+            snapshot.host_translated = snapshot
+                .host_translated
+                .saturating_add(counts.host_translated);
         }
         snapshot
     }
@@ -1546,6 +1571,157 @@ fn registration_key(
     *hasher.finalize().as_bytes()
 }
 
+/// The share-relative directory host-translated DXIL stages are uploaded to.
+pub const HOST_STAGE_DIR: &str = "stages";
+/// Largest DXIL stage the host translator accepts, matching the pool's limit.
+pub const MAX_HOST_STAGE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Uploads one stage's DXIL to `stages/<blake3>.bin`, idempotently.
+///
+/// The name is derived only from the bytes, so a repeat upload of the same
+/// module is a metadata check and no write. A temporary name is renamed into
+/// place, so the host can never open a half-written stage.
+#[cfg(any(windows, test))]
+fn upload_host_stage(share_dir: &Path, bytes: &[u8]) -> Result<String, PipelineError> {
+    if bytes.is_empty() {
+        return Err(PipelineError::HostTranslation(
+            "a shader stage has no DXIL bytes to upload".to_string(),
+        ));
+    }
+    if bytes.len() as u64 > MAX_HOST_STAGE_BYTES {
+        return Err(PipelineError::HostTranslation(format!(
+            "a shader stage is {} bytes, over the {MAX_HOST_STAGE_BYTES}-byte host limit",
+            bytes.len()
+        )));
+    }
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let name = format!("{HOST_STAGE_DIR}/{hash}.bin");
+    let path = share_dir.join(&name);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && metadata.is_file()
+        && metadata.len() == bytes.len() as u64
+    {
+        return Ok(name);
+    }
+    let directory = share_dir.join(HOST_STAGE_DIR);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| PipelineError::Write(format!("{}: {error}", directory.display())))?;
+    let temporary = directory.join(format!(".{hash}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| PipelineError::Write(format!("{}: {error}", temporary.display())))?;
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        PipelineError::Write(format!("{}: {error}", path.display()))
+    })?;
+    Ok(name)
+}
+
+/// The `PipelineState` blob a host-translated registration carries.
+#[cfg(any(windows, test))]
+fn host_pipeline_state(
+    programs: &[StageProgram],
+    details: &PipelineDetails<'_>,
+    kind: PipelineKind,
+) -> Result<Vec<u8>, PipelineError> {
+    if !details.state.is_empty() {
+        return Ok(details.state.to_vec());
+    }
+    Ok(match kind {
+        // A compute `PipelineState` carries no colour/depth shape.
+        PipelineKind::Compute => Vec::new(),
+        PipelineKind::Graphics => {
+            let pixel_entry = programs
+                .iter()
+                .find(|program| program.stage == PipelineStage::Pixel)
+                .map(|program| program.entry.as_str())
+                .unwrap_or_default();
+            encode_graphics_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+        }
+        PipelineKind::Mesh => {
+            let stages: Vec<(PipelineStage, &[u8], &str)> = programs
+                .iter()
+                .map(|program| (program.stage, &[][..], program.entry.as_str()))
+                .collect();
+            default_mesh_state(&stages, &[DEFAULT_COLOR_FORMAT])
+        }
+    })
+}
+
+/// Hands the real DXIL stages to the ARM64 host when this process has no usable
+/// converter (the Win64 Wine guest).
+///
+/// Every stage and the optional root-signature witness are uploaded to
+/// `VICTORY_METAL_SHARE_DIR/stages/<blake3>.bin`; only their share-relative
+/// names, stage codes, entries, encoded state and the root name travel over the
+/// 64 KiB control frame. The host translates with its own bounded Rosetta pool,
+/// derives the `VAB1`-equivalent ABI from the reflection and answers the native
+/// pipeline id. A refusal becomes [`PipelineError::HostTranslation`] with the
+/// host's bounded category, never a fabricated library or a D3DMetal fallback.
+#[cfg(any(windows, test))]
+fn register_with_host_translation(
+    programs: &[StageProgram],
+    details: &PipelineDetails<'_>,
+) -> Result<(u64, PoolServing, AttemptOutcome), PipelineError> {
+    let share = share_dir().ok_or(PipelineError::NoShareDir)?;
+    let stage_codes: Vec<PipelineStage> = programs.iter().map(|program| program.stage).collect();
+    let kind = pipeline_kind(&stage_codes)?;
+    let mut uploaded: Vec<(u8, String, &str)> = Vec::with_capacity(programs.len());
+    for program in programs {
+        let file = upload_host_stage(&share, &program.dxil)?;
+        uploaded.push((program.stage.wire_code(), file, program.entry.as_str()));
+    }
+    let root_signature_file = if details.root_signature.is_empty() {
+        None
+    } else {
+        Some(upload_host_stage(&share, details.root_signature)?)
+    };
+    let state = host_pipeline_state(programs, details, kind)?;
+    let kind_code = match kind {
+        PipelineKind::Graphics => crate::native_metal::client::PIPELINE_KIND_GRAPHICS,
+        PipelineKind::Mesh => crate::native_metal::client::PIPELINE_KIND_MESH,
+        PipelineKind::Compute => crate::native_metal::client::PIPELINE_KIND_COMPUTE,
+    };
+    let session = crate::native_metal::client::live_pipeline_session().ok_or_else(|| {
+        PipelineError::Transport(
+            "no live Wire v3 host session to host-translate the pipeline".to_string(),
+        )
+    })?;
+    let wire: Vec<crate::native_metal::client::Vp3Stage<'_>> = uploaded
+        .iter()
+        .map(|(stage, file, entry)| crate::native_metal::client::Vp3Stage {
+            stage: *stage,
+            file,
+            entry,
+        })
+        .collect();
+    let id = match session.register_pipeline_v3(
+        kind_code,
+        &wire,
+        &state,
+        root_signature_file.as_deref(),
+    ) {
+        Ok(id) => id,
+        Err(crate::native_metal::queue::NativeQueueError::Refused(reason)) => {
+            return Err(PipelineError::HostTranslation(bounded_refusal_reason(&reason)));
+        }
+        Err(error) => return Err(PipelineError::Transport(error.to_string())),
+    };
+
+    // The census memory only records that this content is hosted; a later
+    // reconnect must still ask the (new) host session again.
+    let libraries: Vec<(PipelineStage, &[u8], &str)> = programs
+        .iter()
+        .map(|program| (program.stage, program.dxil.as_slice(), program.entry.as_str()))
+        .collect();
+    let details_key = PipelineDetails {
+        state: &state,
+        abi: &[],
+        root_signature: &[],
+    };
+    let _ = remember(registration_key(&stage_codes, &libraries, Some(&details_key)), id);
+    Ok((id, PoolServing { warm: false }, AttemptOutcome::HostTranslated))
+}
+
 #[cfg(any(windows, test))]
 fn register_with_details_inner(
     programs: &[StageProgram],
@@ -1555,7 +1731,17 @@ fn register_with_details_inner(
     let mut translated: Vec<(PipelineStage, CompiledShader, &str)> =
         Vec::with_capacity(programs.len());
     for program in programs {
-        let (compiled, serving) = translate_with_reflection(program)?;
+        let (compiled, serving) = match translate_with_reflection(program) {
+            Ok(translated_stage) => translated_stage,
+            // The Win64 Wine guest cannot run the x86_64 macOS converter. The
+            // ARM64 host can, so hand it the DXIL through the share directory
+            // instead of refusing the PSO (ADR-038). A guest with no share
+            // directory keeps the explicit refusal below.
+            Err(PipelineError::ConverterUnavailable(_)) if share_dir().is_some() => {
+                return register_with_host_translation(programs, details);
+            }
+            Err(error) => return Err(error),
+        };
         warm &= serving.warm;
         translated.push((program.stage, compiled, &program.entry));
     }
@@ -2444,5 +2630,208 @@ mod tests {
             AttemptKind::MeshObject
         );
         assert_eq!(attempt_kind_of_names(&[]), AttemptKind::Graphics);
+    }
+
+    // ---- ADR-038: guest uploads DXIL stages and asks the host to translate ----
+
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::sync::Mutex as StdMutex;
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::native_metal::client::{self, LiveConfig};
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct TempShare(PathBuf);
+
+    impl TempShare {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "victory-pso-host-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("create share dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempShare {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut envelope = [0u8; 5];
+        stream.read_exact(&mut envelope).expect("read envelope");
+        let len = u32::from_le_bytes(envelope[1..].try_into().expect("four bytes")) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("read payload");
+        (envelope[0], payload)
+    }
+
+    fn write_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
+        let mut envelope = [0u8; 5];
+        envelope[0] = kind;
+        envelope[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        stream.write_all(&envelope).expect("write envelope");
+        stream.write_all(payload).expect("write payload");
+        stream.flush().expect("flush frame");
+    }
+
+    /// One authenticated fake host: it answers the VP3 payload with a native id
+    /// and returns the exact control frame it received.
+    fn fake_host(secret: [u8; 32], id: u64) -> (u16, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind fake host");
+        let port = listener.local_addr().expect("listener address").port();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept guest");
+            let (kind, payload) = read_frame(&mut stream);
+            assert_eq!(kind, client::KIND_AUTH);
+            assert_eq!(payload, secret);
+            write_frame(&mut stream, client::KIND_ACK, &[0]);
+
+            let (kind, payload) = read_frame(&mut stream);
+            assert_eq!(kind, client::KIND_PIPELINE);
+            assert_eq!(&payload[..4], &client::PIPELINE_FRAME_MAGIC_V3);
+            let mut reply = vec![client::PIPELINE_REPLY_OK];
+            reply.extend_from_slice(&id.to_le_bytes());
+            write_frame(&mut stream, client::KIND_PIPELINE_REPLY, &reply);
+            sender.send(payload).expect("send captured frame");
+        });
+        (port, receiver, handle)
+    }
+
+    /// Windows-edition behaviour: the guest cannot run the macOS converter, so
+    /// it uploads the DXIL stages to the share directory and sends one VP3
+    /// frame whose exact bytes name those uploads.
+    #[test]
+    fn a_missing_converter_uploads_stages_and_asks_the_host_to_translate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let share = TempShare::new();
+        let secret = [0x5a; 32];
+        let (port, receiver, host) = fake_host(secret, 0x5151);
+
+        // Production guest configuration: a live authenticated session.
+        let config = LiveConfig::resolve(
+            Some(&format!("127.0.0.1:{port}")),
+            Some(&"5a".repeat(32)),
+            None,
+            None,
+        )
+        .expect("parse endpoint")
+        .expect("live config");
+        let client = config.connect().expect("connect fake host");
+
+        // SAFETY: the test runs with `--test-threads=1`; the lock serialises
+        // the environment across this module's tests.
+        unsafe {
+            std::env::set_var(
+                crate::native_metal::fence_page_guest::SHARE_DIR_ENV,
+                &share.0,
+            );
+            std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
+            std::env::remove_var("VICTORY_METAL_IRCONVERTER");
+        }
+        reset_census();
+
+        let vertex = b"unique-vertex-dxil-for-host-translation".to_vec();
+        let pixel = b"unique-pixel-dxil-for-host-translation".to_vec();
+        let programs = [
+            StageProgram {
+                stage: PipelineStage::Vertex,
+                dxil: vertex.clone(),
+                entry: "vs_main".to_string(),
+            },
+            StageProgram {
+                stage: PipelineStage::Pixel,
+                dxil: pixel.clone(),
+                entry: "ps_main".to_string(),
+            },
+        ];
+        let (id, serving) =
+            register_with_details(&programs, &PipelineDetails::default()).expect("host registration");
+        assert_eq!(id, 0x5151);
+        assert!(!serving.warm);
+        assert_eq!(census().host_translated, 1, "recorded as a host translation");
+
+        let payload = receiver.recv_timeout(Duration::from_secs(5)).expect("captured frame");
+        drop(client);
+        host.join().expect("fake host thread");
+
+        let decoded = client::decode_pipeline_v3_request(&payload).expect("decode VP3 bytes");
+        assert_eq!(decoded.kind, client::PIPELINE_KIND_GRAPHICS);
+        let expected = [
+            (
+                client::PIPELINE_STAGE_VERTEX,
+                format!("stages/{}.bin", blake3::hash(&vertex).to_hex()),
+                "vs_main",
+            ),
+            (
+                client::PIPELINE_STAGE_PIXEL,
+                format!("stages/{}.bin", blake3::hash(&pixel).to_hex()),
+                "ps_main",
+            ),
+        ];
+        assert_eq!(decoded.stages.len(), 2);
+        for (index, (stage, name, entry)) in expected.iter().enumerate() {
+            assert_eq!(decoded.stages[index].0, *stage);
+            assert_eq!(&decoded.stages[index].1, name);
+            assert_eq!(decoded.stages[index].2, *entry);
+            let path = share.0.join(name);
+            let bytes = std::fs::read(&path).expect("uploaded stage");
+            assert_eq!(bytes, if index == 0 { vertex.as_slice() } else { pixel.as_slice() });
+        }
+        assert!(!decoded.state.is_empty(), "graphics state travels in the frame");
+
+        // Idempotent upload: a second call reuses the same files.
+        let before: Vec<_> = std::fs::read_dir(share.0.join("stages"))
+            .expect("stages dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        upload_host_stage(&share.0, &vertex).expect("repeat upload");
+        let after: Vec<_> = std::fs::read_dir(share.0.join("stages"))
+            .expect("stages dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(before.len(), after.len(), "an existing stage is not rewritten");
+
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::remove_var(crate::native_metal::fence_page_guest::SHARE_DIR_ENV);
+        }
+    }
+
+    /// With no share directory the guest keeps today's explicit refusal: it can
+    /// neither upload DXIL nor pretend a metallib exists.
+    #[test]
+    fn without_a_share_dir_a_missing_converter_is_still_an_explicit_refusal() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::remove_var(crate::native_metal::fence_page_guest::SHARE_DIR_ENV);
+            std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
+            std::env::remove_var("VICTORY_METAL_IRCONVERTER");
+        }
+        let programs = [StageProgram {
+            stage: PipelineStage::Compute,
+            dxil: b"unique-compute-dxil-without-a-share-dir".to_vec(),
+            entry: "main".to_string(),
+        }];
+        let error = register_with_details(&programs, &PipelineDetails::default())
+            .expect_err("no converter and no share dir must refuse");
+        assert!(
+            matches!(error, PipelineError::ConverterUnavailable(_)),
+            "unexpected error: {error:?}"
+        );
     }
 }

@@ -497,6 +497,21 @@ struct Stats {
     window_error: Option<String>,
     /// Last bounded GPU/protocol refusal reason observed in this process.
     last_error: Option<String>,
+    /// Host-translated stages per wire stage kind (vertex, pixel, mesh, object,
+    /// compute).
+    host_translated_stages: [u64; 5],
+    /// Host-translated pipelines registered on the native device.
+    host_pipeline_translations_ok: u64,
+    /// Host-side translation or registration refusals.
+    host_pipeline_translations_refused: u64,
+    /// Stages answered from the host pool's disk cache.
+    host_pipeline_cache_hits: u64,
+    /// Last bounded host-translation refusal reason.
+    host_translation_reason: Option<String>,
+    /// Shared translator-pool status: `ready`, `cache-only` or `skipped`.
+    pool_status: &'static str,
+    /// Shared translator-pool counters.
+    pool: victory_metal::compiler_pool::PoolStats,
 }
 
 #[cfg(target_os = "macos")]
@@ -520,6 +535,13 @@ impl Default for Stats {
             window_drawables: 0,
             window_error: None,
             last_error: None,
+            host_translated_stages: [0; 5],
+            host_pipeline_translations_ok: 0,
+            host_pipeline_translations_refused: 0,
+            host_pipeline_cache_hits: 0,
+            host_translation_reason: None,
+            pool_status: "skipped",
+            pool: victory_metal::compiler_pool::PoolStats::default(),
         }
     }
 }
@@ -1043,6 +1065,11 @@ fn write_telemetry(
         || "null".to_string(),
         |message| format!("\"{}\"", json_escape(message)),
     );
+    let host_translation_reason = stats.host_translation_reason.as_deref().map_or_else(
+        || "null".to_string(),
+        |message| format!("\"{}\"", json_escape(message)),
+    );
+    let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
 
     let json = format!(
@@ -1070,6 +1097,23 @@ fn write_telemetry(
             "  \"window_drawables\": {window_drawables},\n",
             "  \"window_error\": {window_error},\n",
             "  \"last_error\": {last_error},\n",
+            "  \"pool_status\": \"{pool_status}\",\n",
+            "  \"pool_jobs\": {pool_jobs},\n",
+            "  \"pool_cache_hits\": {pool_cache_hits},\n",
+            "  \"pool_cache_misses\": {pool_cache_misses},\n",
+            "  \"pool_worker_jobs\": {pool_worker_jobs},\n",
+            "  \"pool_worker_starts\": {pool_worker_starts},\n",
+            "  \"pool_worker_restarts\": {pool_worker_restarts},\n",
+            "  \"host_translated_stages\": {host_translated_total},\n",
+            "  \"host_translated_stage_vertex\": {host_vertex},\n",
+            "  \"host_translated_stage_pixel\": {host_pixel},\n",
+            "  \"host_translated_stage_mesh\": {host_mesh},\n",
+            "  \"host_translated_stage_object\": {host_object},\n",
+            "  \"host_translated_stage_compute\": {host_compute},\n",
+            "  \"host_pipeline_translations_ok\": {host_ok},\n",
+            "  \"host_pipeline_translations_refused\": {host_refused},\n",
+            "  \"host_pipeline_cache_hits\": {host_cache_hits},\n",
+            "  \"host_translation_reason\": {host_translation_reason},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0,\n",
@@ -1099,6 +1143,23 @@ fn write_telemetry(
         window_drawables = stats.window_drawables,
         window_error = window_error,
         last_error = last_error,
+        pool_status = stats.pool_status,
+        pool_jobs = stats.pool.jobs,
+        pool_cache_hits = stats.pool.cache_hits,
+        pool_cache_misses = stats.pool.cache_misses,
+        pool_worker_jobs = stats.pool.worker_jobs,
+        pool_worker_starts = stats.pool.worker_starts,
+        pool_worker_restarts = stats.pool.worker_restarts,
+        host_translated_total = host_translated_total,
+        host_vertex = stats.host_translated_stages[0],
+        host_pixel = stats.host_translated_stages[1],
+        host_mesh = stats.host_translated_stages[2],
+        host_object = stats.host_translated_stages[3],
+        host_compute = stats.host_translated_stages[4],
+        host_ok = stats.host_pipeline_translations_ok,
+        host_refused = stats.host_pipeline_translations_refused,
+        host_cache_hits = stats.host_pipeline_cache_hits,
+        host_translation_reason = host_translation_reason,
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
@@ -1239,6 +1300,24 @@ fn run(args: Args) -> Result<(), String> {
             if let Some(error) = session_stats.last_error {
                 stats.last_error = Some(error);
             }
+            stats.host_pipeline_translations_ok = stats
+                .host_pipeline_translations_ok
+                .saturating_add(session_stats.host_pipeline_translations_ok);
+            stats.host_pipeline_translations_refused = stats
+                .host_pipeline_translations_refused
+                .saturating_add(session_stats.host_pipeline_translations_refused);
+            stats.host_pipeline_cache_hits = stats
+                .host_pipeline_cache_hits
+                .saturating_add(session_stats.host_pipeline_cache_hits);
+            for (index, count) in session_stats.host_translated_stages.iter().enumerate() {
+                stats.host_translated_stages[index] =
+                    stats.host_translated_stages[index].saturating_add(*count);
+            }
+            if let Some(reason) = session_stats.host_translation_reason {
+                stats.host_translation_reason = Some(reason);
+            }
+            stats.pool_status = session_stats.pool_status;
+            stats.pool = session_stats.pool;
             // An asynchronous v3 fault is observed by the completion handler
             // after the reply; prefer the newest diagnostic when present.
             if let Some(failure) = transport.last_gpu_failure() {
@@ -1325,6 +1404,13 @@ impl Clone for Stats {
             window_drawables: self.window_drawables,
             window_error: self.window_error.clone(),
             last_error: self.last_error.clone(),
+            host_translated_stages: self.host_translated_stages,
+            host_pipeline_translations_ok: self.host_pipeline_translations_ok,
+            host_pipeline_translations_refused: self.host_pipeline_translations_refused,
+            host_pipeline_cache_hits: self.host_pipeline_cache_hits,
+            host_translation_reason: self.host_translation_reason.clone(),
+            pool_status: self.pool_status,
+            pool: self.pool,
         }
     }
 }

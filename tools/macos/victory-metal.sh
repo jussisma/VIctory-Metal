@@ -90,6 +90,14 @@ esac
 APP="$TARGET_DIR/x86_64-pc-windows-gnullvm/diag/victory.exe"
 HOST_BIN="$TARGET_DIR/aarch64-apple-darwin/debug/victory_metal_host"
 IRCONV_BIN="$TARGET_DIR/x86_64-apple-darwin/debug/victory-irconverter"
+# The x86_64 converter and its library are macOS build artifacts, not title
+# content. The ARM64 host owns the Rosetta pool (ADR-038), so pass both paths
+# through its environment on every boot. The stock location matches
+# run-title-metal.sh and the live gates; VICTORY_METAL_IRCONVERTER overrides it.
+CONVERTER_LIB="${VICTORY_METAL_IRCONVERTER:-$HOME/Library/Caches/victory-macos/target/wine-cx/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib}"
+VICTORY_IRCONVERTER_WORKER="$IRCONV_BIN"
+VICTORY_METAL_IRCONVERTER="$CONVERTER_LIB"
+export VICTORY_IRCONVERTER_WORKER VICTORY_METAL_IRCONVERTER
 
 WINDOW=0
 WINDOW_SET=0
@@ -537,6 +545,8 @@ dry_run() {
     echo "  VICTORY_FRAME_MEASURED=$FRAMES"
     echo "  VICTORY_FRAME_WARMUP=<delegate default 20>"
     echo "  VICTORY_METAL_SECRET=REDACTED"
+    echo "  VICTORY_IRCONVERTER_WORKER=$IRCONV_BIN"
+    echo "  VICTORY_METAL_IRCONVERTER=$CONVERTER_LIB"
     if [ "$BACKEND" = metal ]; then
         echo "  VICTORY_METAL_ENDPOINT=<resolved by run-title-metal.sh>"
         echo "  VICTORY_METAL_SHARE_DIR=<resolved by run-title-metal.sh>"
