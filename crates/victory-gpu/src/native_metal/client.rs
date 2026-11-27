@@ -36,10 +36,20 @@
 //!
 //! # Configuration
 //!
-//! [`LiveConfig::from_env`] reads `VICTORY_METAL_ENDPOINT` (`host:port`,
-//! default `127.0.0.1:47654`) and `VICTORY_METAL_SECRET` (32 bytes as 64 hex
-//! characters or as raw bytes). The endpoint must be loopback: the host binds
-//! `127.0.0.1`, and the secret is only a local link property. The secret is
+//! [`LiveConfig::from_env`] reads `VICTORY_METAL_ENDPOINT` (`host:port`),
+//! `VICTORY_METAL_SECRET` (32 bytes as 64 hex characters or as raw bytes), and
+//! `VICTORY_BACKEND`/`VICTORY_METAL_PORT` for the ADR-016 guest auto-connect:
+//!
+//! 1. `VICTORY_METAL_ENDPOINT`, when set and non-empty, always wins.
+//! 2. Otherwise, with `VICTORY_BACKEND=metal`, the client dials
+//!    `127.0.0.1:${VICTORY_METAL_PORT:-47654}` with the short
+//!    [`AUTO_CONNECT_TIMEOUT`] instead of the ordinary I/O timeout.
+//! 3. A failed auto-connect is an explicit [`TransportError::Connect`] naming
+//!    that endpoint; there is no silent fallback and no second endpoint.
+//!
+//! The secret is required in every case: an endpoint alone has nothing to
+//! authenticate with. The endpoint must be loopback, because the host binds
+//! `127.0.0.1` and the secret is only a local link property. The secret is
 //! never logged, never named in an error, and is zeroed on drop.
 //!
 //! # Completion
@@ -62,7 +72,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use victory_metal::wire::{MAGIC, Reply, ReplyStatus, decode_reply};
+use victory_metal::wire::{decode_reply, Reply, ReplyStatus, MAGIC};
 use victory_metal::wire_v3::PROTOCOL_VERSION_V3;
 
 use crate::native_metal::queue::{NativeQueueError, V3Sink};
@@ -95,8 +105,17 @@ pub const DEFAULT_ENDPOINT: &str = "127.0.0.1:47654";
 pub const ENDPOINT_ENV: &str = "VICTORY_METAL_ENDPOINT";
 /// Environment variable carrying the 32-byte session secret.
 pub const SECRET_ENV: &str = "VICTORY_METAL_SECRET";
+/// Environment variable selecting the backend (`metal` enables auto-connect).
+pub const BACKEND_ENV: &str = "VICTORY_BACKEND";
+/// Environment variable naming the loopback port for guest auto-connect.
+pub const PORT_ENV: &str = "VICTORY_METAL_PORT";
+/// Backend value that opts into the native Metal host auto-connect.
+pub const METAL_BACKEND: &str = "metal";
 /// Default connect/read/write timeout.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Short connect timeout used only by the implicit (`VICTORY_BACKEND=metal`)
+/// endpoint, so a missing host fails fast instead of stalling the first frame.
+pub const AUTO_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Header of one encoded version 3 submission frame.
 const V3_FRAME_HEADER_LEN: usize = 20;
@@ -389,37 +408,110 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// The environment configuration of a live session.
 ///
-/// Both variables must be present and non-empty: a secret alone never opens a
-/// socket, and an endpoint alone has nothing to authenticate with.
+/// The secret must be present and non-empty; an endpoint alone has nothing to
+/// authenticate with. The endpoint is either configured explicitly or resolved
+/// from `VICTORY_BACKEND=metal`/`VICTORY_METAL_PORT` by [`Self::from_env`].
 #[derive(Debug)]
 pub struct LiveConfig {
     endpoint: Endpoint,
     secret: Secret,
+    /// Timeout used by [`Self::connect`]. It is the ordinary I/O timeout for an
+    /// explicit endpoint and the short auto-connect timeout for an implicit
+    /// one.
+    connect_timeout: Duration,
 }
 
 impl LiveConfig {
-    /// Reads [`ENDPOINT_ENV`] and [`SECRET_ENV`] from the process environment.
+    /// Reads the transport variables from the process environment.
     ///
-    /// Returns `None` when either is unset or empty; a malformed value is an
-    /// explicit error (never a silent default endpoint).
+    /// Returns `None` when no secret is configured (nothing can authenticate),
+    /// even if an endpoint is present. A malformed endpoint, secret or port is
+    /// an explicit error, never a silent fallback.
     pub fn from_env() -> Option<Result<Self, TransportError>> {
-        Self::parse(
+        Self::resolve(
             std::env::var(ENDPOINT_ENV).ok().as_deref(),
             std::env::var(SECRET_ENV).ok().as_deref(),
+            std::env::var(BACKEND_ENV).ok().as_deref(),
+            std::env::var(PORT_ENV).ok().as_deref(),
         )
     }
 
-    /// Parses a raw endpoint/secret pair, as [`Self::from_env`] does.
+    /// Parses an explicit endpoint/secret pair.
+    ///
+    /// This is the strict form: with no endpoint there is no configuration, so
+    /// it keeps [`Self::from_env`]'s explicit-endpoint behaviour.
     pub fn parse(
         endpoint: Option<&str>,
         secret: Option<&str>,
     ) -> Option<Result<Self, TransportError>> {
         let endpoint = endpoint.map(str::trim).filter(|text| !text.is_empty())?;
         let secret = secret.map(str::trim).filter(|text| !text.is_empty())?;
-        Some(
-            Endpoint::parse(endpoint)
-                .and_then(|endpoint| Secret::parse(secret).map(|secret| Self { endpoint, secret })),
-        )
+        Some(Endpoint::parse(endpoint).and_then(|endpoint| {
+            Secret::parse(secret).map(|secret| Self {
+                endpoint,
+                secret,
+                connect_timeout: DEFAULT_IO_TIMEOUT,
+            })
+        }))
+    }
+
+    /// Resolves the endpoint/secret pair, backend and port without touching
+    /// the process environment.
+    ///
+    /// `endpoint` (when non-empty) takes precedence. Otherwise
+    /// `backend == "metal"` selects the ADR-016 implicit endpoint
+    /// `127.0.0.1:${port:-47654}` with [`AUTO_CONNECT_TIMEOUT`]. Any other
+    /// backend with no endpoint yields `None`.
+    pub fn resolve(
+        endpoint: Option<&str>,
+        secret: Option<&str>,
+        backend: Option<&str>,
+        port: Option<&str>,
+    ) -> Option<Result<Self, TransportError>> {
+        let secret = secret.map(str::trim).filter(|text| !text.is_empty())?;
+        let secret = || Secret::parse(secret);
+
+        if let Some(endpoint) = endpoint.map(str::trim).filter(|text| !text.is_empty()) {
+            return Some(Endpoint::parse(endpoint).and_then(|endpoint| {
+                Ok(Self {
+                    endpoint,
+                    secret: secret()?,
+                    connect_timeout: DEFAULT_IO_TIMEOUT,
+                })
+            }));
+        }
+
+        let metal = backend
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case(METAL_BACKEND));
+        if !metal {
+            return None;
+        }
+
+        let port = match port.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => match text.parse::<u16>() {
+                Ok(0) => {
+                    return Some(Err(TransportError::Endpoint(
+                        "VICTORY_METAL_PORT: port 0 is not usable".to_string(),
+                    )));
+                }
+                Ok(port) => port,
+                Err(_) => {
+                    return Some(Err(TransportError::Endpoint(format!(
+                        "VICTORY_METAL_PORT: `{text}` is not a port"
+                    ))));
+                }
+            },
+            None => DEFAULT_PORT,
+        };
+        let auto_endpoint = format!("127.0.0.1:{port}");
+        Some(Endpoint::parse(&auto_endpoint).and_then(|endpoint| {
+            Ok(Self {
+                endpoint,
+                secret: secret()?,
+                connect_timeout: AUTO_CONNECT_TIMEOUT,
+            })
+        }))
     }
 
     /// The configured endpoint.
@@ -427,9 +519,14 @@ impl LiveConfig {
         &self.endpoint
     }
 
-    /// Opens an authenticated session with the default timeout.
+    /// The timeout [`Self::connect`] uses.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Opens an authenticated session with the configured timeout.
     pub fn connect(&self) -> Result<WireV3Client, TransportError> {
-        self.connect_with_timeout(DEFAULT_IO_TIMEOUT)
+        self.connect_with_timeout(self.connect_timeout)
     }
 
     /// Opens an authenticated session with an explicit bounded timeout.
@@ -906,7 +1003,7 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use victory_metal::wire::{BufferBinding, Dispatch1d, ListIdentity, Reply};
-    use victory_metal::wire_v3::{CommandV3, SubmissionV3, encode_submission_v3};
+    use victory_metal::wire_v3::{encode_submission_v3, CommandV3, SubmissionV3};
 
     use super::*;
 
@@ -1390,6 +1487,91 @@ mod tests {
                 .expect("both variables present"),
             Err(TransportError::NotLoopback(_))
         ));
+    }
+
+    fn secret_text() -> String {
+        "ab".repeat(SECRET_LEN)
+    }
+
+    #[test]
+    fn metal_backend_auto_connects_to_the_default_loopback_endpoint() {
+        let secret = secret_text();
+        let config = LiveConfig::resolve(None, Some(&secret), Some("metal"), None)
+            .expect("a secret is configured")
+            .expect("auto-connect resolves");
+        assert_eq!(config.endpoint().to_string(), "127.0.0.1:47654");
+        assert_eq!(config.connect_timeout(), AUTO_CONNECT_TIMEOUT);
+
+        let config = LiveConfig::resolve(None, Some(&secret), Some("METAL"), Some("50123"))
+            .expect("a secret is configured")
+            .expect("auto-connect resolves");
+        assert_eq!(config.endpoint().to_string(), "127.0.0.1:50123");
+        assert_eq!(config.endpoint().port(), 50123);
+    }
+
+    #[test]
+    fn an_explicit_endpoint_beats_backend_auto_connect() {
+        let secret = secret_text();
+        let config = LiveConfig::resolve(
+            Some("127.0.0.1:1234"),
+            Some(&secret),
+            Some("metal"),
+            Some("50123"),
+        )
+        .expect("a secret is configured")
+        .expect("explicit endpoint resolves");
+        assert_eq!(config.endpoint().to_string(), "127.0.0.1:1234");
+        assert_eq!(config.connect_timeout(), DEFAULT_IO_TIMEOUT);
+    }
+
+    #[test]
+    fn auto_connect_requires_the_metal_backend_and_a_secret() {
+        let secret = secret_text();
+        assert!(LiveConfig::resolve(None, Some(&secret), Some("d3d12"), None).is_none());
+        assert!(LiveConfig::resolve(None, Some(&secret), None, None).is_none());
+        assert!(LiveConfig::resolve(None, None, Some("metal"), None).is_none());
+        assert!(LiveConfig::resolve(None, Some("  "), Some("metal"), None).is_none());
+    }
+
+    #[test]
+    fn an_invalid_auto_connect_port_is_an_explicit_endpoint_error() {
+        let secret = secret_text();
+        for port in ["0", "65536", "abc"] {
+            let error = LiveConfig::resolve(None, Some(&secret), Some("metal"), Some(port))
+                .expect("a secret is configured")
+                .expect_err("a bad port is not silently defaulted");
+            let text = error.to_string();
+            assert!(
+                text.contains("VICTORY_METAL_PORT") || text.contains("not a port"),
+                "the error names the port setting: {text}"
+            );
+            assert!(!text.contains("abab"), "the secret is not named: {text}");
+        }
+    }
+
+    #[test]
+    fn a_failed_auto_connect_names_the_implicit_endpoint() {
+        // Bind and drop so the port is almost certainly free.
+        let port = {
+            let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .expect("bind loopback");
+            listener.local_addr().expect("address").port()
+        };
+        let secret = secret_text();
+        let config =
+            LiveConfig::resolve(None, Some(&secret), Some("metal"), Some(&port.to_string()))
+                .expect("a secret is configured")
+                .expect("auto-connect resolves");
+        assert_eq!(config.connect_timeout(), AUTO_CONNECT_TIMEOUT);
+        let error = config
+            .connect()
+            .expect_err("nothing listens on the closed port");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("127.0.0.1:{port}")),
+            "the implicit endpoint is named: {text}"
+        );
+        assert!(!text.contains("abab"), "the secret is not named: {text}");
     }
 
     #[test]
