@@ -640,6 +640,25 @@ impl View {
             View::Placed(..) => 6,
         }
     }
+
+    /// Whether this view names a resource object. D3D12 writes a *null
+    /// resource view* when `CreateShaderResourceView`/
+    /// `CreateUnorderedAccessView` is called with a null resource; such a slot
+    /// names neither a buffer nor a texture. It is not a live view, so a
+    /// descriptor-table run treats it like an unwritten slot and ends there.
+    /// The record stays in [`Views`] so the host view heap still makes its
+    /// null view ([`crate::descriptor::host`] reads [`view_at`], not
+    /// [`view`]). A null CBV keeps its own named refusal instead: it names a
+    /// range, not a resource, and has a separate classification.
+    #[cfg(any(windows, test))]
+    fn names_a_resource(&self) -> bool {
+        match *self {
+            View::Shader(resource, _) | View::Unordered(resource, _, _) => resource != 0,
+            View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_) | View::Placed(..) => {
+                true
+            }
+        }
+    }
 }
 
 /// Every distinct view in use; a descriptor holds a tag, an index into it
@@ -859,6 +878,13 @@ fn views_current_into(records: &[[u32; 3]], out: &mut Vec<bool>) {
 
 /// The view recorded at `handle`, if one is (and its resource is alive),
 /// pinned until the returned value is dropped.
+///
+/// A slot holding a *null resource view* (an SRV/UAV that names no resource)
+/// has no live view: it reads as [`None`] here, exactly like a slot never
+/// written, so a descriptor-table run ends at it instead of misclassifying it
+/// as a buffer or a texture. The record itself is kept for the host view heap,
+/// which reads [`view_at`] directly and still makes the null view of the
+/// title's kind.
 #[cfg(any(windows, test))]
 pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     if handle == 0 {
@@ -866,7 +892,8 @@ pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+    let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()?;
+    view.names_a_resource().then_some(view)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -1344,6 +1371,17 @@ pub(crate) mod tests {
     use std::alloc::Layout;
     use std::ffi::c_void;
 
+    /// The view record a slot holds, *without* [`view`]'s null-descriptor
+    /// filter: what the host view heap reads through [`view_at`].
+    fn recorded(handle: u64) -> Option<ViewPin> {
+        if handle == 0 {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in the test's slot array.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+    }
+
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
     #[repr(C)]
@@ -1583,7 +1621,10 @@ pub(crate) mod tests {
         create_cbv(null, &[0x1000, 1, 256, 0], s0);
         assert_eq!(view(s0).as_deref(), Some(&View::Constant(0x1_0000_1000, 256)));
         create_srv(null, null, std::ptr::null(), s1);
-        assert_eq!(view(s1).as_deref(), Some(&View::Shader(0, None)));
+        // A null descriptor names no live view, so a table run ends there;
+        // the record is still kept for the host view heap.
+        assert!(view(s1).is_none(), "a null SRV names no live view");
+        assert_eq!(recorded(s1).as_deref(), Some(&View::Shader(0, None)));
         // The same view twice is one entry.
         create_srv(null, null, std::ptr::null(), s2);
         // SAFETY: both slots are in `heap`.
@@ -1635,11 +1676,43 @@ pub(crate) mod tests {
         create_cbv(null, &[0x1000, 1, 256, 0], a);
         assert_eq!(view(a).as_deref(), Some(&View::Constant(0x1_0000_1000, 256)));
         create_cbv(null, std::ptr::null(), a);
+        // A null CBV is still a view of its own kind (it names a range, not a
+        // resource); only SRV/UAV null resource views read as no live view.
         assert_eq!(view(a).as_deref(), Some(&View::Constant(0, 0)));
         create_srv(null, null, std::ptr::null(), a);
-        assert_eq!(view(a).as_deref(), Some(&View::Shader(0, None)));
+        assert!(view(a).is_none(), "a null SRV names no live view");
+        assert_eq!(recorded(a).as_deref(), Some(&View::Shader(0, None)));
         create_cbv(null, std::ptr::null(), a);
         assert_eq!(view(a).as_deref(), Some(&View::Constant(0, 0)));
+    }
+
+    /// A null texture SRV, a null buffer SRV and a null UAV all name no
+    /// resource: table enumeration must see no live view for them, while the
+    /// host heap still gets their recorded shape.
+    #[test]
+    fn every_null_resource_view_reads_as_no_live_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 4];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        let texture = [0u32, 3, 0, 0, 0, 1, 0, 0, 0, 0];
+        let buffer = [0u32, 1, 0, 0, 64, 0, 0, 0, 0, 0];
+        // Resource null, view description naming a 2D texture.
+        create_srv(null, null, &raw const texture, at(0));
+        assert!(view(at(0)).is_none());
+        assert_eq!(
+            recorded(at(0)).as_deref(),
+            Some(&View::Shader(0, Some(texture)))
+        );
+        // Resource null, view description naming a buffer.
+        create_srv(null, null, &raw const buffer, at(1));
+        assert!(view(at(1)).is_none());
+        // Resource null UAV with a null counter: still no UAV to bind.
+        create_uav(null, null, null, &raw const buffer, at(2));
+        assert!(view(at(2)).is_none());
+        // A null SRV with no description: the all-zero-descriptor shape.
+        create_srv(null, null, std::ptr::null(), at(3));
+        assert!(view(at(3)).is_none());
+        assert_eq!(recorded(at(3)).as_deref(), Some(&View::Shader(0, None)));
     }
 
     /// A released resource's views go stale; the same view of a new
