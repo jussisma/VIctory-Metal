@@ -430,6 +430,7 @@ dry_run() {
     print_args "$@"
     echo "ENVIRONMENT"
     echo "  VICTORY_BACKEND=metal"
+    echo "  ROSETTA_ADVERTISE_AVX=${ROSETTA_ADVERTISE_AVX:-1}"
     if [ -n "$TIMEOUT" ]; then
         echo "  GUEST_TIMEOUT=$TIMEOUT"
     else
