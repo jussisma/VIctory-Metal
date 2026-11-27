@@ -20,9 +20,11 @@
 //! ```
 //!
 //! Every root parameter is flattened into the top-level argument buffer in root
-//! signature order. Descriptor parameters occupy one 8-byte field containing a
-//! 64-bit device address. Descriptor *tables* occupy one 8-byte field containing
-//! the device address of an array of descriptors in GPU-visible memory:
+//! signature order. Descriptor parameters occupy one field containing a 64-bit
+//! device address; the converter may report that field with an 8-byte or a
+//! 24-byte `Size` (`_Desc { address, 0, 0 }`, of which only the first 8 bytes are
+//! used). Descriptor *tables* occupy one field containing the device address of
+//! an array of descriptors in GPU-visible memory:
 //!
 //! ```text
 //! root CBV / SRV / UAV : field = address of the resource data
@@ -31,6 +33,10 @@
 //! table of samplers    : field = address of [_Desc { smp, id, id }; count]    (stride 24)
 //! root constants       : inline bytes at the reflected offset (see below)
 //! ```
+//!
+//! A sampler table is reflected as `{"Type":"Sampler",…}` (not `"Table"`), and
+//! an argument buffer with no parameters may be an absent or empty
+//! `TopLevelArgumentBuffer`; both are valid layouts.
 //!
 //! Verified against a converted compute shader with
 //! `RootConstants(b0), CBV(b1), SRV(t0), UAV(u0), DescriptorTable(SRV(t1)),
@@ -80,6 +86,7 @@
 //! ```
 
 use std::ffi::c_void;
+use std::fmt;
 
 use crate::abi::VmBufferId;
 use crate::macos::objc;
@@ -287,110 +294,299 @@ pub struct RootSignatureLayout {
     root_constants_metal_index: Option<usize>,
 }
 
+/// A bounded, content-free reason one converter reflection cannot become a
+/// root-signature layout.
+///
+/// The reflection JSON is never reproduced: the error carries only the
+/// zero-based entry index (when the fault is specific to one entry), the
+/// reflected field name and a fixed explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflectionLayoutError {
+    entry: Option<usize>,
+    field: &'static str,
+    reason: &'static str,
+}
+
+impl ReflectionLayoutError {
+    fn document(reason: &'static str) -> Self {
+        Self {
+            entry: None,
+            field: "reflection document",
+            reason,
+        }
+    }
+
+    fn top_level(field: &'static str, reason: &'static str) -> Self {
+        Self {
+            entry: None,
+            field,
+            reason,
+        }
+    }
+
+    fn entry(index: usize, field: &'static str, reason: &'static str) -> Self {
+        Self {
+            entry: Some(index),
+            field,
+            reason,
+        }
+    }
+
+    /// Zero-based `TopLevelArgumentBuffer` entry that failed, when the fault is
+    /// specific to one entry.
+    pub fn entry_index(&self) -> Option<usize> {
+        self.entry
+    }
+
+    /// Reflected field that failed.
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    /// Fixed, content-free explanation.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for ReflectionLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.entry {
+            Some(index) => write!(
+                formatter,
+                "entry {index} field `{}`: {}",
+                self.field, self.reason
+            ),
+            None => write!(formatter, "field `{}`: {}", self.field, self.reason),
+        }
+    }
+}
+
+impl From<ReflectionLayoutError> for MetalError {
+    fn from(error: ReflectionLayoutError) -> Self {
+        // `MetalError::InvalidArg` carries a `&'static str`; callers that need
+        // the entry index use the detailed variant instead.
+        MetalError::InvalidArg(error.reason)
+    }
+}
+
+/// One way a reflected root parameter is not representable in the argument
+/// buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterFault {
+    ConstantsSize,
+    ConstantsSizeAlignment,
+    ConstantsOffsetAlignment,
+    DescriptorTooSmall,
+    DescriptorAlignment,
+    Overlap,
+    ExtentOverflow,
+    ArgumentBufferTooLarge,
+}
+
+impl ParameterFault {
+    fn field(self) -> &'static str {
+        match self {
+            Self::ConstantsSize
+            | Self::ConstantsSizeAlignment
+            | Self::DescriptorTooSmall
+            | Self::ExtentOverflow => "Size",
+            Self::ConstantsOffsetAlignment
+            | Self::DescriptorAlignment
+            | Self::Overlap
+            | Self::ArgumentBufferTooLarge => "EltOffset",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ConstantsSize => "root constants size is outside 1..=4096 bytes",
+            Self::ConstantsSizeAlignment | Self::ConstantsOffsetAlignment => {
+                "root constants must be 4-byte aligned and sized"
+            }
+            Self::DescriptorTooSmall => {
+                "descriptor argument-buffer slot is smaller than one address"
+            }
+            Self::DescriptorAlignment => "descriptor argument-buffer offset must be 8-byte aligned",
+            Self::Overlap => "root parameters overlap in the argument buffer",
+            Self::ExtentOverflow => "root parameter extent overflows",
+            Self::ArgumentBufferTooLarge => "root parameters exceed the 64 KiB argument buffer",
+        }
+    }
+}
+
+/// Validates parameters already sorted by argument-buffer offset.
+///
+/// `sources` is aligned with `parameters` and carries the original reflection
+/// entry index so a refusal can name it.
+fn validate_parameters<E>(
+    parameters: &[RootParameter],
+    sources: &[Option<usize>],
+    mut report: impl FnMut(Option<usize>, ParameterFault) -> E,
+) -> Result<(), E> {
+    let mut end = 0usize;
+    for (position, parameter) in parameters.iter().enumerate() {
+        let source = sources.get(position).copied().flatten();
+        if parameter.kind == RootParameterKind::Constants {
+            if parameter.size == 0 || parameter.size > MAX_ROOT_CONSTANT_BYTES {
+                return Err(report(source, ParameterFault::ConstantsSize));
+            }
+            if !parameter.size.is_multiple_of(4) {
+                return Err(report(source, ParameterFault::ConstantsSizeAlignment));
+            }
+            if !parameter.argument_offset.is_multiple_of(4) {
+                return Err(report(source, ParameterFault::ConstantsOffsetAlignment));
+            }
+        } else {
+            if parameter.size < DEVICE_ADDRESS_BYTES {
+                return Err(report(source, ParameterFault::DescriptorTooSmall));
+            }
+            if !parameter
+                .argument_offset
+                .is_multiple_of(DEVICE_ADDRESS_BYTES)
+            {
+                return Err(report(source, ParameterFault::DescriptorAlignment));
+            }
+        }
+        if parameter.argument_offset < end {
+            return Err(report(source, ParameterFault::Overlap));
+        }
+        end = parameter
+            .argument_offset
+            .checked_add(parameter.size)
+            .ok_or_else(|| report(source, ParameterFault::ExtentOverflow))?;
+        if end > MAX_ARGUMENT_BUFFER_BYTES {
+            return Err(report(source, ParameterFault::ArgumentBufferTooLarge));
+        }
+    }
+    Ok(())
+}
+
 impl RootSignatureLayout {
     /// Parses Apple's `IRShaderReflectionCopyJSONString` output.
     ///
-    /// Required field: `TopLevelArgumentBuffer`. `EntryPoint` and `ShaderType`
-    /// are recorded when present. Every entry must have `EltOffset`, `Size`,
-    /// `Slot`, `Space` and a `Type` of `Constant`, `CBV`, `SRV`, `UAV` or
-    /// `Table`; descriptor fields must be 8-byte aligned and at least 8 bytes,
-    /// root constants must be 4-byte aligned and 4-byte sized, and no two
-    /// parameters may overlap.
+    /// `TopLevelArgumentBuffer` is optional: an absent, `null` or empty array is
+    /// a valid layout with no parameters. When present, every entry must have
+    /// `EltOffset`, `Size`, `Slot`, `Space` and a `Type` of `Constant`, `CBV`,
+    /// `SRV`, `UAV`, `Table` or `Sampler`; descriptor fields must be 8-byte
+    /// aligned and at least 8 bytes, root constants must be 4-byte aligned and
+    /// 4-byte sized, and no two parameters may overlap.
+    ///
+    /// Use [`Self::from_converter_reflection_json_detailed`] when the refusal
+    /// reason must name the failing reflection entry.
     pub fn from_converter_reflection_json(json: &str) -> Result<Self, MetalError> {
-        let root = parse_json(json)?;
-        let entry_point = root
-            .get("EntryPoint")
-            .and_then(Json::as_str)
+        Self::from_converter_reflection_json_detailed(json).map_err(MetalError::from)
+    }
+
+    /// Parses Apple's `IRShaderReflectionCopyJSONString` output, naming the
+    /// failing field on refusal.
+    ///
+    /// The accepted shapes are the same as
+    /// [`Self::from_converter_reflection_json`]. Reflection field names are
+    /// matched case-insensitively because the converter's JSON key casing is not
+    /// part of its contract. A refusal never reproduces reflected names or
+    /// values: it carries only the zero-based entry index, the reflected field
+    /// name and a fixed explanation.
+    pub fn from_converter_reflection_json_detailed(
+        json: &str,
+    ) -> Result<Self, ReflectionLayoutError> {
+        let root = parse_json(json)
+            .map_err(|error| ReflectionLayoutError::document(metal_error_reason(error)))?;
+        let entry_point = json_string_field(&root, "EntryPoint")
             .unwrap_or_default()
             .to_string();
-        let stage = root
-            .get("ShaderType")
-            .and_then(Json::as_str)
+        let stage = json_string_field(&root, "ShaderType")
             .map_or(ReflectedStage::Other, ReflectedStage::from_json);
-        let entries = root
-            .get("TopLevelArgumentBuffer")
-            .and_then(Json::as_array)
-            .ok_or(MetalError::InvalidArg(
-                "converter reflection has no TopLevelArgumentBuffer array",
-            ))?;
+        // A converter that emits no resources omits the array (observed empty
+        // arrays too); both mean "no root parameters", not an unusable layout.
+        let entries: &[Json] = match json_field(&root, &["TopLevelArgumentBuffer"]) {
+            None | Some(Json::Null) => &[],
+            Some(value) => value.as_array().ok_or(ReflectionLayoutError::top_level(
+                "TopLevelArgumentBuffer",
+                "TopLevelArgumentBuffer is not an array",
+            ))?,
+        };
         if entries.len() > 64 {
-            return Err(MetalError::InvalidArg(
+            return Err(ReflectionLayoutError::top_level(
+                "TopLevelArgumentBuffer",
                 "converter reflection has more than 64 root parameters",
             ));
         }
 
         let mut parameters = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let object = entry.as_object().ok_or(MetalError::InvalidArg(
+        for (index, entry) in entries.iter().enumerate() {
+            let object = entry.as_object().ok_or(ReflectionLayoutError::entry(
+                index,
+                "TopLevelArgumentBuffer",
                 "TopLevelArgumentBuffer entry is not an object",
             ))?;
-            let offset = object
-                .iter()
-                .find(|(key, _)| key == "EltOffset")
-                .and_then(|(_, value)| value.as_u64())
-                .ok_or(MetalError::InvalidArg(
-                    "TopLevelArgumentBuffer entry has no EltOffset",
+            let offset = reflection_u64(object, index, "EltOffset")?;
+            let size = reflection_u64(object, index, "Size")?;
+            let slot = reflection_u64(object, index, "Slot")?;
+            let space = reflection_u64(object, index, "Space")?;
+            let type_name = json_object_field(object, &["Type"])
+                .ok_or(ReflectionLayoutError::entry(
+                    index,
+                    "Type",
+                    missing_field_reason("Type"),
+                ))?
+                .as_str()
+                .ok_or(ReflectionLayoutError::entry(
+                    index,
+                    "Type",
+                    "Type is not a string",
                 ))?;
-            let size = object
-                .iter()
-                .find(|(key, _)| key == "Size")
-                .and_then(|(_, value)| value.as_u64())
-                .ok_or(MetalError::InvalidArg(
-                    "TopLevelArgumentBuffer entry has no Size",
-                ))?;
-            let slot = object
-                .iter()
-                .find(|(key, _)| key == "Slot")
-                .and_then(|(_, value)| value.as_u64())
-                .ok_or(MetalError::InvalidArg(
-                    "TopLevelArgumentBuffer entry has no Slot",
-                ))?;
-            let space = object
-                .iter()
-                .find(|(key, _)| key == "Space")
-                .and_then(|(_, value)| value.as_u64())
-                .ok_or(MetalError::InvalidArg(
-                    "TopLevelArgumentBuffer entry has no Space",
-                ))?;
-            let type_name = object
-                .iter()
-                .find(|(key, _)| key == "Type")
-                .and_then(|(_, value)| value.as_str())
-                .ok_or(MetalError::InvalidArg(
-                    "TopLevelArgumentBuffer entry has no Type",
-                ))?;
+            let kind = root_parameter_kind(type_name).ok_or(ReflectionLayoutError::entry(
+                index,
+                "Type",
+                "converter reflection has an unknown root parameter type",
+            ))?;
 
-            let kind = match type_name {
-                "Constant" => RootParameterKind::Constants,
-                "CBV" => RootParameterKind::ConstantBufferView,
-                "SRV" => RootParameterKind::ShaderResourceView,
-                "UAV" => RootParameterKind::UnorderedAccessView,
-                "Table" => RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified),
-                _ => {
-                    return Err(MetalError::InvalidArg(
-                        "converter reflection has an unknown root parameter type",
-                    ));
-                }
+            let (Ok(argument_offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size))
+            else {
+                return Err(ReflectionLayoutError::entry(
+                    index,
+                    "EltOffset",
+                    "reflected offset or size does not fit usize",
+                ));
             };
-            parameters.push(RootParameter {
-                kind,
-                argument_offset: usize::try_from(offset).map_err(|_| {
-                    MetalError::InvalidArg("root parameter offset does not fit usize")
-                })?,
-                size: usize::try_from(size)
-                    .map_err(|_| MetalError::InvalidArg("root parameter size does not fit usize"))?,
-                register: u32::try_from(slot).unwrap_or(u32::MAX),
-                space: u32::try_from(space).unwrap_or(u32::MAX),
-            });
+            parameters.push((
+                index,
+                RootParameter {
+                    kind,
+                    argument_offset,
+                    size,
+                    register: u32::try_from(slot).unwrap_or(u32::MAX),
+                    space: u32::try_from(space).unwrap_or(u32::MAX),
+                },
+            ));
         }
 
-        Self::assemble(
+        parameters.sort_by_key(|(_, parameter)| parameter.argument_offset);
+        let sources: Vec<Option<usize>> = parameters
+            .iter()
+            .map(|(index, _)| Some(*index))
+            .collect();
+        let flattened: Vec<RootParameter> = parameters
+            .into_iter()
+            .map(|(_, parameter)| parameter)
+            .collect();
+        validate_parameters(&flattened, &sources, |source, fault| {
+            ReflectionLayoutError::entry(
+                source.unwrap_or_default(),
+                fault.field(),
+                fault.reason(),
+            )
+        })?;
+
+        Self::assemble_sorted(
             stage,
             entry_point,
             TOP_LEVEL_ARGUMENT_BUFFER_INDEX,
-            parameters,
+            flattened,
             None,
         )
+        .map_err(|error| ReflectionLayoutError::document(metal_error_reason(error)))
     }
 
     /// Builds a layout from an explicit parameter declaration list.
@@ -449,58 +645,38 @@ impl RootSignatureLayout {
         mut parameters: Vec<RootParameter>,
         root_constants_metal_index: Option<usize>,
     ) -> Result<Self, MetalError> {
+        parameters.sort_by_key(|parameter| parameter.argument_offset);
+        Self::assemble_sorted(
+            stage,
+            entry_point,
+            argument_buffer_index,
+            parameters,
+            root_constants_metal_index,
+        )
+    }
+
+    /// Builds a layout from parameters already sorted by argument offset.
+    fn assemble_sorted(
+        stage: ReflectedStage,
+        entry_point: String,
+        argument_buffer_index: usize,
+        parameters: Vec<RootParameter>,
+        root_constants_metal_index: Option<usize>,
+    ) -> Result<Self, MetalError> {
         if argument_buffer_index >= MAX_METAL_BUFFER_ARGUMENT_INDEX {
             return Err(MetalError::InvalidArg(
                 "argument buffer index is not a valid Metal buffer index",
             ));
         }
 
-        parameters.sort_by_key(|parameter| parameter.argument_offset);
-        let mut end = 0usize;
-        let mut constants_count = 0usize;
-        for parameter in &parameters {
-            let is_constants = parameter.kind == RootParameterKind::Constants;
-            if is_constants {
-                constants_count += 1;
-                if parameter.size == 0 || parameter.size > MAX_ROOT_CONSTANT_BYTES {
-                    return Err(MetalError::InvalidArg(
-                        "root constants size is outside 1..=4096 bytes",
-                    ));
-                }
-                if !parameter.size.is_multiple_of(4)
-                    || !parameter.argument_offset.is_multiple_of(4)
-                {
-                    return Err(MetalError::InvalidArg(
-                        "root constants must be 4-byte aligned and sized",
-                    ));
-                }
-            } else {
-                if parameter.size < DEVICE_ADDRESS_BYTES {
-                    return Err(MetalError::InvalidArg(
-                        "descriptor argument-buffer slot is smaller than one address",
-                    ));
-                }
-                if !parameter.argument_offset.is_multiple_of(DEVICE_ADDRESS_BYTES) {
-                    return Err(MetalError::InvalidArg(
-                        "descriptor argument-buffer offset must be 8-byte aligned",
-                    ));
-                }
-            }
-            if parameter.argument_offset < end {
-                return Err(MetalError::InvalidArg(
-                    "root parameters overlap in the argument buffer",
-                ));
-            }
-            end = parameter
-                .argument_offset
-                .checked_add(parameter.size)
-                .ok_or(MetalError::InvalidArg("root parameter extent overflows"))?;
-            if end > MAX_ARGUMENT_BUFFER_BYTES {
-                return Err(MetalError::InvalidArg(
-                    "root parameters exceed the 64 KiB argument buffer",
-                ));
-            }
-        }
+        let sources = vec![None; parameters.len()];
+        validate_parameters(&parameters, &sources, |_, fault| {
+            MetalError::InvalidArg(fault.reason())
+        })?;
+        let constants_count = parameters
+            .iter()
+            .filter(|parameter| parameter.kind == RootParameterKind::Constants)
+            .count();
         if let Some(index) = root_constants_metal_index {
             if index >= MAX_METAL_BUFFER_ARGUMENT_INDEX {
                 return Err(MetalError::InvalidArg(
@@ -514,6 +690,9 @@ impl RootSignatureLayout {
             }
         }
 
+        let end = parameters
+            .last()
+            .map_or(0, |parameter| parameter.argument_offset + parameter.size);
         Ok(Self {
             stage,
             entry_point,
@@ -1397,16 +1576,6 @@ enum Json {
 }
 
 impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Self::Object(entries) => entries
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value),
-            _ => None,
-        }
-    }
-
     fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(text) => Some(text),
@@ -1712,6 +1881,107 @@ fn parse_json(input: &str) -> Result<Json, MetalError> {
     JsonParser::new(input)?.parse()
 }
 
+/// Extracts the fixed reason from a refusal that carries no dynamic text.
+fn metal_error_reason(error: MetalError) -> &'static str {
+    match error {
+        MetalError::InvalidArg(reason) => reason,
+        _ => "converter reflection cannot be a root layout",
+    }
+}
+
+/// Looks up one field of a JSON object, case-insensitively.
+fn json_field<'a>(value: &'a Json, names: &[&str]) -> Option<&'a Json> {
+    let Json::Object(entries) = value else {
+        return None;
+    };
+    json_object_field(entries, names)
+}
+
+/// Looks up one field of a parsed JSON object, case-insensitively.
+///
+/// Key casing is not part of the converter's JSON contract, so `EltOffset` and
+/// `eltoffset` name the same field. A field that is truly missing is still a
+/// refusal; only the spelling is tolerated.
+fn json_object_field<'a>(entries: &'a [(String, Json)], names: &[&str]) -> Option<&'a Json> {
+    entries
+        .iter()
+        .find(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+        .map(|(_, value)| value)
+}
+
+/// Reads one string field of the reflection document.
+fn json_string_field<'a>(value: &'a Json, name: &str) -> Option<&'a str> {
+    json_field(value, &[name]).and_then(Json::as_str)
+}
+
+/// Reads one unsigned integer field of an argument-buffer entry.
+fn reflection_u64(
+    entries: &[(String, Json)],
+    index: usize,
+    field: &'static str,
+) -> Result<u64, ReflectionLayoutError> {
+    let value = json_object_field(entries, &[field])
+        .ok_or(ReflectionLayoutError::entry(index, field, missing_field_reason(field)))?;
+    value.as_u64().ok_or(ReflectionLayoutError::entry(
+        index,
+        field,
+        non_integer_reason(field),
+    ))
+}
+
+/// Fixed refusal for a reflected field that is absent.
+///
+/// The simple [`RootSignatureLayout::from_converter_reflection_json`] path can
+/// only carry a `&'static str`, so each reflected field has its own sentence.
+fn missing_field_reason(field: &'static str) -> &'static str {
+    match field {
+        "EltOffset" => "TopLevelArgumentBuffer entry has no EltOffset",
+        "Size" => "TopLevelArgumentBuffer entry has no Size",
+        "Slot" => "TopLevelArgumentBuffer entry has no Slot",
+        "Space" => "TopLevelArgumentBuffer entry has no Space",
+        "Type" => "TopLevelArgumentBuffer entry has no Type",
+        _ => "TopLevelArgumentBuffer entry is missing a required field",
+    }
+}
+
+/// Fixed refusal for a reflected field of the wrong type.
+fn non_integer_reason(field: &'static str) -> &'static str {
+    match field {
+        "EltOffset" => "EltOffset is not an unsigned integer",
+        "Size" => "Size is not an unsigned integer",
+        "Slot" => "Slot is not an unsigned integer",
+        "Space" => "Space is not an unsigned integer",
+        _ => "field is not an unsigned integer",
+    }
+}
+
+/// Maps one reflected `Type` to a root parameter kind.
+///
+/// `Sampler` is emitted by the converter for a sampler descriptor table (the
+/// only sampler form D3D12 flattens into the top-level argument buffer), so it
+/// is a table with a known kind rather than an unknown type.
+fn root_parameter_kind(type_name: &str) -> Option<RootParameterKind> {
+    if type_name.eq_ignore_ascii_case("Constant") {
+        Some(RootParameterKind::Constants)
+    } else if type_name.eq_ignore_ascii_case("CBV") {
+        Some(RootParameterKind::ConstantBufferView)
+    } else if type_name.eq_ignore_ascii_case("SRV") {
+        Some(RootParameterKind::ShaderResourceView)
+    } else if type_name.eq_ignore_ascii_case("UAV") {
+        Some(RootParameterKind::UnorderedAccessView)
+    } else if type_name.eq_ignore_ascii_case("Table") {
+        Some(RootParameterKind::DescriptorTable(
+            DescriptorTableKind::Unspecified,
+        ))
+    } else if type_name.eq_ignore_ascii_case("Sampler") {
+        Some(RootParameterKind::DescriptorTable(
+            DescriptorTableKind::Sampler,
+        ))
+    } else {
+        None
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1720,9 +1990,9 @@ mod tests {
     use super::{
         ArgumentBufferBuilder, ArgumentBufferEncoder, BufferBinding, DescriptorTableBinding,
         DescriptorTableBuilder, DescriptorTableKind, EncoderKind, ResourceUsage,
-        MAX_ARGUMENT_BUFFER_BYTES, MAX_ROOT_CONSTANT_BYTES, ReflectedStage, RootParameterKind,
-        RootParameterSpec, RootSignatureLayout, SAMPLER_DESCRIPTOR_BYTES,
-        TEXTURE_DESCRIPTOR_BYTES, TOP_LEVEL_ARGUMENT_BUFFER_INDEX,
+        MAX_ARGUMENT_BUFFER_BYTES, MAX_ROOT_CONSTANT_BYTES, ReflectedStage,
+        ReflectionLayoutError, RootParameterKind, RootParameterSpec, RootSignatureLayout,
+        SAMPLER_DESCRIPTOR_BYTES, TEXTURE_DESCRIPTOR_BYTES, TOP_LEVEL_ARGUMENT_BUFFER_INDEX,
     };
     use crate::macos::device::DirectMetalTransport;
     use crate::macos::objc;
@@ -1866,7 +2136,7 @@ mod tests {
         ));
         assert!(matches!(
             RootSignatureLayout::from_converter_reflection_json(
-                r#"{"EntryPoint":"main","ShaderType":"Compute"}"#
+                r#"{"EntryPoint":"main","ShaderType":"Compute","TopLevelArgumentBuffer":42}"#
             ),
             Err(MetalError::InvalidArg(_))
         ));
@@ -1951,6 +2221,135 @@ mod tests {
             ))),
             Err(MetalError::InvalidArg(_))
         ));
+    }
+
+    #[test]
+    fn absent_null_or_empty_argument_buffer_is_an_empty_layout() {
+        // The converter omits the array on a resource-free stage. That is a
+        // valid layout with no parameters, not a malformed reflection.
+        for json in [
+            r#"{"EntryPoint":"main","ShaderType":"Fragment"}"#,
+            r#"{"EntryPoint":"main","ShaderType":"Fragment","TopLevelArgumentBuffer":null}"#,
+            r#"{"EntryPoint":"main","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#,
+        ] {
+            let layout = RootSignatureLayout::from_converter_reflection_json(json)
+                .expect("a reflection with no parameters is a valid layout");
+            assert_eq!(layout.stage(), ReflectedStage::Fragment);
+            assert_eq!(layout.entry_point(), "main");
+            assert!(layout.parameters().is_empty());
+            assert_eq!(layout.argument_buffer_len(), 8);
+            assert!(layout.supports(EncoderKind::Render));
+        }
+    }
+
+    /// The exact shape the converter emitted for the Cycle 14 pixel shader that
+    /// the host refused: a root CBV then a sampler table, both reported with the
+    /// converter's 24-byte descriptor extent. Field names and values only; no
+    /// source bytes.
+    const PIXEL_SAMPLER_REFLECTION: &str = r#"{"EntryPoint":"main","Features":0,"FunctionConstants":[],"HasYieldLoop":false,"NeedsFunctionConstants":false,"ResourceCount":1,"ResourceUsages":0,"SamplerIndices":[],"ShaderType":"Fragment","TopLevelArgumentBuffer":[{"EltOffset":0,"Name":"","Size":24,"Slot":0,"Space":0,"Type":"CBV"},{"EltOffset":24,"Name":"","Size":24,"Slot":0,"Space":0,"Type":"Sampler"}],"UnorderedAccessViewIndices":[],"UsedResources":[],"UsesRayQuery":false}"#;
+
+    #[test]
+    fn observed_pixel_sampler_reflection_is_a_usable_layout() {
+        let layout =
+            RootSignatureLayout::from_converter_reflection_json(PIXEL_SAMPLER_REFLECTION)
+                .expect("the observed pixel reflection must parse");
+        assert_eq!(layout.stage(), ReflectedStage::Fragment);
+        assert_eq!(layout.parameters().len(), 2);
+        assert_eq!(layout.argument_buffer_len(), 48);
+        assert_eq!(
+            layout.parameters()[0].kind(),
+            RootParameterKind::ConstantBufferView
+        );
+        assert_eq!(layout.parameters()[0].argument_offset(), 0);
+        assert_eq!(layout.parameters()[0].size(), 24);
+        assert_eq!(
+            layout.parameters()[1].kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler)
+        );
+        assert_eq!(layout.parameters()[1].argument_offset(), 24);
+        assert!(layout.supports(EncoderKind::Render));
+    }
+
+    #[test]
+    fn reflected_type_and_field_names_are_case_insensitive_but_not_invented() {
+        let lower = reflection_with(
+            r#"{"eltoffset":0,"name":"","size":8,"slot":0,"space":0,"type":"sampler"}"#,
+        );
+        let layout = RootSignatureLayout::from_converter_reflection_json(&lower)
+            .expect("field and type spelling variants are tolerated");
+        assert_eq!(
+            layout.parameters()[0].kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler)
+        );
+        // A type the converter never emits stays a refusal.
+        assert!(matches!(
+            RootSignatureLayout::from_converter_reflection_json(&reflection_with(
+                r#"{"EltOffset":0,"Size":8,"Slot":0,"Space":0,"Type":"Texture"}"#
+            )),
+            Err(MetalError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn detailed_refusal_names_the_entry_and_field() {
+        let error = RootSignatureLayout::from_converter_reflection_json_detailed(
+            &reflection_with(concat!(
+                r#"{"EltOffset":0,"Size":8,"Slot":0,"Space":0,"Type":"CBV"},"#,
+                r#"{"EltOffset":8,"Size":8,"Slot":1,"Type":"SRV"}"#
+            )),
+        )
+        .expect_err("a missing Space must be refused");
+        assert_eq!(error.entry_index(), Some(1));
+        assert_eq!(error.field(), "Space");
+        assert_eq!(
+            error.reason(),
+            "TopLevelArgumentBuffer entry has no Space"
+        );
+        assert_eq!(
+            error.to_string(),
+            "entry 1 field `Space`: TopLevelArgumentBuffer entry has no Space"
+        );
+        // The simple entry point keeps the same bounded reason as InvalidArg.
+        assert!(matches!(
+            RootSignatureLayout::from_converter_reflection_json(&reflection_with(
+                r#"{"EltOffset":0,"Size":8,"Slot":0,"Space":0,"Type":"Bogus"}"#
+            )),
+            Err(MetalError::InvalidArg(
+                "converter reflection has an unknown root parameter type"
+            ))
+        ));
+    }
+
+    #[test]
+    fn detailed_refusal_names_the_failing_validation_entry() {
+        let error = RootSignatureLayout::from_converter_reflection_json_detailed(
+            &reflection_with(concat!(
+                r#"{"EltOffset":0,"Size":8,"Slot":0,"Space":0,"Type":"CBV"},"#,
+                r#"{"EltOffset":4,"Size":8,"Slot":1,"Space":0,"Type":"SRV"}"#
+            )),
+        )
+        .expect_err("a misaligned descriptor must be refused");
+        assert_eq!(error.entry_index(), Some(1));
+        assert_eq!(error.field(), "EltOffset");
+        assert_eq!(
+            error.reason(),
+            "descriptor argument-buffer offset must be 8-byte aligned"
+        );
+        assert_eq!(
+            error.to_string(),
+            "entry 1 field `EltOffset`: descriptor argument-buffer offset must be 8-byte aligned"
+        );
+    }
+
+    #[test]
+    fn detailed_refusal_names_the_top_level_field() {
+        let error = RootSignatureLayout::from_converter_reflection_json_detailed(
+            r#"{"EntryPoint":"main","TopLevelArgumentBuffer":7}"#,
+        )
+        .expect_err("a non-array argument buffer must be refused");
+        assert_eq!(error.entry_index(), None);
+        assert_eq!(error.field(), "TopLevelArgumentBuffer");
+        assert_eq!(error.reason(), "TopLevelArgumentBuffer is not an array");
     }
 
     #[test]
