@@ -693,10 +693,241 @@ fn descriptor_slot(handle: u64) -> crate::native_metal::bindings::DescriptorSlot
         View::ConsoleSampler(_) => DescriptorSlot::Unresolvable(
             "a console sampler descriptor has no D3D12-to-Metal mapping",
         ),
-        View::Placed(..) => {
-            DescriptorSlot::Unresolvable("a placed view is not a buffer descriptor")
+        View::Placed(unordered, resource, desc) => {
+            placed_slot(*unordered, resource, desc, register_texture_handle)
         }
     }
+}
+
+/// ADR-040's placed-view census: two fixed resolution counters, never one per
+/// view. A refusal goes through the existing named-refusal census
+/// ([`crate::native_metal::telemetry::note_named_refusal`]) under its own
+/// static string, so a boot can compare the two totals.
+#[cfg(any(windows, test))]
+mod placed_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// A placed buffer view resolved to a guest buffer range.
+    pub(super) const BUFFER_RESOLVED: usize = 0;
+    /// A placed texture view resolved to a registered host handle.
+    pub(super) const TEXTURE_RESOLVED: usize = 1;
+
+    static COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    /// Counts one placed resolution and logs the whole census at the first
+    /// one and at each power of two after it: bounded log volume, and enough
+    /// for a boot to show the refused tables became resolutions.
+    pub(super) fn note(outcome: usize) {
+        let count = COUNTS[outcome].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            let [buffers, textures] = std::array::from_fn(|i| COUNTS[i].load(Relaxed));
+            tracing::info!(
+                placed_buffer_resolved = buffers,
+                placed_texture_resolved = textures,
+                "placed view census"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn counts() -> [u64; 2] {
+        std::array::from_fn(|i| COUNTS[i].load(Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset() {
+        for count in &COUNTS {
+            count.store(0, Relaxed);
+        }
+    }
+}
+
+/// The resource-description dimension of a buffer
+/// (`D3D12_RESOURCE_DIMENSION_BUFFER`).
+#[cfg(any(windows, test))]
+const PLACED_BUFFER: u32 = 1;
+
+/// A placed view's named refusal: counted under its own string in the
+/// existing refusal census, never returned as a generic one.
+#[cfg(any(windows, test))]
+fn refuse_placed(why: &'static str) -> crate::native_metal::bindings::DescriptorSlot {
+    crate::native_metal::telemetry::note_named_refusal(why);
+    crate::native_metal::bindings::DescriptorSlot::Unresolvable(why)
+}
+
+/// Resolves one placed view (ADR-040) to a guest buffer range or a registered
+/// host texture handle.
+///
+/// A placed view names no resource object, so its bytes come from the words
+/// the title passed to device 0x230/0x238:
+///
+/// * the resource description (words 0-13 of `resource`) is the same 56-byte
+///   layout a title resource uses: word 0 the dimension (1 buffer, 2-4
+///   textures), words 4-5 the buffer's byte length (its whole footprint);
+/// * the view description's memory address (a guest GPU virtual address) is
+///   words 10-11 of `desc`;
+/// * a buffer view's union is words 4-9 (the console's 40-byte view
+///   description puts the shader-4-component mapping at word 2 and a
+///   console-only dword at 3): first element words 4-5, element count word 6,
+///   structure stride word 7, flags word 8.
+///
+/// The resource description's dimension decides buffer against texture, never
+/// the root parameter. A buffer resolves to `(address + first * element,
+/// count * element)`, bounded by the resource footprint; a view with no
+/// element count (or a format the table does not know) reads the whole
+/// buffer. A texture resolves to its guest memory address, registered with the
+/// host on first use exactly as a resource-backed texture is. Every failure is
+/// a named refusal: a zero address, a zero or oversized length, a range past
+/// the footprint, or a mismatched view dimension is never guessed.
+#[cfg(any(windows, test))]
+fn placed_slot(
+    unordered: bool,
+    resource: &[u32; 14],
+    desc: &[u32; 16],
+    register_texture: impl FnOnce(
+        &crate::resource::TextureTableRegistration,
+    ) -> Result<u64, &'static str>,
+) -> crate::native_metal::bindings::DescriptorSlot {
+    use crate::native_metal::bindings::{DescriptorSlot, GuestBinding};
+    use victory_metal::wire_v3::DescriptorKind;
+
+    let dimension = resource[0];
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let footprint = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+    let view_dimension = desc[1];
+    let first = u64::from(desc[4]) | u64::from(desc[5]) << 32;
+    let count = u64::from(desc[6]);
+    let stride = desc[7];
+
+    if dimension == PLACED_BUFFER {
+        if address == 0 {
+            return refuse_placed("a placed buffer view names no device memory");
+        }
+        let kind = if unordered {
+            match view_dimension {
+                // An unordered view has no constant-buffer form.
+                0 => return refuse_placed("a placed view's view dimension is unknown"),
+                1 => DescriptorKind::Uav,
+                2..=11 => {
+                    return refuse_placed("a placed buffer view is described as a texture");
+                }
+                _ => return refuse_placed("a placed view's view dimension is unknown"),
+            }
+        } else {
+            match view_dimension {
+                // A constant-buffer description carries no view dimension at
+                // all (word 1 is zero): it names the buffer's whole footprint.
+                0 => {
+                    if footprint == 0 {
+                        return refuse_placed("a placed buffer view has no bytes");
+                    }
+                    if footprint > victory_metal::wire::MAX_RESOURCE_LEN {
+                        return refuse_placed("a placed buffer view is larger than a wire binding");
+                    }
+                    placed_census::note(placed_census::BUFFER_RESOLVED);
+                    return DescriptorSlot::Live(
+                        DescriptorKind::Cbv,
+                        GuestBinding {
+                            address,
+                            len: footprint,
+                        },
+                    );
+                }
+                1 => DescriptorKind::Srv,
+                2..=11 => {
+                    return refuse_placed("a placed buffer view is described as a texture");
+                }
+                _ => return refuse_placed("a placed view's view dimension is unknown"),
+            }
+        };
+        return placed_buffer_slot(kind, address, footprint, first, count, stride, desc[0]);
+    }
+
+    if (2..=4).contains(&dimension) {
+        if address == 0 {
+            return refuse_placed("a placed texture view names no device memory");
+        }
+        if view_dimension == 1 {
+            return refuse_placed("a placed texture view is described as a buffer");
+        }
+        if !(2..=11).contains(&view_dimension) {
+            return refuse_placed("a placed view's view dimension is unknown");
+        }
+        let kind = if unordered {
+            DescriptorKind::Uav
+        } else {
+            DescriptorKind::Srv
+        };
+        let usage = if unordered { 3 } else { 0 };
+        return match crate::resource::placed_texture_registration(address, resource, usage) {
+            Ok(registration) => match register_texture(&registration) {
+                Ok(handle) => {
+                    placed_census::note(placed_census::TEXTURE_RESOLVED);
+                    DescriptorSlot::Texture(kind, handle)
+                }
+                Err(why) => refuse_placed(why),
+            },
+            Err(why) => refuse_placed(why),
+        };
+    }
+
+    refuse_placed("a placed view's resource dimension is unknown")
+}
+
+/// A placed buffer view's range inside its resource: `(address + first *
+/// element, count * element)`, bounded by the resource footprint.
+///
+/// `first`, `count` and `stride` are the console view description's buffer
+/// union (words 4-7), `format` its word 0. A view with no element count, or a
+/// format this build does not know, reads the whole buffer (footprint) exactly
+/// as the host path does. Every out-of-range case is a named refusal.
+#[cfg(any(windows, test))]
+fn placed_buffer_slot(
+    kind: victory_metal::wire_v3::DescriptorKind,
+    address: u64,
+    footprint: u64,
+    first: u64,
+    count: u64,
+    stride: u32,
+    format: u32,
+) -> crate::native_metal::bindings::DescriptorSlot {
+    use crate::native_metal::bindings::{DescriptorSlot, GuestBinding};
+
+    let element = if stride > 0 {
+        Some(u64::from(stride))
+    } else {
+        crate::resource::element(format).map(|(bytes, _)| bytes)
+    };
+    let range = element
+        .filter(|_| count > 0)
+        .and_then(|element| {
+            Some((
+                first.checked_mul(element)?,
+                count.checked_mul(element)?,
+            ))
+        });
+    // A view with no element count (or a format the table does not know)
+    // reads the whole buffer.
+    let (offset, len) = range.unwrap_or((0, footprint));
+    if len == 0 {
+        return refuse_placed("a placed buffer view has no bytes");
+    }
+    if len > victory_metal::wire::MAX_RESOURCE_LEN {
+        return refuse_placed("a placed buffer view is larger than a wire binding");
+    }
+    let Some(end) = offset.checked_add(len) else {
+        return refuse_placed("a placed buffer view's range overflows its address");
+    };
+    if end > footprint {
+        return refuse_placed(
+            "a placed buffer view's range is not within its resource footprint",
+        );
+    }
+    let Some(address) = address.checked_add(offset) else {
+        return refuse_placed("a placed buffer view's range overflows its address");
+    };
+    placed_census::note(placed_census::BUFFER_RESOLVED);
+    DescriptorSlot::Live(kind, GuestBinding { address, len })
 }
 
 /// A texture resource's host registration handle for a table entry.
@@ -707,8 +938,6 @@ fn descriptor_slot(handle: u64) -> crate::native_metal::bindings::DescriptorSlot
 /// handle. A session without a live host connection is an explicit error.
 #[cfg(windows)]
 fn texture_entry(resource: usize, usage: u8) -> Result<u64, &'static str> {
-    use crate::native_metal::queue;
-
     let this = resource as This;
     let Some(registration) = crate::resource::texture_table_registration(this, usage) else {
         return Err("a descriptor names neither a buffer nor a texture");
@@ -720,6 +949,23 @@ fn texture_entry(resource: usize, usage: u8) -> Result<u64, &'static str> {
             return Err("a sampled texture has no host registration code");
         }
     };
+    register_texture_handle(&registration)
+}
+
+/// Registers a texture with the host on first use and returns its handle.
+///
+/// This is the one registration path for a descriptor table entry: a
+/// resource-backed texture's first bind ([`texture_entry`]) and a placed
+/// texture view ([`placed_slot`]) both come through it, so neither can bind a
+/// handle the session has not registered. Registration is idempotent and
+/// bounded by the host's content map; a refusal is an explicit error, never a
+/// default texture.
+#[cfg(windows)]
+fn register_texture_handle(
+    registration: &crate::resource::TextureTableRegistration,
+) -> Result<u64, &'static str> {
+    use crate::native_metal::queue;
+
     let handle = registration.handle;
     if queue::texture_registered(handle) {
         return Ok(handle);
@@ -4364,5 +4610,355 @@ mod tests {
         // Clean up the pin the successful resolution holds.
         crate::native_metal::bindings::retire_all(&resolver, &resolved.tokens);
         assert_eq!(resolver.live(), 0);
+    }
+
+    /// A placed buffer's resource description: `len` bytes.
+    fn placed_buffer_resource(len: u64) -> [u32; 14] {
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        resource[4] = len as u32;
+        resource[5] = (len >> 32) as u32;
+        resource
+    }
+
+    /// A placed texture's resource description: `width` x `height`, one mip,
+    /// one array slice, one sample.
+    fn placed_texture_resource(width: u64, height: u32, format: u32) -> [u32; 14] {
+        let mut resource = [0u32; 14];
+        resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        resource[4] = width as u32;
+        resource[5] = (width >> 32) as u32;
+        resource[6] = height;
+        resource[7] = 1 | (1 << 16); // one array slice, one mip
+        resource[8] = format;
+        resource[9] = 1; // one sample
+        resource
+    }
+
+    /// A placed view description: the console union begins at word 4.
+    fn placed_view_desc(
+        address: u64,
+        view_dimension: u32,
+        format: u32,
+        first: u64,
+        count: u32,
+        stride: u32,
+    ) -> [u32; 16] {
+        let mut desc = [0u32; 16];
+        desc[0] = format;
+        desc[1] = view_dimension;
+        desc[2] = 0x1688; // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        desc[4] = first as u32;
+        desc[5] = (first >> 32) as u32;
+        desc[6] = count;
+        desc[7] = stride;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        desc
+    }
+
+    #[test]
+    fn a_placed_buffer_view_resolves_to_its_exact_range() {
+        use crate::native_metal::bindings::{DescriptorSlot, GuestBinding};
+        use victory_metal::wire_v3::DescriptorKind;
+
+        const ADDRESS: u64 = 0x1_2345_6000;
+        let resource = placed_buffer_resource(0x400);
+        // An SRV of 0x40 elements of 16 bytes, at the buffer's start.
+        let view = placed_view_desc(ADDRESS, 1, 0, 0, 0x40, 16);
+        assert_eq!(
+            placed_slot(false, &resource, &view, |_| panic!("a buffer binds no texture")),
+            DescriptorSlot::Live(
+                DescriptorKind::Srv,
+                GuestBinding {
+                    address: ADDRESS,
+                    len: 0x400,
+                },
+            )
+        );
+        // The same view as a UAV.
+        assert_eq!(
+            placed_slot(true, &resource, &view, |_| panic!("a buffer binds no texture")),
+            DescriptorSlot::Live(
+                DescriptorKind::Uav,
+                GuestBinding {
+                    address: ADDRESS,
+                    len: 0x400,
+                },
+            )
+        );
+        // A constant-buffer description (no view dimension): the whole
+        // footprint, at the view's exact address.
+        let cbv = placed_view_desc(ADDRESS, 0, 0, 0, 0, 0);
+        assert_eq!(
+            placed_slot(false, &resource, &cbv, |_| panic!("a buffer binds no texture")),
+            DescriptorSlot::Live(
+                DescriptorKind::Cbv,
+                GuestBinding {
+                    address: ADDRESS,
+                    len: 0x400,
+                },
+            )
+        );
+        // A view off the buffer's start keeps its exact in-resource offset.
+        let offset = placed_view_desc(ADDRESS, 1, 0, 2, 8, 4);
+        assert_eq!(
+            placed_slot(false, &resource, &offset, |_| panic!("a buffer binds no texture")),
+            DescriptorSlot::Live(
+                DescriptorKind::Srv,
+                GuestBinding {
+                    address: ADDRESS + 8,
+                    len: 32,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn a_placed_texture_view_yields_its_registration_handle() {
+        use crate::native_metal::bindings::DescriptorSlot;
+        use victory_metal::wire_v3::DescriptorKind;
+
+        const ADDRESS: u64 = 0x2_3456_7000;
+        let resource = placed_texture_resource(4, 4, 28);
+        let view = placed_view_desc(ADDRESS, 4, 28, 0, 0, 0);
+        let mut registered = 0;
+        for (unordered, usage, kind) in [
+            (false, 0u8, DescriptorKind::Srv),
+            (true, 3u8, DescriptorKind::Uav),
+        ] {
+            let slot = placed_slot(unordered, &resource, &view, |registration| {
+                assert_eq!(registration.handle, ADDRESS, "the guest memory address");
+                assert_eq!(registration.usage, usage);
+                assert_eq!(registration.width, 4);
+                assert_eq!(registration.height, 4);
+                assert_eq!(registration.mip_levels, 1);
+                registered += 1;
+                Ok(registration.handle)
+            });
+            assert_eq!(slot, DescriptorSlot::Texture(kind, ADDRESS));
+        }
+        assert_eq!(registered, 2);
+
+        // A host refusal is the same named refusal the resource-backed path
+        // returns, never a guessed handle.
+        let refused = placed_slot(false, &resource, &view, |_| {
+            Err("the host refused a sampled texture registration")
+        });
+        assert_eq!(
+            refused,
+            DescriptorSlot::Unresolvable("the host refused a sampled texture registration")
+        );
+    }
+
+    #[test]
+    fn placed_view_refusals_are_named() {
+        use crate::native_metal::bindings::DescriptorSlot;
+
+        let buffer = placed_buffer_resource(64);
+        let assert_refused = |slot, why: &'static str| {
+            assert_eq!(slot, DescriptorSlot::Unresolvable(why));
+        };
+
+        // No device memory.
+        assert_refused(
+            placed_slot(
+                false,
+                &buffer,
+                &placed_view_desc(0, 1, 0, 0, 16, 4),
+                |_| unreachable!(),
+            ),
+            "a placed buffer view names no device memory",
+        );
+        // A range past the resource footprint.
+        assert_refused(
+            placed_slot(
+                false,
+                &buffer,
+                &placed_view_desc(0x1000, 1, 0, 0, 32, 4),
+                |_| unreachable!(),
+            ),
+            "a placed buffer view's range is not within its resource footprint",
+        );
+        // An unknown resource dimension.
+        let mut unknown = buffer;
+        unknown[0] = 99;
+        assert_refused(
+            placed_slot(
+                false,
+                &unknown,
+                &placed_view_desc(0x1000, 1, 0, 0, 1, 4),
+                |_| unreachable!(),
+            ),
+            "a placed view's resource dimension is unknown",
+        );
+        // A buffer resource named through a texture view description.
+        assert_refused(
+            placed_slot(
+                false,
+                &buffer,
+                &placed_view_desc(0x1000, 4, 0, 0, 0, 0),
+                |_| unreachable!(),
+            ),
+            "a placed buffer view is described as a texture",
+        );
+        // A zero-length buffer.
+        assert_refused(
+            placed_slot(
+                false,
+                &placed_buffer_resource(0),
+                &placed_view_desc(0x1000, 1, 0, 0, 0, 0),
+                |_| unreachable!(),
+            ),
+            "a placed buffer view has no bytes",
+        );
+        // A texture resource named through a buffer view description.
+        let texture = placed_texture_resource(4, 4, 28);
+        assert_refused(
+            placed_slot(
+                false,
+                &texture,
+                &placed_view_desc(0x1000, 1, 28, 0, 0, 0),
+                |_| unreachable!(),
+            ),
+            "a placed texture view is described as a buffer",
+        );
+        // A texture with no device memory.
+        assert_refused(
+            placed_slot(
+                false,
+                &texture,
+                &placed_view_desc(0, 4, 28, 0, 0, 0),
+                |_| unreachable!(),
+            ),
+            "a placed texture view names no device memory",
+        );
+    }
+
+    #[test]
+    fn a_placed_buffer_slot_enumerates_in_a_buffer_only_table() {
+        use crate::native_metal::bindings::{
+            DescriptorSlot, GuestBinding, TableRunError, enumerate_descriptor_table,
+        };
+        use victory_metal::wire_v3::DescriptorKind;
+
+        const BASE: u64 = 0x3000_0000;
+        const ADDRESS: u64 = 0x1_2345_6000;
+        let buffer = placed_buffer_resource(0x400);
+        let view = placed_view_desc(ADDRESS, 1, 0, 0, 0x40, 16);
+        let run = enumerate_descriptor_table(BASE, |handle| {
+            if handle == BASE {
+                placed_slot(false, &buffer, &view, |_| unreachable!())
+            } else {
+                DescriptorSlot::Empty
+            }
+        })
+        .expect("a placed buffer slot is a live buffer entry");
+        assert_eq!(run.kind, DescriptorKind::Srv);
+        assert_eq!(
+            run.entries,
+            vec![GuestBinding {
+                address: ADDRESS,
+                len: 0x400,
+            }]
+        );
+
+        // The same buffer-only table still refuses a placed texture slot.
+        let texture = placed_texture_resource(4, 4, 28);
+        let texture_view = placed_view_desc(ADDRESS, 4, 28, 0, 0, 0);
+        let error = enumerate_descriptor_table(BASE, |handle| {
+            if handle == BASE {
+                placed_slot(false, &texture, &texture_view, |r| Ok(r.handle))
+            } else {
+                DescriptorSlot::Empty
+            }
+        })
+        .expect_err("the buffer-only enumerator cannot carry a registered resource");
+        assert!(matches!(error, TableRunError::Unsupported(_)));
+    }
+
+    #[test]
+    fn a_mixed_placed_run_is_refused_not_mis_bound() {
+        use crate::native_metal::bindings::{
+            DescriptorEntry, DescriptorSlot, TableRunBoundary, TableRunError,
+            VIEW_DESCRIPTOR_INCREMENT, enumerate_descriptor_table_typed,
+        };
+        use victory_metal::wire_v3::DescriptorKind;
+
+        const BASE: u64 = 0x4000_0000;
+        const ADDRESS: u64 = 0x1_2345_6000;
+        let buffer = placed_buffer_resource(0x400);
+        let buffer_view = placed_view_desc(ADDRESS, 1, 0, 0, 0x40, 16);
+        let texture = placed_texture_resource(4, 4, 28);
+        let texture_view = placed_view_desc(ADDRESS, 4, 28, 0, 0, 0);
+        let slot = |handle: u64| ((handle - BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize;
+
+        // A placed UAV buffer and a placed SRV texture end the run as a kind
+        // change, never as one table with the texture mis-bound into it.
+        let run = enumerate_descriptor_table_typed(BASE, |handle| match slot(handle) {
+            0 => placed_slot(true, &buffer, &buffer_view, |_| unreachable!()),
+            1 => placed_slot(false, &texture, &texture_view, |r| Ok(r.handle)),
+            _ => DescriptorSlot::Empty,
+        })
+        .expect("the homogeneous prefix enumerates");
+        assert_eq!(run.kind, DescriptorKind::Uav);
+        assert_eq!(run.len(), 1);
+        assert_eq!(
+            run.boundary,
+            TableRunBoundary::KindChange {
+                kind: DescriptorKind::Srv
+            }
+        );
+        assert_eq!(
+            run.require_homogeneous(),
+            Err(TableRunError::MixedKind {
+                run_kind: DescriptorKind::Uav,
+                next_kind: DescriptorKind::Srv,
+            })
+        );
+
+        // Two same-kind placed SRV entries (one buffer, one texture) enumerate
+        // both shapes, so the encoder refuses the mixed table instead of
+        // binding a prefix.
+        let run = enumerate_descriptor_table_typed(BASE, |handle| match slot(handle) {
+            0 => placed_slot(false, &buffer, &buffer_view, |_| unreachable!()),
+            1 => placed_slot(false, &texture, &texture_view, |r| Ok(r.handle)),
+            _ => DescriptorSlot::Empty,
+        })
+        .expect("the mixed run enumerates");
+        assert_eq!(run.len(), 2);
+        assert!(matches!(run.entries[0], DescriptorEntry::Buffer(_)));
+        assert!(matches!(run.entries[1], DescriptorEntry::Texture(_)));
+    }
+
+    #[test]
+    fn the_placed_census_counts_resolutions_and_names_refusals() {
+        placed_census::reset();
+        const BUFFER_REFUSAL: &str = "a placed buffer view names no device memory";
+
+        let buffer = placed_buffer_resource(64);
+        let buffer_view = placed_view_desc(0x1000, 1, 0, 0, 16, 4);
+        let _ = placed_slot(false, &buffer, &buffer_view, |_| unreachable!());
+        let texture = placed_texture_resource(4, 4, 28);
+        let texture_view = placed_view_desc(0x2000, 4, 28, 0, 0, 0);
+        let _ = placed_slot(false, &texture, &texture_view, |r| Ok(r.handle));
+        assert_eq!(placed_census::counts(), [1, 1]);
+
+        let before = crate::native_metal::telemetry::named_refusal_histogram()
+            .get(BUFFER_REFUSAL)
+            .copied()
+            .unwrap_or(0);
+        let _ = placed_slot(
+            false,
+            &buffer,
+            &placed_view_desc(0, 1, 0, 0, 1, 4),
+            |_| unreachable!(),
+        );
+        let after = crate::native_metal::telemetry::named_refusal_histogram()
+            .get(BUFFER_REFUSAL)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(after, before + 1, "the refusal is in the named census");
+        assert_eq!(placed_census::counts(), [1, 1], "a refusal is not a resolution");
     }
 }
