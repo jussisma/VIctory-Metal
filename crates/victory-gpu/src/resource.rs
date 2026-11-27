@@ -12,9 +12,10 @@ use std::ptr::NonNull;
 use victory_formats::texture;
 
 use crate::object::{
-    self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
-    guid,
+    self, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table,
+    This, guid,
 };
+use crate::native_metal::abi_trace;
 #[cfg(any(windows, test, target_os = "macos"))]
 use crate::native_metal::telemetry::{self, call_names};
 
@@ -629,6 +630,12 @@ fn allocator() -> Option<(AllocRoutine, FreeRoutine)> {
         return choice;
     }
     ALLOCATOR.get().copied()
+}
+
+/// Whether a title allocator is in force (it may still refuse one
+/// allocation), as the descriptor-heap ABI trace reports the backing class.
+pub(crate) fn allocator_installed() -> bool {
+    allocator().is_some()
 }
 
 /// Installs (or forces the host path with `None`) the allocator for a test,
@@ -2551,7 +2558,49 @@ pub(crate) extern "system" fn create_committed(
             );
         }
     }
+    // One line per guest query; the engine's own helpers pass a null device.
+    if !this.is_null() {
+        abi_trace::record(
+            abi_trace::calls::CREATE_COMMITTED_RESOURCE,
+            &resource_trace_values(desc, result, created_gpu_address(result, out)),
+        );
+    }
     result
+}
+
+/// The numeric words the resource-creation traces carry, in one documented
+/// order: `[dimension, width, height, depth_or_array, format, hr, gpu_va]`.
+fn resource_trace_values(desc: *const ResourceDesc, hr: HRESULT, gpu_va: u64) -> [u64; 7] {
+    // SAFETY: read only for the numeric description; null is tolerated.
+    let (dimension, width, height, depth_or_array, format) = unsafe { desc.as_ref() }
+        .map(|desc| {
+            (
+                u64::from(desc.dimension),
+                desc.width,
+                u64::from(desc.height),
+                u64::from(desc.depth_or_array_size),
+                u64::from(desc.format),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0));
+    [
+        dimension,
+        width,
+        height,
+        depth_or_array,
+        format,
+        u64::from(hr as u32),
+        gpu_va,
+    ]
+}
+
+/// The GPU address a creation handed back, zero when it did not succeed.
+fn created_gpu_address(hr: HRESULT, out: *const This) -> u64 {
+    if hr != S_OK || out.is_null() {
+        return 0;
+    }
+    // SAFETY: a successful creation wrote one of our resources there.
+    resource(unsafe { *out }).data() as u64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2693,6 +2742,14 @@ pub(crate) extern "system" fn create_at_address(
             );
         }
     }
+    // The same answer surface as the committed/placed traces, so a diff can
+    // line the address-placed creation up with the other two.
+    if !this.is_null() {
+        abi_trace::record(
+            abi_trace::calls::CREATE_AT_ADDRESS,
+            &resource_trace_values(desc, result, created_gpu_address(result, out)),
+        );
+    }
     result
 }
 
@@ -2737,6 +2794,31 @@ fn create_at_address_impl(
         iid,
         out,
     )
+}
+
+/// Device method 0xf0, `CreateReservedResource`.
+///
+/// Reserved (tiled) resources need `UpdateTileMappings`, which no queue in
+/// this tree implements, so the export keeps the missing-table stub's answer
+/// (`E_NOTIMPL`) and becomes measurable: the trace records the query, where a
+/// bare stub left no guest-visible row. Implementing tiling is a separate
+/// change, not an invented constant here.
+pub(crate) extern "system" fn create_reserved(
+    this: This,
+    desc: *const ResourceDesc,
+    _state: u32,
+    _clear: *const c_void,
+    _iid: *const Iid,
+    _out: *mut This,
+) -> HRESULT {
+    let hr = E_NOTIMPL;
+    if !this.is_null() {
+        abi_trace::record(
+            abi_trace::calls::CREATE_RESERVED_RESOURCE,
+            &resource_trace_values(desc, hr, 0),
+        );
+    }
+    hr
 }
 
 /// Textures the title placed in its own memory and views without a
@@ -2836,6 +2918,13 @@ pub(crate) extern "system" fn create_placed(
                 [offset, dimension, width],
             );
         }
+    }
+    // One line per guest query; the engine's own helpers pass a null device.
+    if !this.is_null() {
+        abi_trace::record(
+            abi_trace::calls::CREATE_PLACED_RESOURCE,
+            &resource_trace_values(desc, result, created_gpu_address(result, out)),
+        );
     }
     result
 }
@@ -3003,6 +3092,12 @@ extern "system" fn gpu_address(this: This) -> u64 {
             tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
         });
     }
+    // One line per guest query: the address and whether it is a buffer or a
+    // texture (`0` buffer, `1` texture), the class a diff compares.
+    abi_trace::record(
+        abi_trace::calls::GET_GPU_VIRTUAL_ADDRESS,
+        &[at, u64::from(r.desc.dimension != BUFFER)],
+    );
     at
 }
 extern "system" fn heap_properties(
@@ -4193,5 +4288,101 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// The committed path records `[dimension, width, height, depth_or_array,
+    /// format, hr, gpu_va]` and the address query records
+    /// `[address, buffer_or_texture]`; each guest query gets one row.
+    #[test]
+    fn committed_creation_and_the_address_query_record_one_row_each() {
+        let _serial = crate::native_metal::abi_trace::test_serial();
+        let device = crate::device::device();
+        let desc = buffer(64);
+        let mut out = std::ptr::null();
+        crate::native_metal::abi_trace::begin_test_trace();
+        assert_eq!(
+            create_committed(
+                device,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            S_OK
+        );
+        let at = resource(out).data() as u64;
+        assert_eq!(slot::<Address>(out, 0x58)(out), at);
+        let lines = crate::native_metal::abi_trace::end_test_trace();
+        let created =
+            format!("abi_trace call=CreateCommittedResource values=[1, 64, 1, 1, 0, 0, {at}]");
+        let address = format!("abi_trace call=GetGPUVirtualAddress values=[{at}, 0]");
+        assert!(lines.iter().any(|line| line == &created), "{lines:?}");
+        assert!(lines.iter().any(|line| line == &address), "{lines:?}");
+        for name in ["CreateCommittedResource", "GetGPUVirtualAddress"] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!("call={name} ")))
+                    .count(),
+                1,
+                "one row for {name}: {lines:?}"
+            );
+        }
+        assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+    }
+
+    /// Placed creation uses the same seven-value order; a reserved creation
+    /// is refused (`E_NOTIMPL`) but now produces a row, so the missing tiling
+    /// support is measurable instead of a bare stub.
+    #[test]
+    fn placed_and_reserved_creations_record_the_same_order() {
+        let _serial = crate::native_metal::abi_trace::test_serial();
+        let device = crate::device::device();
+        let heap = heap(4 * KIB_64);
+        // SAFETY: a heap we made.
+        let base = unsafe { (*heap.cast::<Heap>()).memory.ptr.as_ptr() } as u64;
+        let mut placed = std::ptr::null();
+        crate::native_metal::abi_trace::begin_test_trace();
+        assert_eq!(
+            create_placed(
+                device,
+                heap,
+                KIB_64,
+                &buffer(KIB_64),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut placed
+            ),
+            S_OK
+        );
+        let mut reserved = std::ptr::null();
+        assert_eq!(
+            create_reserved(
+                device,
+                &buffer(64),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut reserved
+            ),
+            E_NOTIMPL
+        );
+        assert!(reserved.is_null());
+        let lines = crate::native_metal::abi_trace::end_test_trace();
+        let at = base + KIB_64;
+        let placed_row =
+            format!("abi_trace call=CreatePlacedResource values=[1, 65536, 1, 1, 0, 0, {at}]");
+        let reserved_row = format!(
+            "abi_trace call=CreateReservedResource values=[1, 64, 1, 1, 0, {}, 0]",
+            E_NOTIMPL as u32
+        );
+        assert!(lines.iter().any(|line| line == &placed_row), "{lines:?}");
+        assert!(lines.iter().any(|line| line == &reserved_row), "{lines:?}");
+        assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
 }
