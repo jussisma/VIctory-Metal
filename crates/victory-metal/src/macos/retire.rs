@@ -22,19 +22,28 @@
 //!   only when the watermark reaches it. Entries are kept in push order so a
 //!   stalled entry never releases a newer one early.
 //!
-//! # Bounded depth
+//! # Bounded depth (hard)
 //!
-//! The queue has a soft capacity ([`RetireQueue::DEFAULT_CAPACITY`] by default,
-//! or [`RetireQueue::with_capacity`]). It never drops a live entry to stay under
-//! it: the only safe eviction is a front entry whose fence the last observed
-//! completion already covers, which [`RetireQueue::drain_upto`] and
-//! [`RetireQueue::drain_completed`] perform. If the front is stalled, the depth
-//! may exceed the capacity, but it is never silent: [`RetireQueue::push`]
-//! retains the entry and counts the refusal, [`RetireQueue::high_watermark`]
-//! reports the peak depth, and [`RetireQueue::is_over_capacity`] reports the
-//! stall. Callers that can apply backpressure should use
-//! [`RetireQueue::try_push`], which returns [`RetireQueueFull`] instead of
-//! growing the queue.
+//! The capacity ([`RetireQueue::DEFAULT_CAPACITY`] by default, or
+//! [`RetireQueue::with_capacity`]) is a **hard bound** for every caller that
+//! pins through [`RetireQueue::push_backpressure`] or
+//! [`RetireQueue::try_push`]; both never grow the queue past it and never drop a
+//! live entry to stay under it. The only safe eviction is a front entry whose
+//! fence the last observed completion already covers, which
+//! [`RetireQueue::drain_upto`] and [`RetireQueue::drain_completed`] perform.
+//!
+//! A caller that cannot wait (or that must not block under its own lock) pins
+//! with [`RetireQueue::try_push`] and handles [`RetireQueueFull`] itself. A
+//! caller that can wait pins with [`RetireQueue::push_backpressure`], which
+//! retries a bounded number of times ([`RetireQueue::MAX_BACKPRESSURE_WAITS`])
+//! and reports [`RetireBackpressure`] instead of hanging on a GPU fence that
+//! never completes.
+//!
+//! [`RetireQueue::push`] is the legacy *soft* path: it retains a live entry over
+//! capacity and counts the refusal. It is kept only for existing single-threaded
+//! callers that have no way to wait; the device must not use it, because a hard
+//! bound is what makes a stuck completion a bounded, typed failure instead of
+//! unbounded host memory growth.
 
 use std::collections::VecDeque;
 
@@ -73,6 +82,84 @@ impl std::fmt::Display for RetireQueueFull {
 
 impl std::error::Error for RetireQueueFull {}
 
+/// Why a pin failed even though the caller waited for completion.
+///
+/// The queue stayed full after [`RetireQueue::MAX_BACKPRESSURE_WAITS`] waits on
+/// the oldest live fence: the GPU or its completion handler never published a
+/// value that covered that fence. The pin was **not** queued and no live entry
+/// was dropped, so the caller may retry once it has other evidence of progress
+/// (an external device reset, for example).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetireBackpressure {
+    /// The capacity that is still full.
+    pub capacity: usize,
+    /// Fence value of the front entry that never completed.
+    pub oldest: u64,
+    /// Highest completion value observed when the budget was spent.
+    pub completed: u64,
+    /// How many waits the pin performed before giving up.
+    pub waits: u32,
+}
+
+impl std::fmt::Display for RetireBackpressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "retire backpressure: capacity {} still full on fence {} after {} waits \
+             (completed {})",
+            self.capacity, self.oldest, self.waits, self.completed
+        )
+    }
+}
+
+impl std::error::Error for RetireBackpressure {}
+
+/// Bounded retry budget for one pin that does not fit.
+///
+/// Shared by [`RetireQueue::push_backpressure`] and the transport, which drives
+/// the same policy across its own mutex: the waiter must not hold the lock the
+/// completion handler needs, so the transport locks per attempt and calls
+/// [`Self::next`] for the same bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackpressureBudget {
+    waits: u32,
+}
+
+impl Default for BackpressureBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackpressureBudget {
+    /// A fresh budget that allows [`RetireQueue::MAX_BACKPRESSURE_WAITS`] waits.
+    pub const fn new() -> Self {
+        Self { waits: 0 }
+    }
+
+    /// How many waits this pin has already performed.
+    pub const fn waits_used(&self) -> u32 {
+        self.waits
+    }
+
+    /// Consumes one wait and returns the fence to wait on.
+    ///
+    /// Returns [`RetireBackpressure`] when the budget is spent; the caller must
+    /// then fail the pin instead of waiting again.
+    pub fn next(&mut self, full: RetireQueueFull) -> Result<u64, RetireBackpressure> {
+        if self.waits >= RetireQueue::MAX_BACKPRESSURE_WAITS {
+            return Err(RetireBackpressure {
+                capacity: full.capacity,
+                oldest: full.oldest,
+                completed: full.completed,
+                waits: self.waits,
+            });
+        }
+        self.waits += 1;
+        Ok(full.oldest)
+    }
+}
+
 /// FIFO of resources awaiting GPU completion.
 #[derive(Debug)]
 pub struct RetireQueue {
@@ -94,10 +181,21 @@ impl Default for RetireQueue {
 }
 
 impl RetireQueue {
-    /// Default soft capacity: a floor that keeps a normal frame's pins
+    /// Default hard capacity: a floor that keeps a normal frame's pins
     /// comfortable while making a stalled completion visible long before the
     /// queue could be mistaken for unbounded.
     pub const DEFAULT_CAPACITY: usize = 4096;
+
+    /// How many times [`Self::push_backpressure`] waits on the oldest live fence
+    /// for one pin before giving up.
+    ///
+    /// Four waits cover the worst honest case on this transport: the in-flight
+    /// cap is at most three, and a pin behind the newest fence may have to watch
+    /// the whole in-flight window drain before its own fence is covered. A fifth
+    /// unanswered wait means the GPU or its completion handler is stuck, and the
+    /// pin fails with [`RetireBackpressure`] instead of blocking the host
+    /// forever.
+    pub const MAX_BACKPRESSURE_WAITS: u32 = 4;
 
     /// Creates an empty queue with [`Self::DEFAULT_CAPACITY`].
     pub const fn new() -> Self {
@@ -161,19 +259,72 @@ impl RetireQueue {
 
     /// Pins `id` until `fence_value` completes, bounded by the soft capacity.
     ///
+    /// **Deprecated for the device path.** This retains a live pin over
+    /// capacity and only counts the refusal, so a stalled completion grows the
+    /// queue without bound. It exists for a single-threaded caller that has no
+    /// way to wait on the GPU; the transport must use
+    /// [`Self::push_backpressure`], which keeps the capacity hard.
+    ///
     /// If the queue is at capacity and its front is still live, the pin is
     /// **retained anyway**: a stalled GPU completion cannot be fixed by
     /// discarding bookkeeping, and dropping either the front or the incoming
     /// resource would free a buffer the GPU may still read. The refusal is
     /// counted and visible through [`Self::refusals`], [`Self::high_watermark`]
-    /// and [`Self::is_over_capacity`]; callers that can apply backpressure
-    /// should drain and use [`Self::try_push`] instead.
+    /// and [`Self::is_over_capacity`].
     pub fn push(&mut self, fence_value: u64, id: u64) {
         if let Err(full) = self.try_push(fence_value, id) {
             debug_assert_eq!(full.capacity, self.capacity);
             self.refusals += 1;
             self.pending.push_back(RetiredResource { fence_value, id });
             self.high_watermark = self.high_watermark.max(self.pending.len());
+        }
+    }
+
+    /// Pins `id` until `fence_value` completes, applying bounded backpressure.
+    ///
+    /// The capacity is a hard bound: this never grows the queue and never drops
+    /// a live entry. When the queue is full, `wait` is called with the oldest
+    /// live fence and must make progress visible to the queue:
+    ///
+    /// * return `true` only when it has *observed* that the oldest fence
+    ///   completed, i.e. the published contiguous watermark now covers it. The
+    ///   queue then releases every entry up to that fence (the watermark is
+    ///   contiguous by construction, so an out-of-order front entry behind it is
+    ///   complete too) and retries the push;
+    /// * return `false` when it made no progress; the queue retries without
+    ///   releasing anything.
+    ///
+    /// At most [`Self::MAX_BACKPRESSURE_WAITS`] waits are performed. When the
+    /// budget is spent the pin is **not** queued and [`RetireBackpressure`] is
+    /// returned, so a stuck GPU is a typed failure rather than a hang.
+    ///
+    /// The ids released while making room are returned in FIFO order, so a
+    /// caller that owns the resources can drop them without leaking. (The
+    /// transport instead drains under its own mutex; see
+    /// `DirectMetalTransport::retire_pin`.)
+    pub fn push_backpressure<W>(
+        &mut self,
+        fence_value: u64,
+        id: u64,
+        mut wait: W,
+    ) -> Result<Vec<u64>, RetireBackpressure>
+    where
+        W: FnMut(u64) -> bool,
+    {
+        let mut budget = BackpressureBudget::new();
+        let mut released = Vec::new();
+        loop {
+            match self.try_push(fence_value, id) {
+                Ok(()) => return Ok(released),
+                Err(full) => {
+                    let oldest = budget.next(full)?;
+                    if wait(oldest) {
+                        // Only the fence the waiter proved complete may be
+                        // released: `drain_upto` keeps every later entry.
+                        released.extend(self.drain_upto(oldest));
+                    }
+                }
+            }
         }
     }
 
@@ -370,5 +521,150 @@ mod tests {
         assert_eq!(queue.completed(), 9);
         assert_eq!(queue.drain_upto(4), Vec::<u64>::new());
         assert_eq!(queue.completed(), 9);
+    }
+
+    /// 10,000 alloc/use/retire cycles with a hard bound of 8 and of 64: the
+    /// depth never exceeds the capacity, no pin is ever refused, and every pin
+    /// is eventually released in push order.
+    #[test]
+    fn backpressure_keeps_depth_bounded_under_churn() {
+        for capacity in [8usize, 64] {
+            let mut queue = RetireQueue::with_capacity(capacity);
+            let mut released = Vec::new();
+            let mut refused = 0u64;
+            let mut waits = 0u32;
+            for cycle in 0..10_000u64 {
+                // Every pin sits behind a monotonically increasing fence; the
+                // waiter simulates the GPU finishing the front fence.
+                let fence = cycle + 1;
+                match queue.push_backpressure(fence, cycle, |oldest| {
+                    waits += 1;
+                    assert!(oldest <= fence, "waiter asked for a future fence");
+                    true
+                }) {
+                    Ok(mut ids) => released.append(&mut ids),
+                    Err(_) => refused += 1,
+                }
+                assert!(
+                    queue.len() <= capacity,
+                    "capacity {capacity} exceeded: {} (cycle {cycle})",
+                    queue.len()
+                );
+                assert!(
+                    queue.high_watermark() <= capacity,
+                    "high watermark {} exceeded capacity {capacity}",
+                    queue.high_watermark()
+                );
+            }
+            assert_eq!(refused, 0, "a wait that advances must never refuse a pin");
+            assert_eq!(
+                queue.refusals(),
+                0,
+                "the soft path must not be reachable through push_backpressure"
+            );
+            // Drain the residue and check FIFO release order over everything.
+            released.extend(queue.drain_upto(u64::MAX));
+            assert_eq!(
+                released,
+                (0..10_000u64).collect::<Vec<_>>(),
+                "release order must match push order"
+            );
+
+            eprintln!(
+                "retire backpressure: capacity={capacity} cycles=10000 waits={waits} \
+                 high_watermark={}",
+                queue.high_watermark()
+            );
+        }
+    }
+
+    /// A waiter that never observes a completion must hit the typed error after
+    /// exactly the documented number of waits, leaving the queue untouched.
+    #[test]
+    fn stuck_waiter_returns_the_typed_backpressure_error() {
+        let mut queue = RetireQueue::with_capacity(4);
+        for fence in 1..=4 {
+            queue.try_push(fence, fence * 10).expect("capacity 4");
+        }
+        let mut waits = 0u32;
+        let error = queue
+            .push_backpressure(5, 50, |_oldest| {
+                waits += 1;
+                false
+            })
+            .expect_err("a stuck completion must not pin");
+        assert_eq!(waits, RetireQueue::MAX_BACKPRESSURE_WAITS);
+        assert_eq!(
+            error,
+            RetireBackpressure {
+                capacity: 4,
+                oldest: 1,
+                completed: 0,
+                waits: RetireQueue::MAX_BACKPRESSURE_WAITS,
+            }
+        );
+        assert_eq!(queue.len(), 4, "no entry may be dropped or added");
+        assert_eq!(queue.oldest(), Some(1));
+        assert_eq!(queue.refusals(), 0);
+        assert_eq!(
+            error.to_string(),
+            "retire backpressure: capacity 4 still full on fence 1 after 4 waits \
+             (completed 0)"
+        );
+        // Nothing was released: the incoming pin never became live.
+        assert_eq!(queue.drain_upto(4), vec![10, 20, 30, 40]);
+    }
+
+    /// Backpressure releases in FIFO order and only what the waiter proved.
+    #[test]
+    fn backpressure_releases_in_push_order() {
+        let mut queue = RetireQueue::with_capacity(2);
+        queue.try_push(1, 10).expect("capacity 2");
+        queue.try_push(2, 20).expect("capacity 2");
+
+        // Prove only fence 1: the queue frees one slot and keeps fence 2.
+        let mut waits = 0u32;
+        let released = queue
+            .push_backpressure(3, 30, |oldest| {
+                waits += 1;
+                assert_eq!(oldest, 1);
+                true
+            })
+            .expect("fence 1 completing makes room");
+        assert_eq!(waits, 1);
+        assert_eq!(released, vec![10]);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.oldest(), Some(2));
+
+        // The push order is preserved behind the stalled fence 2.
+        assert_eq!(queue.drain_upto(u64::MAX), vec![20, 30]);
+        assert_eq!(queue.completed(), u64::MAX);
+        assert_eq!(queue.high_watermark(), 2);
+        assert_eq!(queue.refusals(), 0);
+    }
+
+    /// The budget reports the wait count and builds the typed error itself.
+    #[test]
+    fn backpressure_budget_is_bounded_and_typed() {
+        let full = RetireQueueFull {
+            capacity: 8,
+            oldest: 42,
+            completed: 41,
+        };
+        let mut budget = BackpressureBudget::new();
+        for expected in 1..=RetireQueue::MAX_BACKPRESSURE_WAITS {
+            assert_eq!(budget.next(full), Ok(42));
+            assert_eq!(budget.waits_used(), expected);
+        }
+        assert_eq!(
+            budget.next(full),
+            Err(RetireBackpressure {
+                capacity: 8,
+                oldest: 42,
+                completed: 41,
+                waits: RetireQueue::MAX_BACKPRESSURE_WAITS,
+            })
+        );
+        assert_eq!(BackpressureBudget::default(), BackpressureBudget::new());
     }
 }
