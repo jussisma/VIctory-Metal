@@ -35,7 +35,10 @@
 //! a mesh function must therefore use [`MeshPipeline`], never
 //! [`DirectMetalTransport::load_metallib`].
 
-use crate::macos::device::DirectMetalTransport;
+use crate::macos::bindings::{
+    DescriptorTableKind, MAX_ARGUMENT_BUFFER_BYTES, RootParameterKind, RootSignatureLayout,
+};
+use crate::macos::device::{DirectMetalTransport, PipelineAbi};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::render::{PixelFormat, new_less_depth_state};
 use crate::transport::MetalError;
@@ -43,6 +46,202 @@ use crate::wire_v3::MAX_COLOR_ATTACHMENTS;
 
 /// Metal's maximum declared mesh output bytes (32 KiB).
 pub const METAL_MESH_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// Largest root-constant block a mesh pipeline advertises inline: 64 dwords.
+pub const MAX_MESH_ROOT_CONSTANT_DWORDS: usize = 64;
+
+/// One reflected descriptor table and its entry count.
+///
+/// The converter reflection says a root parameter is a table but not which
+/// range kind it stores. The caller supplies the kind, exactly as
+/// [`RootSignatureLayout::with_descriptor_table_kinds`] does for graphics and
+/// compute, plus the entry count the wire submission will bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshTableExtent {
+    /// Range kind of the table.
+    pub kind: DescriptorTableKind,
+    /// Entries the submission binds.
+    pub count: u32,
+}
+
+impl MeshTableExtent {
+    /// Converted bytes the table occupies (`count * kind.descriptor_bytes()`).
+    pub fn bytes(&self) -> Result<usize, MeshError> {
+        (self.count as usize)
+            .checked_mul(self.kind.descriptor_bytes())
+            .ok_or(MeshError::Budget("descriptor table extent overflows usize"))
+    }
+}
+
+/// The converted root-signature binding plan of one mesh pipeline.
+///
+/// A [`MeshPipelineSpec`] decides whether Metal can create the pipeline; this
+/// plan decides what the live v3 executor must bind for it. It is built from
+/// the three reflected stage layouts (mesh, optional object, fragment) and the
+/// descriptor tables the submission will bind:
+///
+/// * root constants stay inline in the stage's top-level argument buffer and
+///   are limited to [`MAX_MESH_ROOT_CONSTANT_DWORDS`] dwords, stricter than the
+///   converter's general 4 KiB ceiling;
+/// * each stage's argument buffer must fit [`MAX_ARGUMENT_BUFFER_BYTES`];
+/// * every descriptor table's converted extent (`count * stride`) must fit the
+///   same limit, so a packed table larger than the limit is refused before any
+///   `MTLBuffer` is uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshAbiPlan {
+    mesh: RootSignatureLayout,
+    object: Option<RootSignatureLayout>,
+    fragment: Option<RootSignatureLayout>,
+    tables: Vec<MeshTableExtent>,
+    argument_buffer_bytes: usize,
+    descriptor_table_bytes: usize,
+}
+
+impl MeshAbiPlan {
+    /// Builds and validates the plan from reflected stage layouts.
+    pub fn new(
+        mesh: RootSignatureLayout,
+        object: Option<RootSignatureLayout>,
+        fragment: Option<RootSignatureLayout>,
+        tables: &[MeshTableExtent],
+    ) -> Result<Self, MeshError> {
+        validate_layout(&mesh)?;
+        if let Some(object) = object.as_ref() {
+            validate_layout(object)?;
+        }
+        if let Some(fragment) = fragment.as_ref() {
+            validate_layout(fragment)?;
+        }
+        let argument_buffer_bytes = mesh
+            .argument_buffer_len()
+            .checked_add(
+                object
+                    .as_ref()
+                    .map_or(0, RootSignatureLayout::argument_buffer_len),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    fragment
+                        .as_ref()
+                        .map_or(0, RootSignatureLayout::argument_buffer_len),
+                )
+            })
+            .ok_or(MeshError::Budget(
+                "mesh argument-buffer sizes overflow usize",
+            ))?;
+        let mut plan = Self {
+            mesh,
+            object,
+            fragment,
+            tables: Vec::new(),
+            argument_buffer_bytes,
+            descriptor_table_bytes: 0,
+        };
+        plan.set_tables(tables)?;
+        Ok(plan)
+    }
+
+    /// Builds the plan from Apple's `IRShaderReflectionCopyJSONString` output.
+    ///
+    /// A mesh pipeline always has a fragment stage, but its reflection may be
+    /// empty when the stage does not read the root signature.
+    pub fn from_reflection_json(
+        mesh_json: &str,
+        object_json: Option<&str>,
+        fragment_json: Option<&str>,
+        tables: &[MeshTableExtent],
+    ) -> Result<Self, MeshError> {
+        let parse = |json: &str, stage: &str| {
+            RootSignatureLayout::from_converter_reflection_json(json)
+                .map_err(|error| MeshError::Create(format!("{stage} reflection: {error}")))
+        };
+        let mesh = parse(mesh_json, "mesh")?;
+        let object = object_json.map(|json| parse(json, "object")).transpose()?;
+        let fragment = fragment_json
+            .map(|json| parse(json, "fragment"))
+            .transpose()?;
+        Self::new(mesh, object, fragment, tables)
+    }
+
+    /// Replaces the descriptor tables and revalidates the packed extent.
+    pub fn set_tables(&mut self, tables: &[MeshTableExtent]) -> Result<(), MeshError> {
+        let mut total = 0usize;
+        for table in tables {
+            total = total
+                .checked_add(table.bytes()?)
+                .ok_or(MeshError::Budget("descriptor table extents overflow usize"))?;
+        }
+        if total > MAX_ARGUMENT_BUFFER_BYTES {
+            return Err(MeshError::Budget(
+                "descriptor tables exceed the 64 KiB argument-buffer limit",
+            ));
+        }
+        self.tables = tables.to_vec();
+        self.descriptor_table_bytes = total;
+        Ok(())
+    }
+
+    /// Mesh-stage reflected layout.
+    pub fn mesh(&self) -> &RootSignatureLayout {
+        &self.mesh
+    }
+
+    /// Object-stage reflected layout, when the pipeline has an object stage.
+    pub fn object(&self) -> Option<&RootSignatureLayout> {
+        self.object.as_ref()
+    }
+
+    /// Fragment-stage reflected layout.
+    pub fn fragment(&self) -> Option<&RootSignatureLayout> {
+        self.fragment.as_ref()
+    }
+
+    /// Descriptor tables the submission binds.
+    pub fn tables(&self) -> &[MeshTableExtent] {
+        &self.tables
+    }
+
+    /// Sum of the three stage argument-buffer lengths.
+    pub fn argument_buffer_bytes(&self) -> usize {
+        self.argument_buffer_bytes
+    }
+
+    /// Sum of every descriptor table's converted extent.
+    pub fn descriptor_table_bytes(&self) -> usize {
+        self.descriptor_table_bytes
+    }
+
+    /// The ABI the live v3 executor stores with the mesh pipeline handle.
+    pub fn pipeline_abi(&self) -> PipelineAbi {
+        PipelineAbi::mesh(
+            Some(self.mesh.clone()),
+            self.object.clone(),
+            self.fragment.clone(),
+        )
+    }
+}
+
+/// Rejects a stage layout whose constants or argument buffer exceed a mesh
+/// pipeline's advertised budgets.
+fn validate_layout(layout: &RootSignatureLayout) -> Result<(), MeshError> {
+    if layout.argument_buffer_len() > MAX_ARGUMENT_BUFFER_BYTES {
+        return Err(MeshError::Budget(
+            "stage argument buffer exceeds the 64 KiB limit",
+        ));
+    }
+    let mut constants = 0usize;
+    for parameter in layout.parameters() {
+        if parameter.kind() == RootParameterKind::Constants {
+            constants = constants
+                .checked_add(parameter.size())
+                .ok_or(MeshError::Budget("root-constant sizes overflow usize"))?;
+        }
+    }
+    if constants > MAX_MESH_ROOT_CONSTANT_DWORDS * 4 {
+        return Err(MeshError::Budget("mesh root constants exceed 64 dwords"));
+    }
+    Ok(())
+}
 
 /// Why a mesh pipeline request could not be satisfied on this device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -711,5 +910,120 @@ mod tests {
         );
         spec.validate_limits(1024, 32 * 1024)
             .expect("stencil format is a valid depth attachment");
+    }
+
+    #[test]
+    fn mesh_abi_plan_counts_inline_constants_and_tables() {
+        use crate::macos::bindings::{DescriptorTableKind, RootParameterSpec};
+
+        let mesh = RootSignatureLayout::from_parameters(
+            crate::macos::bindings::ReflectedStage::Other,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::ShaderResourceView,
+                    ),
+                    size: 0,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::ConstantBufferView,
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+            ],
+        )
+        .expect("mesh layout");
+        let tables = [MeshTableExtent {
+            kind: DescriptorTableKind::ShaderResourceView,
+            count: 8,
+        }];
+        let plan = MeshAbiPlan::new(mesh.clone(), None, Some(mesh), &tables).expect("plan builds");
+        assert_eq!(plan.mesh().argument_buffer_len(), 32);
+        assert_eq!(plan.argument_buffer_bytes(), 64);
+        assert_eq!(plan.descriptor_table_bytes(), 64);
+        assert_eq!(plan.tables().len(), 1);
+        assert!(plan.pipeline_abi().mesh.is_some());
+        assert!(plan.pipeline_abi().fragment.is_some());
+    }
+
+    #[test]
+    fn mesh_abi_plan_refuses_root_constants_over_64_dwords() {
+        use crate::macos::bindings::RootParameterSpec;
+
+        let mesh = RootSignatureLayout::from_parameters(
+            crate::macos::bindings::ReflectedStage::Other,
+            &[RootParameterSpec {
+                kind: RootParameterKind::Constants,
+                size: (MAX_MESH_ROOT_CONSTANT_DWORDS + 4) * 4,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("a 68-dword layout is constructible");
+        let error = MeshAbiPlan::new(mesh, None, None, &[]).unwrap_err();
+        assert_eq!(
+            error,
+            MeshError::Budget("mesh root constants exceed 64 dwords")
+        );
+    }
+
+    #[test]
+    fn mesh_abi_plan_refuses_a_packed_table_over_64k() {
+        use crate::macos::bindings::{DescriptorTableKind, RootParameterSpec};
+
+        let mesh = RootSignatureLayout::from_parameters(
+            crate::macos::bindings::ReflectedStage::Other,
+            &[RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+                size: 0,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("mesh layout");
+        // 8,193 eight-byte addresses = 65,544 B, just over the 64 KiB ceiling.
+        let tables = [MeshTableExtent {
+            kind: DescriptorTableKind::ShaderResourceView,
+            count: 8_193,
+        }];
+        let error = MeshAbiPlan::new(mesh, None, None, &tables).unwrap_err();
+        assert_eq!(
+            error,
+            MeshError::Budget("descriptor tables exceed the 64 KiB argument-buffer limit")
+        );
+    }
+
+    #[test]
+    fn mesh_abi_plan_parses_converter_reflection() {
+        let json = r#"{
+            "EntryPoint": "main",
+            "ShaderType": "Mesh",
+            "TopLevelArgumentBuffer": [
+                {"EltOffset": 0, "Size": 8, "Slot": 0, "Space": 0, "Type": "Table"},
+                {"EltOffset": 8, "Size": 16, "Slot": 0, "Space": 1, "Type": "Constant"}
+            ]
+        }"#;
+        let plan = MeshAbiPlan::from_reflection_json(
+            json,
+            None,
+            None,
+            &[MeshTableExtent {
+                kind: DescriptorTableKind::ShaderResourceView,
+                count: 4,
+            }],
+        )
+        .expect("the reflected plan builds");
+        assert_eq!(plan.mesh().parameters().len(), 2);
+        assert_eq!(plan.mesh().argument_buffer_len(), 24);
+        assert_eq!(plan.descriptor_table_bytes(), 32);
     }
 }
