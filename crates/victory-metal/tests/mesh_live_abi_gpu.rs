@@ -15,10 +15,11 @@
 //!   converted root-signature layout maps root constants, root views and a
 //!   descriptor table onto one argument-buffer plan.
 //! * [`live_submit_v3_mesh_draw_is_exact`] runs the linked pair through the
-//!   Rosetta IRConverter, registers it under a wire handle with the reflected
-//!   ABI, submits `BeginRenderPass` / `SetMeshPipeline` / bindings /
-//!   `DispatchMesh` / `EndRenderPass` through `submit_v3_with_stats`, and
-//!   checks the exact pixel checksum after the submission completes.
+//!   Rosetta IRConverter, registers it as a content-hashed mesh PSO under a wire
+//!   handle with the reflected ABI, submits `BeginRenderPass` /
+//!   `SetMeshPipeline` / descriptor table / bindings / `DispatchMesh` /
+//!   `EndRenderPass` through `submit_v3_with_stats`, and checks the exact pixel
+//!   checksum after the submission completes.
 //! * [`mesh_dispatch_without_a_selected_pipeline_is_refused`] is the negative
 //!   regression: an unknown mesh handle and a dispatch without a preceding
 //!   `SetMeshPipeline` are refused before any command buffer exists.
@@ -50,15 +51,15 @@ use victory_metal::macos::cache::TranslationOptions;
 use victory_metal::macos::device::DirectMetalTransport;
 use victory_metal::macos::irconverter::{ProcessWorker, translate_dxil_with};
 use victory_metal::macos::mesh::{
-    MAX_MESH_ROOT_CONSTANT_DWORDS, MeshAbiPlan, MeshPipeline, MeshPipelineSpec, MeshTableExtent,
+    MAX_MESH_ROOT_CONSTANT_DWORDS, MeshAbiPlan, MeshTableExtent,
 };
 use victory_metal::macos::registry::{
     PipelineStage, PipelineState, TextureDesc, TextureDimension, TextureFormat, TextureUsage,
 };
-use victory_metal::wire::{self, ReplyStatus};
+use victory_metal::wire::{self, BufferBinding, ReplyStatus};
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, LoadOp, PipelineRef, RootBufferView,
-    RootConstantsV3, StoreOp, SubmissionV3,
+    BeginRenderPass, ColorAttachment, CommandV3, DescriptorKind, DescriptorTableV3, LoadOp,
+    PipelineRef, RootBufferView, RootConstantsV3, StoreOp, SubmissionV3,
 };
 use victory_shader::emit::{
     METAL_MESH_OUTPUT_BYTES, Options, mesh_output_layout, mesh_outputs, mesh_pack_proof, translate,
@@ -688,6 +689,16 @@ fn binding_layout(stage: ReflectedStage) -> RootSignatureLayout {
     .expect("the mesh binding layout builds")
 }
 
+/// The fragment stage of the live submission declares no root parameter.
+///
+/// The fixture's pixel shader reads none, and an empty fragment layout makes
+/// the descriptor-table ordinal resolvable *only* through the mesh stages — the
+/// exact ABI gap this test guards.
+fn fragment_layout() -> RootSignatureLayout {
+    RootSignatureLayout::from_parameters(ReflectedStage::Fragment, &[])
+        .expect("an empty fragment layout builds")
+}
+
 /// A page-aligned zero-copy host page.
 struct HostPage {
     ptr: *mut c_void,
@@ -855,14 +866,16 @@ fn float4_bytes(values: [f32; 4]) -> Vec<u8> {
 /// `submit_v3` mesh path with a reflected argument-buffer ABI.
 ///
 /// The fixture's real reflection is empty (it reads no resources), so the test
-/// registers the explicit binding plan from [`binding_layout`]: the converted
-/// executor encodes and binds the root constants and the three root views into
-/// mesh/fragment argument buffers, declares every referenced allocation with
-/// `useResource`, and the residency set holds the host pages and the target.
-/// The descriptor-table parameter is carried in the registered ABI and its
-/// extent is validated, but no `SetDescriptorTable` command is recorded: the
-/// executor releases the table's `MTLBuffer` before encoding (reported as a
-/// device.rs fix, not edited here). The pixel checksum proves the draw itself.
+/// registers the explicit binding plan from [`binding_layout`]. The pipeline is
+/// registered **only** through the content-hashed mesh path — no legacy
+/// `MeshPipeline` shares its handle — so the `DispatchMesh` resolution and the
+/// per-stage mesh threadgroup sizes come from the `PipelineState` blob alone.
+///
+/// The submission also binds an SRV `SetDescriptorTable`: its converted table
+/// `MTLBuffer` used to be released when the pending bindings were cleared, before
+/// the submission was encoded (SIGSEGV in `objc_retain`). The table is now owned
+/// by the prepared argument buffer and pinned until the fence completes, and the
+/// pixel checksum proves the draw itself is still exact.
 #[test]
 fn live_submit_v3_mesh_draw_is_exact() {
     let fixture = Fixture::new();
@@ -893,25 +906,10 @@ fn live_submit_v3_mesh_draw_is_exact() {
     let transport = DirectMetalTransport::new().expect("Metal device should open");
     let info = transport.device_info().expect("device info");
 
-    let spec = MeshPipelineSpec {
-        mesh_output_bytes: linked.bytes() as usize,
-        ..MeshPipelineSpec::new(
-            vec![victory_metal::macos::render::PixelFormat::Rgba8Unorm],
-            None,
-            [THREADS, 1, 1],
-        )
-    };
-    // The drawn PSO is built from the two unlinked IRConverter outputs. The
-    // combined metallib is the same code linked into one library, used only
-    // because the content-hashed ABI registration loads one library.
-    let pipeline = MeshPipeline::from_metallibs(
-        &transport, &mesh_lib, "main", None, &pixel_lib, "main", &spec,
-    )
-    .expect("the packed mesh pipeline should be created");
-    let pipeline_id = transport
-        .register_mesh_pipeline(pipeline)
-        .expect("mesh pipeline should register");
-
+    // Content-hashed registration is the only one: a mesh PSO created from the
+    // combined metallib must be dispatchable without a legacy `MeshPipeline`
+    // registered under the same handle.
+    const MESH_HANDLE: u64 = 0x3_000;
     let tables = [MeshTableExtent {
         kind: DescriptorTableKind::ShaderResourceView,
         count: 1,
@@ -919,7 +917,7 @@ fn live_submit_v3_mesh_draw_is_exact() {
     let plan = MeshAbiPlan::new(
         binding_layout(ReflectedStage::Other),
         None,
-        Some(binding_layout(ReflectedStage::Fragment)),
+        Some(fragment_layout()),
         &tables,
     )
     .expect("the ABI plan builds");
@@ -928,6 +926,8 @@ fn live_submit_v3_mesh_draw_is_exact() {
         depth_format: None,
         fragment_entry: Some(fragment_entry),
         object_entry: None,
+        // The per-stage threadgroup sizes `DispatchMesh` uses; the wire only
+        // carries group counts.
         mesh_threadgroup: [THREADS, 1, 1],
         object_threadgroup: [1, 1, 1],
         ..Default::default()
@@ -935,13 +935,13 @@ fn live_submit_v3_mesh_draw_is_exact() {
     .encode(PipelineStage::Mesh);
     transport
         .register_content_hashed_mesh_pipeline(
-            pipeline_id.0,
+            MESH_HANDLE,
             &combined,
             "main",
             &state,
             plan.pipeline_abi(),
         )
-        .expect("the content-hashed ABI carrier should register under the mesh handle");
+        .expect("the content-hashed mesh pipeline should register");
 
     const EDGE: u32 = 16;
     const TARGET: u64 = 0x2_000;
@@ -980,7 +980,21 @@ fn live_submit_v3_mesh_draw_is_exact() {
                 depth_stencil: None,
             }),
             CommandV3::SetMeshPipeline(PipelineRef {
-                pipeline_id: pipeline_id.0,
+                pipeline_id: MESH_HANDLE,
+            }),
+            // Parameter 0: the SRV descriptor table. Binding it exercises the
+            // converted table path whose `MTLBuffer` used to be released before
+            // the submission was encoded.
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![BufferBinding {
+                    allocation_id: 3,
+                    generation: 1,
+                    offset: 0,
+                    length: 16,
+                }],
             }),
             // Parameter 1: inline root constants.
             CommandV3::SetRootConstants(RootConstantsV3 {
@@ -1009,14 +1023,11 @@ fn live_submit_v3_mesh_draw_is_exact() {
                 offset: 0,
                 length: 16,
             }),
-            // NOTE: a `SetDescriptorTable` command is omitted for now: the
-            // executor's `PendingAbiBinding::Table` buffer is released when
-            // the pending bindings are cleared, before the command buffer
-            // encodes the argument buffer that points at it. The table is part
-            // of the registered ABI plan above; the device.rs fix is reported
-            // with this task rather than edited here.
+            // NOTE: the descriptor table and root views above and the mesh
+            // dispatch all live in one pass; the table buffer must stay alive
+            // from encoding through completion.
             CommandV3::DispatchMesh(wire::DispatchMesh {
-                pipeline_id: pipeline_id.0,
+                pipeline_id: MESH_HANDLE,
                 group_counts: [1, 1, 1],
                 bindings: Vec::new(),
             }),
@@ -1029,6 +1040,12 @@ fn live_submit_v3_mesh_draw_is_exact() {
     assert_eq!(reply.status, ReplyStatus::Ok, "mesh submission status");
     assert_eq!(stats.command_buffers, 1);
     assert_eq!(stats.render_encoders, 1);
+
+    // `submit_v3` returns after `commit`; the readback below reads host-visible
+    // memory, so the submission must have completed first.
+    transport
+        .wait_for_gpu()
+        .expect("the mesh submission should complete");
 
     let pixels = transport
         .read_registered_texture_rgba8(TARGET)
@@ -1080,7 +1097,7 @@ fn live_submit_v3_mesh_draw_is_exact() {
 
     eprintln!(
         "live mesh ABI on {}: packed {} B, {} px, checksum {checksum:#018x}, \
-         columns {columns:?}, abi argument-buffer {} B, planned table {} B (live table binding blocked), \
+         columns {columns:?}, abi argument-buffer {} B, bound table {} B, \
          native_residency={native}, resident={resident}, fallback={fallback:?}, stats={stats:?}",
         info.name_str(),
         linked.bytes(),

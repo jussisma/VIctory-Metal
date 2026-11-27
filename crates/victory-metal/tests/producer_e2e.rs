@@ -73,9 +73,11 @@ use std::thread;
 use std::time::Duration;
 
 use victory_metal::abi::VmBufferId;
+use victory_metal::fence_page::{FENCE_PAGE_LEN, FencePageMapping};
 use victory_metal::ipc_host::{
-    BatchExecutor, HostSecret, IpcHost, KIND_ACK, KIND_AUTH, KIND_REGISTER, KIND_SUBMISSION_V3,
-    REGISTER_PAYLOAD_LEN, V3_REQUEST_HEADER_LEN, V3_REQUEST_MAGIC,
+    BatchExecutor, FENCE_PAGE_FILE_NAME, FENCE_PAGE_REGISTER_PAYLOAD_LEN, HostSecret, IpcHost,
+    KIND_ACK, KIND_AUTH, KIND_FENCE_PAGE, KIND_REGISTER, KIND_SUBMISSION_V3, REGISTER_PAYLOAD_LEN,
+    V3_REQUEST_HEADER_LEN, V3_REQUEST_MAGIC,
 };
 use victory_metal::macos::cache::TranslationOptions;
 use victory_metal::macos::irconverter::{ProcessWorker, translate_dxil_with};
@@ -418,6 +420,17 @@ impl BatchExecutor for SharedExecutor {
     ) -> Result<victory_metal::VmPipelineId, MetalError> {
         BatchExecutor::load_pipeline(&*self.0, metallib, entry)
     }
+
+    fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
+        // The wrapper must forward this: the default would report a synchronous
+        // executor and make the host publish completion itself, which is exactly
+        // the ADR-017 defect.
+        BatchExecutor::attach_fence_page(&*self.0, page)
+    }
+
+    fn detach_fence_page(&self) {
+        BatchExecutor::detach_fence_page(&*self.0)
+    }
 }
 
 /// Raw TCP v3 client: the same framing the production sink must carry.
@@ -453,6 +466,19 @@ impl V3Client {
             self.read_frame().expect("read registration ack"),
             Some((KIND_ACK, vec![0])),
             "host did not acknowledge registration"
+        );
+    }
+
+    /// Registers the shared completion page (kind 6): one `byte_len` word.
+    fn register_fence_page(&mut self) {
+        let mut payload = [0u8; FENCE_PAGE_REGISTER_PAYLOAD_LEN];
+        payload.copy_from_slice(&(FENCE_PAGE_LEN as u64).to_le_bytes());
+        self.write_frame(KIND_FENCE_PAGE, &payload)
+            .expect("send fence page registration");
+        assert_eq!(
+            self.read_frame().expect("read fence page ack"),
+            Some((KIND_ACK, vec![0])),
+            "host did not acknowledge the fence page"
         );
     }
 
@@ -963,6 +989,20 @@ fn v3_production_gate_compute_alias_graphics_mrt_and_refusals() {
     let mut client = V3Client::connect(address, &secret);
     client.register(ALLOCATION_ID, FILE_LEN as u64);
 
+    // The launcher creates the page; the host opens it (kind 6) and publishes
+    // completions from its GPU completion handler. This second mapping is the
+    // guest's view: one atomic load, no IPC round-trip.
+    let fence_path = directory.path().join(FENCE_PAGE_FILE_NAME);
+    let launcher_page = FencePageMapping::create(&fence_path).expect("create the fence page");
+    client.register_fence_page();
+    let guest_page = FencePageMapping::open(&fence_path).expect("open the guest fence page");
+    // `begin_session` ran before the acknowledgement: both fences start at zero
+    // and the epoch advanced.
+    assert_eq!(guest_page.page().completed(), 0, "session must start idle");
+    assert_eq!(guest_page.page().submitted(), 0);
+    assert_eq!(guest_page.page().epoch(), 1, "session epoch must advance");
+    drop(launcher_page);
+
     let identity = ListIdentity {
         list_id: 41,
         list_generation: 1,
@@ -991,6 +1031,23 @@ fn v3_production_gate_compute_alias_graphics_mrt_and_refusals() {
             status: ReplyStatus::Ok,
         }
     );
+    // The host submits asynchronously (ADR-017): `Ok` means the command buffer
+    // was accepted, so the guest-visible alias is only final after the GPU
+    // completed the submission. `submitted_fence` is published before the
+    // executor runs; `completed_fence` only from the completion handler.
+    assert!(
+        guest_page.page().submitted() >= 1,
+        "the host must publish the submitted sequence before executing"
+    );
+    transport
+        .wait_for_gpu()
+        .expect("the IPC compute submission should complete");
+    assert_eq!(
+        guest_page.page().completed(),
+        1,
+        "the completion handler must publish sequence 1 exactly once"
+    );
+    assert_eq!(transport.completed_fence(), 1);
     let after_compute = fs::read(&allocation).expect("read the alias after compute");
     for index in 0..COMPUTE_THREADS as usize {
         let at = index * 4;
@@ -1185,6 +1242,11 @@ fn v3_production_gate_compute_alias_graphics_mrt_and_refusals() {
             status: ReplyStatus::Ok,
         }
     );
+    // The draw is committed, not finished: the presented surface and the second
+    // colour target are read on the CPU below, so observe GPU completion first.
+    transport
+        .wait_for_gpu()
+        .expect("the MRT submission should complete");
 
     // The frame that was drawn is the frame the host presents.
     let mut path = PresentPath::new(&transport);
