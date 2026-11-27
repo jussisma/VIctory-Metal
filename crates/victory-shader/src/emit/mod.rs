@@ -261,10 +261,16 @@ mod mesh_pack;
 mod mark_tests;
 mod deltas;
 mod rect;
+mod root_signature;
 pub use container::sign as sign_container;
 pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
 pub use mesh_pack::{MeshPackProof, MeshPruneReason, MeshRowProof, mesh_pack_proof};
 pub use rect::{rectangle_gs, right_angle};
+pub use root_signature::{
+    DescriptorKind, DescriptorRange, MAX_BLOB_BYTES, MAX_ROOT_PARAMETERS, MAX_STATIC_SAMPLERS,
+    ParameterKind, RangeKind, RootParameter, RootSampler, RootSignature, SignatureFlags,
+    Visibility, translated_pipeline_root_signature, translated_root_signature,
+};
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;

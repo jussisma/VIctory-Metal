@@ -46,4 +46,9 @@ pub enum ShaderError {
     /// `host_wave32`).
     #[error("translation options: {0}")]
     Options(&'static str),
+    /// A translated root signature that cannot be described or serialized
+    /// (`emit::root_signature`): too many parameters, or a size that does not
+    /// fit the format.
+    #[error("root signature: {0}")]
+    RootSignature(&'static str),
 }
