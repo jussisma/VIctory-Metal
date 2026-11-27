@@ -503,34 +503,141 @@ fn push_stencil_face(out: &mut Vec<u8>, face: &StencilFaceState) {
     out.push(face.write_mask);
 }
 
+/// Canonical DXGI -> (PSO code, depth/stencil) rows for the guest (Windows)
+/// build, where `victory-metal`'s macOS-only registry module is not compiled.
+///
+/// The canonical table in
+/// `victory_metal::macos::registry::FORMAT_TABLE` is the source of truth; the
+/// macOS test [`pso_format_codes_match_the_canonical_table`] asserts every row
+/// here agrees with it. BC formats and stencil-only read views are not
+/// pipeline attachment formats and are omitted.
+#[allow(dead_code)]
+const DXGI_FORMAT_CODES: &[(u32, u8, bool)] = &[
+    (1, 23, false),
+    (2, 20, false),
+    (3, 21, false),
+    (4, 22, false),
+    (9, 28, false),
+    (10, 17, false),
+    (11, 24, false),
+    (12, 25, false),
+    (13, 26, false),
+    (14, 27, false),
+    (15, 32, false),
+    (16, 29, false),
+    (17, 30, false),
+    (18, 31, false),
+    (19, 35, true),
+    (20, 16, true),
+    (21, 33, true),
+    (23, 37, false),
+    (24, 11, false),
+    (25, 36, false),
+    (26, 10, false),
+    (27, 41, false),
+    (28, 7, false),
+    (29, 8, false),
+    (30, 38, false),
+    (31, 39, false),
+    (32, 40, false),
+    (33, 47, false),
+    (34, 42, false),
+    (35, 43, false),
+    (36, 44, false),
+    (37, 45, false),
+    (38, 46, false),
+    (39, 48, false),
+    (40, 14, true),
+    (41, 12, false),
+    (42, 18, false),
+    (43, 19, false),
+    (44, 51, true),
+    (45, 15, true),
+    (46, 49, true),
+    (48, 56, false),
+    (49, 52, false),
+    (50, 53, false),
+    (51, 54, false),
+    (52, 55, false),
+    (53, 62, false),
+    (54, 13, false),
+    (55, 61, true),
+    (56, 57, false),
+    (57, 58, false),
+    (58, 59, false),
+    (59, 60, false),
+    (60, 67, false),
+    (61, 63, false),
+    (62, 64, false),
+    (63, 65, false),
+    (64, 66, false),
+    (65, 68, false),
+    (67, 69, false),
+    (85, 70, false),
+    (86, 71, false),
+    (87, 9, false),
+    (88, 74, false),
+    (90, 73, false),
+    (91, 72, false),
+    (92, 76, false),
+    (93, 75, false),
+];
+
+/// The canonical table's answer for `dxgi`, or the cross-target mirror.
+#[cfg(target_os = "macos")]
+fn canonical_format_code(dxgi: u32) -> Option<(u8, bool)> {
+    let format = victory_metal::macos::registry::TextureFormat::from_dxgi(dxgi).ok()?;
+    Some((format.code(), format.is_depth_stencil()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn canonical_format_code(dxgi: u32) -> Option<(u8, bool)> {
+    DXGI_FORMAT_CODES
+        .iter()
+        .find(|(value, _, _)| *value == dxgi)
+        .map(|(_, code, depth)| (*code, *depth))
+}
+
+#[cfg(target_os = "macos")]
+fn format_is_block_compressed(dxgi: u32) -> bool {
+    victory_metal::macos::registry::TextureFormat::from_dxgi(dxgi)
+        .is_ok_and(|format| format.is_block_compressed())
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn format_is_block_compressed(_dxgi: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn format_is_colour_attachment(dxgi: u32) -> bool {
+    use victory_metal::macos::registry::FormatKind;
+    victory_metal::macos::registry::TextureFormat::from_dxgi(dxgi)
+        .is_ok_and(|format| matches!(format.kind(), FormatKind::Colour))
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn format_is_colour_attachment(_dxgi: u32) -> bool {
+    true
+}
+
 /// Host `TextureFormat` code for a PC `DXGI_FORMAT` render-target format.
 ///
-/// Only formats the host registry can attach are mapped; an unmapped format
-/// leaves the caller's historical `Rgba8Unorm` default, exactly as the
+/// Every colour row of the canonical table is accepted (including typeless
+/// rows, which the host creates with their concrete base); block-compressed,
+/// depth and stencil-only formats are never colour attachments. An unmapped
+/// format leaves the caller's historical `Rgba8Unorm` default, exactly as the
 /// pre-`VPS2` default state did.
-pub const fn color_format_code(dxgi: u32) -> Option<u8> {
-    Some(match dxgi {
-        24 => 11, // R10G10B10A2_UNORM
-        26 => 10, // R11G11B10_FLOAT
-        28 => 7,  // R8G8B8A8_UNORM
-        29 => 8,  // R8G8B8A8_UNORM_SRGB
-        41 => 12, // R32_FLOAT
-        42 => 18, // R32_UINT (MTLPixelFormatR32Uint, 53)
-        43 => 19, // R32_SINT (MTLPixelFormatR32Sint, 54)
-        54 => 13, // R16_FLOAT
-        87 => 9,  // B8G8R8A8_UNORM
-        _ => return None,
+pub fn color_format_code(dxgi: u32) -> Option<u8> {
+    canonical_format_code(dxgi).and_then(|(code, depth)| {
+        (!depth && !format_is_block_compressed(dxgi) && format_is_colour_attachment(dxgi))
+            .then_some(code)
     })
 }
 
 /// Host `TextureFormat` code for a PC `DXGI_FORMAT` depth format.
-pub const fn depth_format_code(dxgi: u32) -> Option<u8> {
-    Some(match dxgi {
-        20 => 16, // D32_FLOAT_S8X24_UINT
-        40 => 14, // D32_FLOAT
-        45 => 15, // D24_UNORM_S8_UINT
-        _ => return None,
-    })
+pub fn depth_format_code(dxgi: u32) -> Option<u8> {
+    canonical_format_code(dxgi).and_then(|(code, depth)| depth.then_some(code))
 }
 
 fn push_u16_string(out: &mut Vec<u8>, text: &str) {
@@ -1198,7 +1305,8 @@ mod tests {
     fn r32_integer_targets_map_to_the_r32_host_codes() {
         assert_eq!(color_format_code(42), Some(18));
         assert_eq!(color_format_code(43), Some(19));
-        assert_eq!(color_format_code(11), None);
+        assert_eq!(color_format_code(11), Some(24), "R16G16B16A16_UNORM");
+        assert_eq!(color_format_code(5), None, "R32G32B32_TYPELESS is refused");
         #[cfg(target_os = "macos")]
         {
             use victory_metal::macos::registry::TextureFormat;
@@ -1206,6 +1314,48 @@ mod tests {
             assert_eq!(TextureFormat::from_code(19), Some(TextureFormat::R32Sint));
             assert_eq!(TextureFormat::R32Uint.mtl_pixel_format(), 53);
             assert_eq!(TextureFormat::R32Sint.mtl_pixel_format(), 54);
+        }
+    }
+
+    /// The full canonical DXGI set maps to the shared PSO codes; the values the
+    /// cycle directive listed are corrected by name (62 is R8_UINT, 57 is
+    /// R16_UINT, 64 is R8_SINT, 88 is B8G8R8X8_UNORM).
+    #[test]
+    fn canonical_pso_codes_cover_the_standard_set() {
+        assert_eq!(color_format_code(62), Some(64), "R8_UINT");
+        assert_eq!(color_format_code(57), Some(58), "R16_UINT");
+        assert_eq!(color_format_code(63), Some(65), "R8_SNORM");
+        assert_eq!(color_format_code(64), Some(66), "R8_SINT");
+        assert_eq!(color_format_code(65), Some(68), "A8_UNORM");
+        assert_eq!(color_format_code(24), Some(11), "R10G10B10A2_UNORM");
+        assert_eq!(color_format_code(26), Some(10), "R11G11B10_FLOAT");
+        assert_eq!(color_format_code(87), Some(9), "B8G8R8A8_UNORM");
+        assert_eq!(color_format_code(88), Some(74), "B8G8R8X8_UNORM");
+        assert_eq!(color_format_code(6), None, "three-channel refused");
+        assert_eq!(color_format_code(71), None, "BC is not an attachment");
+        assert_eq!(depth_format_code(40), Some(14), "D32_FLOAT");
+        assert_eq!(depth_format_code(45), Some(15), "D24_UNORM_S8_UINT");
+        assert_eq!(depth_format_code(20), Some(16), "D32_FLOAT_S8X24_UINT");
+        assert_eq!(depth_format_code(55), Some(61), "D16_UNORM");
+        assert_eq!(depth_format_code(28), None, "RGBA8 is not depth");
+    }
+
+    /// The guest (Windows) mirror must agree with the canonical table for every
+    /// row it carries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pso_format_codes_match_the_canonical_table() {
+        use victory_metal::macos::registry::TextureFormat;
+        for &(dxgi, code, depth) in DXGI_FORMAT_CODES {
+            let format = TextureFormat::from_dxgi(dxgi)
+                .unwrap_or_else(|error| panic!("DXGI {dxgi}: {error}"));
+            assert_eq!(format.code(), code, "{} code", format.name());
+            assert_eq!(
+                format.is_depth_stencil(),
+                depth,
+                "{} depth-ness",
+                format.name()
+            );
         }
     }
 
