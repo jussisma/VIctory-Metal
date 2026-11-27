@@ -79,9 +79,11 @@
 //! Requests and responses are strictly alternating on one pipe pair, so the
 //! pool never needs a worker-side scheduler. A worker that exits, closes its
 //! stdout or violates the frame layout is reported as an explicit error, its
-//! process is reaped, and the slot is respawned for the next job; a caller
-//! that exceeds `job_timeout` cancels its job, kills the worker and receives
-//! [`PoolError::Timeout`], and the pool remains usable.
+//! process is reaped with its exit code or signal and stderr tail, and the slot
+//! is respawned for the next job. A `--stdio` supervisor that answers a
+//! complete nonzero frame stays alive and keeps serving: a failed conversion is
+//! not a restart. A caller that exceeds `job_timeout` cancels its job, kills
+//! the worker and receives [`PoolError::Timeout`], and the pool remains usable.
 //!
 //! # Cache
 //!
@@ -96,7 +98,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -145,6 +147,14 @@ pub const POOL_REFLECTION_PRODUCER_VERSION: &str = "reflection-json-1";
 /// one host log line and one error message finite. The tail is kept (the
 /// reason a worker died is the end of its stderr), not the first bytes.
 pub const MAX_WORKER_STDERR_BYTES: usize = 4096;
+
+/// Raw bytes the stderr reader retains before escaping.
+///
+/// The reported text is still capped at [`MAX_WORKER_STDERR_BYTES`]; this
+/// larger window keeps a crash line that follows a long startup banner, and
+/// [`escape_worker_stderr`] keeps the *tail* of it, because a worker's last
+/// words are the reason it died.
+const MAX_WORKER_STDERR_CAPTURE_BYTES: usize = MAX_WORKER_STDERR_BYTES * 4;
 
 /// Longest worker stderr text that may enter telemetry.
 ///
@@ -348,7 +358,11 @@ pub struct PoolStats {
     pub cache_misses: u64,
     /// Worker processes started (a restarted worker counts again).
     pub worker_starts: u64,
-    /// Workers reaped after a crash, timeout or protocol error.
+    /// Workers reaped after a crash, timeout or protocol desync.
+    ///
+    /// A conversion the supervisor reports as failed (`VMRES2` with a nonzero
+    /// status) is not a restart: the supervisor stayed in step and serves the
+    /// next job.
     pub worker_restarts: u64,
     /// Jobs that completed successfully, including cache hits.
     pub completed: u64,
@@ -389,6 +403,92 @@ impl WorkerTiming {
     }
 }
 
+/// How a worker process ended, as observed by reaping it.
+///
+/// A `--stdio` supervisor that survives a failed conversion answers a complete
+/// nonzero frame and is *not* reaped; this type describes the cases where the
+/// pool lost the process (crash, killed on timeout, protocol desync). On Unix
+/// a signal is distinguished from an exit code so the diagnostic can say
+/// `signal 11 (SIGSEGV)` rather than inventing a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    /// Normal exit with this code.
+    Code(i32),
+    /// Killed by this Unix signal number.
+    Signal(i32),
+    /// The pool could not collect a status (the child was already reaped).
+    Unknown,
+}
+
+impl WorkerExit {
+    fn from_status(status: ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return Self::Signal(signal);
+            }
+        }
+        match status.code() {
+            Some(code) => Self::Code(code),
+            None => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(f, "exit code {code}"),
+            Self::Signal(signal) => match signal_name(*signal) {
+                Some(name) => write!(f, "signal {signal} ({name})"),
+                None => write!(f, "signal {signal}"),
+            },
+            Self::Unknown => f.write_str("unknown exit status"),
+        }
+    }
+}
+
+/// Names the signals a converter process most often dies from.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    match signal {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        3 => Some("SIGQUIT"),
+        4 => Some("SIGILL"),
+        5 => Some("SIGTRAP"),
+        6 => Some("SIGABRT"),
+        8 => Some("SIGFPE"),
+        9 => Some("SIGKILL"),
+        10 => Some("SIGBUS"),
+        11 => Some("SIGSEGV"),
+        12 => Some("SIGSYS"),
+        13 => Some("SIGPIPE"),
+        14 => Some("SIGALRM"),
+        15 => Some("SIGTERM"),
+        _ => None,
+    }
+}
+
+/// Everything the pool knows about a worker it lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerDeath {
+    /// Exit code, signal or unknown status.
+    pub exit: WorkerExit,
+    /// Bounded, escaped stderr tail; empty when nothing was captured.
+    pub stderr: String,
+}
+
+impl std::fmt::Display for WorkerDeath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.exit)?;
+        if !self.stderr.is_empty() {
+            write!(f, "; worker stderr: {}", self.stderr)?;
+        }
+        Ok(())
+    }
+}
+
 /// Explicit pool failure. Every variant is terminal for the affected job only.
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
@@ -422,11 +522,13 @@ pub enum PoolError {
         /// Underlying IO error.
         source: std::io::Error,
     },
-    /// The worker closed stdout before answering, which includes a crash.
-    #[error("shader worker exited before answering job {job_id}")]
+    /// The worker closed stdout before answering, including a crash.
+    #[error("shader worker exited before answering job {job_id}: {death}")]
     WorkerExited {
         /// Job that lost its worker.
         job_id: u64,
+        /// Exit code or signal plus the captured stderr tail.
+        death: WorkerDeath,
     },
     /// The response sequence number did not match the dispatched request.
     #[error("shader worker answered sequence {expected} as sequence {got}")]
@@ -654,9 +756,11 @@ impl CompilerPool {
     ///
     /// The text is at most [`MAX_WORKER_STDERR_BYTES`], has control characters
     /// replaced, and has absolute paths redacted to `<path>`: it is safe to put
-    /// on one diagnostic line. A worker that exited before answering leaves its
-    /// own reason here even though [`PoolError::WorkerExited`] cannot carry an
-    /// extra field without breaking every existing matcher.
+    /// on one diagnostic line. A worker that exited before answering carries
+    /// the same tail in [`PoolError::WorkerExited`]; a `--stdio` supervisor
+    /// that answered a nonzero frame contributes its bounded reason (which
+    /// already includes the conversion child's exit status and stderr tail).
+    /// This accessor keeps the last one for telemetry and the host log.
     pub fn last_worker_stderr(&self) -> Option<String> {
         self.last_stderr.lock().ok().and_then(|text| text.clone())
     }
@@ -981,19 +1085,34 @@ impl WorkerSlot {
     fn reap(&self) {
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
-                kill_worker(&mut child);
+                let _ = kill_worker(&mut child);
             }
         }
     }
+
+    /// Kills and reaps the worker, returning how it ended.
+    ///
+    /// An already exited child is reaped as-is, so a worker that closed its
+    /// stdout and then died reports its real exit code or signal. A child the
+    /// pool has to kill (protocol desync, timeout) reports the kill.
+    fn reap_status(&self) -> Option<ExitStatus> {
+        let mut guard = self.child.lock().ok()?;
+        let mut child = guard.take()?;
+        kill_worker(&mut child)
+    }
 }
 
-/// Kills a worker and its process group, then reaps it.
+/// Kills a worker and its process group, then reaps it and reports its status.
 ///
 /// Workers are started with `process_group(0)`, so a wrapper script's child
 /// processes cannot keep the stdout pipe open after the direct child dies;
 /// without the group kill a hung grandchild would make the pool's read block
-/// past the job timeout.
-fn kill_worker(child: &mut Child) {
+/// past the job timeout. A worker that already exited keeps its own status
+/// instead of being reported as `SIGKILL`.
+fn kill_worker(child: &mut Child) -> Option<ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
+    }
     #[cfg(unix)]
     {
         if let Ok(pid) = i32::try_from(child.id()) {
@@ -1008,17 +1127,18 @@ fn kill_worker(child: &mut Child) {
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 /// Reads a worker's stderr into a bounded tail ring and sends the escaped
 /// text back when the pipe closes.
 ///
 /// The reader never blocks the worker: it drains the pipe for the whole child
-/// lifetime and only keeps the last [`MAX_WORKER_STDERR_BYTES`] bytes, because
-/// the reason a worker died is at the end of its stderr. The receiver carries
-/// the text once, at EOF; a caller that already reaped the child gets it
-/// immediately.
+/// lifetime and only keeps the last [`MAX_WORKER_STDERR_CAPTURE_BYTES`] bytes,
+/// because the reason a worker died is at the end of its stderr. The receiver
+/// carries the escaped tail once, at EOF; a caller that already reaped the
+/// child gets it immediately, so the pool reaps before reading when the child
+/// closed stdout.
 fn spawn_stderr_reader(mut pipe: ChildStderr) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
     let spawned = thread::Builder::new()
@@ -1032,8 +1152,8 @@ fn spawn_stderr_reader(mut pipe: ChildStderr) -> Receiver<String> {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         ring.extend_from_slice(&chunk[..read]);
-                        if ring.len() > MAX_WORKER_STDERR_BYTES {
-                            let overflow = ring.len() - MAX_WORKER_STDERR_BYTES;
+                        if ring.len() > MAX_WORKER_STDERR_CAPTURE_BYTES {
+                            let overflow = ring.len() - MAX_WORKER_STDERR_CAPTURE_BYTES;
                             ring.drain(..overflow);
                             truncated = true;
                         }
@@ -1077,9 +1197,9 @@ fn escape_worker_stderr(raw: &[u8], truncated: bool) -> String {
         }
     }
     let escaped = redact_absolute_paths(cleaned.trim_end());
-    let suffix = if truncated { " [truncated]" } else { "" };
+    let suffix = " [truncated]";
     let room = MAX_WORKER_STDERR_BYTES.saturating_sub(suffix.len());
-    let mut out = truncate_chars(&escaped, room);
+    let mut out = truncate_chars_tail(&escaped, room);
     if truncated || out.len() < escaped.len() {
         out.push_str(suffix);
     }
@@ -1132,16 +1252,21 @@ fn is_absolute_path(token: &str) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
-/// Truncates `text` to at most `max` bytes without splitting a character.
-fn truncate_chars(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.len() + ch.len_utf8() > max {
-            break;
-        }
-        out.push(ch);
+/// Keeps the last `max` bytes of `text` without splitting a character.
+///
+/// Stderr is reported as a *tail*: the worker's last line (a panic, a converter
+/// abort, a signal handler's note) is the diagnostic, while the first line is
+/// often a startup banner. Truncating from the front would discard exactly the
+/// bytes that explain the failure.
+fn truncate_chars_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
     }
-    out
+    let mut start = text.len().saturating_sub(max);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 /// [`MAX_WORKER_STDERR_TELEMETRY_CHARS`]-bounded view of captured stderr.
@@ -1237,7 +1362,16 @@ impl ChildIo {
                     source,
                 })?;
         if read == 0 {
-            return Err(PoolError::WorkerExited { job_id: job.id });
+            // The supervisor is gone or closed its stdout. The worker loop
+            // reaps it and fills in the exit code/signal and stderr tail, so
+            // the reason is not lost behind a bare "exited" message.
+            return Err(PoolError::WorkerExited {
+                job_id: job.id,
+                death: WorkerDeath {
+                    exit: WorkerExit::Unknown,
+                    stderr: String::new(),
+                },
+            });
         }
         if line.len() > MAX_FRAME_HEADER_BYTES {
             return Err(PoolError::Protocol {
@@ -1554,29 +1688,56 @@ fn worker_loop(
             Ok(reply) => {
                 let _ = job.reply.send(Ok(reply));
             }
-            Err(err) => {
-                // The worker's own last words are the only evidence for why
-                // it died. The read is bounded: a worker that exited has
-                // already closed stderr, so this returns at once; only a
-                // descendant that escaped the process-group kill can make it
-                // wait out the short timeout.
-                let stderr = child.take_stderr();
-                // Any IO or protocol failure leaves the pipeline unusable:
-                // reap the child and respawn on the next job.
-                io = None;
-                slot.reap();
-                stats.worker_restarts.fetch_add(1, Ordering::Relaxed);
-                let err = match stderr {
-                    Some(text) => {
-                        record_worker_stderr(&last_stderr, &text);
+            // A complete nonzero answer is a *conversion* failure, not a dead
+            // worker: the supervisor stayed in step on stdin and serves the
+            // next job. Reaping it here is what made Boot #17 show one process
+            // start per job.
+            Err(err @ PoolError::WorkerFailed { .. }) => {
+                // Carry the supervisor's bounded reason (which includes the
+                // conversion child's signal/exit and stderr tail) into the
+                // same diagnostic channel as captured worker stderr, so the
+                // host's `host_translation_reason` can say why the stage
+                // failed instead of only "converter rejected the shader".
+                if let PoolError::WorkerFailed { message, .. } = &err {
+                    let detail = escape_worker_stderr(message.as_bytes(), false);
+                    if !detail.is_empty() {
+                        record_worker_stderr(&last_stderr, &detail);
                         tracing::warn!(
                             job_id = job.id,
-                            worker_stderr = %text,
-                            "shader worker failed a job and wrote to stderr"
+                            worker_reason = %detail,
+                            "shader worker rejected a job with a bounded reason"
                         );
-                        attach_stderr(err, text)
                     }
-                    None => err,
+                }
+                let _ = job.reply.send(Err(err));
+            }
+            Err(err) => {
+                // The pipeline is unusable (EOF, IO error, protocol desync).
+                // Reap first so the stderr reader sees EOF and the child's real
+                // exit code or signal is collected instead of being reported as
+                // SIGKILL; then take the bounded tail.
+                let exit = slot.reap_status().map(WorkerExit::from_status);
+                let stderr = child.take_stderr();
+                io = None;
+                stats.worker_restarts.fetch_add(1, Ordering::Relaxed);
+                if let Some(text) = &stderr {
+                    record_worker_stderr(&last_stderr, text);
+                    tracing::warn!(
+                        job_id = job.id,
+                        exit = %exit.unwrap_or(WorkerExit::Unknown),
+                        worker_stderr = %text,
+                        "shader worker failed a job and wrote to stderr"
+                    );
+                }
+                let err = match err {
+                    PoolError::WorkerExited { job_id, .. } => PoolError::WorkerExited {
+                        job_id,
+                        death: WorkerDeath {
+                            exit: exit.unwrap_or(WorkerExit::Unknown),
+                            stderr: stderr.unwrap_or_default(),
+                        },
+                    },
+                    other => attach_stderr(other, stderr.unwrap_or_default()),
                 };
                 let _ = job.reply.send(Err(err));
             }
@@ -2039,7 +2200,7 @@ mod tests {
             })
             .expect_err("a worker that exits before answering must fail the job");
         assert!(
-            matches!(err, PoolError::WorkerExited { job_id: 1 }),
+            matches!(err, PoolError::WorkerExited { job_id: 1, .. }),
             "unexpected error: {err:?}"
         );
         let stderr = pool
@@ -2094,6 +2255,38 @@ mod tests {
             text.len()
         );
         assert!(text.ends_with(" [truncated]"), "{text}");
+    }
+
+    #[test]
+    fn worker_stderr_keeps_the_crash_line_after_a_long_banner() {
+        let banner = "victory-irconverter: serving --stdio with converter <path>\n";
+        let mut raw = banner.as_bytes().to_vec();
+        raw.extend(std::iter::repeat_n(b'.', MAX_WORKER_STDERR_BYTES * 3));
+        raw.extend_from_slice(b"\nconverter child died: signal 11\n");
+        let text = escape_worker_stderr(&raw, true);
+        assert!(
+            text.ends_with("converter child died: signal 11 [truncated]"),
+            "the tail, not the banner, must survive: {text}"
+        );
+        assert!(
+            text.len() <= MAX_WORKER_STDERR_BYTES,
+            "{} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn worker_exit_names_codes_and_signals() {
+        assert_eq!(WorkerExit::Code(9).to_string(), "exit code 9");
+        assert_eq!(WorkerExit::Signal(11).to_string(), "signal 11 (SIGSEGV)");
+        assert_eq!(WorkerExit::Signal(6).to_string(), "signal 6 (SIGABRT)");
+        assert_eq!(WorkerExit::Signal(77).to_string(), "signal 77");
+        assert_eq!(WorkerExit::Unknown.to_string(), "unknown exit status");
+        let death = WorkerDeath {
+            exit: WorkerExit::Signal(11),
+            stderr: String::new(),
+        };
+        assert_eq!(death.to_string(), "signal 11 (SIGSEGV)");
     }
 
     #[test]

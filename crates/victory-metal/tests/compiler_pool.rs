@@ -17,7 +17,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use victory_metal::compiler_pool::{
-    CompileJob, CompilerPool, DEFAULT_WORKERS, MAX_WORKERS, PoolConfig, PoolError,
+    CompileJob, CompilerPool, DEFAULT_WORKERS, MAX_WORKERS, PoolConfig, PoolError, WorkerExit,
 };
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +51,7 @@ impl Drop for TempDir {
 ///
 /// Modes selected by the job's entry point:
 /// * `crash`  — exits before answering (mid-job worker death);
+/// * `signal` — kills itself with SIGSEGV (signal reaped by the pool);
 /// * `hang`   — sleeps 30 s before answering (caller timeout);
 /// * `badseq` — echoes a different internal sequence number;
 /// * `badid`  — echoes a different caller id;
@@ -71,6 +72,11 @@ while IFS=' ' read -r magic seq id stage entry_len dxil_len; do
         crash)
             rm -f "$scratch.entry" "$scratch.dxil"
             exit 9
+            ;;
+        signal)
+            rm -f "$scratch.entry" "$scratch.dxil"
+            printf 'pool fixture: dying at /Users/private/secret.dylib\n' >&2
+            kill -SEGV $$
             ;;
         hang)
             sleep 30
@@ -222,8 +228,54 @@ fn cache_hit_avoids_a_second_worker_start() {
     assert_eq!(entries.len(), 1, "one content-addressed entry on disk");
 }
 
-/// Test (c): a worker that exits mid-job is an explicit error, and the pool
-/// respawns for the next job.
+/// Test: a worker killed by a signal is reaped and the signal is named.
+#[test]
+fn worker_signal_is_reaped_and_named() {
+    let dir = TempDir::new("signal");
+    let program = write_fixture(dir.path());
+    let pool = CompilerPool::new(test_config(dir.path()), Some(program));
+
+    let err = pool
+        .compile(&job(1, "signal", b"dxil"))
+        .expect_err("a signal-killed worker must not produce a result");
+    match err {
+        PoolError::WorkerExited { job_id, death } => {
+            assert_eq!(job_id, 1);
+            assert_eq!(
+                death.exit,
+                WorkerExit::Signal(11),
+                "SIGSEGV must be reaped and named, not hidden: {death:?}"
+            );
+            assert!(
+                death.to_string().contains("signal 11"),
+                "the error must name the signal: {death}"
+            );
+            assert!(
+                death.stderr.contains("pool fixture: dying at <path>"),
+                "the reaped stderr tail must travel with the error: {:?}",
+                death.stderr
+            );
+            assert!(
+                !death.stderr.contains("/Users"),
+                "the tail must stay path-scrubbed: {:?}",
+                death.stderr
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let recovered = pool
+        .compile(&job(2, "main", b"dxil-after-signal"))
+        .expect("pool must remain usable after a signal-killed worker");
+    let mut expected = b"main".to_vec();
+    expected.extend_from_slice(b"dxil-after-signal");
+    assert_eq!(recovered, expected);
+
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// Test (c): a worker that exits before answering is an explicit error, and
+/// the pool respawns for the next job.
 #[test]
 fn worker_crash_is_explicit_and_pool_stays_usable() {
     let dir = TempDir::new("crash");
@@ -234,7 +286,7 @@ fn worker_crash_is_explicit_and_pool_stays_usable() {
         .compile(&job(1, "crash", b"dxil"))
         .expect_err("a dead worker must not produce a result");
     assert!(
-        matches!(err, PoolError::WorkerExited { job_id: 1 }),
+        matches!(err, PoolError::WorkerExited { job_id: 1, .. }),
         "unexpected crash error: {err:?}"
     );
 
@@ -326,6 +378,7 @@ fn mismatched_worker_frames_are_rejected() {
     );
 
     // Worker status and empty payloads are explicit too.
+    let before = pool.stats();
     let err = pool
         .compile(&job(3, "fail", b"dxil"))
         .expect_err("worker status 7 must be an error");
@@ -340,6 +393,16 @@ fn mismatched_worker_frames_are_rejected() {
         ),
         "unexpected status error: {err:?}"
     );
+    let after = pool.stats();
+    assert_eq!(
+        after.worker_restarts, before.worker_restarts,
+        "a supervisor-reported failure must not restart the worker"
+    );
+    assert!(
+        pool.last_worker_stderr()
+            .is_some_and(|stderr| stderr.contains("boom-fail")),
+        "the supervisor's reason must reach the diagnostic channel"
+    );
 
     // A zero-length payload is a valid (empty) result at the frame level.
     assert_eq!(
@@ -347,6 +410,47 @@ fn mismatched_worker_frames_are_rejected() {
             .expect("empty payload is well framed"),
         Vec::<u8>::new()
     );
+    assert_eq!(
+        pool.stats().worker_restarts,
+        before.worker_restarts,
+        "the failed job's supervisor must not be reaped"
+    );
+}
+
+/// A boot must not pay one process start per failed job: repeated
+/// supervisor-reported failures reuse one long-lived `--stdio` worker.
+#[test]
+fn repeated_failed_jobs_do_not_restart_the_supervisor() {
+    let dir = TempDir::new("failure-churn");
+    let program = write_fixture(dir.path());
+    let config = PoolConfig {
+        workers: 1,
+        ..test_config(dir.path())
+    };
+    let pool = CompilerPool::new(config, Some(program));
+
+    for id in 1..=3 {
+        let err = pool
+            .compile(&job(id, "fail", format!("dxil-{id}").as_bytes()))
+            .expect_err("status 7 must fail the job");
+        assert!(
+            matches!(err, PoolError::WorkerFailed { status: 7, .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+    // Unique inputs, so the successful jobs cannot be cache hits: they must
+    // reach the same supervisor that answered the failures.
+    for id in 10..=12 {
+        pool.compile(&job(id, "ok", format!("dxil-{id}").as_bytes()))
+            .expect("a normal job after failures must succeed");
+    }
+
+    let stats = pool.stats();
+    assert_eq!(stats.worker_restarts, 0, "no failure lost the supervisor");
+    assert_eq!(stats.worker_starts, 1, "one persistent supervisor for 6 jobs");
+    assert_eq!(stats.worker_jobs, 6);
+    assert_eq!(stats.errors, 3);
+    assert_eq!(stats.completed, 3);
 }
 
 /// Test (d): `VICTORY_SHADER_WORKERS=99` clamps to 8 and `=0` clamps to 1.
