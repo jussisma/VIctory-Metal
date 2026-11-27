@@ -708,6 +708,12 @@ pub(crate) enum ResolveError {
     OutOfBounds,
     /// Not every page of the range is shown by a tracked view.
     NotMapped,
+    /// A page of the range is reserved by a virtual region but not
+    /// committed: its address space exists, its bytes do not.
+    Uncommitted,
+    /// A page of the range is committed, but its protection forbids reading
+    /// (or it is a guard page): the bytes exist, the host may not map them.
+    Inaccessible,
     /// The views do not show one contiguous run of one section.
     NotContiguous,
     /// The backing is not this session's: a foreign id or generation.
@@ -722,6 +728,8 @@ impl std::fmt::Display for ResolveError {
             ResolveError::Empty => "the range is empty",
             ResolveError::OutOfBounds => "the range leaves its section",
             ResolveError::NotMapped => "the range is not mapped by tracked views",
+            ResolveError::Uncommitted => "the range is reserved but not committed",
+            ResolveError::Inaccessible => "the range is committed but not readable",
             ResolveError::NotContiguous => "the range is not one contiguous section run",
             ResolveError::Stale => "the range's backing is stale or not this session's",
             ResolveError::Pagefile => "the range's section has no host-visible backing",
@@ -766,6 +774,13 @@ fn directory() -> Option<PathBuf> {
         static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
         RESOLVED.get_or_init(read_directory).clone()
     }
+}
+
+/// Whether a share directory is configured for this thread/process: the
+/// virtual region path (`XMemVirtualAlloc`, ADR-045) only takes over from the
+/// host allocator when the guest can name host-visible backing.
+pub(crate) fn configured() -> bool {
+    directory().is_some()
 }
 
 /// A fresh, monotonic, non-zero id. `None` only if the counter would wrap.
@@ -853,15 +868,17 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
 ///
 /// `at` and `len` need not be 64 KiB aligned: the result starts at the page
 /// containing `at` and covers every page the range touches, so the host can
-/// map it. The whole rounded span must be shown by the existing tracked
-/// views and be one contiguous run of pages of one section, all within the
-/// section. In particular, a range whose last byte is mapped is still
-/// refused if rounding it would reach an unmapped or foreign page: never
-/// grant a page the guest did not map.
+/// map it. Every page of the rounded span must be a page of one tracked view
+/// run, or a committed, readable page of one virtual region (ADR-045). The
+/// returned window starts at that page, so a committed sub-range of a larger
+/// reservation resolves to exactly the bytes asked for, not the whole
+/// reservation. A range that would reach an unmapped, reserved-but-uncommitted
+/// or differently-backed page is refused by name: never grant a page the guest
+/// did not commit.
 ///
 /// This takes the physical-page lock only to inspect and clone what the
-/// views already hold; the returned lease keeps the section (and its file)
-/// alive with an `Arc`.
+/// views and committed runs already hold; the returned lease keeps the section
+/// (and its file) alive with an `Arc`.
 pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, ResolveError> {
     install_if_metal();
     if len == 0 {
@@ -874,46 +891,87 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
     let start = at & !(PAGE - 1);
     let stop = end.checked_add(PAGE - 1).ok_or(ResolveError::OutOfBounds)? & !(PAGE - 1);
     let physical = super::physical();
+    // The one section the whole span resolves in, and the byte offset in it
+    // that `start` maps to.
     let mut section: Option<Arc<Section>> = None;
-    let mut first_index = None;
-    let mut next_index = None;
+    let mut window = 0usize;
     let mut cursor = start;
     while cursor < stop {
-        let Some((base, size, slice)) = view_at(&physical, cursor) else {
-            return Err(ResolveError::NotMapped);
-        };
-        let index = slice
-            .index
-            .checked_add((cursor - base) / PAGE)
-            .ok_or(ResolveError::OutOfBounds)?;
+        // The run covering `cursor`, as (its section, the offset in that
+        // section `cursor` maps to, the next page boundary to walk).
+        let (run_section, section_offset, next) =
+            if let Some((base, size, slice)) = view_at(&physical, cursor) {
+                // A physical-page view: its pages are consecutive slices.
+                let index = slice
+                    .index
+                    .checked_add((cursor - base) / PAGE)
+                    .ok_or(ResolveError::OutOfBounds)?;
+                let next = base
+                    .checked_add(size)
+                    .ok_or(ResolveError::OutOfBounds)?
+                    .min(stop);
+                (slice.section.clone(), index * PAGE, next)
+            } else {
+                // A virtual region: only its committed pages have bytes, and
+                // each committed run is a view of its own section starting at
+                // `file_offset`.
+                let Some((base, region)) = physical.reservation_at(cursor) else {
+                    return Err(ResolveError::NotMapped);
+                };
+                let region_end = base
+                    .checked_add(region.size)
+                    .ok_or(ResolveError::OutOfBounds)?;
+                if stop > region_end {
+                    return Err(ResolveError::OutOfBounds);
+                }
+                let offset = cursor.checked_sub(base).ok_or(ResolveError::OutOfBounds)?;
+                let Some((run_start, run)) = region.committed_at(offset) else {
+                    // A 64 KiB physical-page reservation keeps the older,
+                    // coarser answer for its unmapped pages.
+                    return Err(if region.physical_pages {
+                        ResolveError::NotMapped
+                    } else {
+                        ResolveError::Uncommitted
+                    });
+                };
+                if !readable(run.protect) {
+                    return Err(ResolveError::Inaccessible);
+                }
+                let run_at = base.checked_add(run_start).ok_or(ResolveError::OutOfBounds)?;
+                let next = run_at
+                    .checked_add(run.len)
+                    .ok_or(ResolveError::OutOfBounds)?
+                    .min(stop);
+                let section_offset = run
+                    .file_offset
+                    .checked_add(cursor - run_at)
+                    .ok_or(ResolveError::OutOfBounds)?;
+                (run.section.clone(), section_offset, next)
+            };
         match &section {
             None => {
-                section = Some(slice.section.clone());
-                first_index = Some(index);
+                window = section_offset;
+                section = Some(run_section);
             }
-            Some(section) if !Arc::ptr_eq(section, &slice.section) => {
+            Some(held) if !Arc::ptr_eq(held, &run_section) => {
                 return Err(ResolveError::NotContiguous);
             }
-            Some(_) => {}
+            Some(_) => {
+                let expected = window
+                    .checked_add(cursor - start)
+                    .ok_or(ResolveError::OutOfBounds)?;
+                if section_offset != expected {
+                    return Err(ResolveError::NotContiguous);
+                }
+            }
         }
-        if next_index.is_some_and(|next| next != index) {
-            return Err(ResolveError::NotContiguous);
-        }
-        next_index = index.checked_add(1);
-        let view_end = base.checked_add(size).ok_or(ResolveError::OutOfBounds)?;
-        cursor = view_end.min(stop);
+        cursor = next.max(cursor + PAGE);
     }
     let section = section.ok_or(ResolveError::NotMapped)?;
-    let offset = first_index
-        .ok_or(ResolveError::NotMapped)?
-        .checked_mul(PAGE)
-        .ok_or(ResolveError::OutOfBounds)?;
     let length = stop.checked_sub(start).ok_or(ResolveError::OutOfBounds)?;
     // Even though every page is shown by a view, check the whole rounded
     // span lies in the section: no view may grant a page outside it.
-    let end_offset = offset
-        .checked_add(length)
-        .ok_or(ResolveError::OutOfBounds)?;
+    let end_offset = window.checked_add(length).ok_or(ResolveError::OutOfBounds)?;
     if end_offset > section.size {
         return Err(ResolveError::OutOfBounds);
     }
@@ -929,13 +987,23 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
         range: Range {
             id: backing.id,
             generation: backing.generation,
-            offset: offset as u64,
+            offset: window as u64,
             length: length as u64,
             file_size: section.map_size as u64,
         },
         path: backing.path.clone(),
         section,
     })
+}
+
+/// The protections that let the host read a committed page.
+const READ: u32 = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
+/// `PAGE_NOACCESS` and `PAGE_GUARD`: committed, but the host must not read it.
+const NOT_READ: u32 = 0x01 | 0x100;
+
+/// Whether a commit's protection lets the host read the page's bytes.
+fn readable(protect: u32) -> bool {
+    protect & READ != 0 && protect & NOT_READ == 0
 }
 
 /// The tracked view holding `at`, as `(base, length, first slice)`.
@@ -1056,6 +1124,8 @@ fn seam_resolve_error(error: ResolveError, address: u64, len: u64) -> SeamError 
     match error {
         ResolveError::Empty => SeamError::Invalid("the guest range is empty"),
         ResolveError::OutOfBounds | ResolveError::NotMapped => SeamError::Unmapped { address, len },
+        ResolveError::Uncommitted => SeamError::Invalid("the range is reserved but not committed"),
+        ResolveError::Inaccessible => SeamError::Invalid("the range is committed but not readable"),
         ResolveError::NotContiguous => {
             SeamError::Invalid("the range is not one contiguous shared allocation")
         }
@@ -1137,6 +1207,9 @@ fn uninstall_for_test() {
 }
 
 #[cfg(test)]
+pub(crate) use tests::ShareDirectory;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1174,18 +1247,19 @@ mod tests {
     /// Sets this thread's share directory for section-creating calls, restoring
     /// the previous override on drop. `unconfigured` forces the provider off
     /// even when the harness set the variable.
-    struct ShareDirectory(Option<Option<PathBuf>>);
+    pub(crate) struct ShareDirectory(pub(crate) Option<Option<PathBuf>>);
 
     impl ShareDirectory {
-        fn configured(path: &Path) -> Self {
+        pub(crate) fn configured(path: &Path) -> Self {
             Self::install(Some(Some(path.to_path_buf())))
         }
 
-        fn unconfigured() -> Self {
+        #[allow(dead_code)]
+        pub(crate) fn unconfigured() -> Self {
             Self::install(Some(None))
         }
 
-        fn install(directory: Option<Option<PathBuf>>) -> Self {
+        pub(crate) fn install(directory: Option<Option<PathBuf>>) -> Self {
             let previous = DIRECTORY_OVERRIDE.with(|slot| slot.replace(directory));
             ShareDirectory(previous)
         }
@@ -2343,6 +2417,86 @@ mod tests {
         eprintln!(
             "bounded share registry: cycles={CYCLES} peak={peak} capacity={} watermark={watermark}",
             registry.capacity
+        );
+    }
+
+    /// ADR-045: a commit inside a multi-GiB reservation owns a section sized
+    /// to the commit, so the resolver answers exactly the committed bytes and a
+    /// two-GiB reservation never creates a two-GiB share file. A page the title
+    /// only reserved is refused by name, and a range crossing the commit's end
+    /// is refused rather than truncated to its committed prefix.
+    #[test]
+    fn a_committed_sub_range_of_a_large_reservation_resolves_with_a_small_file() {
+        const MIB: usize = 1 << 20;
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let size = 2usize << 30;
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE,
+            0,
+            windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+        );
+        assert!(!at.is_null(), "a 2 GiB reservation failed");
+        let base = at as usize;
+        let committed = base + (1 << 30);
+        assert_eq!(
+            XMemVirtualAlloc(
+                committed as *mut std::ffi::c_void,
+                128 << 10,
+                windows_sys::Win32::System::Memory::MEM_COMMIT,
+                0,
+                PAGE_READWRITE,
+            ) as usize,
+            committed,
+            "a sub-range of the reservation commits in place"
+        );
+
+        let lease = resolve_guest_range(committed, PAGE).expect("the committed page resolves");
+        assert_eq!(lease.range.offset, 0, "the window starts at the commit");
+        assert_eq!(lease.range.length, PAGE as u64, "only the bytes asked for");
+        assert_eq!(
+            lease.file_size(),
+            (128 << 10) as u64,
+            "the section is the commit, not the reservation"
+        );
+        let on_disk = std::fs::metadata(lease.path())
+            .expect("the share file's metadata")
+            .len();
+        assert_eq!(
+            on_disk,
+            (128 << 10) as u64,
+            "a 2 GiB reservation must not create a 2 GiB share file"
+        );
+        drop(lease);
+
+        // The pages around the commit are reserved, never committed.
+        assert_eq!(
+            resolve_guest_range(committed - PAGE, PAGE).unwrap_err(),
+            ResolveError::Uncommitted
+        );
+        assert_eq!(
+            resolve_guest_range(committed + (128 << 10), PAGE).unwrap_err(),
+            ResolveError::Uncommitted,
+            "the reservation's tail stays uncommitted"
+        );
+        assert_eq!(
+            resolve_guest_range(committed + (128 << 10) - PAGE, 2 * PAGE).unwrap_err(),
+            ResolveError::Uncommitted,
+            "a range crossing the commit's end is refused, not truncated"
+        );
+
+        // The whole region releases through the guest entry point.
+        assert_eq!(
+            XMemVirtualAlloc(
+                base as *mut std::ffi::c_void,
+                0,
+                windows_sys::Win32::System::Memory::MEM_RELEASE,
+                0,
+                0,
+            ) as usize,
+            base
         );
     }
 }
