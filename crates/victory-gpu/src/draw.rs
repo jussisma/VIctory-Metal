@@ -453,9 +453,19 @@ impl State {
     /// D3D12 list; a native-backend list has none, so its call site must
     /// record before that early return to audit native binds.
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
-        use crate::native_metal::telemetry::{HeapBind, HeapKind, note_heap_bindings};
+        let (slots, recorded) = Self::classify_heaps(heaps);
+        self.heaps = slots;
+        crate::native_metal::telemetry::note_heap_bindings(&recorded);
+    }
 
-        self.heaps = [0; 2];
+    /// Classifies one `SetDescriptorHeaps` call: the two host slots to keep and
+    /// the recorded binds, one entry per slot in bind order.
+    fn classify_heaps(
+        heaps: &[This],
+    ) -> ([usize; 2], Vec<crate::native_metal::telemetry::HeapBind>) {
+        use crate::native_metal::telemetry::{HeapBind, HeapKind};
+
+        let mut slots = [0; 2];
         let mut recorded = Vec::with_capacity(heaps.len());
         for &h in heaps {
             if h.is_null() {
@@ -474,13 +484,20 @@ impl State {
             let bind = HeapBind::classify(heap.start, samplers, placeable);
             if let HeapBind::Bound(bound) = bind {
                 // The same slot selection as before: sampler heaps in slot 1.
-                self.heaps[usize::from(bound.kind == HeapKind::Samplers)] = h as usize;
+                slots[usize::from(bound.kind == HeapKind::Samplers)] = h as usize;
             }
             recorded.push(bind);
         }
-        // One call per `SetDescriptorHeaps`: bound heaps by identity, null or
-        // foreign slots by their static refusal name, and the last set.
-        note_heap_bindings(&recorded);
+        (slots, recorded)
+    }
+
+    /// Records one `SetDescriptorHeaps` call on the native backend, which owns
+    /// no host D3D12 list and therefore never reaches [`Self::set_heaps`]: the
+    /// title's binding is audited (never dropped silently) and the census
+    /// matches the heaps the title created.
+    pub(crate) fn record_native_heaps(heaps: &[This]) {
+        let (_, recorded) = Self::classify_heaps(heaps);
+        crate::native_metal::telemetry::note_heap_bindings(&recorded);
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {

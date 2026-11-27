@@ -2959,7 +2959,16 @@ mod state {
         with_state(this, |list, s| s.stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
-        with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+        let slots = items(heaps, count);
+        // The native backend has no host D3D12 list, so `with_state` returns
+        // before recording: audit the title's binding directly, else the bind
+        // is dropped silently and the census stays at zero.
+        #[cfg(windows)]
+        if metal() {
+            crate::draw::State::record_native_heaps(slots);
+            return;
+        }
+        with_state(this, |_, s| s.set_heaps(slots));
     }
 
     /// `SetComputeRootSignature(root signature)`: recorded on the producer.
