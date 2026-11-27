@@ -419,136 +419,182 @@ The shared-buffer probe's 2,293,760 words are 140 dispatches of 16,384 words
 (docs/ARM64-RENDERER.md). Scripts print their own pass lines; do not run two at
 once on one GPU.
 
-## Cycle 04 (pending)
+## Cycle 04 — transport, registries, indirect work and the AAA synthetic frame
 
-Reserved for the orchestrator. Every value below is `TBD-by-orchestrator` until
-the Cycle 04 run is complete; nothing in this section is measured. Cycle 04 base
-is `210df67c` and its decisions are ADR-012 through ADR-016
-(../.swarm/decisions.json, ../.swarm/prompts/architect-directive-04.md).
+Base `210df67c`, code head `6d14b9db`, scaffold `a43c8dee`. Decisions ADR-012
+through ADR-016 (../.swarm/decisions.json). Hardware: Apple M4 Max, macOS 27.0
+(26A428); every GPU run serialized with `/tmp/victory-gpu.lock` and
+`--test-threads=1`.
 
-### 4.1 Transport and fence
+Result: a Wine Win64 guest drives an ARM64 Metal host through 120 measured
+frames of a synthetic AAA-shaped pipeline (compute culling -> indirect draw ->
+MRT/depth graphics -> post-FX compute -> present) with exact pixels, a replay
+guard, a shared fence page, zero D3DMetal and no leaked processes. The frame is
+synthetic: no title list, no title assets, no title frame time.
 
-Async fire-and-forget Wire v3 submission over the shared-memory ring, GPU
-completion published by `addCompletedHandler` into a shared `AtomicU64` fence
-page (0-syscall `GetCompletedValue`), wakeup behind `LoopbackTcpWake` and
-`UnixSocketWake` (ADR-012). Seams:
-`crates/victory-metal/src/{transport,fence_page,ipc_host}.rs`.
+### 4.1 Transport and fence (ADR-012)
 
-- Guest submission cost without a synchronous reply: `TBD-by-orchestrator`
-- 0-IPC fence read latency, p50 / p95: `TBD-by-orchestrator`
-- Round-trips removed per `ExecuteCommandLists`: `TBD-by-orchestrator`
+`FencePage` is one 4 KiB `#[repr(C)]` page (`completed_fence`, `submitted_fence`,
+epoch) mapped `MAP_SHARED`, published after a real v3 submission returns `Ok`
+and never republished by a replay or a refusal; `GuestTransport` is Wine-free and
+`Wake` has `LoopbackTcpWake` and `UnixSocketWake` (`Unsupported` off-Unix).
 
-### 4.2 Resource and PSO registry
+- Reply-less async submissions (kind 7): one reply frame removed per
+  `ExecuteCommandLists`; the transport test observes completion with a cloned
+  socket and zero reply frames (`tests/transport_fence.rs`, 6 passed).
+- 0-IPC fence read: 0.67 ns per atomic load, measured as a loop average in the
+  benchmark guest, not as a cache-miss latency.
+- Host submit is still synchronous (`waitUntilCompleted` in
+  `macos/device.rs`), so the 0-IPC property is proven; the host-side
+  non-blocking submit is not.
 
-Texture registry (BC1–BC7, D32F, D24S8, R11G11B10F, R10G10B10A2; 2D/array/cube/3D;
-mips; RTV/DSV/SRV/UAV views), content-hashed graphics/mesh/compute PSOs from
-converted metallibs, live IRConverter argument-buffer bindings inside
-`submit_v3`, persistent `MTLResidencySet` with `useResources` fallback
-(ADR-013). Seams:
-`crates/victory-metal/src/macos/{registry,residency,bindings}.rs`.
+### 4.2 Resource, PSO and residency (ADR-013)
 
-- Textures and PSOs registered in the gate run: `TBD-by-orchestrator`
-- Residency path used (`MTLResidencySet` / fallback): `TBD-by-orchestrator`
-- PSO dedup ratio by content hash: `TBD-by-orchestrator`
+`macos/registry.rs` registers 17 formats (BC1-BC7, D32F, D32F_S8, R11G11B10F,
+R10G10B10A2, colour and depth), 2D/array/cube/3D dimensions, mips and MSAA, with
+RTV/DSV/SRV/UAV views and blake3 content keys; `macos/residency.rs` creates a
+native `MTLResidencySet` with a documented `useResources` fallback.
 
-### 4.3 Indirect and blit
+- Graphics proof (`tests/submit_v3_bindings_gpu.rs`, 3 passed): two registry
+  RGBA8 targets plus D32F depth, content-hashed MRT PSO, root constants and root
+  CBV through the reflected ABI -> target0 `[255,128,0,255]` for all 4096 texels,
+  target1 `[0,128,255,255]` for all 4096 texels; residency native = true, 4
+  allocations, fallback = none.
+- Compute ABI proof: content-hashed compute PSO, root constants + CBV/UAV ->
+  exact 64 dwords `7..70`.
+- Content-key dedup: `created=1 reused=1` for a duplicate key; one pipeline
+  object per key.
+- Handle validation: unknown pipeline and unknown texture return `UnknownHandle`
+  with `EncoderStats::default()` and the 4096-pixel target unchanged.
+- Mesh PSO construction is implemented but not hardware-proven; the mesh draw
+  proof remains the Cycle 03 `mesh_pair_gpu` fixture.
 
-`ExecuteIndirect` for draw, drawIndexed, dispatchMesh and dispatch, with optional
-count buffer, plus `CopyTextureRegion` with subresource box and
-`ResolveSubresource`, in Wire v3 opcodes 40–45 (ADR-015). Seams:
-`crates/victory-metal/src/macos/{indirect,blit}.rs`.
+### 4.3 Indirect and blit (ADR-015)
 
-- GPU-written indirect arguments rendering exact pixels: `TBD-by-orchestrator`
-- CPU readbacks on the indirect path: `TBD-by-orchestrator`
-- Copy/resolve subresource cases proven: `TBD-by-orchestrator`
+Wire v3 opcodes 40-45: indirect draw, indexed draw, mesh dispatch and compute
+dispatch (optional count buffer), `CopyTextureRegion` with independent origins
+and a texel box, and `ResolveSubresource` as a render-pass store action.
 
-### 4.4 Shader pool and archive
+- Direct vs indirect indexed draw: identical exact pixels, checksum
+  `0xc25466880556e425`, 256/256 pixels, 256 distinct colours; the argument
+  record is written by a compute kernel and never read back.
+- `CopyTextureRegion` 32x32 sub-box: 0 differing pixels, checksum
+  `0xabbeaf356e39f5a5`.
+- 4x MSAA `ResolveSubresource` equals a direct clear: checksum
+  `0x80af855529174d25`.
+- `tests/indirect_gpu.rs`, 4 passed.
 
-Bounded multi-process Rosetta IRConverter pool (4–8 workers,
-`VICTORY_SHADER_WORKERS`), content-hashed disk cache and persistent
-`MTLBinaryArchive` (ADR-014). Seams:
-`crates/victory-metal/src/{compiler_pool.rs,macos/binary_archive.rs,macos/cache.rs}`.
+### 4.4 Shader pool and archive (ADR-014)
 
-- Cold compile time, serialized pool: `TBD-by-orchestrator`
-- Cold compile time, pooled: `TBD-by-orchestrator`
-- Warm start with `MTLBinaryArchive`: `TBD-by-orchestrator`
-- Cold vs warm speedup: `TBD-by-orchestrator`
+`compiler_pool.rs` runs a bounded pool (1-8 workers from
+`VICTORY_SHADER_WORKERS`, default 4) over a length-prefixed job/result framing
+with the content-hashed disk cache in front; `macos/binary_archive.rs` persists
+an `MTLBinaryArchive` with atomic writes and corrupt-archive recovery.
 
-### 4.5 Live client and telemetry
+- Pool: 7 tests pass (8 concurrent id-matched jobs, cache hit without a second
+  worker, crash containment, env clamping, timeout).
+- `MTLBinaryArchive`: supported (`respondsToSelector:` probe true). Cold
+  9.707 ms (open 0.026, PSO 0.097, store 9.495) -> warm 0.182 ms (open 0.152,
+  PSO 0.016), 53.27x, archive 12,992 B; 3 tests pass.
+- The control PSO without the archive costs 0.002 ms, so on this trivial kernel
+  the ratio is dominated by skipping archive serialization, not by PSO
+  compilation. The pool's real converter path is untested because
+  `victory-irconverter` has no stdin/stdout mode.
 
-Standalone ARM64 `victory-metal-host` daemon with guest auto-connect under
-`VICTORY_BACKEND=metal` (`VICTORY_METAL_ENDPOINT` override), per-frame
-telemetry (record, ring, encode and GPU microseconds; p50/p95/p99; FPS;
-unsupported-opcode histogram) and a hard `d3dmetal_fallback_count == 0` guard
-(ADR-016). Seams:
-`crates/victory-metal/src/bin/victory_metal_host.rs`,
-`crates/victory-gpu/src/native_metal/{client,telemetry}.rs`.
+### 4.5 Host daemon, live client and telemetry (ADR-016)
 
-- Host daemon start-to-ready time: `TBD-by-orchestrator`
-- Frames with a title list on the native path: `TBD-by-orchestrator`
-- `d3dmetal_fallback_count`: `TBD-by-orchestrator`
-- Unsupported-opcode histogram: `TBD-by-orchestrator`
+`victory_metal_host` serves the authenticated loopback session with a
+machine-readable ready banner (`compute_pipeline`, `graphics_pipeline` ids),
+`--once`, `--frame-gate`, `--share-dir` and `--telemetry-json`.
+`crates/victory-gpu/src/native_metal/client.rs` authenticates, sends one
+`KIND_SUBMISSION_V3` frame per batch and maps the reply status; the native queue
+connects lazily from `VICTORY_METAL_ENDPOINT`/`VICTORY_METAL_SECRET` and still
+fails explicitly without one. `telemetry.rs` records record/ring/encode/GPU
+microseconds, exact nearest-rank p50/p95/p99, FPS, an unsupported-opcode
+histogram and a hard `d3dmetal_fallback_count`.
+
+- Client 11 tests, telemetry 11 tests, `native_metal` 59 tests, Windows
+  all-targets clean.
+- Histogram is exact on fixtures only: the producer's refusal detail is private,
+  so the live path records `opcode: None` (`list.rs:234`).
+- `gpu_us` is 0 on the live path: the reply carries status, not GPU time.
 
 ### 4.6 120-frame benchmark (20 warmup frames)
 
-Pipeline under test: compute culling → `ExecuteIndirect` → packed >32 KiB
-mesh+pixel pair → MRT/depth graphics with argument-buffer CBV/SRV/UAV/sampler →
-post-FX compute → IOSurface present
-(../.swarm/prompts/architect-directive-04.md). Script:
-`tools/macos/metal-poc/aaa-frame-bench.sh`.
+`tools/macos/metal-poc/aaa-frame-bench.sh`, one measured run on the integrated
+head (`6d14b9db`), exit 0:
 
-| Metric | Cold run | Warm run |
-| --- | --- | --- |
-| Frame time p50 (ms) | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| Frame time p95 (ms) | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| Frame time p99 (ms) | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| Sustained FPS | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| 0-IPC fence latency (us) | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| Shader pool cold vs warm speedup | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| Pixel checksum | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| `AlreadyExecuted` replay guard | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
-| D3DMetal calls | `TBD-by-orchestrator` | `TBD-by-orchestrator` |
+| Metric | Measured |
+| --- | --- |
+| Frames measured | 120 / 120 (140 submitted, 20 warmup) |
+| Frame time p50 | 0.624 ms |
+| Frame time p95 | 0.857 ms |
+| Frame time p99 | 1.672 ms |
+| Sustained FPS | 1440.68 |
+| Host-side telemetry p50 / p95 / p99 | 0.116 / 0.462 / 0.527 ms |
+| 0-IPC fence read | 0.67 ns per atomic load (loop average) |
+| Shader pool cold vs warm | 9.707 -> 0.182 ms, 53.27x (archive, not a game shader) |
+| Present checksum | `0xd5791f96cdb32383` (matches expected) |
+| `AlreadyExecuted` replay guard | status 3, alias unchanged |
+| D3DMetal calls / modules | 0 / 0 (host fallback count 0) |
+| Leaked processes | 0 |
 
-Target for the cycle is p50 ≤ 33.3 ms (30 FPS) with zero D3DMetal calls
-(../.swarm/prompts/architect-directive-04.md). Report median and tail
-values, not an average FPS.
+Stage statuses were all 0: `texture0`, `texture1`, `depth`, `surface`,
+`graphics`, `present`. Two submissions per frame (281 executions including the
+replay probe). This is a synthetic pipeline; the ms values are not a prediction
+of title frame time.
+
+The target (p50 <= 33.3 ms, zero D3DMetal) is met on the synthetic pipeline only.
 
 ### 4.7 Readiness for Cycle 05
 
-Cycle 05 is the first live title boot and real game-frame diagnostic under
-`VICTORY_BACKEND=metal` (../.swarm/prompts/architect-directive-04.md).
-
-- Geometry/materials/lighting/streaming correct on a title frame:
-  `TBD-by-orchestrator`
-- Title frame time p50 / p95: `TBD-by-orchestrator`
-- Remaining blockers, top three: `TBD-by-orchestrator`
-- Go / no-go for Cycle 05: `TBD-by-orchestrator`
+- Geometry/materials/lighting/streaming on a title frame: **not demonstrated**;
+  no title list has reached the native path.
+- Title frame time p50 / p95: **not measured**.
+- Top three blockers: (1) title command-list recording into Wire v3 and the
+  production queue still installing the disconnected sink at runtime, so no
+  title submission exists (`crates/victory-gpu/src/native_metal/queue.rs`);
+  (2) the shader pool cannot drive the real converter (no stdio mode,
+  `crates/victory-metal/src/bin/victory-irconverter.rs:29`) and 105 of 111
+  historical compute rejects remain refused; (3) mesh PSOs are not yet proven
+  through the live ABI, and Wine-only `xmem::share` lease tests have four
+  pre-existing failures.
+- Go / no-go: **go for a diagnostic title boot under `VICTORY_BACKEND=metal`
+  only after the title command-list producer is wired**; expect explicit native
+  failures rather than D3DMetal output, and do not treat a frame count as visual
+  acceptance.
 
 ## Known gaps
 
-State at `210df67c`, traced to source:
+State at `6d14b9db`, traced to source:
 
 1. **No title frame on this path.** The title still runs on D3DMetal; only
    synthetic frames exist (../.swarm/state.json `goal`;
-   ../.swarm/reports/architect-sync-03.md).
-2. **Production sink disconnected.** `victory-gpu` installs `DisconnectedSink`
-   and `GuestIpcClient` has no v3 encoder, so no title list reaches the host
-   (../.swarm/state.json `global_blockers`).
-3. **No texture registration and no PSO from converted metallibs.** IPC cannot
-   register render-target textures, and `submit_v3` has no graphics PSO or
-   IRConverter argument-buffer binder (../.swarm/state.json
-   `global_blockers`).
-4. **No fallback counter or frame capture on a title run.** The
-   ≥30 FPS acceptance with median and tail frame times is unmet and unmeasured
-   (../.swarm/reports/architect-sync-03.md).
+   ../.swarm/reports/architect-sync-04.md).
+2. **No title command list reaches the native path.** `victory-gpu` now installs
+   a lazy live `WireV3Client`, but nothing records a recorded D3D12 title list
+   into Wire v3, so no title submission has been made
+   (`crates/victory-gpu/src/native_metal/queue.rs`;
+   ../.swarm/state.json `global_blockers`).
+3. **The new resource/PSO/IPC path is synthetic-only.** Textures and surfaces
+   can be registered over IPC (kinds 8/9) and `submit_v3` binds content-hashed
+   PSOs and argument buffers, but no title pipeline, texture or shader has gone
+   through it (`crates/victory-metal/src/ipc_host.rs`,
+   `tests/submit_v3_bindings_gpu.rs`).
+4. **Telemetry covers the synthetic gate only.** `d3dmetal_fallback_count`
+   exists and is asserted on the benchmark, but there is no title frame capture
+   and no title frame time; the >=30 FPS acceptance is unmet and unmeasured
+   (../.swarm/reports/architect-sync-04.md).
 5. **Shader coverage is shape coverage.** 105 of 111 compute rejects are still
    refused by design and 19/19 mesh pairs remain inferred from size classes; the
    one hardware pixel proof is a single 33,280 B pair
    (../.swarm/reports/architect-sync-03.md).
-6. **Wine-backed resolver tests compiled but not executed.**
-   `GUEST-DESCRIPTOR-RESOLVE` is PARTIAL for that reason
-   (../.swarm/state.json `global_blockers`;
-   ../.swarm/state.json `wave_6.tasks.GUEST-DESCRIPTOR-RESOLVE`).
+6. **Wine-backed xmem range lease tests are partly red.**
+   `victory-hle` is unchanged from `210df67c` and its aarch64 host suite is
+   81/81 green, but on the Windows target four `xmem::share` lease tests fail
+   (release order, retained ranges, stale generations, two-submission share);
+   the guard test passes under Wine. Pre-existing, not introduced by Cycle 04
+   (../.swarm/logs/; ../.swarm/reports/architect-sync-04.md).
 7. **Census is historical.** The 111 and 19 counts come from one diagnostic run
    and cannot be re-attributed without the shader bytes
    (../.swarm/reports/WAVE64-111-AUDIT-FIX-1.md).
