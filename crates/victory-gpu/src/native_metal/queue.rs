@@ -33,6 +33,7 @@
 //! sink is the one socket, and only when it is configured).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use victory_metal::wire::{ListIdentity, ReplyStatus, WireError};
@@ -189,6 +190,19 @@ impl NativeSink {
             Self::Live(client) => Some(client),
             Self::Disconnected(_) => None,
         }
+    }
+
+    /// The live client, when one is installed.
+    pub fn client(&self) -> Option<&WireV3Client> {
+        match self {
+            Self::Live(client) => Some(client),
+            Self::Disconnected(_) => None,
+        }
+    }
+
+    /// The host's completed fence, one atomic load when a page is mapped.
+    pub fn client_completed_fence(&self) -> Option<u64> {
+        self.client().and_then(WireV3Client::completed_fence)
     }
 }
 
@@ -420,6 +434,74 @@ pub fn dispatch_measured<S: V3Sink>(
     }
 }
 
+/// The last submission sequence handed to the host in this session.
+static LAST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A fence signal waiting for the host to complete `sequence`.
+#[derive(Debug, Clone, Copy)]
+struct PendingSignal {
+    fence: usize,
+    value: u64,
+    sequence: u64,
+}
+
+/// Fence signals whose host submission has not completed yet.
+#[cfg(any(windows, test))]
+fn pending_signals() -> std::sync::MutexGuard<'static, Vec<PendingSignal>> {
+    static PENDING: std::sync::Mutex<Vec<PendingSignal>> = std::sync::Mutex::new(Vec::new());
+    PENDING.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Records a queue `Signal` and completes it as soon as the host has run the
+/// submission it follows.
+///
+/// With no shared page the kind 5 transport is synchronous (the reply is
+/// written after the host executed the batch), so the signal completes now.
+/// With a page the value moves only once `completed_fence` has reached the
+/// sequence submitted before the signal: this is the zero-IPC path ADR-019
+/// asks for, and `GetCompletedValue` never waits.
+#[cfg(any(windows, test))]
+pub fn signal_native(fence: crate::object::This, value: u64) {
+    let sequence = LAST_SEQUENCE.load(Ordering::Acquire);
+    pending_signals().push(PendingSignal {
+        fence: fence as usize,
+        value,
+        sequence,
+    });
+    poll_native_fence();
+}
+
+/// Advances every fence whose host submission has completed.
+///
+/// One atomic load of the shared page per call; no blocking wait and no IPC.
+/// Without a registered page every pending signal is completed immediately
+/// because the transport reply already followed host execution.
+#[cfg(any(windows, test))]
+pub fn poll_native_fence() {
+    let completion = {
+        let queue = native_queue();
+        queue.sink().client_completed_fence()
+    };
+    let mut pending = pending_signals();
+    match completion {
+        Some(completed) => {
+            pending.retain(|signal| {
+                if signal.sequence <= completed {
+                    crate::fence::set(signal.fence as crate::object::This, signal.value);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        None => {
+            for signal in pending.drain(..) {
+                crate::fence::set(signal.fence as crate::object::This, signal.value);
+            }
+        }
+    }
+}
+
 /// The session's native queue. It starts disconnected and connects lazily.
 #[cfg(any(windows, test))]
 fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<NativeSink>> {
@@ -466,6 +548,95 @@ pub fn native_queue_connect_from_env() -> bool {
             false
         }
     }
+}
+
+/// Registers one host texture for a title resource identity.
+///
+/// The codes are the stable kinds documented in `ipc_host::register_texture`
+/// (dimension, format, usage). A configured endpoint connects on first use; a
+/// refusal is an explicit error, never a fallback.
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+pub fn register_texture(
+    id: u64,
+    generation: u32,
+    dimension: u8,
+    format: u8,
+    usage: u8,
+    sample_count: u8,
+    width: u32,
+    height: u32,
+    depth: u32,
+    mip_levels: u16,
+    array_layers: u16,
+) -> Result<bool, NativeQueueError> {
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    if queue
+        .sink()
+        .client()
+        .is_some_and(|client| client.texture_registered(id))
+    {
+        // Several title resources share one memory (placed views and
+        // aliases); the host registers the handle once.
+        return Ok(true);
+    }
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    client.register_texture(
+        id,
+        generation,
+        dimension,
+        format,
+        usage,
+        sample_count,
+        width,
+        height,
+        depth,
+        mip_levels,
+        array_layers,
+    )
+}
+
+/// Registers a texture handle as a present surface with the host.
+#[cfg(any(windows, test))]
+pub fn register_surface(surface_id: u64, texture_id: u64) -> Result<bool, NativeQueueError> {
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    client.register_surface(surface_id, texture_id)
+}
+
+/// Connects the session queue from the environment exactly once per process.
+///
+/// Device creation calls this under `VICTORY_BACKEND=metal`. The result is
+/// remembered (including a failure), so a title cannot get a second attempt
+/// later in the run: a configured endpoint that refused the session is an
+/// explicit error the device creation surfaces, and no endpoint leaves the
+/// queue disconnected with an explicit transport failure on first submission.
+#[cfg(any(windows, test))]
+pub fn connect_once_from_env() -> Result<bool, NativeQueueError> {
+    static ONCE: std::sync::Mutex<Option<Result<bool, NativeQueueError>>> =
+        std::sync::Mutex::new(None);
+    let mut slot = ONCE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(result) = slot.as_ref() {
+        return result.clone();
+    }
+    let result = native_queue_connect_from_env_try();
+    *slot = Some(result.clone());
+    result
+}
+
+/// [`native_queue_connect_from_env`] without collapsing a configuration
+/// failure to `false`.
+#[cfg(any(windows, test))]
+fn native_queue_connect_from_env_try() -> Result<bool, NativeQueueError> {
+    ensure_live(LiveConfig::from_env)
 }
 
 /// Connects the session queue through `config`, once.
@@ -520,10 +691,14 @@ pub fn submit_recorded_batch(
 
     match outcome {
         Ok((dispatch, timing)) => {
+            if let Some(last) = submissions.iter().map(|submission| submission.sequence).max() {
+                LAST_SEQUENCE.fetch_max(u64::from(last), Ordering::AcqRel);
+            }
             if let Some(timing) = timing {
-                // `gpu_us` is 0: the kind 5 reply carries a status only, and no
-                // shared completion-fence page is published yet
-                // (`WireV3Client::completed_fence` is `None`).
+                // `gpu_us` is 0: the kind 5 reply carries a status only. The
+                // host's completion still advances the shared fence page
+                // (`WireV3Client::completed_fence`), which the guest reads with
+                // one atomic load.
                 crate::native_metal::telemetry::record_frame(
                     record_us,
                     timing.submit_us,
@@ -532,15 +707,31 @@ pub fn submit_recorded_batch(
                     None,
                 );
             }
+            // A host status other than `Ok` is a refusal, including the
+            // replayed `AlreadyExecuted` this queue surfaces rather than
+            // retries. The opcode of a producer refusal was already counted
+            // where the call was refused (`list::with_metal`), so the frame
+            // sample here never counts it twice.
+            if matches!(
+                dispatch,
+                NativeDispatch::Native {
+                    status: ReplyStatus::Ok,
+                    ..
+                }
+            ) {
+                crate::native_metal::telemetry::note_submit_ok();
+            } else if matches!(dispatch, NativeDispatch::Native { .. }) {
+                crate::native_metal::telemetry::note_submit_refused();
+                crate::native_metal::telemetry::record_frame(record_us, 0, 0, 0, None);
+            }
             Ok(dispatch)
         }
         Err(error) => {
-            if let NativeQueueError::Producer(ProducerError::Unsupported {
-                opcode: Some(opcode),
-                ..
-            }) = &error
+            crate::native_metal::telemetry::note_submit_refused();
+            if let NativeQueueError::Producer(producer) = &error
+                && producer.opcode().is_some()
             {
-                crate::native_metal::telemetry::record_frame(record_us, 0, 0, 0, Some(*opcode));
+                crate::native_metal::telemetry::record_frame(record_us, 0, 0, 0, None);
             }
             Err(error)
         }
@@ -692,6 +883,14 @@ pub fn take_present() -> Option<NativePresenter> {
     PRESENT.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+/// Whether a native presenter is installed.
+pub fn native_queue_has_presenter() -> bool {
+    PRESENT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .is_some()
+}
+
 /// Presents one frame into the installed native swapchain.
 ///
 /// With no swapchain installed this is [`NativeQueueError::NoSwapchain`]; the
@@ -699,10 +898,153 @@ pub fn take_present() -> Option<NativePresenter> {
 /// D3D12 swapchain.
 pub fn present_registered() -> Result<PresentedSurface, NativeQueueError> {
     let mut slot = PRESENT.lock().unwrap_or_else(|e| e.into_inner());
-    match slot.as_mut() {
+    let result = match slot.as_mut() {
         Some(presenter) => presenter.present(),
         None => Err(NativeQueueError::NoSwapchain),
+    };
+    match &result {
+        Ok(_) => crate::native_metal::telemetry::note_present_ok(),
+        Err(_) => crate::native_metal::telemetry::note_present_refused(),
     }
+    result
+}
+
+/// The native presenter used by the real title path: it carries one
+/// `CommandV3::Present` to the host through the session queue.
+///
+/// No pixels cross the boundary: the host owns the surface (registered with
+/// kind 9) and presents it. A refused registration or submission is returned
+/// unchanged, so the guest `Present` entry point returns a real failure
+/// HRESULT instead of falling back.
+pub struct WirePresenter {
+    surface_id: u64,
+    texture_id: u64,
+    registered: bool,
+}
+
+impl WirePresenter {
+    /// A presenter for `surface_id`, backed by the already-registered
+    /// `texture_id`.
+    pub fn new(surface_id: u64, texture_id: u64) -> Self {
+        Self {
+            surface_id,
+            texture_id,
+            registered: false,
+        }
+    }
+}
+
+impl SurfacePresenter for WirePresenter {
+    fn present(&mut self, frame: PresentedSurface) -> Result<(), PresentError> {
+        if !self.registered {
+            match crate::native_metal::queue::register_surface(self.surface_id, self.texture_id) {
+                Ok(true) => self.registered = true,
+                Ok(false) => {
+                    return Err(PresentError::SinkRefused {
+                        frame_index: frame.frame_index,
+                        reason: format!(
+                            "the host refused surface {} backed by texture {}",
+                            self.surface_id, self.texture_id
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(PresentError::SinkRefused {
+                        frame_index: frame.frame_index,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let list_id = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut producer =
+            crate::native_metal::producer::MetalProducer::new(list_id, 1).map_err(|error| {
+                PresentError::SinkRefused {
+                    frame_index: frame.frame_index,
+                    reason: error.to_string(),
+                }
+            })?;
+        producer
+            .present(self.surface_id, frame.sync_interval.as_wire())
+            .map_err(|error| PresentError::SinkRefused {
+                frame_index: frame.frame_index,
+                reason: error.to_string(),
+            })?;
+        let submission = producer.flush().map_err(|error| PresentError::SinkRefused {
+            frame_index: frame.frame_index,
+            reason: error.to_string(),
+        })?;
+        let submissions = [submission];
+        match submit_recorded_batch(&submissions, 0) {
+            Ok(NativeDispatch::Native {
+                status: ReplyStatus::Ok,
+                ..
+            }) => Ok(()),
+            Ok(NativeDispatch::Native { status, .. }) => Err(PresentError::SinkRefused {
+                frame_index: frame.frame_index,
+                reason: format!("the host answered {status:?} for the present"),
+            }),
+            Ok(NativeDispatch::Host) => Err(PresentError::SinkRefused {
+                frame_index: frame.frame_index,
+                reason: "the present reached the D3D12 path".to_string(),
+            }),
+            Err(error) => Err(PresentError::SinkRefused {
+                frame_index: frame.frame_index,
+                reason: error.to_string(),
+            }),
+        }
+    }
+}
+
+/// Installs the wire presenter the launcher's environment names.
+///
+/// `VICTORY_METAL_SURFACE` (a nonzero u64) selects the surface;
+/// `VICTORY_METAL_PRESENT_TEXTURE` names the registered texture backing it
+/// (default: the surface id). Width and height come from
+/// `VICTORY_METAL_SURFACE_WIDTH`/`_HEIGHT` (default 3840x2160). With no
+/// surface named nothing is installed, and `Present` fails explicitly with
+/// `NoSwapchain` instead of using the D3D12 swapchain.
+#[cfg(any(windows, test))]
+pub fn install_present_from_env() -> Result<bool, NativeQueueError> {
+    fn number(name: &str) -> Option<u64> {
+        std::env::var(name)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+    let Some(surface_id) = number("VICTORY_METAL_SURFACE").filter(|&id| id != 0) else {
+        return Ok(false);
+    };
+    let texture_id = number("VICTORY_METAL_PRESENT_TEXTURE")
+        .filter(|&id| id != 0)
+        .unwrap_or(surface_id);
+    let width = number("VICTORY_METAL_SURFACE_WIDTH").unwrap_or(3840) as u32;
+    let height = number("VICTORY_METAL_SURFACE_HEIGHT").unwrap_or(2160) as u32;
+    install_wire_present(surface_id, texture_id, width, height)?;
+    Ok(true)
+}
+
+/// Installs a [`WirePresenter`] over a headless swapchain (tests and the
+/// launcher path).
+#[cfg(any(windows, test))]
+pub fn install_wire_present(
+    surface_id: u64,
+    texture_id: u64,
+    width: u32,
+    height: u32,
+) -> Result<(), NativeQueueError> {
+    let swapchain = NativeSwapchain::new(
+        surface_id,
+        width,
+        height,
+        crate::native_metal::present::SurfaceFormat::Bgra8Unorm,
+        GpuBackend::Metal,
+    )?;
+    install_present(NativePresenter::new(
+        swapchain,
+        Box::new(WirePresenter::new(surface_id, texture_id)),
+    ))
 }
 
 #[cfg(test)]
@@ -716,6 +1058,7 @@ mod tests {
 
     use victory_metal::wire_v3::{CommandV3, Present, decode_submission_v3};
 
+    use crate::object::S_OK;
     use crate::native_metal::client::{ENVELOPE_LEN, KIND_ACK, KIND_AUTH, KIND_SUBMISSION_V3};
     use crate::native_metal::telemetry;
 
@@ -1165,5 +1508,241 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(telemetry::global().snapshot(), before);
         assert!(!native_queue_is_live());
+    }
+
+    /// A unique path for a test's shared fence page.
+    fn test_page(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "victory-gpu-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// A loopback host that accepts one session, acknowledges the fence page
+    /// (kind 6) and then hands the stream to `serve`.
+    fn page_host<F>(ready: mpsc::Sender<()>, serve: F) -> (String, JoinHandle<()>)
+    where
+        F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("listener address").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept the guest");
+            stream
+                .set_read_timeout(Some(TEST_TIMEOUT))
+                .expect("server read timeout");
+            let (kind, payload) = read_frame(&mut stream);
+            assert_eq!(kind, KIND_AUTH, "the first frame authenticates");
+            assert_eq!(payload, SECRET);
+            write_frame(&mut stream, KIND_ACK, &[0]);
+            let (kind, payload) = read_frame(&mut stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_FENCE_PAGE);
+            assert_eq!(payload.len(), 8);
+            write_frame(&mut stream, KIND_ACK, &[0]);
+            ready.send(()).expect("report ready");
+            serve(&mut stream);
+        });
+        (format!("127.0.0.1:{port}"), handle)
+    }
+
+    /// `GetCompletedValue` reads the shared page once: a signal stays pending
+    /// until the host publishes the submission's sequence, then moves with no
+    /// IPC round trip.
+    #[test]
+    fn the_shared_page_gates_signals_with_one_atomic_read() {
+        native_queue_reset();
+        telemetry::global().reset();
+        super::LAST_SEQUENCE.store(7, Ordering::Release);
+        let path = test_page("fence");
+        let (ready, ready_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, |stream| {
+            // Hold the session open until the client is dropped.
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client with a page");
+        assert_eq!(client.completed_fence(), Some(0), "one atomic load");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("page registered");
+
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+        signal_native(fence, 9);
+        assert_eq!(
+            crate::fence::value(fence),
+            0,
+            "the signal waits for the host's completed sequence"
+        );
+
+        // The host publishes sequence 7 (the submission before the signal).
+        let host_page = crate::native_metal::fence_page_guest::GuestFencePage::open(&path)
+            .expect("the host's own mapping");
+        host_page.publish(7);
+        poll_native_fence();
+        assert_eq!(crate::fence::value(fence), 9, "completed with one load");
+
+        native_queue_reset();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: the fence is one of ours; drop the test reference.
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(fence),
+            0
+        );
+    }
+
+    /// With no shared page the synchronous kind 5 reply means the host has
+    /// already run the batch, so a signal completes immediately.
+    #[test]
+    fn without_a_page_a_signal_completes_after_the_synchronous_reply() {
+        native_queue_reset();
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+        signal_native(fence, 3);
+        assert_eq!(crate::fence::value(fence), 3);
+        // SAFETY: the fence is one of ours.
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(fence),
+            0
+        );
+    }
+
+    /// The native presenter registers its surface and carries one `Present`
+    /// command over the live queue; a refused registration is an explicit
+    /// presenter error.
+    #[test]
+    fn the_wire_presenter_registers_the_surface_and_carries_a_present() {
+        native_queue_reset();
+        telemetry::global().reset();
+        let _ = take_present();
+        let path = test_page("present");
+        let (ready, ready_rx) = mpsc::channel();
+        let (carried, carried_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, move |stream| {
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            assert_eq!(payload.len(), 16);
+            write_frame(stream, KIND_ACK, &[0]);
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, KIND_SUBMISSION_V3);
+            let inner = decode_submission_v3(&payload[16..]).expect("a v3 submission");
+            carried.send(inner).expect("report the present");
+            let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
+                sequence: u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]),
+                status: ReplyStatus::Ok,
+            })
+            .expect("reply encodes");
+            write_frame(stream, KIND_SUBMISSION_V3, &reply);
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
+        install_wire_present(42, 42, 64, 64).expect("install the wire presenter");
+        let before = telemetry::global().present_counts();
+
+        let frame = present_registered().expect("the host accepted the frame");
+        assert_eq!((frame.surface_id, frame.frame_index), (42, 0));
+        let delivered = carried_rx.recv_timeout(TEST_TIMEOUT).expect("the host saw it");
+        assert_eq!(delivered.list.map(|list| list.list_id), Some(1));
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == 42 && present.sync_interval == 0
+            ),
+            "unexpected commands {:?}",
+            delivered.commands
+        );
+        assert_eq!(
+            telemetry::global().present_counts(),
+            (before.0 + 1, before.1)
+        );
+        assert_eq!(telemetry::global().d3dmetal_fallback_count(), 0);
+
+        let _ = take_present();
+        native_queue_reset();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A surface the host refuses makes `Present` fail explicitly and is
+    /// counted as a refused present.
+    #[test]
+    fn a_refused_surface_registration_refuses_the_present() {
+        native_queue_reset();
+        telemetry::global().reset();
+        let _ = take_present();
+        let path = test_page("present-refused");
+        let (ready, ready_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, move |stream| {
+            let (kind, _payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            write_frame(stream, KIND_ACK, &[1]);
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
+        install_wire_present(43, 43, 64, 64).expect("install");
+        let before = telemetry::global().present_counts();
+
+        let error = present_registered().expect_err("a refused surface cannot present");
+        assert!(
+            matches!(error, NativeQueueError::Present(_)),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            telemetry::global().present_counts(),
+            (before.0, before.1 + 1)
+        );
+        assert_eq!(telemetry::global().d3dmetal_fallback_count(), 0);
+        let _ = take_present();
+        native_queue_reset();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
     }
 }

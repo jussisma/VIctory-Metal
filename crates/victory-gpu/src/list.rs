@@ -212,6 +212,10 @@ pub(crate) fn with_metal(
     if let Some(metal) = metal.as_mut() {
         let result = f(metal.producer_mut());
         if let Err(error) = result {
+            // Record the refusal where it happens: `Close` returns the
+            // HRESULT and the list submits nothing, so waiting until
+            // `ExecuteCommandLists` would lose the opcode.
+            crate::native_metal::telemetry::note_unsupported_opcode(error.opcode());
             metal.note_error(error);
         }
     }
@@ -501,6 +505,31 @@ fn metal_resource(this: This) -> Option<crate::native_metal::producer::ResourceI
         None => crate::resource::buffer_bytes(this)?.0 as u64,
     };
     ResourceId::from_guest_address(address).ok()
+}
+
+/// One texture subresource as the wire names it, from a D3D12 subresource
+/// index.
+#[cfg(windows)]
+fn metal_subresource(
+    this: This,
+    index: u32,
+) -> Result<victory_metal::wire_v3::TextureSubresource, crate::native_metal::producer::ProducerError>
+{
+    use crate::native_metal::producer::{ProducerError, ResourceId};
+    let (base, mip_level, slice, _extent) =
+        crate::resource::texture_subresource(this, index).ok_or(
+            ProducerError::unsupported_opcode(
+                "a texture subresource index names no subresource",
+                victory_metal::wire_v3::OP_COPY_TEXTURE_REGION,
+            ),
+        )?;
+    let resource = ResourceId::from_guest_address(base)?;
+    Ok(victory_metal::wire_v3::TextureSubresource {
+        allocation_id: resource.allocation_id,
+        generation: resource.generation,
+        mip_level,
+        slice,
+    })
 }
 
 /// Whole-resource byte length for a barrier range, when the guest knows it.
@@ -1007,7 +1036,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                             const BEGIN_ONLY: u32 = 1;
                             if barrier.flags & BEGIN_ONLY != 0 {
                                 return producer
-                                    .refuse("ResourceBarrier: split barrier begin", None);
+                                    .refuse(
+                                        "ResourceBarrier: split barrier begin",
+                                        Some(victory_metal::wire_v3::OP_RESOURCE_BARRIER),
+                                    );
                             }
                             (
                                 barrier.first,
@@ -1015,12 +1047,21 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                                 barrier.last as u32,
                             )
                         }
-                        1 => return producer.refuse("ResourceBarrier: aliasing barrier", None),
+                        1 => return producer.refuse(
+                            "ResourceBarrier: aliasing barrier",
+                            Some(victory_metal::wire_v3::OP_RESOURCE_BARRIER),
+                        ),
                         2 if barrier.first.is_null() => {
-                            return producer.refuse("ResourceBarrier: global UAV barrier", None);
+                            return producer.refuse(
+                                "ResourceBarrier: global UAV barrier",
+                                Some(victory_metal::wire_v3::OP_RESOURCE_BARRIER),
+                            );
                         }
                         2 => (barrier.first, UNORDERED_ACCESS, UNORDERED_ACCESS),
-                        _ => return producer.refuse("ResourceBarrier: unknown barrier type", None),
+                        _ => return producer.refuse(
+                            "ResourceBarrier: unknown barrier type",
+                            Some(victory_metal::wire_v3::OP_RESOURCE_BARRIER),
+                        ),
                     };
                     let resource = metal_resource(handle).ok_or(
                         crate::native_metal::producer::ProducerError::unsupported(
@@ -1153,7 +1194,10 @@ extern "system" fn copy_buffer_region(
             if src_offset.checked_add(len).is_none_or(|end| end > src_size)
                 || dst_offset.checked_add(len).is_none_or(|end| end > dst_size)
             {
-                return producer.refuse("CopyBufferRegion: range outside its buffer", None);
+                return producer.refuse(
+                    "CopyBufferRegion: range outside its buffer",
+                    Some(victory_metal::wire_v3::OP_COPY_BUFFER),
+                );
             }
             let src =
                 crate::native_metal::producer::ResourceId::from_guest_address(src_address as u64)?;
@@ -1184,7 +1228,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ) {
                 let length = to_size.min(from_size);
                 if length == 0 {
-                    return producer.refuse("CopyResource: empty buffer", None);
+                    return producer.refuse(
+                        "CopyResource: empty buffer",
+                        Some(victory_metal::wire_v3::OP_COPY_BUFFER),
+                    );
                 }
                 let to = crate::native_metal::producer::ResourceId::from_guest_address(to as u64)?;
                 let from =
@@ -1254,6 +1301,70 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        use crate::native_metal::producer::ProducerError;
+        // SAFETY: the title passes both locations (null is tolerated).
+        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
+            return;
+        };
+        let copy_refused = |why: &'static str| {
+            ProducerError::unsupported_opcode(why, victory_metal::wire_v3::OP_COPY_TEXTURE_REGION)
+        };
+        with_metal(this, |producer| {
+            // A buffer footprint is an upload or a readback: the wire carries
+            // only texture-to-texture boxes.
+            if dst.kind != 0 || src.kind != 0 {
+                return Err(copy_refused(
+                    "CopyTextureRegion: a buffer footprint is not expressible",
+                ));
+            }
+            let to = metal_subresource(dst.resource, dst.footprint.offset as u32)?;
+            let from = metal_subresource(src.resource, src.footprint.offset as u32)?;
+            let to_extent = crate::resource::texture_subresource(
+                dst.resource,
+                dst.footprint.offset as u32,
+            )
+            .map(|(_, _, _, extent)| extent)
+            .ok_or(copy_refused("CopyTextureRegion: destination subresource"))?;
+            let from_extent = crate::resource::texture_subresource(
+                src.resource,
+                src.footprint.offset as u32,
+            )
+            .map(|(_, _, _, extent)| extent)
+            .ok_or(copy_refused("CopyTextureRegion: source subresource"))?;
+            // A null box is the whole source subresource; a title box is
+            // [left, top, front, right, bottom, back].
+            let (origin, size) = match unsafe { source_box.as_ref() } {
+                Some(&[left, top, front, right, bottom, back]) => (
+                    [x, y, z],
+                    [
+                        right.saturating_sub(left).max(1),
+                        bottom.saturating_sub(top).max(1),
+                        back.saturating_sub(front).max(1),
+                    ],
+                ),
+                None => {
+                    let size = [
+                        from_extent[0].saturating_sub(x).max(1),
+                        from_extent[1].saturating_sub(y).max(1),
+                        from_extent[2].saturating_sub(z).max(1),
+                    ];
+                    ([x, y, z], size)
+                }
+            };
+            if x.checked_add(size[0]).is_none_or(|end| end > to_extent[0])
+                || y.checked_add(size[1]).is_none_or(|end| end > to_extent[1])
+                || z.checked_add(size[2]).is_none_or(|end| end > to_extent[2])
+            {
+                return Err(copy_refused(
+                    "CopyTextureRegion: destination box outside its subresource",
+                ));
+            }
+            producer.copy_texture_region(from, to, origin, [x, y, z], size)
+        });
+        return;
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1508,6 +1619,16 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        let _ = format;
+        with_metal(this, |producer| {
+            let to = metal_subresource(dst, dst_sub)?;
+            let from = metal_subresource(src, src_sub)?;
+            producer.resolve_subresource(from, to)
+        });
+        return;
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1581,10 +1702,16 @@ extern "system" fn clear_rtv(
         let color = unsafe { color.as_ref() }.copied();
         with_metal(this, |producer| {
             let Some(color) = color else {
-                return producer.refuse("ClearRenderTargetView: no clear colour", None);
+                return producer.refuse(
+                "ClearRenderTargetView: no clear colour",
+                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+            );
             };
             if count > 0 || !rects.is_null() {
-                return producer.refuse("ClearRenderTargetView: partial rectangles", None);
+                return producer.refuse(
+                "ClearRenderTargetView: partial rectangles",
+                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+            );
             }
             let record = crate::descriptor::rtv_record(handle).ok_or(
                 crate::native_metal::producer::ProducerError::unsupported(
@@ -1654,7 +1781,10 @@ extern "system" fn clear_dsv(
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
         with_metal(this, |producer| {
             if count > 0 || !rects.is_null() {
-                return producer.refuse("ClearDepthStencilView: partial rectangles", None);
+                return producer.refuse(
+                "ClearDepthStencilView: partial rectangles",
+                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+            );
             }
             let record = crate::descriptor::dsv_record(handle).ok_or(
                 crate::native_metal::producer::ProducerError::unsupported(
@@ -2009,7 +2139,10 @@ mod state {
                     view.MinDepth,
                     view.MaxDepth,
                 ),
-                _ => p.refuse("RSSetViewports: more than one viewport", None),
+                _ => p.refuse(
+                    "RSSetViewports: more than one viewport",
+                    Some(victory_metal::wire_v3::OP_SET_VIEWPORT),
+                ),
             });
             return;
         }
@@ -2020,7 +2153,10 @@ mod state {
             let rects = items(rects, count);
             with_metal(this, |p| match rects {
                 [rect] => p.set_scissor_edges(rect.left, rect.top, rect.right, rect.bottom),
-                _ => p.refuse("RSSetScissorRects: more than one rectangle", None),
+                _ => p.refuse(
+                    "RSSetScissorRects: more than one rectangle",
+                    Some(victory_metal::wire_v3::OP_SET_SCISSOR),
+                ),
             });
             return;
         }
@@ -2183,7 +2319,10 @@ mod state {
             let view = unsafe { view.cast::<super::MetalIndexView>().as_ref() }.copied();
             with_metal(this, |p| match view {
                 Some(view) => p.set_index_buffer_at(view.address, view.size, view.format),
-                None => p.refuse("IASetIndexBuffer(null)", None),
+                None => p.refuse(
+                    "IASetIndexBuffer(null)",
+                    Some(victory_metal::wire_v3::OP_SET_INDEX_BUFFER),
+                ),
             });
             return;
         }
@@ -2324,7 +2463,10 @@ mod state {
         if metal() {
             with_metal(this, |p| {
                 if indirect != 0 {
-                    p.refuse("DispatchMeshX: indirect mesh dispatch", None)
+                    p.refuse(
+                        "DispatchMeshX: indirect mesh dispatch",
+                        Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DISPATCH_MESH),
+                    )
                 } else {
                     p.dispatch_mesh(x, 1, 1)
                 }
@@ -2421,7 +2563,87 @@ extern "system" fn execute_indirect(
     count_draw();
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
-        with_metal(this, |producer| producer.refuse("ExecuteIndirect", None));
+        use crate::native_metal::producer::{ProducerError, ResourceId};
+        use victory_metal::wire_v3::{IndirectArguments, IndirectCountBuffer};
+        with_metal(this, |producer| {
+            if max == 0 {
+                // D3D12 executes nothing; no wire command is needed.
+                return Ok(());
+            }
+            let Some((stride, args)) = crate::signature::layout(signature) else {
+                return producer.refuse("ExecuteIndirect: signature is not one of ours", None);
+            };
+            // A signature that also changes root arguments or geometry is
+            // not expressible: the wire command carries only the argument
+            // range.
+            let [[kind, ..]] = args else {
+                return producer.refuse(
+                    "ExecuteIndirect: a multi-argument signature",
+                    Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
+                );
+            };
+            let Some((address, size)) = crate::resource::buffer_bytes(arguments) else {
+                return producer.refuse(
+                    "ExecuteIndirect: arguments are not a buffer",
+                    Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
+                );
+            };
+            if offset.checked_add(u64::from(max).saturating_mul(u64::from(stride))).is_none_or(|end| end > size)
+            {
+                return producer.refuse(
+                    "ExecuteIndirect: argument range outside its buffer",
+                    Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
+                );
+            }
+            let allocation = ResourceId::from_guest_address(address as u64)?;
+            let count = if count.is_null() {
+                None
+            } else {
+                let Some((counter, count_size)) = crate::resource::buffer_bytes(count) else {
+                    return producer.refuse(
+                        "ExecuteIndirect: count is not a buffer",
+                        Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
+                    );
+                };
+                if count_offset.checked_add(4).is_none_or(|end| end > count_size) {
+                    return producer.refuse(
+                        "ExecuteIndirect: count outside its buffer",
+                        Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
+                    );
+                }
+                let counter = ResourceId::from_guest_address(counter as u64)?;
+                Some(IndirectCountBuffer {
+                    allocation_id: counter.allocation_id,
+                    generation: counter.generation,
+                    offset: count_offset,
+                })
+            };
+            let arguments = IndirectArguments {
+                allocation_id: allocation.allocation_id,
+                generation: allocation.generation,
+                offset,
+                max_count: max,
+                count,
+            };
+            // D3D12 indirect argument types: draw 0, indexed draw 1,
+            // dispatch 2, mesh dispatch 9; 105 is the console's single-pass
+            // dispatch, whose record is the three group counts.
+            match *kind {
+                0 => producer.execute_indirect_draw(arguments),
+                1 => producer.execute_indirect_draw_indexed(arguments),
+                2 | 105 => producer.execute_indirect_dispatch(arguments),
+                9 => {
+                    let Some(pipeline) = producer.mesh_pipeline() else {
+                        return Err(ProducerError::MissingPipeline { stage: "mesh" });
+                    };
+                    producer.execute_indirect_dispatch_mesh(pipeline, arguments)
+                }
+                _ => Err(ProducerError::unsupported_opcode(
+                    "ExecuteIndirect: argument type has no native command",
+                    victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW,
+                )),
+            }
+        });
         return;
     }
     let Some((stride, args)) = crate::signature::layout(signature) else {

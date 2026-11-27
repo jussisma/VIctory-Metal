@@ -10,6 +10,7 @@
 
 pub mod bindings;
 pub mod client;
+pub mod fence_page_guest;
 pub mod present;
 pub mod producer;
 pub mod queue;

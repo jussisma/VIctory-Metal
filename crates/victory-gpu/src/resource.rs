@@ -1526,6 +1526,58 @@ pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
 }
 
+/// A texture subresource as the wire names it: allocation base, mip level,
+/// array slice and the subresource's texel extent.
+///
+/// D3D12 numbers subresources as `mip + slice * mip_levels` for 1D/2D
+/// arrays; a 3D texture has one slice per mip (`mip = index`).
+pub(crate) fn texture_subresource(
+    this: This,
+    index: u32,
+) -> Option<(u64, u16, u16, [u32; 3])> {
+    let (base, desc) = texture_memory(this)?;
+    let mips = u32::from(desc.mip_levels.max(1));
+    let (mip, slice) = if desc.dimension == TEXTURE_3D {
+        (index, 0)
+    } else {
+        (index % mips, index / mips)
+    };
+    if mip >= mips {
+        return None;
+    }
+    let depth_or_array = u32::from(desc.depth_or_array_size.max(1));
+    let slices = if desc.dimension == TEXTURE_3D {
+        1
+    } else {
+        depth_or_array
+    };
+    if slice >= slices {
+        return None;
+    }
+    let width = (u32::try_from(desc.width >> mip).ok()?.max(1)).min(u32::MAX);
+    let height = (desc.height >> mip).max(1);
+    let depth = if desc.dimension == TEXTURE_3D {
+        (depth_or_array >> mip).max(1)
+    } else {
+        1
+    };
+    Some((
+        base as u64,
+        u16::try_from(mip).ok()?,
+        u16::try_from(slice).ok()?,
+        [width, height, depth],
+    ))
+}
+
+/// A texture's top-level extent, for the native presenter registration.
+pub(crate) fn texture_extent(this: This) -> Option<(u32, u32)> {
+    let (_, desc) = texture_memory(this)?;
+    Some((
+        u32::try_from(desc.width).ok()?,
+        desc.height,
+    ))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -1954,6 +2006,107 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 }
 
 // The creation methods' own arguments, passed on.
+/// The host registration of one texture, when the native path needs it.
+///
+/// Only textures the GPU writes (render targets, depth targets, UAVs) and a
+/// present surface are host-owned; a sampled texture stays in guest memory
+/// and is reached through the binding tables. `None` means "no host object":
+/// a buffer, or a texture the native path never names directly.
+#[cfg(windows)]
+fn native_texture_registration(
+    desc: &ResourceDesc,
+) -> Option<Result<(u8, u8, u8), &'static str>> {
+    if desc.dimension == BUFFER || desc.flags & (0x4 | 0x8 | 0x10) == 0 {
+        return None;
+    }
+    let dimension = match desc.dimension {
+        2 => 0,                                     // D1
+        3 if desc.depth_or_array_size > 1 => 2,    // D2Array
+        3 => 1,                                     // D2
+        4 => 5,                                     // D3
+        _ => return Some(Err("texture registration: unknown dimension")),
+    };
+    let format = match desc.format {
+        28 => 0,
+        87 => 1,
+        29 => 2,
+        41 => 3,
+        54 => 4,
+        26 => 5,
+        24 => 6,
+        40 => 7,
+        20 => 8,
+        _ => return Some(Err("texture registration: format has no host code")),
+    };
+    let usage = if desc.flags & 0x10 != 0 {
+        2
+    } else if desc.flags & 0x8 != 0 {
+        3
+    } else {
+        1
+    };
+    Some(Ok((dimension, format, usage)))
+}
+
+#[cfg(windows)]
+fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
+    let Some(registration) = native_texture_registration(desc) else {
+        return S_OK;
+    };
+    let Ok((dimension, format, usage)) = registration else {
+        tracing::warn!(
+            ?desc,
+            "VICTORY_BACKEND=metal: a target texture has no host registration code"
+        );
+        return 0x8000_4005_u32 as i32; // E_FAIL
+    };
+    let id = resource.data() as u64;
+    let width = u32::try_from(desc.width).unwrap_or(u32::MAX);
+    let depth = if desc.dimension == TEXTURE_3D {
+        u32::from(desc.depth_or_array_size)
+    } else {
+        1
+    };
+    let array_layers = if desc.dimension == TEXTURE_3D {
+        1
+    } else {
+        desc.depth_or_array_size
+    };
+    match crate::native_metal::queue::register_texture(
+        id,
+        1,
+        dimension,
+        format,
+        usage,
+        desc.sample_count.max(1).try_into().unwrap_or(1),
+        width,
+        desc.height,
+        depth,
+        desc.mip_levels.max(1),
+        array_layers.max(1),
+    ) {
+        Ok(true) => {
+            tracing::debug!(id = format_args!("{id:#x}"), "native texture registered");
+            S_OK
+        }
+        Ok(false) => {
+            tracing::warn!(
+                id = format_args!("{id:#x}"),
+                "VICTORY_BACKEND=metal: the host refused a target texture registration"
+            );
+            0x8000_4005_u32 as i32
+        }
+        Err(error) => {
+            tracing::warn!(
+                id = format_args!("{id:#x}"),
+                %error,
+                "VICTORY_BACKEND=metal: a target texture could not be registered"
+            );
+            error.hresult()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
     desc: ResourceDesc,
@@ -1989,6 +2142,13 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
+    }
+    #[cfg(windows)]
+    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        let hr = register_native_texture(&resource, &desc);
+        if hr != S_OK {
+            return hr;
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
