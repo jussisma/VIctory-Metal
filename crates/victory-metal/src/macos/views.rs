@@ -42,7 +42,7 @@ use thiserror::Error;
 use crate::abi::VmBufferId;
 use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
-use crate::macos::registry::{FormatKind, TextureFormat};
+use crate::macos::registry::{FormatKind, TextureDimension, TextureFormat, canonical_texture_type};
 use crate::macos::texture::{VmTextureId, MAX_TEXTURE_DIMENSION_2D};
 use crate::transport::{MetalError, MetalTransport};
 
@@ -50,10 +50,6 @@ use crate::transport::{MetalError, MetalTransport};
 const MTL_STORAGE_MODE_PRIVATE: usize = 2;
 /// `MTLResourceStorageModeShared` for CPU-written staging buffers.
 const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
-/// `MTLTextureType2D`.
-const MTL_TEXTURE_TYPE_2D: usize = 2;
-/// `MTLTextureType2DArray`.
-const MTL_TEXTURE_TYPE_2D_ARRAY: usize = 3;
 /// `MTLTextureUsageShaderRead`.
 const MTL_TEXTURE_USAGE_SHADER_READ: usize = 1;
 /// `MTLTextureUsageShaderWrite`.
@@ -744,19 +740,20 @@ impl DirectMetalTransport {
             c"setMipmapLevelCount:",
             validated.mip_levels as usize,
         );
+        // 2D or 2D array, from the same canonical `MTLTextureType` table the
+        // host registry uses (ADR-042); this layer never declares its own
+        // numeric constants.
+        set_descriptor_usize(
+            descriptor,
+            c"setTextureType:",
+            canonical_texture_type(TextureDimension::D2Array, 1, validated.array_layers),
+        );
         if validated.array_layers > 1 {
-            set_descriptor_usize(
-                descriptor,
-                c"setTextureType:",
-                MTL_TEXTURE_TYPE_2D_ARRAY,
-            );
             set_descriptor_usize(
                 descriptor,
                 c"setArrayLength:",
                 validated.array_layers as usize,
             );
-        } else {
-            set_descriptor_usize(descriptor, c"setTextureType:", MTL_TEXTURE_TYPE_2D);
         }
 
         // SAFETY: `self.device_raw()` is a live `MTLDevice`, `descriptor` is a
@@ -1288,7 +1285,8 @@ fn validate_upload_region(
             upload.level, info.mip_levels
         )));
     }
-    if info.texture_type == MTL_TEXTURE_TYPE_2D_ARRAY {
+    // Two layers selects the 2D-array entry of the one canonical type table.
+    if info.texture_type == canonical_texture_type(TextureDimension::D2Array, 1, 2) {
         if upload.slice >= info.array_layers {
             return Err(ResourceError::InvalidUpload(format!(
                 "upload slice {} exceeds the texture's {} array layers",

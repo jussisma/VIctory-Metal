@@ -2094,6 +2094,30 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 }
 
 // The creation methods' own arguments, passed on.
+/// The resource flags that make the GPU write a texture, as the title sets
+/// them (`D3D12_RESOURCE_FLAGS`: render target `0x1`, depth `0x2`, unordered
+/// access `0x4`).
+///
+/// `0x8` is `DENY_SHADER_RESOURCE` and `0x10` names no D3D12 resource flag;
+/// neither is a write use, so neither may select a kind 8 usage code.
+#[cfg(any(windows, test))]
+const TARGET_TEXTURE_FLAGS: u32 = 0x1 | 0x2 | 0x4;
+
+/// The kind 8 usage code for a target texture: depth `2`, unordered `3`, else
+/// colour attachment `1` (Boot #11's 33x33x33 fp16 volume is an unordered
+/// access target and must not be sent as a colour attachment, which the host
+/// refuses for a 3D texture).
+#[cfg(any(windows, test))]
+fn target_texture_usage(flags: u32) -> u8 {
+    if flags & 0x2 != 0 {
+        2
+    } else if flags & 0x4 != 0 {
+        3
+    } else {
+        1
+    }
+}
+
 /// The host registration of one texture, when the native path needs it.
 ///
 /// Only textures the GPU writes (render targets, depth targets, UAVs) and a
@@ -2105,17 +2129,174 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 fn native_texture_registration(
     desc: &ResourceDesc,
 ) -> Option<Result<(u8, u8, u8), &'static str>> {
-    if desc.dimension == BUFFER || desc.flags & (0x4 | 0x8 | 0x10) == 0 {
+    if desc.dimension == BUFFER || desc.flags & TARGET_TEXTURE_FLAGS == 0 {
         return None;
     }
-    let usage = if desc.flags & 0x10 != 0 {
-        2
-    } else if desc.flags & 0x8 != 0 {
-        3
-    } else {
-        1
+    Some(texture_registration_codes(
+        desc,
+        target_texture_usage(desc.flags),
+    ))
+}
+
+/// Kind 8 registration request for one target texture at creation.
+///
+/// Built once from the description (and the codes
+/// [`native_texture_registration`] resolved) so the Windows creation path and
+/// its tests agree on every argument: dimension, format, usage, sample count,
+/// extents, mips and array layers.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeTextureRegistration {
+    /// Guest memory base, the kind 8 handle.
+    id: u64,
+    /// Registration generation (the resource's first).
+    generation: u32,
+    /// Kind 8 dimension code.
+    dimension: u8,
+    /// Kind 8 format code.
+    format: u8,
+    /// Kind 8 usage code.
+    usage: u8,
+    /// Sample count.
+    sample_count: u8,
+    /// Top-level width.
+    width: u32,
+    /// Top-level height.
+    height: u32,
+    /// Depth for a 3D texture, otherwise 1.
+    depth: u32,
+    /// Mip levels.
+    mip_levels: u16,
+    /// Array layers (1 for a 3D texture).
+    array_layers: u16,
+}
+
+#[cfg(any(windows, test))]
+impl NativeTextureRegistration {
+    /// The kind 8 request for `desc` at guest `id`, with `codes` resolved.
+    fn from_desc(id: u64, desc: &ResourceDesc, (dimension, format, usage): (u8, u8, u8)) -> Self {
+        Self {
+            id,
+            // A resource has one identity for its life; the host keys the
+            // handle's first registration by generation 1.
+            generation: 1,
+            dimension,
+            format,
+            usage,
+            sample_count: desc.sample_count.max(1).try_into().unwrap_or(1),
+            width: u32::try_from(desc.width).unwrap_or(u32::MAX),
+            height: desc.height,
+            depth: if desc.dimension == TEXTURE_3D {
+                u32::from(desc.depth_or_array_size)
+            } else {
+                1
+            },
+            mip_levels: desc.mip_levels.max(1),
+            array_layers: if desc.dimension == TEXTURE_3D {
+                1
+            } else {
+                desc.depth_or_array_size.max(1)
+            },
+        }
+    }
+
+    /// Sends this registration to the live host session.
+    #[cfg(any(windows, test, target_os = "macos"))]
+    fn send(self) -> Result<bool, crate::native_metal::queue::NativeQueueError> {
+        crate::native_metal::queue::register_texture(
+            self.id,
+            self.generation,
+            self.dimension,
+            self.format,
+            self.usage,
+            self.sample_count,
+            self.width,
+            self.height,
+            self.depth,
+            self.mip_levels,
+            self.array_layers,
+        )
+    }
+}
+
+/// The creation-time kind 8 request for `desc` at guest `id`, or the named
+/// reason the native path cannot express it.
+#[cfg(any(windows, test))]
+fn native_texture_request(
+    id: u64,
+    desc: &ResourceDesc,
+) -> Option<Result<NativeTextureRegistration, &'static str>> {
+    native_texture_registration(desc)
+        .map(|codes| codes.map(|codes| NativeTextureRegistration::from_desc(id, desc, codes)))
+}
+
+/// Target textures whose creation-time registration was refused.
+///
+/// Bounded (one `AtomicU64`, never a growing list) and separate from
+/// `telemetry::registration_failures` (buffers and pipelines), so Boot #12 can
+/// tell a texture-view gap from a buffer gap. A session total, never reset.
+#[cfg(any(windows, test))]
+static TEXTURE_REGISTRATION_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Target texture registrations refused at creation so far (tests, Boot #12).
+#[cfg(test)]
+pub(crate) fn texture_registration_refusals() -> u64 {
+    TEXTURE_REGISTRATION_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records one refused target texture registration at creation and answers
+/// `S_OK`.
+///
+/// Creation never fails for a registration gap, exactly as it does not for a
+/// buffer: the resource exists and the first explicit bind refuses with the
+/// same named reason (see `list.rs`). The refusal is logged and counted here,
+/// so it is never silent and never falls back to D3DMetal.
+#[cfg(any(windows, test))]
+fn refuse_target_texture_registration(id: u64, reason: &str) -> HRESULT {
+    let refusals = TEXTURE_REGISTRATION_REFUSALS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    tracing::warn!(
+        id = format_args!("{id:#x}"),
+        reason,
+        texture_registration_refusals = refusals,
+        "VICTORY_BACKEND=metal: target texture registration refused at creation; \
+         the resource is still created and its first bind will be refused"
+    );
+    S_OK
+}
+
+/// Settles a creation-time target texture registration, never failing creation.
+///
+/// `send` is the transport call (injected in tests): `Ok(true)` registered,
+/// `Ok(false)` is the host's refusal, `Err` is a transport refusal. Every
+/// non-success outcome is a named, counted registration refusal and still
+/// `S_OK`. A description with no host code ([`native_texture_registration`]'s
+/// `Err`) is the same named refusal, not a creation failure.
+#[cfg(any(windows, test))]
+fn settle_native_texture_registration(
+    id: u64,
+    registration: Option<Result<NativeTextureRegistration, &'static str>>,
+    send: impl FnOnce(
+        NativeTextureRegistration,
+    ) -> Result<bool, crate::native_metal::queue::NativeQueueError>,
+) -> HRESULT {
+    let Some(registration) = registration else {
+        return S_OK;
     };
-    Some(texture_registration_codes(desc, usage))
+    let request = match registration {
+        Ok(request) => request,
+        Err(reason) => return refuse_target_texture_registration(id, reason),
+    };
+    match send(request) {
+        Ok(true) => {
+            tracing::debug!(id = format_args!("{id:#x}"), "native texture registered");
+            S_OK
+        }
+        Ok(false) => refuse_target_texture_registration(id, "the host refused the registration"),
+        Err(error) => refuse_target_texture_registration(id, &error.to_string()),
+    }
 }
 
 /// Parameters for registering a texture at its first table bind.
@@ -2359,61 +2540,11 @@ fn register_native_buffer(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
 }
 
 #[cfg(windows)]
-fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {    let Some(registration) = native_texture_registration(desc) else {
-        return S_OK;
-    };
-    let Ok((dimension, format, usage)) = registration else {
-        tracing::warn!(
-            ?desc,
-            "VICTORY_BACKEND=metal: a target texture has no host registration code"
-        );
-        return 0x8000_4005_u32 as i32; // E_FAIL
-    };
+fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
     let id = resource.data() as u64;
-    let width = u32::try_from(desc.width).unwrap_or(u32::MAX);
-    let depth = if desc.dimension == TEXTURE_3D {
-        u32::from(desc.depth_or_array_size)
-    } else {
-        1
-    };
-    let array_layers = if desc.dimension == TEXTURE_3D {
-        1
-    } else {
-        desc.depth_or_array_size
-    };
-    match crate::native_metal::queue::register_texture(
-        id,
-        1,
-        dimension,
-        format,
-        usage,
-        desc.sample_count.max(1).try_into().unwrap_or(1),
-        width,
-        desc.height,
-        depth,
-        desc.mip_levels.max(1),
-        array_layers.max(1),
-    ) {
-        Ok(true) => {
-            tracing::debug!(id = format_args!("{id:#x}"), "native texture registered");
-            S_OK
-        }
-        Ok(false) => {
-            tracing::warn!(
-                id = format_args!("{id:#x}"),
-                "VICTORY_BACKEND=metal: the host refused a target texture registration"
-            );
-            0x8000_4005_u32 as i32
-        }
-        Err(error) => {
-            tracing::warn!(
-                id = format_args!("{id:#x}"),
-                %error,
-                "VICTORY_BACKEND=metal: a target texture could not be registered"
-            );
-            error.hresult()
-        }
-    }
+    settle_native_texture_registration(id, native_texture_request(id, desc), |request| {
+        request.send()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3361,11 +3492,13 @@ mod tests {
 
     /// The title's SDR-presented FP16 back-buffer (`DXGI_FORMAT` 10,
     /// `R16G16B16A16_FLOAT`) maps to kind 8 host format code 9. Boot #1
-    /// refused it as "format has no host code"; 2560x1440 must now register.
+    /// refused it as "format has no host code"; 2560x1440 must now register,
+    /// including as a plain colour render target (flag `0x1`), which the old
+    /// `0x4 | 0x8 | 0x10` mask skipped.
     #[test]
     fn a_fp16_present_target_registers_with_host_code_9() {
         let desc = ResourceDesc {
-            flags: 0x4, // ALLOW_UNORDERED_ACCESS in the console's flag encoding
+            flags: 0x1, // ALLOW_RENDER_TARGET
             ..texture(2560, 1440, 10, 1)
         };
         assert_eq!(native_texture_registration(&desc), Some(Ok((1, 9, 1))));
@@ -3373,18 +3506,17 @@ mod tests {
 
     /// Boot #2b's compute-storage target (`DXGI_FORMAT` 42, R32_UINT, a UAV
     /// target with flags 0x4) maps to kind 8 host code 10; its signed sibling
-    /// 43 (R32_SINT) maps to 11. The existing flags -> usage computation still
-    /// names a 0x4 target a colour attachment (usage 1); the host widens that
-    /// to the storage/colour set for these two formats.
+    /// 43 (R32_SINT) maps to 11. A UAV is usage code 3 (storage), not a
+    /// colour attachment: the flag names `ALLOW_UNORDERED_ACCESS`.
     #[test]
     fn an_r32_uint_storage_target_registers_with_host_code_10() {
         let desc = ResourceDesc {
             flags: 0x4,
             ..texture(1280, 720, 42, 1)
         };
-        assert_eq!(native_texture_registration(&desc), Some(Ok((1, 10, 1))));
+        assert_eq!(native_texture_registration(&desc), Some(Ok((1, 10, 3))));
         let signed = ResourceDesc { format: 43, ..desc };
-        assert_eq!(native_texture_registration(&signed), Some(Ok((1, 11, 1))));
+        assert_eq!(native_texture_registration(&signed), Some(Ok((1, 11, 3))));
     }
 
     /// The first-bind path (`texture_table_registration`'s codes) names the
@@ -3399,6 +3531,137 @@ mod tests {
         assert_eq!(texture_registration_codes(&desc, 3), Ok((1, 10, 3)));
         let signed = ResourceDesc { format: 43, ..desc };
         assert_eq!(texture_registration_codes(&signed, 3), Ok((1, 11, 3)));
+    }
+
+    /// Boot #11's failing at-address target: a 33x33x33 `R16G16B16A16_FLOAT`
+    /// (DXGI 10) volume with `ALLOW_UNORDERED_ACCESS` (`0x4`) at guest
+    /// `0xe2e190000`. It used to be sent as usage 1 (colour attachment), which
+    /// the host's `TextureDesc::validate` D3 arm refuses ("3D textures cannot
+    /// be render or depth attachments here"), turning CreateAtAddress into
+    /// E_FAIL. It must be usage 3 (unordered) with every other argument
+    /// matching the description, and a host refusal must not fail creation.
+    #[test]
+    fn boot_11_fp16_volume_target_registers_as_unordered_access() {
+        let desc = ResourceDesc {
+            dimension: 4, // TEXTURE_3D
+            depth_or_array_size: 33,
+            flags: 0x4,
+            ..texture(33, 33, 10, 1)
+        };
+        assert_eq!(native_texture_registration(&desc), Some(Ok((5, 9, 3))));
+        let request = native_texture_request(0xe2e_190000u64, &desc)
+            .expect("a target texture")
+            .expect("DXGI 10 has a host code");
+        assert_eq!(
+            request,
+            NativeTextureRegistration {
+                id: 0xe2e_190000u64,
+                generation: 1,
+                dimension: 5, // D3
+                format: 9,    // Rgba16Float
+                usage: 3,     // unordered access
+                sample_count: 1,
+                width: 33,
+                height: 33,
+                depth: 33,
+                mip_levels: 1,
+                array_layers: 1,
+            }
+        );
+        let before = texture_registration_refusals();
+        let mut seen = None;
+        let hr = settle_native_texture_registration(0xe2e_190000u64, Some(Ok(request)), |sent| {
+            seen = Some(sent);
+            Ok(false)
+        });
+        assert_eq!(hr, S_OK, "a host refusal must not fail creation");
+        assert_eq!(seen, Some(request), "the request reached the registration");
+        assert_eq!(texture_registration_refusals(), before + 1);
+    }
+
+    /// A format the host cannot view (DXGI 6, `R32G32B32_FLOAT`: Metal has no
+    /// 3-channel format) is a named refusal at creation, not E_FAIL: the
+    /// resource exists and its first bind refuses explicitly.
+    #[test]
+    fn a_format_the_host_cannot_view_is_a_named_refusal_not_a_creation_failure() {
+        let desc = ResourceDesc {
+            flags: 0x4,
+            ..texture(2560, 1440, 6, 1)
+        };
+        let request = native_texture_request(0x1234, &desc);
+        assert_eq!(
+            request,
+            Some(Err("texture registration: format has no host code"))
+        );
+        let before = texture_registration_refusals();
+        let hr = settle_native_texture_registration(0x1234, request, |_| {
+            panic!("a format with no host code must not reach register_texture")
+        });
+        assert_eq!(hr, S_OK);
+        assert_eq!(texture_registration_refusals(), before + 1);
+    }
+
+    /// A 2D array target passes its layer count (not 1), dimension D2Array
+    /// (code 2) and depth 1; a 3D target passes its depth and one layer.
+    #[test]
+    fn a_2d_array_target_passes_its_array_layers() {
+        for layers in [2u16, 6, 12] {
+            let desc = ResourceDesc {
+                depth_or_array_size: layers,
+                flags: 0x1,
+                ..texture(256, 256, 28, 1)
+            };
+            assert_eq!(native_texture_registration(&desc), Some(Ok((2, 0, 1))));
+            let request = native_texture_request(0x1000, &desc)
+                .expect("a target texture")
+                .expect("DXGI 28 has a host code");
+            assert_eq!(
+                (request.dimension, request.depth, request.array_layers),
+                (2, 1, layers)
+            );
+        }
+        let volume = ResourceDesc {
+            dimension: 4,
+            depth_or_array_size: 4,
+            flags: 0x4,
+            ..texture(64, 64, 10, 1)
+        };
+        let request = native_texture_request(0x1000, &volume)
+            .expect("a target texture")
+            .expect("DXGI 10 has a host code");
+        assert_eq!(
+            (request.dimension, request.depth, request.array_layers),
+            (5, 4, 1)
+        );
+    }
+
+    /// Only the target flags name a kind 8 usage: render target 1, depth 2,
+    /// unordered 3; `DENY_SHADER_RESOURCE` (0x8) and the unassigned 0x10 are
+    /// not write uses.
+    #[test]
+    fn only_target_flags_name_a_usage_code() {
+        let rgb = texture(64, 64, 28, 1);
+        let depth = texture(64, 64, 40, 1);
+        assert_eq!(
+            native_texture_registration(&ResourceDesc { flags: 0x1, ..rgb }),
+            Some(Ok((1, 0, 1)))
+        );
+        assert_eq!(
+            native_texture_registration(&ResourceDesc { flags: 0x2, ..depth }),
+            Some(Ok((1, 7, 2)))
+        );
+        assert_eq!(
+            native_texture_registration(&ResourceDesc { flags: 0x4, ..rgb }),
+            Some(Ok((1, 0, 3)))
+        );
+        assert_eq!(
+            native_texture_registration(&ResourceDesc { flags: 0x8, ..rgb }),
+            None
+        );
+        assert_eq!(
+            native_texture_registration(&ResourceDesc { flags: 0x10, ..rgb }),
+            None
+        );
     }
 
     /// A format outside the kind 8 table still refuses explicitly, so no
