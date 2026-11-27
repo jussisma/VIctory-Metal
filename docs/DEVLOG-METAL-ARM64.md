@@ -1357,19 +1357,20 @@ the native run's. The ABI is therefore not the delta; device behaviour is.
 
 ### 10.3 Boot progression (counts only)
 
-| | Boot #5 | Boot #6 | Ref #6 (D3D12) | Boot #9 (windowed) |
-|---|---|---|---|---|
-| head | `c652a848` | Wave 10A | Wave 10A | Wave 10A |
-| session | headless | headless | headless | windowed |
-| D3DMetal attempts / fallback | 0 / 0 | 0 / 0 | reference | 0 / 0 |
-| submissions ok/refused | 2 / 1 | **2 / 0** | 9,413 | 72 / 0 |
-| frames presented | 0 | 0 | n/a | **70** (71 drawables) |
-| assert `+0x2215c35` | yes | yes | no | **no** |
-| pipeline attempts (graphics) | 0 | 0 | many | **3** |
-| translator unavailable | 0 | 0 | 0 | 3 |
-| buffers / PSOs registered | 0 / 0 | 0 / 0 | host n/a | 0 / 0 |
-| non-black pixel probe | n/a | n/a (headless) | n/a | 0 of 4,096, 1 luma bucket |
-| furthest event | assert | assert | frames | **real presents, first pipelines** |
+| | Boot #5 | Boot #6 | Ref #6 (D3D12) | Boot #9 | Boot #10 |
+|---|---|---|---|---|---|
+| head | `c652a848` | Wave 10A | Wave 10A | Wave 10A | +resolver `248cbe86` |
+| session | headless | headless | headless | windowed | windowed |
+| D3DMetal attempts / fallback | 0 / 0 | 0 / 0 | reference | 0 / 0 | 0 / 0 |
+| submissions ok/refused | 2 / 1 | **2 / 0** | 9,413 | 72 / 0 | 67 / 0 |
+| frames presented | 0 | 0 | n/a | **70** (71 drawables) | **65** (66) |
+| assert `+0x2215c35` | yes | yes | no | **no** | **no** |
+| pipeline attempts (graphics) | 0 | 0 | many | **3** | **3** |
+| translator unavailable | 0 | 0 | 0 | 3 | 3 |
+| "needs the guest range resolver" | n/a | n/a | n/a | many | **0** |
+| buffers / PSOs registered | 0 / 0 | 0 / 0 | host n/a | 0 / 0 | 0 / 0 |
+| non-black pixel probe | n/a | n/a (headless) | n/a | 0 of 4,096 | 0 of 4,096 |
+| furthest event | assert | assert | frames | **real presents, first pipelines** | same, bindings resolve one layer deeper |
 
 ### 10.4 Why the headline is a headless predicate
 
@@ -1384,20 +1385,39 @@ gate; the harness now reports the mode in every summary.
 
 ### 10.5 Counts at the integration head
 
-- `victory-gpu` lib **325 passed / 0 failed / 1 ignored**; `victory-metal` lib
-  **314 / 0 / 7**; `victory-hle` **81 / 0 / 0**; launcher session test 8 checks,
-  process-hygiene 13, GPU lock 10; `test-abi-diff` 8.
-- Windows all-targets checks for `victory-gpu` (diagnostics) and `victory-metal`
-  exit 0; `git diff --check` clean; no surviving process after any boot.
+- `victory-metal` lib **314 passed / 0 failed / 7 ignored**; `victory-shader`
+  **254 / 0 / 2**; `victory-gpu` **325 / 0 / 1**; `victory-hle` **81 / 0 / 0**
+  (Wine suite 186 / 0 / 1); `victory` bin **20 / 0 / 0** under Wine; DStorage
+  and the Wine share module green.
+- Win64 `diag` build exit 0; `victory-metal` and `victory-hle` Windows
+  all-targets exit 0; `victory-gpu` (diagnostics) exit 0; x86_64
+  `victory-irconverter` exit 0.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.826 / p95 0.902 / p99 0.962 ms,
+  1,211 FPS, model checksum `11527919792119713699` unchanged, xmem and retire
+  proofs measured, `fallback=0`.
+- Hermetic suites: `test-abi-diff` 8 checks, `test-launcher-session` 8,
+  process-hygiene 13, GPU lock 10. `git diff --check` clean; no surviving
+  process after any boot; 140 GB free.
 - Frames are presented but still blank: `non_black_pixels=0`,
-  `unique_luma_buckets=1`, `fallback_clear=1` on every sampled frame.
+  `unique_luma_buckets=1`, `fallback_clear=1` on every sampled frame. **No
+  loading screen, title screen or 3D frame is claimed.**
 
 ### 10.6 Remaining gaps (honest)
 
-- **No real draw yet.** All three graphics pipeline attempts are refused as
-  `graphics/converter-unavailable` ("no IRConverter is available to this
-  process"), and every bind is refused for want of the guest range resolver
-  (`registered=0 buffers`, `0 psos`). Those two are the Cycle 10B targets.
+- **No real draw yet, for two named reasons.** Every graphics pipeline attempt
+  is refused as `graphics/converter-unavailable`: the guest is a Win64 process
+  under Wine and cannot run the macOS IRConverter, and the kind 4 v2 pipeline
+  registration carries only a *ticket naming a pre-existing metallib* — no DXIL,
+  no hash, no reflection and no capability advertisement (verified field by
+  field; the host daemon owns no translator pool at all). With the resolver now
+  installed, binds get one layer further and fail as
+  `unsupported guest binding: the range's section has no host-visible backing`
+  (134 vertex buffers, 67 root views, 67 descriptor tables per run), plus
+  `a placed view is not a buffer descriptor` for 67 table enumerations.
+- **Host-side translation is a real wire change**, not a wiring fix: a
+  file-backed or chunked stage upload (the transport frame is 64 KiB against a
+  16 MiB stage cap), a host translator-pool owner, a capability reply and a
+  bounded rejection reason. That is the Cycle 11 headline.
 - **Presents are blank**, so no loading screen, title screen or 3D frame is
   claimed; the probe is the instrument that will say so when it changes.
 - **The headless gate is the title's**, not ours; the harness must run windowed
