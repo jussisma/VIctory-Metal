@@ -59,6 +59,11 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// The register space recorded with each root argument, graphics then
+    /// compute, by title root-parameter slot. The reference path binds by slot
+    /// alone; the native path carries the space to address the translated root
+    /// signature. A slot without an entry was set through the slot-only API.
+    spaces: [std::collections::BTreeMap<u16, u16>; 2],
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
@@ -508,15 +513,70 @@ impl State {
         }
     }
 
+    /// The register space recorded for a root argument, when one was named.
+    #[allow(dead_code)] // the reference path binds by slot; the plan reads it.
+    pub(crate) fn root_space(&self, compute: bool, slot: u16) -> Option<u16> {
+        self.spaces[usize::from(compute)].get(&slot).copied()
+    }
+
+    fn note_space(&mut self, compute: bool, slot: u32, space: u16) {
+        if let Ok(slot) = u16::try_from(slot) {
+            self.spaces[usize::from(compute)].insert(slot, space);
+        }
+    }
+
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
+        self.set_table_at(
+            compute,
+            slot,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+            handle,
+        );
+    }
+
+    /// Records a descriptor table with the register space the native plan
+    /// binds it in. The reference path uses the slot exactly as before.
+    pub(crate) fn set_table_at(&mut self, compute: bool, slot: u32, space: u16, handle: u64) {
         set(self.roots(compute), slot, Root::Table(handle));
+        self.note_space(compute, slot, space);
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
+        self.set_view_at(
+            compute,
+            slot,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+            address,
+        );
+    }
+
+    /// Records a root CBV/SRV/UAV with the register space the native plan
+    /// binds it in.
+    pub(crate) fn set_view_at(&mut self, compute: bool, slot: u32, space: u16, address: u64) {
         set(self.roots(compute), slot, Root::View(address));
+        self.note_space(compute, slot, space);
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+        self.set_constants_at(
+            compute,
+            slot,
+            victory_shader::emit::USER_DATA_SPACE as u16,
+            values,
+            offset,
+        );
+    }
+
+    /// Records root constants with the register space the native plan binds
+    /// them in.
+    pub(crate) fn set_constants_at(
+        &mut self,
+        compute: bool,
+        slot: u32,
+        space: u16,
+        values: &[u32],
+        offset: u32,
+    ) {
         let roots = self.roots(compute);
         let s = slot as usize;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
@@ -529,6 +589,7 @@ impl State {
             }
             c[offset as usize..end].copy_from_slice(values);
         }
+        self.note_space(compute, slot, space);
     }
 
     pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
@@ -4925,5 +4986,31 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.host_state_lost();
         assert!(state.host_targets.is_none());
         list.close();
+    }
+
+    /// The slot-only API keeps its old behaviour and names the translated
+    /// space; the `_at` form records any space beside the same slot data.
+    #[test]
+    fn root_argument_spaces_are_recorded_beside_the_slot_data() {
+        let mut state = State::default();
+        state.set_view(false, 3, 0x1000);
+        assert_eq!(
+            state.root_space(false, 3),
+            Some(victory_shader::emit::ROOT_CBV_SPACE as u16)
+        );
+        state.set_view_at(false, 3, 9, 0x2000);
+        assert_eq!(state.root_space(false, 3), Some(9));
+        state.set_constants(true, 1, &[7, 8], 0);
+        assert_eq!(
+            state.root_space(true, 1),
+            Some(victory_shader::emit::USER_DATA_SPACE as u16)
+        );
+        state.set_table_at(true, 2, 4, 0x3000);
+        assert_eq!(state.root_space(true, 2), Some(4));
+        // The reference path's slot data is unchanged by the space.
+        assert!(matches!(
+            state.compute.get(2),
+            Some(Root::Table(0x3000))
+        ));
     }
 }

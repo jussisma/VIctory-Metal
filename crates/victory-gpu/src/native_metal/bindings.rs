@@ -1045,6 +1045,410 @@ pub fn root_constants_words(slot: u16, words: &[u32]) -> Result<RootConstantsV3,
     root_constants(slot, &bytes)
 }
 
+// --------------------------------------------------------------- root arguments
+//
+// A title sets a root argument by *root parameter index*, which names a
+// register, a register space and an argument kind only in the title's root
+// signature. Under `VICTORY_BACKEND=metal` the converter derives its own root
+// signature from the translated DXIL (`victory_shader::emit`): per-stage user
+// data in [`USER_DATA_SPACE`], root CBV/SRV/UAV views and descriptor tables in
+// [`ROOT_CBV_SPACE`], the title-memory page table in `MEMORY_SPACE`, and
+// static samplers in [`SAMPLER_SPACE`]. The wire's `RootConstantsV3`,
+// `RootBufferView` and `DescriptorTableV3` carry a root parameter *index* only,
+// so an encoded plan that names `(root_parameter, space, kind, register/offset,
+// size)` gives the host everything it needs to find the translated parameter.
+//
+// The plan is versioned so a reader that predates the `space` field keeps
+// decoding the old shape: version 1 records carry no space and decode with the
+// kind's default space, version 2 records carry it explicitly. An older reader
+// that sees version 2 refuses it by version instead of mis-reading the bytes as
+// a legacy record.
+
+use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+
+/// The largest register space a captured root argument may name.
+///
+/// D3D12 register spaces are sparse but a plan is not a root signature: an
+/// argument past this is not a space this backend can have translated.
+pub const MAX_ROOT_SPACE: u16 = 15;
+
+/// The most root arguments one encoded plan carries.
+pub const MAX_ROOT_ARGUMENTS: usize = 256;
+
+/// Magic of the versioned root-argument plan (`VRAB`).
+pub const ROOT_ARGUMENT_MAGIC: [u8; 4] = *b"VRAB";
+
+/// The plan version that carries the register space.
+pub const ROOT_ARGUMENT_VERSION: u8 = 2;
+
+/// The plan version before the space field existed.
+///
+/// Its records decode with [`RootArgumentKind::translated_space`], which is
+/// exactly the space the translated signature gives that kind.
+pub const ROOT_ARGUMENT_VERSION_LEGACY: u8 = 1;
+
+/// Bytes of one version 2 record (space included):
+/// `root_parameter(2) space(2) kind(1) register(2) offset(4) size(4)`.
+const ROOT_ARGUMENT_RECORD_V2: usize = 15;
+
+/// Bytes of one version 1 record (no space):
+/// `root_parameter(2) kind(1) register(2) offset(4) size(4)`.
+const ROOT_ARGUMENT_RECORD_V1: usize = 13;
+
+/// Bytes of the plan header: magic, version, count.
+const ROOT_ARGUMENT_HEADER: usize = 7;
+
+/// Which translated root argument a captured title root parameter feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RootArgumentKind {
+    /// A 32-bit-constants block (`Set*Root32BitConstants`).
+    Constants = 0,
+    /// A root CBV, SRV or UAV (`Set*Root*View`).
+    RootView = 1,
+    /// A descriptor table of CBV, SRV or UAV ranges.
+    DescriptorTable = 2,
+    /// A descriptor table of sampler states.
+    SamplerTable = 3,
+}
+
+impl RootArgumentKind {
+    /// The wire code of this kind.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind a wire code names, or `None` for an unknown code.
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Constants,
+            1 => Self::RootView,
+            2 => Self::DescriptorTable,
+            3 => Self::SamplerTable,
+            _ => return None,
+        })
+    }
+
+    /// The translated register space this kind is bound in.
+    ///
+    /// This is the mapping `victory_shader::emit` gives the translated root
+    /// signature; it is the space a version 1 record (which has no space
+    /// field) is decoded with.
+    pub const fn translated_space(self) -> u16 {
+        match self {
+            Self::Constants => USER_DATA_SPACE as u16,
+            Self::RootView | Self::DescriptorTable => ROOT_CBV_SPACE as u16,
+            Self::SamplerTable => SAMPLER_SPACE as u16,
+        }
+    }
+
+    /// A short name for errors and diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Constants => "root constants",
+            Self::RootView => "root view",
+            Self::DescriptorTable => "descriptor table",
+            Self::SamplerTable => "sampler table",
+        }
+    }
+}
+
+/// One captured root argument as the translated root signature addresses it.
+///
+/// `root_parameter` keeps the title's root-parameter index, which is also the
+/// index the wire's root commands carry today. `space`, `kind` and `register`
+/// let the host find the translated parameter; `offset` and `size` describe the
+/// argument's extent (constants bytes, or a view/table range).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootArgument {
+    /// Title root-parameter index the title set.
+    pub root_parameter: u16,
+    /// Register space the translated root signature binds it in.
+    pub space: u16,
+    /// What the argument is.
+    pub kind: RootArgumentKind,
+    /// Register (views/tables) or the constant block's base register.
+    pub register: u16,
+    /// Constants block's starting dword; `0` for a view or table.
+    pub offset: u32,
+    /// Bytes of a constants block or view, or entries of a table.
+    pub size: u32,
+}
+
+impl RootArgument {
+    /// A constants block: `words` dwords written at dword `offset`.
+    pub fn constants(
+        root_parameter: u16,
+        space: u16,
+        offset: u32,
+        words: usize,
+    ) -> Result<Self, RootArgumentError> {
+        let size = u32::try_from(words)
+            .ok()
+            .and_then(|words| words.checked_mul(4))
+            .ok_or(RootArgumentError::Invalid(
+                "the root constant block is too large",
+            ))?;
+        Self {
+            root_parameter,
+            space,
+            kind: RootArgumentKind::Constants,
+            register: 0,
+            offset,
+            size,
+        }
+        .checked()
+    }
+
+    /// A root CBV/SRV/UAV view.
+    pub const fn root_view(root_parameter: u16, space: u16, length: u32) -> Self {
+        Self {
+            root_parameter,
+            space,
+            kind: RootArgumentKind::RootView,
+            register: root_parameter,
+            offset: 0,
+            size: length,
+        }
+    }
+
+    /// A descriptor table at `base_register`.
+    pub const fn descriptor_table(
+        root_parameter: u16,
+        space: u16,
+        base_register: u16,
+        kind: RootArgumentKind,
+        entries: u32,
+    ) -> Self {
+        Self {
+            root_parameter,
+            space,
+            kind,
+            register: base_register,
+            offset: 0,
+            size: entries,
+        }
+    }
+
+    /// Checks the argument against the spaces and shapes this backend names.
+    pub fn validate(&self) -> Result<(), RootArgumentError> {
+        if self.space > MAX_ROOT_SPACE {
+            return Err(RootArgumentError::UnknownSpace { space: self.space });
+        }
+        if self.kind == RootArgumentKind::SamplerTable && self.space != SAMPLER_SPACE as u16 {
+            return Err(RootArgumentError::SamplerNonSamplerSpace { space: self.space });
+        }
+        if self.size == 0 {
+            return Err(RootArgumentError::Invalid("the root argument is empty"));
+        }
+        Ok(())
+    }
+
+    fn checked(self) -> Result<Self, RootArgumentError> {
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+/// Why a root-argument plan could not be validated or decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootArgumentError {
+    /// The plan is malformed.
+    Invalid(&'static str),
+    /// The space is past [`MAX_ROOT_SPACE`].
+    UnknownSpace {
+        /// The space the argument named.
+        space: u16,
+    },
+    /// A sampler table is not in [`SAMPLER_SPACE`].
+    SamplerNonSamplerSpace {
+        /// The space the table named.
+        space: u16,
+    },
+    /// A constants write extends past the block the pipeline declared.
+    ConstantsBeyondBlock {
+        /// Dword offset of the write.
+        offset: u32,
+        /// Bytes the write reaches.
+        end: u32,
+        /// Bytes the translated block declares.
+        block: u32,
+    },
+    /// The plan names a version this reader does not know.
+    UnsupportedVersion(u8),
+    /// The plan carries more than [`MAX_ROOT_ARGUMENTS`].
+    TooMany(usize),
+    /// The plan ends in the middle of a record.
+    Truncated,
+}
+
+impl std::fmt::Display for RootArgumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(why) => write!(f, "invalid root argument: {why}"),
+            Self::UnknownSpace { space } => {
+                write!(f, "root argument names unknown register space {space}")
+            }
+            Self::SamplerNonSamplerSpace { space } => write!(
+                f,
+                "a sampler table is in space {space}, not the sampler space {}",
+                SAMPLER_SPACE
+            ),
+            Self::ConstantsBeyondBlock { offset, end, block } => write!(
+                f,
+                "root constants at dword {offset} reach {end} bytes past the declared {block}"
+            ),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "root-argument plan version {version} is not supported")
+            }
+            Self::TooMany(count) => write!(
+                f,
+                "the root-argument plan carries {count}, more than {MAX_ROOT_ARGUMENTS}"
+            ),
+            Self::Truncated => write!(f, "the root-argument plan ends mid-record"),
+        }
+    }
+}
+
+impl std::error::Error for RootArgumentError {}
+
+/// Encodes a root-argument plan in the current (version 2) shape.
+///
+/// The header names the version, so a reader can tell a legacy record from one
+/// that carries a space before it reads any record.
+pub fn encode_root_arguments(
+    arguments: &[RootArgument],
+) -> Result<Vec<u8>, RootArgumentError> {
+    if arguments.len() > MAX_ROOT_ARGUMENTS {
+        return Err(RootArgumentError::TooMany(arguments.len()));
+    }
+    let mut out = Vec::with_capacity(
+        ROOT_ARGUMENT_HEADER + ROOT_ARGUMENT_RECORD_V2 * arguments.len(),
+    );
+    out.extend_from_slice(&ROOT_ARGUMENT_MAGIC);
+    out.push(ROOT_ARGUMENT_VERSION);
+    out.extend_from_slice(&(arguments.len() as u16).to_le_bytes());
+    for argument in arguments {
+        argument.validate()?;
+        out.extend_from_slice(&argument.root_parameter.to_le_bytes());
+        out.extend_from_slice(&argument.space.to_le_bytes());
+        out.push(argument.kind.code());
+        out.extend_from_slice(&argument.register.to_le_bytes());
+        out.extend_from_slice(&argument.offset.to_le_bytes());
+        out.extend_from_slice(&argument.size.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Decodes a root-argument plan, accepting both the legacy (version 1, no
+/// space) and current (version 2) record shapes.
+///
+/// A version 1 record decodes with the kind's translated space, which is where
+/// the pre-space encoder implicitly put it. An unknown version is refused
+/// before any record is read, so an older reader never mis-interprets a newer
+/// payload as a legacy one.
+pub fn decode_root_arguments(bytes: &[u8]) -> Result<Vec<RootArgument>, RootArgumentError> {
+    let header = bytes.get(..ROOT_ARGUMENT_HEADER).ok_or(RootArgumentError::Truncated)?;
+    if header[..4] != ROOT_ARGUMENT_MAGIC {
+        return Err(RootArgumentError::Invalid("the plan magic is not VRAB"));
+    }
+    let version = header[4];
+    let count = usize::from(u16::from_le_bytes([header[5], header[6]]));
+    if count > MAX_ROOT_ARGUMENTS {
+        return Err(RootArgumentError::TooMany(count));
+    }
+    let record = match version {
+        ROOT_ARGUMENT_VERSION_LEGACY => ROOT_ARGUMENT_RECORD_V1,
+        ROOT_ARGUMENT_VERSION => ROOT_ARGUMENT_RECORD_V2,
+        other => return Err(RootArgumentError::UnsupportedVersion(other)),
+    };
+    let expected = ROOT_ARGUMENT_HEADER
+        .checked_add(record.checked_mul(count).ok_or(RootArgumentError::TooMany(count))?)
+        .ok_or(RootArgumentError::TooMany(count))?;
+    if bytes.len() < expected {
+        return Err(RootArgumentError::Truncated);
+    }
+    if bytes.len() > expected {
+        return Err(RootArgumentError::Invalid(
+            "the plan has trailing bytes after its last record",
+        ));
+    }
+    let mut arguments = Vec::with_capacity(count);
+    let mut at = ROOT_ARGUMENT_HEADER;
+    for _ in 0..count {
+        let root_parameter = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let (space, kind_at) = match version {
+            ROOT_ARGUMENT_VERSION => (
+                u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]),
+                at + 4,
+            ),
+            _ => (0, at + 2),
+        };
+        let code = bytes[kind_at];
+        let kind = RootArgumentKind::from_code(code)
+            .ok_or(RootArgumentError::Invalid("the plan names an unknown root-argument kind"))?;
+        let space = if version == ROOT_ARGUMENT_VERSION_LEGACY {
+            kind.translated_space()
+        } else {
+            space
+        };
+        let register_at = kind_at + 1;
+        let offset_at = register_at + 2;
+        let size_at = offset_at + 4;
+        let register = u16::from_le_bytes([bytes[register_at], bytes[register_at + 1]]);
+        let offset = u32::from_le_bytes(bytes[offset_at..offset_at + 4].try_into().unwrap());
+        let size = u32::from_le_bytes(bytes[size_at..size_at + 4].try_into().unwrap());
+        let argument = RootArgument {
+            root_parameter,
+            space,
+            kind,
+            register,
+            offset,
+            size,
+        };
+        argument.validate()?;
+        arguments.push(argument);
+        at += record;
+    }
+    Ok(arguments)
+}
+
+/// Refuses a constants write that reaches past the block a translated pipeline
+/// declared for `(root_parameter, space)`.
+///
+/// `declared_dwords` is the block size the translated stage's user data has;
+/// a write the title makes past it would be silently unreadable by the
+/// translated shader, so it is named instead.
+pub fn check_constant_block(
+    _root_parameter: u16,
+    _space: u16,
+    offset: u32,
+    words: usize,
+    declared_dwords: u32,
+) -> Result<(), RootArgumentError> {
+    let start = offset
+        .checked_mul(4)
+        .ok_or(RootArgumentError::Invalid("the constants offset overflows"))?;
+    let bytes = u32::try_from(words)
+        .ok()
+        .and_then(|words| words.checked_mul(4))
+        .ok_or(RootArgumentError::Invalid("the root constant write is too large"))?;
+    let end = start
+        .checked_add(bytes)
+        .ok_or(RootArgumentError::Invalid("the constants write overflows"))?;
+    let block = declared_dwords
+        .checked_mul(4)
+        .ok_or(RootArgumentError::Invalid("the declared block overflows"))?;
+    if end > block {
+        return Err(RootArgumentError::ConstantsBeyondBlock {
+            offset,
+            end,
+            block,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,5 +2461,168 @@ mod tests {
         );
         assert_eq!(resolver.live(), 0, "both buffer pins were released");
         assert_eq!(resolver.retires.load(Ordering::Relaxed), 2);
+    }
+
+    // ------------------------------------------------------ root arguments
+
+    #[test]
+    fn a_root_argument_plan_round_trips_with_its_space() {
+        let arguments = [
+            RootArgument::constants(3, USER_DATA_SPACE as u16, 4, 2).expect("constants"),
+            RootArgument::root_view(5, ROOT_CBV_SPACE as u16, 0x80),
+            RootArgument::descriptor_table(
+                7,
+                ROOT_CBV_SPACE as u16,
+                7,
+                RootArgumentKind::DescriptorTable,
+                3,
+            ),
+            RootArgument::descriptor_table(
+                9,
+                SAMPLER_SPACE as u16,
+                9,
+                RootArgumentKind::SamplerTable,
+                2,
+            ),
+        ];
+        let encoded = encode_root_arguments(&arguments).expect("the plan encodes");
+        assert_eq!(&encoded[..4], b"VRAB");
+        assert_eq!(encoded[4], ROOT_ARGUMENT_VERSION);
+        assert_eq!(
+            decode_root_arguments(&encoded).expect("the plan decodes"),
+            arguments,
+            "space, kind, register, offset and size all survive"
+        );
+    }
+
+    /// The literal contract of requirement 3: two constants at the same title
+    /// root parameter but different spaces do not collapse into one record.
+    #[test]
+    fn two_root_constants_with_the_same_slot_but_different_spaces_stay_distinct() {
+        let first = RootArgument::constants(2, 0, 0, 1).expect("space 0 constants");
+        let second = RootArgument::constants(2, 1, 0, 1).expect("space 1 constants");
+        assert_ne!(first, second);
+        let encoded = encode_root_arguments(&[first, second]).expect("the plan encodes");
+        assert_eq!(
+            decode_root_arguments(&encoded).expect("the plan decodes"),
+            vec![first, second],
+            "both records keep their own space"
+        );
+    }
+
+    /// A reader that predates the space field decodes the legacy shape; here
+    /// the same decoder reads a hand-built version 1 payload. The space comes
+    /// from the kind, which is exactly where the legacy encoder meant it.
+    #[test]
+    fn a_legacy_plan_decodes_with_the_kinds_translated_space() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&ROOT_ARGUMENT_MAGIC);
+        legacy.push(ROOT_ARGUMENT_VERSION_LEGACY);
+        legacy.extend_from_slice(&2u16.to_le_bytes());
+        // Constants at root parameter 0, register 0, offset 0, 8 bytes.
+        legacy.extend_from_slice(&0u16.to_le_bytes());
+        legacy.push(RootArgumentKind::Constants.code());
+        legacy.extend_from_slice(&0u16.to_le_bytes());
+        legacy.extend_from_slice(&0u32.to_le_bytes());
+        legacy.extend_from_slice(&8u32.to_le_bytes());
+        // A root view at root parameter 1, register 1, 64 bytes.
+        legacy.extend_from_slice(&1u16.to_le_bytes());
+        legacy.push(RootArgumentKind::RootView.code());
+        legacy.extend_from_slice(&1u16.to_le_bytes());
+        legacy.extend_from_slice(&0u32.to_le_bytes());
+        legacy.extend_from_slice(&64u32.to_le_bytes());
+
+        let decoded = decode_root_arguments(&legacy).expect("the legacy plan decodes");
+        assert_eq!(decoded[0].space, USER_DATA_SPACE as u16);
+        assert_eq!(decoded[1].space, ROOT_CBV_SPACE as u16);
+        assert_eq!(decoded[0].size, 8);
+        assert_eq!(decoded[1].size, 64);
+    }
+
+    /// A newer payload is refused by version, never mis-read as a legacy one
+    /// (which would take the space bytes for the kind).
+    #[test]
+    fn an_unknown_plan_version_is_refused_before_any_record() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&ROOT_ARGUMENT_MAGIC);
+        bytes.push(ROOT_ARGUMENT_VERSION + 1);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            decode_root_arguments(&bytes),
+            Err(RootArgumentError::UnsupportedVersion(
+                ROOT_ARGUMENT_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_spaces_and_samplers_outside_the_sampler_space_are_named() {
+        let unknown = RootArgument {
+            root_parameter: 0,
+            space: MAX_ROOT_SPACE + 1,
+            kind: RootArgumentKind::RootView,
+            register: 0,
+            offset: 0,
+            size: 4,
+        };
+        assert_eq!(
+            unknown.validate(),
+            Err(RootArgumentError::UnknownSpace {
+                space: MAX_ROOT_SPACE + 1
+            })
+        );
+        let sampler = RootArgument::descriptor_table(
+            1,
+            ROOT_CBV_SPACE as u16,
+            1,
+            RootArgumentKind::SamplerTable,
+            2,
+        );
+        assert_eq!(
+            sampler.validate(),
+            Err(RootArgumentError::SamplerNonSamplerSpace {
+                space: ROOT_CBV_SPACE as u16
+            })
+        );
+        assert_eq!(
+            encode_root_arguments(&[sampler]),
+            Err(RootArgumentError::SamplerNonSamplerSpace {
+                space: ROOT_CBV_SPACE as u16
+            })
+        );
+    }
+
+    #[test]
+    fn a_constants_write_past_the_declared_block_is_refused() {
+        // A 4-dword block accepts dwords 0..=3 and refuses a write at dword 4.
+        assert!(check_constant_block(0, USER_DATA_SPACE as u16, 0, 4, 4).is_ok());
+        assert_eq!(
+            check_constant_block(0, USER_DATA_SPACE as u16, 3, 2, 4),
+            Err(RootArgumentError::ConstantsBeyondBlock {
+                offset: 3,
+                end: 20,
+                block: 16
+            })
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_trailing_plan_is_refused() {
+        let argument = RootArgument::constants(0, 0, 0, 1).expect("constants");
+        let mut encoded = encode_root_arguments(&[argument]).expect("the plan encodes");
+        encoded.pop();
+        assert_eq!(
+            decode_root_arguments(&encoded),
+            Err(RootArgumentError::Truncated)
+        );
+
+        let mut trailing = encode_root_arguments(&[argument]).expect("the plan encodes");
+        trailing.push(0);
+        assert_eq!(
+            decode_root_arguments(&trailing),
+            Err(RootArgumentError::Invalid(
+                "the plan has trailing bytes after its last record"
+            ))
+        );
     }
 }

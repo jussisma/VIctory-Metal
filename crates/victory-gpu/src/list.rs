@@ -470,7 +470,10 @@ fn bind_compute_root_view(this: This, slot: u32, address: u64) {
     let (view, tokens) = resolved.into_parts();
     let mut recorded = None;
     with_metal(this, |producer| {
-        let result = producer.set_compute_root_buffer_view(view);
+        let result = producer.set_compute_root_buffer_view_at(
+            view,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+        );
         recorded = Some(result.is_ok());
         result
     });
@@ -525,7 +528,10 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
     }
     let mut recorded = None;
     with_metal(this, |producer| {
-        let result = producer.set_graphics_root_buffer_view(view);
+        let result = producer.set_graphics_root_buffer_view_at(
+            view,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+        );
         recorded = Some(result.is_ok());
         result
     });
@@ -1149,9 +1155,14 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
             return;
         }
     }
+    let space = if table.kind == victory_metal::wire_v3::DescriptorKind::Sampler {
+        victory_shader::emit::SAMPLER_SPACE as u16
+    } else {
+        victory_shader::emit::ROOT_CBV_SPACE as u16
+    };
     let mut recorded = None;
     with_metal(this, |producer| {
-        let result = producer.set_graphics_descriptor_table(table);
+        let result = producer.set_graphics_descriptor_table_at(table, space);
         recorded = Some(result.is_ok());
         result
     });
@@ -1257,9 +1268,14 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
             return;
         }
     }
+    let space = if table.kind == victory_metal::wire_v3::DescriptorKind::Sampler {
+        victory_shader::emit::SAMPLER_SPACE as u16
+    } else {
+        victory_shader::emit::ROOT_CBV_SPACE as u16
+    };
     let mut recorded = None;
     with_metal(this, |producer| {
-        let result = producer.set_compute_descriptor_table(table);
+        let result = producer.set_compute_descriptor_table_at(table, space);
         recorded = Some(result.is_ok());
         result
     });
@@ -3519,7 +3535,12 @@ mod state {
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
         if metal() {
             with_metal(this, |p| {
-                p.set_compute_root_constants(slot, &[value], offset)
+                p.set_compute_root_constants_at(
+                    slot,
+                    victory_shader::emit::USER_DATA_SPACE as u16,
+                    &[value],
+                    offset,
+                )
             });
             return;
         }
@@ -3533,7 +3554,12 @@ mod state {
     ) {
         if metal() {
             with_metal(this, |p| {
-                p.set_graphics_root_constants(slot, &[value], offset)
+                p.set_graphics_root_constants_at(
+                    slot,
+                    victory_shader::emit::USER_DATA_SPACE as u16,
+                    &[value],
+                    offset,
+                )
             });
             return;
         }
@@ -3548,7 +3574,14 @@ mod state {
     ) {
         if metal() {
             let values = items(values, count);
-            with_metal(this, |p| p.set_compute_root_constants(slot, values, offset));
+            with_metal(this, |p| {
+                p.set_compute_root_constants_at(
+                    slot,
+                    victory_shader::emit::USER_DATA_SPACE as u16,
+                    values,
+                    offset,
+                )
+            });
             return;
         }
         with_state(this, |_, s| {
@@ -3565,7 +3598,12 @@ mod state {
         if metal() {
             let values = items(values, count);
             with_metal(this, |p| {
-                p.set_graphics_root_constants(slot, values, offset)
+                p.set_graphics_root_constants_at(
+                    slot,
+                    victory_shader::emit::USER_DATA_SPACE as u16,
+                    values,
+                    offset,
+                )
             });
             return;
         }
