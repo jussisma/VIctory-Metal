@@ -21,6 +21,7 @@ use crate::macos::render::{
     plan_encoder_segments, texture_info,
 };
 use crate::macos::texture::VmTextureId;
+use crate::macos::{blit, indirect};
 use crate::transport::{MetalError, MetalTransport};
 use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
 use crate::wire_v3::{
@@ -1696,6 +1697,12 @@ enum PreparedComputeOp {
     Bytes { slot: usize, bytes: Vec<u8> },
     Bind(Vec<BoundRange>),
     Dispatch(PreparedV3Dispatch),
+    /// One GPU-driven dispatch; the grid is read by the GPU.
+    DispatchIndirect {
+        pipeline: objc::Id,
+        threads_per_group: MTLSize,
+        arguments: indirect::IndirectArguments,
+    },
     Barrier,
 }
 
@@ -1738,6 +1745,37 @@ enum PreparedRenderOp {
         threads_per_mesh_threadgroup: MTLSize,
         bindings: Vec<BoundRange>,
     },
+    /// GPU-driven non-indexed instanced draw.
+    DrawIndirect {
+        primitive: PrimitiveType,
+        arguments: indirect::IndirectArguments,
+    },
+    /// GPU-driven indexed instanced draw.
+    DrawIndexedIndirect {
+        primitive: PrimitiveType,
+        index_type: IndexType,
+        index_buffer: objc::Id,
+        index_offset: usize,
+        arguments: indirect::IndirectArguments,
+    },
+    /// GPU-driven mesh-shader dispatch.
+    DispatchMeshIndirect {
+        threads_per_object_threadgroup: MTLSize,
+        threads_per_mesh_threadgroup: MTLSize,
+        arguments: indirect::IndirectArguments,
+    },
+}
+
+impl PreparedRenderOp {
+    /// Whether this operation needs the indirect-aware render executor.
+    fn is_indirect(&self) -> bool {
+        matches!(
+            self,
+            Self::DrawIndirect { .. }
+                | Self::DrawIndexedIndirect { .. }
+                | Self::DispatchMeshIndirect { .. }
+        )
+    }
 }
 
 /// One validated blit-segment command.
@@ -1759,6 +1797,13 @@ enum PreparedBlitOp {
         width: usize,
         height: usize,
         depth: usize,
+    },
+    /// Explicit texel-box copy with independent origins.
+    CopyTextureRegion(blit::TextureRegion),
+    /// Multisample resolve into a single-sample subresource.
+    ResolveSubresource {
+        src: blit::TextureSubresourceRef,
+        dst: blit::TextureSubresourceRef,
     },
     /// A barrier between copies; the blit encoder boundary is the fence.
     Barrier,
@@ -1894,6 +1939,70 @@ fn resolve_binding_slots(
         resolved.push((buffer, offset, slot));
     }
     Ok(resolved)
+}
+
+/// Resolves one wire indirect range and its optional count buffer.
+///
+/// The argument range length is `max_count * stride`, so a range that runs past
+/// the registered buffer is an unknown handle exactly like a bad binding. A
+/// present count buffer is resolved too (so an unresolved allocation is
+/// `UnknownHandle` before any encoder exists); [`indirect::validate`] then
+/// refuses it because Metal's legacy indirect selectors cannot consume it.
+fn resolve_indirect_arguments(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    arguments: &crate::wire_v3::IndirectArguments,
+    stride: u64,
+) -> Result<indirect::IndirectArguments, PrepareAbort> {
+    let length = arguments
+        .byte_len(stride)
+        .ok_or(MetalError::InvalidArg("indirect argument range overflows u64"))?;
+    let (argument_buffer, argument_offset, _) = resolve_buffer_range(
+        state,
+        allocations,
+        arguments.allocation_id,
+        arguments.generation,
+        arguments.offset,
+        length,
+    )
+    .ok_or(PrepareAbort::UnknownHandle)?;
+    let count = match &arguments.count {
+        Some(count) => {
+            let (buffer, offset, _) = resolve_buffer_range(
+                state,
+                allocations,
+                count.allocation_id,
+                count.generation,
+                count.offset,
+                4,
+            )
+            .ok_or(PrepareAbort::UnknownHandle)?;
+            Some(indirect::IndirectCount { buffer, offset })
+        }
+        None => None,
+    };
+    Ok(indirect::IndirectArguments {
+        argument_buffer,
+        argument_offset,
+        max_count: arguments.max_count,
+        count,
+    })
+}
+
+/// Resolves the bound index buffer for an indirect indexed draw.
+///
+/// The index count is GPU-side, so only the binding itself can be checked; the
+/// GPU clamps every read to the declared index-buffer range at execution.
+fn prepare_indirect_indexed_draw(
+    index_binding: &Option<(objc::Id, usize, IndexType, u64)>,
+) -> Result<(objc::Id, usize, IndexType), PrepareAbort> {
+    let Some((buffer, base_offset, index_type, _length)) = *index_binding else {
+        return Err(
+            MetalError::InvalidArg("indirect indexed draw requires a preceding SetIndexBuffer")
+                .into(),
+        );
+    };
+    Ok((buffer, base_offset, index_type))
 }
 
 fn validate_viewport(
@@ -2065,6 +2174,50 @@ fn prepare_compute_segment(
                     "mesh dispatch is only valid inside a render pass",
                 )
                 .into());
+            }
+            CommandV3::ExecuteIndirectDispatch(dispatch) => {
+                let pso = state
+                    .pipelines
+                    .get(&dispatch.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if dispatch.threads_per_group.contains(&0) {
+                    return Err(
+                        MetalError::InvalidArg("indirect dispatch threadgroup must be nonzero")
+                            .into(),
+                    );
+                }
+                let local_threads = dispatch.threads_per_group.iter().try_fold(
+                    1u64,
+                    |product, dimension| product.checked_mul(u64::from(*dimension)),
+                );
+                let Some(local_threads) = local_threads else {
+                    return Err(MetalError::InvalidArg(
+                        "indirect dispatch threadgroup product overflows u64",
+                    )
+                    .into());
+                };
+                if local_threads > pipeline_thread_limit(pso) {
+                    return Err(MetalError::InvalidArg(
+                        "indirect dispatch exceeds the pipeline threadgroup maximum",
+                    )
+                    .into());
+                }
+                let arguments = resolve_indirect_arguments(
+                    state,
+                    allocations,
+                    &dispatch.arguments,
+                    indirect::DISPATCH_ARGUMENT_STRIDE,
+                )?;
+                indirect::validate(&arguments)?;
+                ops.push(PreparedComputeOp::DispatchIndirect {
+                    pipeline: pso.as_raw(),
+                    threads_per_group: MTLSize {
+                        width: dispatch.threads_per_group[0] as usize,
+                        height: dispatch.threads_per_group[1] as usize,
+                        depth: dispatch.threads_per_group[2] as usize,
+                    },
+                    arguments,
+                });
             }
             CommandV3::SetRootConstants(constants) => {
                 if constants.bytes.is_empty()
@@ -2565,6 +2718,73 @@ fn prepare_render_segment(
                     base_instance: draw.start_instance as usize,
                 });
             }
+            CommandV3::ExecuteIndirectDraw(draw) => {
+                if !current_pipeline || mesh_pipeline.is_some() {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                let arguments = resolve_indirect_arguments(
+                    state,
+                    allocations,
+                    &draw.arguments,
+                    indirect::DRAW_ARGUMENT_STRIDE,
+                )?;
+                indirect::validate(&arguments)?;
+                ops.push(PreparedRenderOp::DrawIndirect {
+                    primitive: topology,
+                    arguments,
+                });
+            }
+            CommandV3::ExecuteIndirectDrawIndexed(draw) => {
+                if !current_pipeline || mesh_pipeline.is_some() {
+                    return Err(MetalError::InvalidArg(
+                        "draw requires a selected graphics pipeline in its render pass",
+                    )
+                    .into());
+                }
+                let (index_buffer, index_offset, index_type) =
+                    prepare_indirect_indexed_draw(&index_binding)?;
+                let arguments = resolve_indirect_arguments(
+                    state,
+                    allocations,
+                    &draw.arguments,
+                    indirect::DRAW_INDEXED_ARGUMENT_STRIDE,
+                )?;
+                indirect::validate(&arguments)?;
+                ops.push(PreparedRenderOp::DrawIndexedIndirect {
+                    primitive: topology,
+                    index_type,
+                    index_buffer,
+                    index_offset,
+                    arguments,
+                });
+            }
+            CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+                let mesh = state
+                    .mesh_pipelines
+                    .get(&dispatch.pipeline_id)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                if mesh_pipeline != Some(dispatch.pipeline_id) {
+                    return Err(MetalError::InvalidArg(
+                        "mesh dispatch requires a selected mesh pipeline in its render pass",
+                    )
+                    .into());
+                }
+                let arguments = resolve_indirect_arguments(
+                    state,
+                    allocations,
+                    &dispatch.arguments,
+                    indirect::DISPATCH_ARGUMENT_STRIDE,
+                )?;
+                indirect::validate(&arguments)?;
+                ops.push(PreparedRenderOp::DispatchMeshIndirect {
+                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
+                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
+                    arguments,
+                });
+            }
             _ => {
                 return Err(
                     MetalError::InvalidArg("command is not valid in a render segment").into(),
@@ -2713,6 +2933,88 @@ fn prepare_blit_segment(
                     width: copy.width as usize,
                     height: copy.height as usize,
                     depth: copy.depth as usize,
+                });
+            }
+            CommandV3::CopyTextureRegion(copy) => {
+                let (src, src_info) = resolve_texture(
+                    state,
+                    allocations,
+                    copy.src.allocation_id,
+                    copy.src.generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let (dst, dst_info) = resolve_texture(
+                    state,
+                    allocations,
+                    copy.dst.allocation_id,
+                    copy.dst.generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                if src_info.format != dst_info.format {
+                    return Err(MetalError::InvalidArg(
+                        "texture copy source and destination formats must match",
+                    )
+                    .into());
+                }
+                let region = blit::TextureRegion {
+                    source: blit::TextureSubresourceRef {
+                        texture: src,
+                        slice: usize::from(copy.src.slice),
+                        level: usize::from(copy.src.mip_level),
+                    },
+                    source_origin: [
+                        copy.src_origin[0] as usize,
+                        copy.src_origin[1] as usize,
+                        copy.src_origin[2] as usize,
+                    ],
+                    destination: blit::TextureSubresourceRef {
+                        texture: dst,
+                        slice: usize::from(copy.dst.slice),
+                        level: usize::from(copy.dst.mip_level),
+                    },
+                    destination_origin: [
+                        copy.dst_origin[0] as usize,
+                        copy.dst_origin[1] as usize,
+                        copy.dst_origin[2] as usize,
+                    ],
+                    size: [
+                        copy.size[0] as usize,
+                        copy.size[1] as usize,
+                        copy.size[2] as usize,
+                    ],
+                };
+                region.validate()?;
+                ops.push(PreparedBlitOp::CopyTextureRegion(region));
+            }
+            CommandV3::ResolveSubresource(resolve) => {
+                let (src, _) = resolve_texture(
+                    state,
+                    allocations,
+                    resolve.src.allocation_id,
+                    resolve.src.generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let (dst, _) = resolve_texture(
+                    state,
+                    allocations,
+                    resolve.dst.allocation_id,
+                    resolve.dst.generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let source = blit::TextureSubresourceRef {
+                    texture: src,
+                    slice: usize::from(resolve.src.slice),
+                    level: usize::from(resolve.src.mip_level),
+                };
+                let destination = blit::TextureSubresourceRef {
+                    texture: dst,
+                    slice: usize::from(resolve.dst.slice),
+                    level: usize::from(resolve.dst.mip_level),
+                };
+                blit::validate_resolve(source, destination)?;
+                ops.push(PreparedBlitOp::ResolveSubresource {
+                    src: source,
+                    dst: destination,
                 });
             }
             CommandV3::ResourceBarrier(barrier) => {
@@ -3020,6 +3322,27 @@ impl DirectMetalTransport {
                                     }
                                 }
                             }
+                            PreparedComputeOp::DispatchIndirect {
+                                pipeline,
+                                threads_per_group,
+                                arguments,
+                            } => {
+                                // SAFETY: `enc` is a live compute encoder, the
+                                // pipeline is registry-held and the argument
+                                // buffer was bounds-checked in prepare.
+                                unsafe {
+                                    objc::msg_send_void_1(
+                                        enc,
+                                        objc::sel(c"setComputePipelineState:"),
+                                        *pipeline,
+                                    );
+                                }
+                                indirect::encode_dispatch_threadgroups(
+                                    enc,
+                                    *threads_per_group,
+                                    arguments,
+                                )?;
+                            }
                             PreparedComputeOp::Barrier => {
                                 // SAFETY: `enc` is a live compute encoder, and
                                 // the scope covers every resource class.
@@ -3043,6 +3366,12 @@ impl DirectMetalTransport {
                     height,
                     ops,
                 } => {
+                    if ops.iter().any(PreparedRenderOp::is_indirect) {
+                        encode_indirect_render_segment(
+                            cb, *descriptor, *width, *height, ops, stats,
+                        )?;
+                        continue;
+                    }
                     let mut encoder =
                         RenderEncoder::new_with_descriptor(self, cb, *descriptor, *width, *height);
                     encoder.ensure_started()?;
@@ -3132,13 +3461,21 @@ impl DirectMetalTransport {
                                     *threads_per_mesh_threadgroup,
                                 )?;
                             }
+                            PreparedRenderOp::DrawIndirect { .. }
+                            | PreparedRenderOp::DrawIndexedIndirect { .. }
+                            | PreparedRenderOp::DispatchMeshIndirect { .. } => {
+                                return Err(MetalError::InternalError(
+                                    "indirect render op reached the non-indirect executor"
+                                        .to_string(),
+                                ));
+                            }
                         }
                     }
                     encoder.end_encoding();
                 }
                 PreparedSegment::Blit(ops) => {
                     // SAFETY: `cb` is a live uncommitted command buffer.
-                    let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"blitCommandEncoder")) };
+                    let mut enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"blitCommandEncoder")) };
                     if enc.is_null() {
                         return Err(MetalError::InternalError(
                             "MTLCommandBuffer.blitCommandEncoder returned null".to_string(),
@@ -3199,6 +3536,31 @@ impl DirectMetalTransport {
                                     );
                                 }
                             }
+                            PreparedBlitOp::CopyTextureRegion(region) => {
+                                blit::copy_texture_region(enc, region)?;
+                            }
+                            PreparedBlitOp::ResolveSubresource { src, dst } => {
+                                // A resolve is a render-pass store action, so
+                                // the blit encoder must close first and a fresh
+                                // blit encoder resumes any later copies.
+                                // SAFETY: `enc` is the live blit encoder opened
+                                // above and no work is recorded after this call.
+                                unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
+                                blit::encode_resolve(cb, *src, *dst)?;
+                                stats.render_encoders += 1;
+                                // SAFETY: `cb` is the live uncommitted command
+                                // buffer used for every segment.
+                                enc = unsafe {
+                                    objc::msg_send_id_0(cb, objc::sel(c"blitCommandEncoder"))
+                                };
+                                if enc.is_null() {
+                                    return Err(MetalError::InternalError(
+                                        "MTLCommandBuffer.blitCommandEncoder returned null"
+                                            .to_string(),
+                                    ));
+                                }
+                                stats.blit_encoders += 1;
+                            }
                             PreparedBlitOp::Barrier => {
                                 // The blit encoder has no barrier API; the
                                 // encoder boundary is the fence.
@@ -3223,7 +3585,450 @@ impl DirectMetalTransport {
     }
 }
 
-/// `-[MTLComputeCommandEncoder setBytes:length:atIndex:]`.
+/// Apple `MTLViewport` for the indirect-aware render executor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct HostViewport {
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
+    znear: f64,
+    zfar: f64,
+}
+
+/// Apple `MTLScissorRect` for the indirect-aware render executor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct HostScissorRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+/// Replays a render segment that contains an indirect command.
+///
+/// [`RenderEncoder`] owns its raw `enc` privately and `render.rs` is outside
+/// this task's write scope, so this executor opens the same
+/// `MTLRenderPassDescriptor` on the shared command buffer directly and replays
+/// the already-validated [`PreparedRenderOp`] stream. Segments without an
+/// indirect command stay on [`RenderEncoder`].
+fn encode_indirect_render_segment(
+    cb: objc::Id,
+    descriptor: objc::Id,
+    width: u32,
+    height: u32,
+    ops: &[PreparedRenderOp],
+    stats: &mut EncoderStats,
+) -> Result<(), MetalError> {
+    let _pool = AutoreleasePool::new();
+    // SAFETY: `cb` is a live uncommitted command buffer and `descriptor` is a
+    // live render pass descriptor owned by the prepared segment.
+    let enc = unsafe {
+        objc::msg_send_id_1(
+            cb,
+            objc::sel(c"renderCommandEncoderWithDescriptor:"),
+            descriptor,
+        )
+    };
+    if enc.is_null() {
+        return Err(MetalError::InternalError(
+            "MTLCommandBuffer.renderCommandEncoderWithDescriptor returned null".to_string(),
+        ));
+    }
+    stats.render_encoders += 1;
+
+    // SAFETY: `enc` is a live render encoder; the defaults cover the whole
+    // attachment exactly like `RenderEncoder::ensure_encoder`.
+    unsafe {
+        msg_send_set_viewport(
+            enc,
+            objc::sel(c"setViewport:"),
+            HostViewport {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                width: f64::from(width),
+                height: f64::from(height),
+                znear: 0.0,
+                zfar: 1.0,
+            },
+        );
+        msg_send_set_scissor(
+            enc,
+            objc::sel(c"setScissorRect:"),
+            HostScissorRect {
+                x: 0,
+                y: 0,
+                width: width as usize,
+                height: height as usize,
+            },
+        );
+    }
+
+    for op in ops {
+        match op {
+            PreparedRenderOp::Pipeline { state, depth_state } => {
+                // SAFETY: both objects are registry-held pipeline states.
+                unsafe {
+                    objc::msg_send_void_1(enc, objc::sel(c"setRenderPipelineState:"), *state);
+                    if let Some(depth_state) = depth_state {
+                        objc::msg_send_void_1(
+                            enc,
+                            objc::sel(c"setDepthStencilState:"),
+                            *depth_state,
+                        );
+                    }
+                }
+            }
+            PreparedRenderOp::Viewport(viewport) => {
+                // SAFETY: `enc` is live and the viewport was validated against
+                // the attachment extent.
+                unsafe {
+                    msg_send_set_viewport(
+                        enc,
+                        objc::sel(c"setViewport:"),
+                        HostViewport {
+                            origin_x: viewport.origin_x,
+                            origin_y: viewport.origin_y,
+                            width: viewport.width,
+                            height: viewport.height,
+                            znear: viewport.znear,
+                            zfar: viewport.zfar,
+                        },
+                    );
+                }
+            }
+            PreparedRenderOp::Scissor(scissor) => {
+                // SAFETY: `enc` is live and the scissor was validated.
+                unsafe {
+                    msg_send_set_scissor(
+                        enc,
+                        objc::sel(c"setScissorRect:"),
+                        HostScissorRect {
+                            x: scissor.x as usize,
+                            y: scissor.y as usize,
+                            width: scissor.width as usize,
+                            height: scissor.height as usize,
+                        },
+                    );
+                }
+            }
+            PreparedRenderOp::VertexBuffers(bindings) => {
+                for (buffer, offset, slot) in bindings {
+                    // SAFETY: registry-held buffer, validated range.
+                    unsafe { msg_send_set_vertex_buffer(enc, *buffer, *offset, *slot) };
+                }
+            }
+            PreparedRenderOp::VertexBytes { slot, bytes } => {
+                // SAFETY: `bytes` is valid for the call; Metal copies it.
+                unsafe {
+                    msg_send_set_vertex_bytes(enc, bytes.as_ptr(), bytes.len(), *slot);
+                }
+            }
+            PreparedRenderOp::Barrier => {
+                // SAFETY: `enc` is live; the scope is a documented mask.
+                unsafe {
+                    msg_send_memory_barrier(
+                        enc,
+                        MTL_BARRIER_SCOPE_BUFFERS | MTL_BARRIER_SCOPE_TEXTURES,
+                    );
+                }
+                stats.barriers += 1;
+            }
+            PreparedRenderOp::Draw {
+                primitive,
+                vertex_start,
+                vertex_count,
+                instance_count,
+                base_instance,
+            } => {
+                // SAFETY: every count was validated in prepare.
+                unsafe {
+                    msg_send_draw_primitives_instanced(
+                        enc,
+                        *primitive as usize,
+                        *vertex_start,
+                        *vertex_count,
+                        *instance_count,
+                        *base_instance,
+                    );
+                }
+            }
+            PreparedRenderOp::DrawIndexed {
+                primitive,
+                index_count,
+                index_type,
+                index_buffer,
+                index_offset,
+                base_vertex,
+                instance_count,
+                base_instance,
+            } => {
+                // SAFETY: the index window was validated in prepare.
+                unsafe {
+                    msg_send_draw_indexed_primitives_instanced(
+                        enc,
+                        *primitive as usize,
+                        *index_count,
+                        *index_type as usize,
+                        *index_buffer,
+                        *index_offset,
+                        *instance_count,
+                        *base_vertex,
+                        *base_instance,
+                    );
+                }
+            }
+            PreparedRenderOp::DispatchMesh {
+                group_counts,
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
+                bindings,
+            } => {
+                for (buffer, offset, slot) in bindings {
+                    // SAFETY: registry-held buffer, validated range.
+                    unsafe { msg_send_set_mesh_buffer(enc, *buffer, *offset, *slot) };
+                }
+                // SAFETY: the mesh pipeline is selected and the group counts
+                // fit the pipeline's declared limits.
+                unsafe {
+                    msg_send_draw_mesh_threadgroups(
+                        enc,
+                        *group_counts,
+                        *threads_per_object_threadgroup,
+                        *threads_per_mesh_threadgroup,
+                    );
+                }
+            }
+            PreparedRenderOp::DrawIndirect {
+                primitive,
+                arguments,
+            } => indirect::encode_draw(enc, *primitive, arguments)?,
+            PreparedRenderOp::DrawIndexedIndirect {
+                primitive,
+                index_type,
+                index_buffer,
+                index_offset,
+                arguments,
+            } => indirect::encode_draw_indexed(
+                enc,
+                *primitive,
+                *index_type,
+                *index_buffer,
+                *index_offset,
+                arguments,
+            )?,
+            PreparedRenderOp::DispatchMeshIndirect {
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
+                arguments,
+            } => indirect::encode_dispatch_mesh(
+                enc,
+                *threads_per_object_threadgroup,
+                *threads_per_mesh_threadgroup,
+                arguments,
+            )?,
+        }
+    }
+
+    // SAFETY: `enc` is a live render encoder awaiting its end.
+    unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
+    Ok(())
+}
+
+/// `-[MTLRenderCommandEncoder setViewport:]`.
+unsafe fn msg_send_set_viewport(enc: objc::Id, s: objc::Sel, viewport: HostViewport) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, HostViewport);
+    // SAFETY: Caller supplies a live render encoder and a valid `MTLViewport`.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe { send(enc, s, viewport) }
+}
+
+/// `-[MTLRenderCommandEncoder setScissorRect:]`.
+unsafe fn msg_send_set_scissor(enc: objc::Id, s: objc::Sel, scissor: HostScissorRect) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, HostScissorRect);
+    // SAFETY: Caller supplies a live render encoder and a valid `MTLScissorRect`.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe { send(enc, s, scissor) }
+}
+
+/// `-[MTLRenderCommandEncoder setVertexBuffer:offset:atIndex:]`.
+unsafe fn msg_send_set_vertex_buffer(
+    enc: objc::Id,
+    buffer: objc::Id,
+    offset: usize,
+    index: usize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, usize);
+    // SAFETY: Caller supplies a live render encoder and a registry-held buffer.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(c"setVertexBuffer:offset:atIndex:"),
+            buffer,
+            offset,
+            index,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder setMeshBuffer:offset:atIndex:]`.
+unsafe fn msg_send_set_mesh_buffer(
+    enc: objc::Id,
+    buffer: objc::Id,
+    offset: usize,
+    index: usize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, usize);
+    // SAFETY: Caller supplies a live render encoder and a registry-held buffer.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(c"setMeshBuffer:offset:atIndex:"),
+            buffer,
+            offset,
+            index,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder setVertexBytes:length:atIndex:]`.
+unsafe fn msg_send_set_vertex_bytes(
+    enc: objc::Id,
+    bytes: *const u8,
+    len: usize,
+    index: usize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, *const c_void, usize, usize);
+    // SAFETY: Caller supplies a live render encoder and `bytes` valid for `len`.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(c"setVertexBytes:length:atIndex:"),
+            bytes.cast(),
+            len,
+            index,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:]`.
+unsafe fn msg_send_draw_primitives_instanced(
+    enc: objc::Id,
+    primitive: usize,
+    vertex_start: usize,
+    vertex_count: usize,
+    instance_count: usize,
+    base_instance: usize,
+) {
+    type Fn =
+        unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, usize, usize);
+    // SAFETY: Caller supplies a live render encoder and validated counts.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(c"drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+            primitive,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:]`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn msg_send_draw_indexed_primitives_instanced(
+    enc: objc::Id,
+    primitive: usize,
+    index_count: usize,
+    index_type: usize,
+    index_buffer: objc::Id,
+    index_offset: usize,
+    instance_count: usize,
+    base_vertex: isize,
+    base_instance: usize,
+) {
+    type Fn = unsafe extern "C" fn(
+        objc::Id,
+        objc::Sel,
+        usize,
+        usize,
+        usize,
+        objc::Id,
+        usize,
+        usize,
+        isize,
+        usize,
+    );
+    // SAFETY: Caller supplies a live render encoder, a registry-held index
+    // buffer and a validated index window.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(
+                c"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",
+            ),
+            primitive,
+            index_count,
+            index_type,
+            index_buffer,
+            index_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:]`.
+unsafe fn msg_send_draw_mesh_threadgroups(
+    enc: objc::Id,
+    group_counts: MTLSize,
+    threads_per_object_threadgroup: MTLSize,
+    threads_per_mesh_threadgroup: MTLSize,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, MTLSize, MTLSize, MTLSize);
+    // SAFETY: Caller supplies a live render encoder with a mesh pipeline.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe {
+        send(
+            enc,
+            objc::sel(
+                c"drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+            ),
+            group_counts,
+            threads_per_object_threadgroup,
+            threads_per_mesh_threadgroup,
+        )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder memoryBarrierWithScope:]`.
+unsafe fn msg_send_memory_barrier(enc: objc::Id, scope: usize) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize);
+    // SAFETY: Caller supplies a live render encoder and a barrier scope mask.
+    let send: Fn = unsafe { std::mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `send` matches the selector's documented argument layout.
+    unsafe { send(enc, objc::sel(c"memoryBarrierWithScope:"), scope) }
+}
+
+
 unsafe fn msg_send_set_bytes(enc: objc::Id, bytes: *const u8, len: usize, index: usize) {
     type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, *const c_void, usize, usize);
     // SAFETY: Caller supplies a live compute encoder and `bytes` valid for

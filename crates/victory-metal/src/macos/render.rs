@@ -2169,6 +2169,65 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                 cursor = index + 1;
                 pending_work_state = 0;
             }
+            CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+                if pass_open.is_none() {
+                    return Err(plan_error("mesh dispatch requires an open render pass"));
+                }
+                if dispatch.pipeline_id == 0 {
+                    return Err(plan_error("mesh dispatch pipeline handle must be nonzero"));
+                }
+                if dispatch.arguments.max_count == 0 {
+                    return Err(plan_error(
+                        "indirect mesh dispatch max command count must be nonzero",
+                    ));
+                }
+                if !mesh_pipeline_selected {
+                    return Err(plan_error("mesh dispatch requires a preceding SetMeshPipeline"));
+                }
+                if let Some((WorkKind::Render, segment_index)) = current {
+                    if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind
+                        && range.end < index + 1
+                    {
+                        range.end = index + 1;
+                    }
+                } else {
+                    return Err(plan_error("mesh dispatch outside a render pass"));
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::ExecuteIndirectDispatch(dispatch) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("compute dispatch inside an open render pass"));
+                }
+                if dispatch.pipeline_id == 0 {
+                    return Err(plan_error(
+                        "dispatch pipeline handle must be nonzero",
+                    ));
+                }
+                if dispatch.arguments.max_count == 0
+                    || dispatch.threads_per_group.contains(&0)
+                {
+                    return Err(plan_error(
+                        "indirect dispatch handle, count and threadgroup must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Compute, segment_index)) => {
+                        if let SegmentKind::Compute(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Compute(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Compute, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
             CommandV3::CopyBuffer(copy) => {
                 if pass_open.is_some() {
                     return Err(plan_error("buffer copy inside an open render pass"));
@@ -2200,6 +2259,51 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                     return Err(plan_error(
                         "texture copy width, height and depth must be nonzero",
                     ));
+                }
+                match current {
+                    Some((WorkKind::Blit, segment_index)) => {
+                        if let SegmentKind::Blit(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Blit(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Blit, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::CopyTextureRegion(copy) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("texture copy inside an open render pass"));
+                }
+                if copy.size.contains(&0) {
+                    return Err(plan_error(
+                        "texture copy width, height and depth must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Blit, segment_index)) => {
+                        if let SegmentKind::Blit(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Blit(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Blit, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
+            CommandV3::ResolveSubresource(_) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("texture resolve inside an open render pass"));
                 }
                 match current {
                     Some((WorkKind::Blit, segment_index)) => {
@@ -2267,12 +2371,28 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             CommandV3::Draw(_)
             | CommandV3::DrawIndexed(_)
             | CommandV3::DrawInstanced(_)
-            | CommandV3::DrawIndexedInstanced(_) => {
+            | CommandV3::DrawIndexedInstanced(_)
+            | CommandV3::ExecuteIndirectDraw(_)
+            | CommandV3::ExecuteIndirectDrawIndexed(_) => {
                 if pass_open.is_none() {
                     return Err(plan_error("draw outside a render pass"));
                 }
                 if !graphics_pipeline_selected {
                     return Err(plan_error("draw requires a preceding SetGraphicsPipeline"));
+                }
+                if let CommandV3::ExecuteIndirectDraw(draw) = command
+                    && draw.arguments.max_count == 0
+                {
+                    return Err(plan_error(
+                        "indirect draw max command count must be nonzero",
+                    ));
+                }
+                if let CommandV3::ExecuteIndirectDrawIndexed(draw) = command
+                    && draw.arguments.max_count == 0
+                {
+                    return Err(plan_error(
+                        "indirect draw max command count must be nonzero",
+                    ));
                 }
                 if let Some((WorkKind::Render, segment_index)) = current {
                     if let SegmentKind::Render { range, .. } = &mut segments[segment_index].kind

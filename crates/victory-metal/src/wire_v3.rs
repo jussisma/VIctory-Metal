@@ -466,6 +466,21 @@ pub const OP_COPY_BUFFER: u16 = 29;
 pub const OP_COPY_TEXTURE: u16 = 30;
 pub const OP_PRESENT: u16 = 31;
 
+// ADR-015 opcode band (40+). Bytes 1..=31 stay frozen.
+pub const OP_EXECUTE_INDIRECT_DRAW: u16 = 40;
+pub const OP_EXECUTE_INDIRECT_DRAW_INDEXED: u16 = 41;
+pub const OP_EXECUTE_INDIRECT_DISPATCH_MESH: u16 = 42;
+pub const OP_EXECUTE_INDIRECT_DISPATCH: u16 = 43;
+pub const OP_COPY_TEXTURE_REGION: u16 = 44;
+pub const OP_RESOLVE_SUBRESOURCE: u16 = 45;
+
+/// Maximum number of indirect commands one v3 command may execute.
+///
+/// Without a count buffer D3D12 executes exactly `MaxCommandCount` commands;
+/// the Metal executor issues one GPU-read indirect call per command, so the cap
+/// bounds both the wire payload and the number of encoder calls.
+pub const MAX_INDIRECT_COMMANDS_V3: u32 = 256;
+
 /// One version 3 submission: an ordered stateful command stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubmissionV3 {
@@ -528,6 +543,18 @@ pub enum CommandV3 {
     CopyBuffer(CopyBuffer),
     /// Texture-to-texture copy.
     CopyTexture(CopyTexture),
+    /// GPU-driven non-indexed instanced draw.
+    ExecuteIndirectDraw(ExecuteIndirectDraw),
+    /// GPU-driven indexed instanced draw.
+    ExecuteIndirectDrawIndexed(ExecuteIndirectDrawIndexed),
+    /// GPU-driven mesh-shader dispatch.
+    ExecuteIndirectDispatchMesh(ExecuteIndirectDispatchMesh),
+    /// GPU-driven compute dispatch.
+    ExecuteIndirectDispatch(ExecuteIndirectDispatch),
+    /// Texture-to-texture copy of an explicit texel box.
+    CopyTextureRegion(CopyTextureRegion),
+    /// Multisample resolve into a single-sample subresource.
+    ResolveSubresource(ResolveSubresource),
     /// Presents a swapchain surface.
     Present(Present),
 }
@@ -866,6 +893,114 @@ pub struct Present {
     pub sync_interval: u32,
 }
 
+/// Optional GPU-side command count for an `ExecuteIndirect` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndirectCountBuffer {
+    /// Count-buffer allocation ID; never zero.
+    pub allocation_id: u64,
+    /// Allocation generation; never zero.
+    pub generation: u32,
+    /// Byte offset of the 32-bit count; 4-byte aligned.
+    pub offset: u64,
+}
+
+/// The GPU-resident argument range of one `ExecuteIndirect` command.
+///
+/// `offset` and every argument record are 4-byte aligned. `max_count` is the
+/// D3D12 `MaxCommandCount`; the argument records are read by the GPU only and
+/// never copied to the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndirectArguments {
+    /// Argument-buffer allocation ID; never zero.
+    pub allocation_id: u64,
+    /// Allocation generation; never zero.
+    pub generation: u32,
+    /// Byte offset of the first argument record; 4-byte aligned.
+    pub offset: u64,
+    /// Maximum commands to execute; 1..=MAX_INDIRECT_COMMANDS_V3.
+    pub max_count: u32,
+    /// Optional count buffer; `None` is encoded as allocation ID zero.
+    pub count: Option<IndirectCountBuffer>,
+}
+
+impl IndirectArguments {
+    /// Bytes covered by `max_count` argument records of `stride` bytes.
+    pub fn byte_len(&self, stride: u64) -> Option<u64> {
+        u64::from(self.max_count).checked_mul(stride)
+    }
+}
+
+/// Non-indexed `ExecuteIndirect` draw arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteIndirectDraw {
+    /// GPU-resident argument records.
+    pub arguments: IndirectArguments,
+}
+
+/// Indexed `ExecuteIndirect` draw arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteIndirectDrawIndexed {
+    /// GPU-resident argument records.
+    pub arguments: IndirectArguments,
+}
+
+/// Mesh-shader `ExecuteIndirect` dispatch arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteIndirectDispatchMesh {
+    /// Mesh pipeline handle; never zero.
+    pub pipeline_id: u64,
+    /// GPU-resident threadgroup-count records.
+    pub arguments: IndirectArguments,
+}
+
+/// Compute `ExecuteIndirect` dispatch arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteIndirectDispatch {
+    /// Compute pipeline handle; never zero.
+    pub pipeline_id: u64,
+    /// GPU-resident threadgroup-count records.
+    pub arguments: IndirectArguments,
+    /// Threadgroup size; Metal requires it alongside the indirect grid.
+    pub threads_per_group: [u32; 3],
+}
+
+/// One texture subresource named by a copy or resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureSubresource {
+    /// Texture allocation ID; never zero.
+    pub allocation_id: u64,
+    /// Allocation generation; never zero.
+    pub generation: u32,
+    /// Mip level.
+    pub mip_level: u16,
+    /// Array slice.
+    pub slice: u16,
+}
+
+/// Texture-to-texture copy of an explicit texel box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyTextureRegion {
+    /// Source subresource.
+    pub src: TextureSubresource,
+    /// Destination subresource.
+    pub dst: TextureSubresource,
+    /// Source box origin in texels.
+    pub src_origin: [u32; 3],
+    /// Destination box origin in texels.
+    pub dst_origin: [u32; 3],
+    /// Box size in texels; every component nonzero.
+    pub size: [u32; 3],
+}
+
+/// Multisample resolve of one subresource into a single-sample target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveSubresource {
+    /// Multisample source subresource.
+    pub src: TextureSubresource,
+    /// Single-sample destination subresource.
+    pub dst: TextureSubresource,
+}
+
 /// Convenience accessor: the frozen opcode of a command.
 impl CommandV3 {
     /// Returns the wire opcode for this command.
@@ -895,6 +1030,12 @@ impl CommandV3 {
             Self::DrawIndexedInstanced(_) => OP_DRAW_INDEXED_INSTANCED,
             Self::CopyBuffer(_) => OP_COPY_BUFFER,
             Self::CopyTexture(_) => OP_COPY_TEXTURE,
+            Self::ExecuteIndirectDraw(_) => OP_EXECUTE_INDIRECT_DRAW,
+            Self::ExecuteIndirectDrawIndexed(_) => OP_EXECUTE_INDIRECT_DRAW_INDEXED,
+            Self::ExecuteIndirectDispatchMesh(_) => OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+            Self::ExecuteIndirectDispatch(_) => OP_EXECUTE_INDIRECT_DISPATCH,
+            Self::CopyTextureRegion(_) => OP_COPY_TEXTURE_REGION,
+            Self::ResolveSubresource(_) => OP_RESOLVE_SUBRESOURCE,
             Self::Present(_) => OP_PRESENT,
         }
     }
@@ -934,6 +1075,12 @@ const DRAW_INSTANCED_LEN: usize = 20;
 const DRAW_INDEXED_INSTANCED_LEN: usize = 24;
 const COPY_BUFFER_LEN: usize = 60;
 const COPY_TEXTURE_LEN: usize = 52;
+const INDIRECT_ARGUMENTS_LEN: usize = 56;
+const EXECUTE_INDIRECT_DRAW_LEN: usize = 4 + INDIRECT_ARGUMENTS_LEN;
+const EXECUTE_INDIRECT_DISPATCH_MESH_LEN: usize = 4 + 8 + INDIRECT_ARGUMENTS_LEN;
+const EXECUTE_INDIRECT_DISPATCH_LEN: usize = 4 + 8 + INDIRECT_ARGUMENTS_LEN + 16;
+const COPY_TEXTURE_REGION_LEN: usize = 4 + 72;
+const RESOLVE_SUBRESOURCE_LEN: usize = 4 + 32;
 const PRESENT_LEN: usize = 20;
 
 /// Checked little-endian cursor over a version 3 frame or payload.
@@ -1329,8 +1476,59 @@ fn empty_command(opcode: u16) -> Result<CommandV3, WireError> {
             surface_id: 0,
             sync_interval: 0,
         }),
+        OP_EXECUTE_INDIRECT_DRAW => CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
+            arguments: empty_indirect_arguments(),
+        }),
+        OP_EXECUTE_INDIRECT_DRAW_INDEXED => {
+            CommandV3::ExecuteIndirectDrawIndexed(ExecuteIndirectDrawIndexed {
+                arguments: empty_indirect_arguments(),
+            })
+        }
+        OP_EXECUTE_INDIRECT_DISPATCH_MESH => {
+            CommandV3::ExecuteIndirectDispatchMesh(ExecuteIndirectDispatchMesh {
+                pipeline_id: 0,
+                arguments: empty_indirect_arguments(),
+            })
+        }
+        OP_EXECUTE_INDIRECT_DISPATCH => {
+            CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
+                pipeline_id: 0,
+                arguments: empty_indirect_arguments(),
+                threads_per_group: [0; 3],
+            })
+        }
+        OP_COPY_TEXTURE_REGION => CommandV3::CopyTextureRegion(CopyTextureRegion {
+            src: empty_subresource(),
+            dst: empty_subresource(),
+            src_origin: [0; 3],
+            dst_origin: [0; 3],
+            size: [0; 3],
+        }),
+        OP_RESOLVE_SUBRESOURCE => CommandV3::ResolveSubresource(ResolveSubresource {
+            src: empty_subresource(),
+            dst: empty_subresource(),
+        }),
         other => return Err(WireError::UnknownOpcode(other)),
     })
+}
+
+fn empty_indirect_arguments() -> IndirectArguments {
+    IndirectArguments {
+        allocation_id: 0,
+        generation: 0,
+        offset: 0,
+        max_count: 0,
+        count: None,
+    }
+}
+
+fn empty_subresource() -> TextureSubresource {
+    TextureSubresource {
+        allocation_id: 0,
+        generation: 0,
+        mip_level: 0,
+        slice: 0,
+    }
 }
 
 fn read_command_payload(
@@ -1362,6 +1560,18 @@ fn read_command_payload(
         CommandV3::DrawIndexedInstanced(draw) => read_draw_indexed_instanced(reader, draw),
         CommandV3::CopyBuffer(copy) => read_copy_buffer(reader, copy),
         CommandV3::CopyTexture(copy) => read_copy_texture(reader, copy),
+        CommandV3::ExecuteIndirectDraw(draw) => read_execute_indirect_draw(reader, draw),
+        CommandV3::ExecuteIndirectDrawIndexed(draw) => {
+            read_execute_indirect_draw_indexed(reader, draw)
+        }
+        CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+            read_execute_indirect_dispatch_mesh(reader, dispatch)
+        }
+        CommandV3::ExecuteIndirectDispatch(dispatch) => {
+            read_execute_indirect_dispatch(reader, dispatch)
+        }
+        CommandV3::CopyTextureRegion(copy) => read_copy_texture_region(reader, copy),
+        CommandV3::ResolveSubresource(resolve) => read_resolve_subresource(reader, resolve),
         CommandV3::Present(present) => read_present(reader, present),
     }
 }
@@ -1857,6 +2067,140 @@ fn read_present(reader: &mut ReaderV3<'_>, present: &mut Present) -> Result<(), 
     Ok(())
 }
 
+fn read_execute_indirect_draw(
+    reader: &mut ReaderV3<'_>,
+    draw: &mut ExecuteIndirectDraw,
+) -> Result<(), WireError> {
+    read_indirect_arguments(reader, &mut draw.arguments)
+}
+
+fn read_execute_indirect_draw_indexed(
+    reader: &mut ReaderV3<'_>,
+    draw: &mut ExecuteIndirectDrawIndexed,
+) -> Result<(), WireError> {
+    read_indirect_arguments(reader, &mut draw.arguments)
+}
+
+fn read_execute_indirect_dispatch_mesh(
+    reader: &mut ReaderV3<'_>,
+    dispatch: &mut ExecuteIndirectDispatchMesh,
+) -> Result<(), WireError> {
+    let pipeline_id = reader.u64()?;
+    validate_pipeline(pipeline_id)?;
+    read_indirect_arguments(reader, &mut dispatch.arguments)?;
+    dispatch.pipeline_id = pipeline_id;
+    Ok(())
+}
+
+fn read_execute_indirect_dispatch(
+    reader: &mut ReaderV3<'_>,
+    dispatch: &mut ExecuteIndirectDispatch,
+) -> Result<(), WireError> {
+    let pipeline_id = reader.u64()?;
+    validate_pipeline(pipeline_id)?;
+    read_indirect_arguments(reader, &mut dispatch.arguments)?;
+    let threads_per_group = [reader.u32()?, reader.u32()?, reader.u32()?];
+    validate_dimensions(threads_per_group)?;
+    reader.reserved_u32()?;
+    dispatch.pipeline_id = pipeline_id;
+    dispatch.threads_per_group = threads_per_group;
+    Ok(())
+}
+
+/// Reads one indirect argument range and its optional count buffer.
+///
+/// An absent count buffer is the all-zero triple. A partially populated triple
+/// is rejected so a producer cannot encode a count buffer whose generation or
+/// offset is silently dropped.
+fn read_indirect_arguments(
+    reader: &mut ReaderV3<'_>,
+    arguments: &mut IndirectArguments,
+) -> Result<(), WireError> {
+    let allocation_id = reader.u64()?;
+    let generation = reader.u32()?;
+    reader.reserved_u32()?;
+    let offset = reader.u64()?;
+    let max_count = reader.u32()?;
+    reader.reserved_u32()?;
+    let count_allocation_id = reader.u64()?;
+    let count_generation = reader.u32()?;
+    reader.reserved_u32()?;
+    let count_offset = reader.u64()?;
+
+    validate_handle(allocation_id, generation)?;
+    validate_alignment(offset, "indirect argument offset alignment")?;
+    validate_indirect_max_count(max_count)?;
+    let count = match count_allocation_id {
+        0 => {
+            if count_generation != 0 || count_offset != 0 {
+                return Err(WireError::ZeroAllocationId);
+            }
+            None
+        }
+        allocation_id => {
+            validate_handle(allocation_id, count_generation)?;
+            validate_alignment(count_offset, "indirect count offset alignment")?;
+            Some(IndirectCountBuffer {
+                allocation_id,
+                generation: count_generation,
+                offset: count_offset,
+            })
+        }
+    };
+
+    arguments.allocation_id = allocation_id;
+    arguments.generation = generation;
+    arguments.offset = offset;
+    arguments.max_count = max_count;
+    arguments.count = count;
+    Ok(())
+}
+
+fn read_copy_texture_region(
+    reader: &mut ReaderV3<'_>,
+    copy: &mut CopyTextureRegion,
+) -> Result<(), WireError> {
+    let src = read_subresource(reader)?;
+    let dst = read_subresource(reader)?;
+    let src_origin = [reader.u32()?, reader.u32()?, reader.u32()?];
+    let dst_origin = [reader.u32()?, reader.u32()?, reader.u32()?];
+    let size = [reader.u32()?, reader.u32()?, reader.u32()?];
+    reader.reserved_u32()?;
+    validate_box("copy region", src_origin, size)?;
+    validate_box("copy region", dst_origin, size)?;
+    *copy = CopyTextureRegion {
+        src,
+        dst,
+        src_origin,
+        dst_origin,
+        size,
+    };
+    Ok(())
+}
+
+fn read_resolve_subresource(
+    reader: &mut ReaderV3<'_>,
+    resolve: &mut ResolveSubresource,
+) -> Result<(), WireError> {
+    resolve.src = read_subresource(reader)?;
+    resolve.dst = read_subresource(reader)?;
+    Ok(())
+}
+
+fn read_subresource(reader: &mut ReaderV3<'_>) -> Result<TextureSubresource, WireError> {
+    let allocation_id = reader.u64()?;
+    let generation = reader.u32()?;
+    validate_handle(allocation_id, generation)?;
+    let mip_level = reader.u16()?;
+    let slice = reader.u16()?;
+    Ok(TextureSubresource {
+        allocation_id,
+        generation,
+        mip_level,
+        slice,
+    })
+}
+
 fn read_bindings_into(
     reader: &mut ReaderV3<'_>,
     bindings: &mut Vec<BufferBinding>,
@@ -1914,6 +2258,20 @@ fn command_encoded_len(command: &CommandV3) -> Result<usize, WireError> {
         CommandV3::DrawIndexedInstanced(draw) => draw_indexed_instanced_encoded_len(draw),
         CommandV3::CopyBuffer(copy) => copy_buffer_encoded_len(copy),
         CommandV3::CopyTexture(copy) => copy_texture_encoded_len(copy),
+        CommandV3::ExecuteIndirectDraw(draw) => {
+            execute_indirect_draw_encoded_len(&draw.arguments)
+        }
+        CommandV3::ExecuteIndirectDrawIndexed(draw) => {
+            execute_indirect_draw_indexed_encoded_len(&draw.arguments)
+        }
+        CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+            execute_indirect_dispatch_mesh_encoded_len(dispatch)
+        }
+        CommandV3::ExecuteIndirectDispatch(dispatch) => {
+            execute_indirect_dispatch_encoded_len(dispatch)
+        }
+        CommandV3::CopyTextureRegion(copy) => copy_texture_region_encoded_len(copy),
+        CommandV3::ResolveSubresource(resolve) => resolve_subresource_encoded_len(resolve),
         CommandV3::Present(present) => present_encoded_len(present),
     }
 }
@@ -2156,6 +2514,121 @@ fn present_encoded_len(present: &Present) -> Result<usize, WireError> {
     Ok(PRESENT_LEN)
 }
 
+fn validate_indirect_arguments(arguments: &IndirectArguments) -> Result<(), WireError> {
+    validate_handle(arguments.allocation_id, arguments.generation)?;
+    validate_alignment(
+        arguments.offset,
+        "indirect argument offset alignment",
+    )?;
+    validate_indirect_max_count(arguments.max_count)?;
+    if let Some(count) = &arguments.count {
+        validate_handle(count.allocation_id, count.generation)?;
+        validate_alignment(count.offset, "indirect count offset alignment")?;
+    }
+    Ok(())
+}
+
+fn execute_indirect_draw_encoded_len(arguments: &IndirectArguments) -> Result<usize, WireError> {
+    validate_indirect_arguments(arguments)?;
+    Ok(EXECUTE_INDIRECT_DRAW_LEN)
+}
+
+fn execute_indirect_draw_indexed_encoded_len(
+    arguments: &IndirectArguments,
+) -> Result<usize, WireError> {
+    validate_indirect_arguments(arguments)?;
+    Ok(EXECUTE_INDIRECT_DRAW_LEN)
+}
+
+fn execute_indirect_dispatch_mesh_encoded_len(
+    dispatch: &ExecuteIndirectDispatchMesh,
+) -> Result<usize, WireError> {
+    validate_pipeline(dispatch.pipeline_id)?;
+    validate_indirect_arguments(&dispatch.arguments)?;
+    Ok(EXECUTE_INDIRECT_DISPATCH_MESH_LEN)
+}
+
+fn execute_indirect_dispatch_encoded_len(
+    dispatch: &ExecuteIndirectDispatch,
+) -> Result<usize, WireError> {
+    validate_pipeline(dispatch.pipeline_id)?;
+    validate_indirect_arguments(&dispatch.arguments)?;
+    validate_dimensions(dispatch.threads_per_group)?;
+    Ok(EXECUTE_INDIRECT_DISPATCH_LEN)
+}
+
+fn copy_texture_region_encoded_len(copy: &CopyTextureRegion) -> Result<usize, WireError> {
+    validate_subresource(&copy.src)?;
+    validate_subresource(&copy.dst)?;
+    validate_box("copy region", copy.src_origin, copy.size)?;
+    validate_box("copy region", copy.dst_origin, copy.size)?;
+    Ok(COPY_TEXTURE_REGION_LEN)
+}
+
+fn resolve_subresource_encoded_len(resolve: &ResolveSubresource) -> Result<usize, WireError> {
+    validate_subresource(&resolve.src)?;
+    validate_subresource(&resolve.dst)?;
+    Ok(RESOLVE_SUBRESOURCE_LEN)
+}
+
+fn validate_subresource(subresource: &TextureSubresource) -> Result<(), WireError> {
+    validate_handle(subresource.allocation_id, subresource.generation)
+}
+
+/// Rejects an empty box and an origin/size pair that overflows `u32`.
+///
+/// The live texture extent is not on the wire; the host re-checks the box
+/// against the resolved mip dimensions before it creates an encoder.
+fn validate_box(_field: &'static str, origin: [u32; 3], size: [u32; 3]) -> Result<(), WireError> {
+    if size[0] == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "copy region width",
+        });
+    }
+    if size[1] == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "copy region height",
+        });
+    }
+    if size[2] == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "copy region depth",
+        });
+    }
+    for (start, extent) in origin.into_iter().zip(size) {
+        if start.checked_add(extent).is_none() {
+            return Err(WireError::OffsetOverflow);
+        }
+    }
+    Ok(())
+}
+
+fn validate_alignment(offset: u64, field: &'static str) -> Result<(), WireError> {
+    if offset.is_multiple_of(4) {
+        Ok(())
+    } else {
+        // `WireError` is frozen with wire.rs outside this task's scope and has
+        // no alignment variant; the field names the rule and the code carries
+        // the misaligned low bits.
+        Err(WireError::InvalidEnumCode {
+            field,
+            code: (offset & 3) as u16,
+        })
+    }
+}
+
+fn validate_indirect_max_count(max_count: u32) -> Result<(), WireError> {
+    if max_count == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "indirect max command count",
+        });
+    }
+    if max_count > MAX_INDIRECT_COMMANDS_V3 {
+        return Err(WireError::TooManyCommandsV3(max_count as usize));
+    }
+    Ok(())
+}
+
 fn sized_with_bindings(header_len: usize, bindings: &[BufferBinding]) -> Result<usize, WireError> {
     if bindings.len() > MAX_BINDINGS_PER_DISPATCH {
         return Err(WireError::TooManyBindings(bindings.len()));
@@ -2371,7 +2844,73 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             write_u32(out, present.sync_interval);
             write_u32(out, 0);
         }
+        CommandV3::ExecuteIndirectDraw(draw) => {
+            write_indirect_arguments(out, &draw.arguments);
+        }
+        CommandV3::ExecuteIndirectDrawIndexed(draw) => {
+            write_indirect_arguments(out, &draw.arguments);
+        }
+        CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+            write_u64(out, dispatch.pipeline_id);
+            write_indirect_arguments(out, &dispatch.arguments);
+        }
+        CommandV3::ExecuteIndirectDispatch(dispatch) => {
+            write_u64(out, dispatch.pipeline_id);
+            write_indirect_arguments(out, &dispatch.arguments);
+            for dimension in dispatch.threads_per_group {
+                write_u32(out, dimension);
+            }
+            write_u32(out, 0);
+        }
+        CommandV3::CopyTextureRegion(copy) => {
+            write_subresource(out, &copy.src);
+            write_subresource(out, &copy.dst);
+            for value in copy.src_origin {
+                write_u32(out, value);
+            }
+            for value in copy.dst_origin {
+                write_u32(out, value);
+            }
+            for value in copy.size {
+                write_u32(out, value);
+            }
+            write_u32(out, 0);
+        }
+        CommandV3::ResolveSubresource(resolve) => {
+            write_subresource(out, &resolve.src);
+            write_subresource(out, &resolve.dst);
+        }
     }
+}
+
+fn write_indirect_arguments(out: &mut Vec<u8>, arguments: &IndirectArguments) {
+    write_u64(out, arguments.allocation_id);
+    write_u32(out, arguments.generation);
+    write_u32(out, 0);
+    write_u64(out, arguments.offset);
+    write_u32(out, arguments.max_count);
+    write_u32(out, 0);
+    match &arguments.count {
+        Some(count) => {
+            write_u64(out, count.allocation_id);
+            write_u32(out, count.generation);
+            write_u32(out, 0);
+            write_u64(out, count.offset);
+        }
+        None => {
+            write_u64(out, 0);
+            write_u32(out, 0);
+            write_u32(out, 0);
+            write_u64(out, 0);
+        }
+    }
+}
+
+fn write_subresource(out: &mut Vec<u8>, subresource: &TextureSubresource) {
+    write_u64(out, subresource.allocation_id);
+    write_u32(out, subresource.generation);
+    write_u16(out, subresource.mip_level);
+    write_u16(out, subresource.slice);
 }
 
 fn write_bindings(out: &mut Vec<u8>, bindings: &[BufferBinding]) {
@@ -2709,6 +3248,60 @@ mod tests {
         }
     }
 
+    fn indirect_arguments(count: Option<IndirectCountBuffer>) -> IndirectArguments {
+        IndirectArguments {
+            allocation_id: 11,
+            generation: 2,
+            offset: 32,
+            max_count: 3,
+            count,
+        }
+    }
+
+    fn subresource(allocation_id: u64, mip_level: u16, slice: u16) -> TextureSubresource {
+        TextureSubresource {
+            allocation_id,
+            generation: 1,
+            mip_level,
+            slice,
+        }
+    }
+
+    fn indirect_commands() -> Vec<CommandV3> {
+        vec![
+            CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
+                arguments: indirect_arguments(None),
+            }),
+            CommandV3::ExecuteIndirectDrawIndexed(ExecuteIndirectDrawIndexed {
+                arguments: indirect_arguments(Some(IndirectCountBuffer {
+                    allocation_id: 12,
+                    generation: 2,
+                    offset: 64,
+                })),
+            }),
+            CommandV3::ExecuteIndirectDispatchMesh(ExecuteIndirectDispatchMesh {
+                pipeline_id: 10,
+                arguments: indirect_arguments(None),
+            }),
+            CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
+                pipeline_id: 11,
+                arguments: indirect_arguments(None),
+                threads_per_group: [8, 4, 2],
+            }),
+            CommandV3::CopyTextureRegion(CopyTextureRegion {
+                src: subresource(9, 0, 1),
+                dst: subresource(10, 1, 2),
+                src_origin: [8, 16, 0],
+                dst_origin: [24, 32, 0],
+                size: [32, 16, 1],
+            }),
+            CommandV3::ResolveSubresource(ResolveSubresource {
+                src: subresource(11, 0, 0),
+                dst: subresource(12, 0, 0),
+            }),
+        ]
+    }
+
     fn all_commands() -> Vec<CommandV3> {
         vec![
             CommandV3::Dispatch1d(Dispatch1d {
@@ -2826,6 +3419,36 @@ mod tests {
                 height: 64,
                 depth: 1,
             }),
+            CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
+                arguments: indirect_arguments(None),
+            }),
+            CommandV3::ExecuteIndirectDrawIndexed(ExecuteIndirectDrawIndexed {
+                arguments: indirect_arguments(Some(IndirectCountBuffer {
+                    allocation_id: 12,
+                    generation: 2,
+                    offset: 64,
+                })),
+            }),
+            CommandV3::ExecuteIndirectDispatchMesh(ExecuteIndirectDispatchMesh {
+                pipeline_id: 10,
+                arguments: indirect_arguments(None),
+            }),
+            CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
+                pipeline_id: 11,
+                arguments: indirect_arguments(None),
+                threads_per_group: [8, 4, 2],
+            }),
+            CommandV3::CopyTextureRegion(CopyTextureRegion {
+                src: subresource(9, 0, 1),
+                dst: subresource(10, 1, 2),
+                src_origin: [8, 16, 0],
+                dst_origin: [24, 32, 0],
+                size: [32, 16, 1],
+            }),
+            CommandV3::ResolveSubresource(ResolveSubresource {
+                src: subresource(11, 0, 0),
+                dst: subresource(12, 0, 0),
+            }),
             CommandV3::Present(Present {
                 surface_id: 1,
                 sync_interval: 1,
@@ -2883,7 +3506,7 @@ mod tests {
         let submission = rich_submission();
         let decoded = decode_submission_v3(&encoded_rich()).expect("rich frame decodes");
         assert_eq!(decoded, submission);
-        assert_eq!(decoded.commands.len(), 26);
+        assert_eq!(decoded.commands.len(), 32);
 
         let opcodes: std::collections::BTreeSet<u16> =
             decoded.commands.iter().map(CommandV3::opcode).collect();
@@ -2912,6 +3535,12 @@ mod tests {
             OP_DRAW_INDEXED_INSTANCED,
             OP_COPY_BUFFER,
             OP_COPY_TEXTURE,
+            OP_EXECUTE_INDIRECT_DRAW,
+            OP_EXECUTE_INDIRECT_DRAW_INDEXED,
+            OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+            OP_EXECUTE_INDIRECT_DISPATCH,
+            OP_COPY_TEXTURE_REGION,
+            OP_RESOLVE_SUBRESOURCE,
             OP_PRESENT,
         ] {
             assert!(opcodes.contains(&opcode), "opcode {opcode} missing");
@@ -3605,6 +4234,184 @@ mod tests {
         assert_eq!(out, smaller);
         assert_eq!(out.commands.as_ptr(), command_pointer);
         assert_eq!(out.commands.capacity(), command_capacity);
+    }
+
+    #[test]
+    fn wire_v3_indirect_and_region_commands_roundtrip_and_reject_bad_fields() {
+        for command in indirect_commands() {
+            assert_roundtrip(&submission_with(vec![command]));
+        }
+
+        let draw = single_frame(CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
+            arguments: indirect_arguments(None),
+        }));
+        let base = COMMAND_START + 4;
+        assert_decode_error(&draw, base, &[0; 8], WireError::ZeroAllocationId);
+        assert_decode_error(&draw, base + 8, &[0; 4], WireError::ZeroGeneration);
+        assert_decode_error(
+            &draw,
+            base + 16,
+            &2u64.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "indirect argument offset alignment",
+                code: 2,
+            },
+        );
+        assert_decode_error(
+            &draw,
+            base + 24,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "indirect max command count",
+            },
+        );
+        assert_decode_error(
+            &draw,
+            base + 24,
+            &(MAX_INDIRECT_COMMANDS_V3 + 1).to_le_bytes(),
+            WireError::TooManyCommandsV3(MAX_INDIRECT_COMMANDS_V3 as usize + 1),
+        );
+        // A count buffer is the all-zero triple or fully populated.
+        assert_decode_error(
+            &draw,
+            base + 40,
+            &2u32.to_le_bytes(),
+            WireError::ZeroAllocationId,
+        );
+
+        let indexed = single_frame(CommandV3::ExecuteIndirectDrawIndexed(
+            ExecuteIndirectDrawIndexed {
+                arguments: indirect_arguments(Some(IndirectCountBuffer {
+                    allocation_id: 12,
+                    generation: 2,
+                    offset: 64,
+                })),
+            },
+        ));
+        assert_decode_error(&indexed, base + 40, &[0; 4], WireError::ZeroGeneration);
+        assert_decode_error(&indexed, base + 32, &[0; 8], WireError::ZeroAllocationId);
+        assert_decode_error(
+            &indexed,
+            base + 48,
+            &2u64.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "indirect count offset alignment",
+                code: 2,
+            },
+        );
+
+        let mesh = single_frame(CommandV3::ExecuteIndirectDispatchMesh(
+            ExecuteIndirectDispatchMesh {
+                pipeline_id: 10,
+                arguments: indirect_arguments(None),
+            },
+        ));
+        assert_decode_error(&mesh, base, &[0; 8], WireError::ZeroPipelineId);
+        assert_decode_error(&mesh, base + 8, &[0; 8], WireError::ZeroAllocationId);
+
+        let dispatch = single_frame(CommandV3::ExecuteIndirectDispatch(
+            ExecuteIndirectDispatch {
+                pipeline_id: 11,
+                arguments: indirect_arguments(None),
+                threads_per_group: [8, 4, 2],
+            },
+        ));
+        assert_decode_error(&dispatch, base + 64, &0u32.to_le_bytes(), WireError::ZeroThreads);
+        assert_decode_error(&dispatch, base, &[0; 8], WireError::ZeroPipelineId);
+
+        let region = single_frame(CommandV3::CopyTextureRegion(CopyTextureRegion {
+            src: subresource(9, 0, 1),
+            dst: subresource(10, 1, 2),
+            src_origin: [8, 16, 0],
+            dst_origin: [24, 32, 0],
+            size: [32, 16, 1],
+        }));
+        assert_decode_error(
+            &region,
+            base + 56,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "copy region width",
+            },
+        );
+        assert_decode_error(
+            &region,
+            base + 60,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "copy region height",
+            },
+        );
+        assert_decode_error(
+            &region,
+            base + 64,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "copy region depth",
+            },
+        );
+        assert_decode_error(&region, base, &[0; 8], WireError::ZeroAllocationId);
+        assert_decode_error(
+            &region,
+            base + 32,
+            &u32::MAX.to_le_bytes(),
+            WireError::OffsetOverflow,
+        );
+
+        let resolve = single_frame(CommandV3::ResolveSubresource(ResolveSubresource {
+            src: subresource(11, 0, 0),
+            dst: subresource(12, 0, 0),
+        }));
+        assert_decode_error(&resolve, base, &[0; 8], WireError::ZeroAllocationId);
+        assert_decode_error(&resolve, base + 16, &[0; 8], WireError::ZeroAllocationId);
+
+        // The writer enforces the same rules before producing a frame.
+        assert_encode_error(
+            CommandV3::ExecuteIndirectDrawIndexed(ExecuteIndirectDrawIndexed {
+                arguments: IndirectArguments {
+                    offset: 6,
+                    ..indirect_arguments(None)
+                },
+            }),
+            WireError::InvalidEnumCode {
+                field: "indirect argument offset alignment",
+                code: 2,
+            },
+        );
+        assert_encode_error(
+            CommandV3::CopyTextureRegion(CopyTextureRegion {
+                src: subresource(9, 0, 1),
+                dst: subresource(10, 1, 2),
+                src_origin: [8, 16, 0],
+                dst_origin: [24, 32, 0],
+                size: [0, 16, 1],
+            }),
+            WireError::ZeroExtent {
+                field: "copy region width",
+            },
+        );
+        assert_encode_error(
+            CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
+                pipeline_id: 11,
+                arguments: indirect_arguments(None),
+                threads_per_group: [8, 0, 2],
+            }),
+            WireError::ZeroThreads,
+        );
+    }
+
+    #[test]
+    fn wire_v3_new_opcodes_reject_every_truncated_prefix() {
+        for command in indirect_commands() {
+            let frame = single_frame(command);
+            for length in 0..frame.len() {
+                assert!(
+                    decode_submission_v3(&frame[..length]).is_err(),
+                    "prefix {length} of a new opcode must not decode"
+                );
+            }
+            assert!(decode_submission_v3(&frame).is_ok());
+        }
     }
 
     #[test]
