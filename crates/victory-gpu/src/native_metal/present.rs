@@ -350,6 +350,11 @@ pub enum PresentError {
         /// Presenter-provided refusal reason.
         reason: String,
     },
+    /// The strict zero-D3DMetal guard tripped: a frame reached D3DMetal.
+    D3dMetalFallback {
+        /// Frames that fell back.
+        count: u64,
+    },
 }
 
 impl std::fmt::Display for PresentError {
@@ -391,6 +396,10 @@ impl std::fmt::Display for PresentError {
                 frame_index,
                 reason,
             } => write!(f, "present sink refused frame {frame_index}: {reason}"),
+            Self::D3dMetalFallback { count } => write!(
+                f,
+                "{count} frame(s) fell back to D3DMetal; the native present path is not exclusive"
+            ),
         }
     }
 }
@@ -466,6 +475,24 @@ pub fn present_surface(
         return Err(error);
     }
     Ok(frame)
+}
+
+/// The strict zero-D3DMetal guard, run at the end of a native present.
+///
+/// ADR-016 makes `d3dmetal_fallback_count == 0` an invariant of the native
+/// path: a present that finds a nonzero count is refused with an explicit
+/// error instead of showing a frame produced by a fallback. Nothing on this
+/// path increments the counter; the guard exists so a future fallback hook
+/// cannot stay silent. `telemetry` is a parameter (rather than always the
+/// process-wide instance) so the rule is testable without poisoning a run.
+pub fn guard_native_only(
+    telemetry: &crate::native_metal::telemetry::FrameTelemetry,
+) -> Result<(), PresentError> {
+    telemetry
+        .assert_no_fallback()
+        .map_err(|error| PresentError::D3dMetalFallback {
+            count: error.fallback_count(),
+        })
 }
 
 #[cfg(test)]
@@ -674,5 +701,31 @@ mod tests {
         assert_eq!(presenter.frames.len(), 0);
         assert_eq!(swapchain.in_flight(), None);
         assert_eq!(swapchain.next_frame_index(), 0);
+    }
+
+    /// The strict zero-D3DMetal guard passes on a clean session and refuses a
+    /// present once a frame has declared a D3DMetal fallback.
+    #[test]
+    fn the_present_guard_is_zero_d3dmetal_only() {
+        let telemetry = crate::native_metal::telemetry::FrameTelemetry::new();
+        assert_eq!(guard_native_only(&telemetry), Ok(()));
+
+        telemetry.record_frame_at(0, 10, 20, 30, 40, None);
+        assert_eq!(
+            guard_native_only(&telemetry),
+            Ok(()),
+            "a recorded native frame is not a fallback"
+        );
+
+        telemetry.note_d3dmetal_fallback();
+        assert_eq!(
+            guard_native_only(&telemetry),
+            Err(PresentError::D3dMetalFallback { count: 1 })
+        );
+        assert_eq!(
+            telemetry.d3dmetal_fallback_count(),
+            1,
+            "the guard reads the counter and never clears it"
+        );
     }
 }
