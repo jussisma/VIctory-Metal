@@ -73,17 +73,25 @@ pub enum PipelineStage {
     Pixel,
     /// Mesh shader (converter stage 5).
     Mesh,
+    /// Object/amplification shader (converter stage 6).
+    Object,
     /// Compute shader (converter stage 8).
     Compute,
 }
 
 impl PipelineStage {
     /// The converter's stage code for this stage.
+    ///
+    /// These are the values `IRObjectGetMetalIRShaderStage` reports: vertex 1,
+    /// fragment 2, mesh 5, object/amplification 6, kernel 8. The object code is
+    /// the ADR-024a ordering; it is reported back by the converter and checked
+    /// against `CompileJob::stage`.
     pub const fn converter_stage(self) -> u32 {
         match self {
             Self::Vertex => 1,
             Self::Pixel => 2,
             Self::Mesh => 5,
+            Self::Object => 6,
             Self::Compute => 8,
         }
     }
@@ -94,16 +102,21 @@ impl PipelineStage {
             Self::Vertex => crate::native_metal::client::PIPELINE_STAGE_VERTEX,
             Self::Pixel => crate::native_metal::client::PIPELINE_STAGE_PIXEL,
             Self::Mesh => crate::native_metal::client::PIPELINE_STAGE_MESH,
+            Self::Object => crate::native_metal::client::PIPELINE_STAGE_OBJECT,
             Self::Compute => crate::native_metal::client::PIPELINE_STAGE_COMPUTE,
         }
     }
 
     /// The stage name the title pipeline uses (`pipeline::Shader::stage`).
+    ///
+    /// The console names the object stage an amplification shader, and that is
+    /// the name `pipeline.rs` maps console subobject type 23 to.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "vertex" => Some(Self::Vertex),
             "pixel" => Some(Self::Pixel),
             "mesh" => Some(Self::Mesh),
+            "amplification" => Some(Self::Object),
             "compute" => Some(Self::Compute),
             _ => None,
         }
@@ -175,7 +188,7 @@ impl std::fmt::Display for PipelineError {
                 "a {} PSO cannot be registered: {missing} (failing stage: {stage:?})",
                 match stage {
                     PipelineStage::Vertex | PipelineStage::Pixel => "graphics",
-                    PipelineStage::Mesh => "mesh",
+                    PipelineStage::Mesh | PipelineStage::Object => "mesh",
                     PipelineStage::Compute => "compute",
                 }
             ),
@@ -209,8 +222,31 @@ pub const WIRE_STAGE_VERTEX: u8 = 0;
 pub const WIRE_STAGE_PIXEL: u8 = 1;
 /// Wire stage code for a mesh shader.
 pub const WIRE_STAGE_MESH: u8 = 2;
+/// Wire stage code for an object/amplification shader.
+///
+/// Must equal the host's `PIPELINE_STAGE_OBJECT` (`ipc_host.rs`); the version 2
+/// mesh frame carries the object stage between the mesh and pixel stages.
+pub const WIRE_STAGE_OBJECT: u8 = 3;
 /// Wire stage code for a compute shader.
 pub const WIRE_STAGE_COMPUTE: u8 = crate::native_metal::client::PIPELINE_STAGE_COMPUTE;
+
+const _: () = assert!(WIRE_STAGE_OBJECT == crate::native_metal::client::PIPELINE_STAGE_OBJECT);
+
+/// The mesh threadgroup encoded when a caller supplies no explicit `VPS1`
+/// state. This is the historical default (one 32-thread mesh threadgroup).
+pub const DEFAULT_MESH_THREADGROUP: [u16; 3] = [32, 1, 1];
+/// The object threadgroup encoded when an object stage is present and the
+/// caller supplies no explicit `VPS1` state.
+pub const DEFAULT_OBJECT_THREADGROUP: [u16; 3] = [1, 1, 1];
+/// The payload budget encoded when an object stage is present and the caller
+/// supplies no `VPS1` state.
+///
+/// A caller with converter reflection (the object stage's
+/// `state.max_payload_size_in_bytes`) should pass an explicit state; this is a
+/// conservative budget for the pool path, which does not decode the object
+/// reflection into threadgroup limits. It is deliberately non-zero: an object
+/// function that writes any payload needs a non-empty payload allocation.
+pub const DEFAULT_PAYLOAD_MEMORY_LENGTH: u16 = 1024;
 
 /// Encodes a graphics `PipelineState` (`VPS1`) for the stage set.
 ///
@@ -218,25 +254,54 @@ pub const WIRE_STAGE_COMPUTE: u8 = crate::native_metal::client::PIPELINE_STAGE_C
 /// magic, stage code `0`, colour formats, no depth, a fragment entry, no
 /// object entry and zero mesh budgets.
 pub fn encode_graphics_state(color_formats: &[u8], fragment_entry: &str) -> Vec<u8> {
-    encode_state(0, color_formats, fragment_entry, None, [0; 3], [0; 3])
+    encode_state(0, color_formats, fragment_entry, None, [0; 3], [0; 3], 0, 0)
 }
 
-/// Encodes a mesh `PipelineState` (`VPS1`) for the stage set.
+/// Encodes a mesh `PipelineState` (`VPS1`) without an object stage.
 ///
-/// Mirrors `PipelineState::encode(Mesh)`: the fragment entry is required and
-/// the mesh/object threadgroups are set; the object entry is supplied by a
-/// caller that has an object stage.
+/// Mirrors `PipelineState::encode(Mesh)` for a mesh+pixel pair: the fragment
+/// entry is required and the mesh threadgroup is the historical default; no
+/// object entry and no payload budget are recorded.
 pub fn encode_mesh_state(color_formats: &[u8], fragment_entry: &str) -> Vec<u8> {
+    encode_mesh_state_for(
+        color_formats,
+        fragment_entry,
+        None,
+        DEFAULT_MESH_THREADGROUP,
+        [1, 1, 1],
+        0,
+    )
+}
+
+/// Encodes a mesh `PipelineState` (`VPS1`) for mesh (+ optional object) +
+/// pixel.
+///
+/// `object_entry` must be the entry point of the object/amplification stage the
+/// version 2 frame carries; the host cross-checks the two and refuses a frame
+/// whose state names an object entry the stage set does not carry (or the
+/// reverse). `payload_memory_length` is the object stage's payload budget.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mesh_state_for(
+    color_formats: &[u8],
+    fragment_entry: &str,
+    object_entry: Option<&str>,
+    mesh_threadgroup: [u16; 3],
+    object_threadgroup: [u16; 3],
+    payload_memory_length: u16,
+) -> Vec<u8> {
     encode_state(
         1,
         color_formats,
         fragment_entry,
-        None,
-        [32, 1, 1],
-        [1, 1, 1],
+        object_entry,
+        mesh_threadgroup,
+        object_threadgroup,
+        payload_memory_length,
+        0,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_state(
     stage: u8,
     color_formats: &[u8],
@@ -244,6 +309,8 @@ fn encode_state(
     object_entry: Option<&str>,
     mesh_threadgroup: [u16; 3],
     object_threadgroup: [u16; 3],
+    payload_memory_length: u16,
+    max_total_threadgroups_per_mesh_grid: u32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + fragment_entry.len());
     out.extend_from_slice(b"VPS1");
@@ -258,8 +325,8 @@ fn encode_state(
     for value in mesh_threadgroup.iter().chain(object_threadgroup.iter()) {
         out.extend_from_slice(&value.to_le_bytes());
     }
-    out.extend_from_slice(&0u16.to_le_bytes()); // payload memory length
-    out.extend_from_slice(&0u32.to_le_bytes()); // max threadgroups per mesh grid
+    out.extend_from_slice(&payload_memory_length.to_le_bytes());
+    out.extend_from_slice(&max_total_threadgroups_per_mesh_grid.to_le_bytes());
     out
 }
 
@@ -270,6 +337,44 @@ fn push_u16_string(out: &mut Vec<u8>, text: &str) {
             .to_le_bytes(),
     );
     out.extend_from_slice(text.as_bytes());
+}
+
+/// The default `VPS1` mesh state derived from the registered stage set.
+///
+/// The fragment entry always comes from the pixel stage. When the set carries
+/// an object/amplification stage (`[Mesh, Object, Pixel]`, the only order
+/// [`pipeline_kind`] accepts for it), its entry becomes the encoded object
+/// entry and the default object threadgroup and payload budget are recorded;
+/// a mesh+pixel set keeps the historical no-object state exactly.
+fn default_mesh_state(
+    stages: &[(PipelineStage, &[u8], &str)],
+    color_formats: &[u8],
+) -> Vec<u8> {
+    let fragment_entry = stages
+        .iter()
+        .find(|(stage, _, _)| *stage == PipelineStage::Pixel)
+        .map(|(_, _, entry)| *entry)
+        .unwrap_or_default();
+    let object_entry = stages
+        .iter()
+        .find(|(stage, _, _)| *stage == PipelineStage::Object)
+        .map(|(_, _, entry)| *entry);
+    encode_mesh_state_for(
+        color_formats,
+        fragment_entry,
+        object_entry,
+        DEFAULT_MESH_THREADGROUP,
+        if object_entry.is_some() {
+            DEFAULT_OBJECT_THREADGROUP
+        } else {
+            [1, 1, 1]
+        },
+        if object_entry.is_some() {
+            DEFAULT_PAYLOAD_MEMORY_LENGTH
+        } else {
+            0
+        },
+    )
 }
 
 /// Encodes the `VAB1` per-stage ABI container from converter reflection JSON.
@@ -418,6 +523,7 @@ pub fn stage_program(
             PipelineStage::Vertex => "vertex",
             PipelineStage::Pixel => "pixel",
             PipelineStage::Mesh => "mesh",
+            PipelineStage::Object => "object",
             PipelineStage::Compute => "compute",
         }))?;
     Ok(StageProgram {
@@ -740,7 +846,7 @@ pub fn register_translated(
         &[]
     } else {
         state_storage = if kind == PipelineKind::Mesh {
-            encode_mesh_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+            default_mesh_state(stages, &[DEFAULT_COLOR_FORMAT])
         } else {
             encode_graphics_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
         };
@@ -781,6 +887,18 @@ fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError
         | [PipelineStage::Pixel, PipelineStage::Vertex] => Ok(PipelineKind::Graphics),
         [PipelineStage::Mesh, PipelineStage::Pixel]
         | [PipelineStage::Pixel, PipelineStage::Mesh] => Ok(PipelineKind::Mesh),
+        // ADR-024a: the version 2 frame carries the object/amplification stage
+        // between the mesh and pixel stages, the order the host binds.
+        [PipelineStage::Mesh, PipelineStage::Object, PipelineStage::Pixel] => {
+            Ok(PipelineKind::Mesh)
+        }
+        [PipelineStage::Object, PipelineStage::Mesh, PipelineStage::Pixel] => {
+            Err(PipelineError::HostCannotRegister {
+                stage: PipelineStage::Object,
+                missing: "the object/amplification stage must follow the mesh stage and precede \
+                          the pixel stage (mesh, object, pixel)",
+            })
+        }
         [] => Err(PipelineError::Translation(
             "no shader stage to register".to_string(),
         )),
@@ -790,6 +908,9 @@ fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError
                 PipelineStage::Vertex => "a graphics pipeline also needs a pixel stage",
                 PipelineStage::Pixel => "a render pipeline also needs a vertex or mesh stage",
                 PipelineStage::Mesh => "a mesh pipeline also needs a pixel stage",
+                PipelineStage::Object => {
+                    "an object/amplification pipeline also needs mesh and pixel stages"
+                }
                 PipelineStage::Compute => "a compute pipeline needs exactly one stage",
             },
         }),
@@ -802,14 +923,15 @@ fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError
                         PipelineStage::Vertex
                             | PipelineStage::Pixel
                             | PipelineStage::Mesh
+                            | PipelineStage::Object
                             | PipelineStage::Compute
                     )
                 })
                 .unwrap_or(&stages[stages.len() - 1]);
             Err(PipelineError::HostCannotRegister {
                 stage,
-                missing: "the native path registers vertex+pixel, mesh+pixel or one compute \
-                          stage only",
+                missing: "the native path registers vertex+pixel, mesh+pixel, \
+                          mesh+object+pixel or one compute stage only",
             })
         }
     }
@@ -824,11 +946,18 @@ mod tests {
         assert_eq!(PipelineStage::Vertex.converter_stage(), 1);
         assert_eq!(PipelineStage::Pixel.converter_stage(), 2);
         assert_eq!(PipelineStage::Mesh.converter_stage(), 5);
+        assert_eq!(PipelineStage::Object.converter_stage(), 6);
         assert_eq!(PipelineStage::Compute.converter_stage(), 8);
         assert_eq!(
             PipelineStage::from_name("compute"),
             Some(PipelineStage::Compute)
         );
+        assert_eq!(
+            PipelineStage::from_name("amplification"),
+            Some(PipelineStage::Object)
+        );
+        assert_eq!(PipelineStage::Object.wire_code(), WIRE_STAGE_OBJECT);
+        assert_eq!(WIRE_STAGE_OBJECT, 3);
         assert_eq!(PipelineStage::from_name("hull"), None);
     }
 
@@ -856,6 +985,145 @@ mod tests {
         let mesh = encode_mesh_state(&[DEFAULT_COLOR_FORMAT], "main");
         assert_eq!(&mesh[..4], b"VPS1");
         assert_eq!(mesh[4], 1, "mesh stage code");
+    }
+
+    /// The fields of a `VPS1` blob the guest encoder can produce.
+    #[derive(Debug)]
+    struct DecodedState {
+        stage: u8,
+        colors: Vec<u8>,
+        fragment: String,
+        object: Option<String>,
+        mesh_threadgroup: [u16; 3],
+        object_threadgroup: [u16; 3],
+        payload_memory_length: u16,
+        max_total_threadgroups_per_mesh_grid: u32,
+    }
+
+    /// Decodes the exact layout
+    /// `victory_metal::macos::registry::PipelineState` writes.
+    fn decode_state(bytes: &[u8]) -> DecodedState {
+        let mut at = 0usize;
+        macro_rules! take {
+            ($count:expr) => {{
+                let count = $count;
+                let slice = &bytes[at..at + count];
+                at += count;
+                slice
+            }};
+        }
+        macro_rules! u16_at {
+            () => {
+                u16::from_le_bytes(take!(2).try_into().unwrap())
+            };
+        }
+        assert_eq!(take!(4), b"VPS1");
+        let stage = take!(1)[0];
+        let color_count = take!(1)[0] as usize;
+        let colors = take!(color_count).to_vec();
+        assert_eq!(take!(1)[0], 0, "no depth attachment");
+        let flags = take!(1)[0];
+        let length = usize::from(u16_at!());
+        let fragment = std::str::from_utf8(take!(length)).unwrap().to_string();
+        let length = usize::from(u16_at!());
+        let object = std::str::from_utf8(take!(length)).unwrap().to_string();
+        let mut threadgroups = || {
+            let mut out = [0u16; 3];
+            for value in &mut out {
+                *value = u16_at!();
+            }
+            out
+        };
+        let mesh_threadgroup = threadgroups();
+        let object_threadgroup = threadgroups();
+        let payload_memory_length = u16_at!();
+        let max_total_threadgroups_per_mesh_grid =
+            u32::from_le_bytes(take!(4).try_into().unwrap());
+        assert_eq!(at, bytes.len(), "no trailing bytes");
+        DecodedState {
+            stage,
+            colors,
+            fragment: if flags & 1 != 0 { fragment } else { String::new() },
+            object: (flags & 2 != 0).then_some(object),
+            mesh_threadgroup,
+            object_threadgroup,
+            payload_memory_length,
+            max_total_threadgroups_per_mesh_grid,
+        }
+    }
+
+    /// ADR-024a: `[Mesh, Object, Pixel]` is a valid mesh family and its
+    /// default state encodes the object entry, wire stage 3 and the object
+    /// threadgroup/payload budgets the host binds.
+    #[test]
+    fn a_mesh_object_pixel_order_encodes_the_object_stage() {
+        assert_eq!(
+            pipeline_kind(&[
+                PipelineStage::Mesh,
+                PipelineStage::Object,
+                PipelineStage::Pixel
+            ]),
+            Ok(PipelineKind::Mesh)
+        );
+        let stages: [(PipelineStage, &[u8], &str); 3] = [
+            (PipelineStage::Mesh, b"mesh metallib", "ms_main"),
+            (PipelineStage::Object, b"object metallib", "as_main"),
+            (PipelineStage::Pixel, b"pixel metallib", "ps_main"),
+        ];
+        let state = default_mesh_state(&stages, &[DEFAULT_COLOR_FORMAT]);
+        let decoded = decode_state(&state);
+        assert_eq!(decoded.stage, 1, "mesh VPS1 stage code");
+        assert_eq!(decoded.colors, vec![DEFAULT_COLOR_FORMAT]);
+        assert_eq!(decoded.fragment, "ps_main");
+        assert_eq!(decoded.object.as_deref(), Some("as_main"));
+        assert_eq!(decoded.mesh_threadgroup, DEFAULT_MESH_THREADGROUP);
+        assert_eq!(decoded.object_threadgroup, DEFAULT_OBJECT_THREADGROUP);
+        assert_eq!(
+            decoded.payload_memory_length,
+            DEFAULT_PAYLOAD_MEMORY_LENGTH
+        );
+        assert!(
+            decoded.payload_memory_length > 0,
+            "an object stage needs a payload budget"
+        );
+        assert_eq!(decoded.max_total_threadgroups_per_mesh_grid, 0);
+        assert_eq!(PipelineStage::Object.wire_code(), 3);
+    }
+
+    /// A mesh+pixel set keeps the historical no-object state exactly.
+    #[test]
+    fn a_mesh_pixel_order_still_encodes_without_an_object_stage() {
+        assert_eq!(
+            pipeline_kind(&[PipelineStage::Mesh, PipelineStage::Pixel]),
+            Ok(PipelineKind::Mesh)
+        );
+        let stages: [(PipelineStage, &[u8], &str); 2] = [
+            (PipelineStage::Mesh, b"mesh metallib", "ms_main"),
+            (PipelineStage::Pixel, b"pixel metallib", "ps_main"),
+        ];
+        let decoded = decode_state(&default_mesh_state(&stages, &[DEFAULT_COLOR_FORMAT]));
+        assert_eq!(decoded.object, None);
+        assert_eq!(decoded.payload_memory_length, 0);
+        assert_eq!(decoded.object_threadgroup, [1, 1, 1]);
+    }
+
+    /// `[Object, Mesh, Pixel]` is the wrong order and is refused explicitly;
+    /// the guest never reorders or drops the stage.
+    #[test]
+    fn a_wrong_object_stage_order_is_refused_explicitly() {
+        let error = pipeline_kind(&[
+            PipelineStage::Object,
+            PipelineStage::Mesh,
+            PipelineStage::Pixel,
+        ])
+        .expect_err("object before mesh is refused");
+        match error {
+            PipelineError::HostCannotRegister {
+                stage: PipelineStage::Object,
+                missing,
+            } => assert!(missing.contains("mesh, object, pixel"), "{missing}"),
+            other => panic!("expected an explicit order refusal, saw {other:?}"),
+        }
     }
 
     #[test]

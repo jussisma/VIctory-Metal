@@ -10,10 +10,11 @@
 //! use (decision 0003).
 //!
 //! shortcut: only vertex or mesh plus pixel pipelines from streams and
-//! compute pipelines get host pipelines; amplification, tessellation and
-//! geometry stages, and the plain graphics description, keep their
-//! containers only. The 32-byte packet after the header stays zero: titles
-//! only copy it inline, which our null command-list limits keep from
+//! compute pipelines get host pipelines; an amplification/object stage is
+//! registered when it is part of a `[mesh, object, pixel]` set (ADR-024a),
+//! while tessellation/geometry stages and the plain graphics description keep
+//! their containers only. The 32-byte packet after the header stays zero:
+//! titles only copy it inline, which our null command-list limits keep from
 //! running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -538,9 +539,12 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// The stages `this` would register with the native host, with their DXIL.
 ///
 /// Only the stages the native pipeline registration understands are listed
-/// (vertex, pixel, mesh, compute); a title pipeline carrying hull, domain,
-/// geometry or amplification stages is a graphics PSO the host cannot register,
-/// which the caller refuses explicitly rather than silently dropping a stage.
+/// (vertex, pixel, mesh, object/amplification, compute); a title pipeline
+/// carrying hull, domain or geometry stages is a graphics PSO the host cannot
+/// register, which the caller refuses explicitly rather than silently dropping
+/// a stage. The amplification/object stage keeps its description position, so
+/// `[mesh, amplification, pixel]` reaches the registration order check instead
+/// of being reordered.
 #[cfg(windows)]
 pub(crate) fn native_stages(this: This) -> Vec<(&'static str, Vec<u8>)> {
     if this.is_null() {
@@ -552,7 +556,7 @@ pub(crate) fn native_stages(this: This) -> Vec<(&'static str, Vec<u8>)> {
         .filter(|shader| {
             matches!(
                 shader.stage,
-                "vertex" | "pixel" | "mesh" | "compute"
+                "vertex" | "pixel" | "mesh" | "amplification" | "compute"
             )
         })
         .map(|shader| {
@@ -607,8 +611,8 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
             .filter(|stage| !stages.iter().any(|(known, _)| known == stage))
             .collect();
         let error = format!(
-            "the native host registers vertex, pixel, mesh and compute stages only; this PSO also \
-             carries {}",
+            "the native host registers vertex, pixel, mesh, object/amplification and compute \
+             stages only; this PSO also carries {}",
             missing.join(", ")
         );
         crate::native_metal::telemetry::note_registration_failure();
