@@ -164,7 +164,7 @@ fn typed_texture_and_sampler_tables_round_trip_the_wire() {
 }
 
 #[test]
-fn a_texture_entry_is_not_a_buffer_range_and_mixed_shapes_are_refused() {
+fn a_texture_entry_is_not_a_buffer_range_and_incompatible_shapes_are_refused() {
     let resolver = NoBufferResolver;
     // A buffer entry in a sampler table.
     assert!(matches!(
@@ -193,8 +193,10 @@ fn a_texture_entry_is_not_a_buffer_range_and_mixed_shapes_are_refused() {
         ),
         Err(ResolveError::Unsupported(_))
     ));
-    // A buffer and a texture in one SRV table: one wire tag cannot carry both.
-    assert!(matches!(
+    // A buffer and a texture in one SRV table are legal: the encoder keeps
+    // both shapes in guest order, so what fails here is the buffer lookup, not
+    // an entry-shape refusal.
+    assert_eq!(
         descriptor_table_typed(
             &resolver,
             0x102,
@@ -209,8 +211,8 @@ fn a_texture_entry_is_not_a_buffer_range_and_mixed_shapes_are_refused() {
                 DescriptorEntry::Texture(TEXTURE0),
             ]
         ),
-        Err(ResolveError::Unsupported(_))
-    ));
+        Err(ResolveError::Unmapped { address: 0, len: 0 })
+    );
     // A zero registered handle is invalid before any submission.
     assert!(matches!(
         descriptor_table_typed(

@@ -181,8 +181,9 @@ pub fn descriptor_increment(kind: DescriptorKind) -> u64 {
 ///
 /// A buffer entry still has to resolve and pin its guest range; a texture or
 /// sampler entry already names a handle the host registered (kind 8 or the
-/// sampler-registration frame). Wire v3 encodes one entry shape per table, so a
-/// run may not mix the three.
+/// sampler-registration frame). Wire v3 tags each entry individually, so one
+/// table may carry buffers and registered resources side by side in guest
+/// order; the table kind still decides which shapes are legal at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorEntry {
     /// A guest buffer range, resolved through [`GuestRangeResolver`].
@@ -300,8 +301,9 @@ pub enum TableRunBoundary {
     /// The next slot held a descriptor this backend cannot express.
     Unresolvable(&'static str),
     /// The next slot held another `kind`: the boundary of the next root
-    /// parameter's table (or a genuinely mixed range, which wire v3 cannot
-    /// carry).
+    /// parameter's table. A table still carries one kind across all its
+    /// entries; only the entry *shape* (buffer range versus registered
+    /// resource) may vary inside it.
     KindChange {
         /// Kind of the slot that ended the run.
         kind: DescriptorKind,
@@ -465,8 +467,8 @@ impl TypedDescriptorTableRun {
 /// the 32-byte view increment. A first slot that is empty, unresolvable or
 /// whose entry shape the kind cannot express is an error. A later slot of the
 /// same kind is included even when its entry shape differs, so
-/// [`descriptor_table_typed`] can refuse the mixed table explicitly instead of
-/// silently binding a prefix.
+/// [`descriptor_table_typed`] can carry a mixed buffer/texture table (the wire
+/// tags every entry) instead of binding a prefix.
 pub fn enumerate_descriptor_table_typed<F>(
     base_handle: u64,
     mut read: F,
@@ -721,19 +723,21 @@ pub fn descriptor_table(
     descriptor_table_typed(resolver, handle, set, base_register, kind, &entries)
 }
 
-/// Resolves and pins one homogeneous descriptor table.
+/// Resolves and pins one descriptor table, keeping each entry's shape.
 ///
 /// `handle` is the D3D12 GPU descriptor handle of the table's first entry; it
 /// is validated (non-zero) but the Wire frame carries the resolved entries, not
 /// the handle. `entries` are the table entries in register order, as the caller
-/// read them from guest descriptor memory.
+/// read them from guest descriptor memory; the encoder never splits, reorders,
+/// truncates or pads them.
 ///
-/// Wire v3 encodes one entry tag per table: all buffers (legacy 32-byte
-/// encoding), all registered texture handles, or all registered sampler
-/// handles. A table that mixes entry shapes, or whose entry shape the reflected
-/// range kind cannot express (a texture in a CBV table, a sampler in a view
-/// table, a buffer in a sampler table), is refused instead of being split,
-/// truncated or written with a guessed tag.
+/// Wire v3 tags every entry individually
+/// (`DESCRIPTOR_ENTRY_TAGGED`, ADR-044), so a table may mix buffer ranges and
+/// registered-resource handles. A table whose entries all share the legacy
+/// shape keeps the old single-tag layout. An entry the reflected range kind
+/// cannot express (a texture in a CBV table, a sampler in a view table, a
+/// buffer in a sampler table) and a zero registered handle stay fatal: those
+/// entries name something the guest could not have bound either.
 pub fn descriptor_table_typed(
     resolver: &dyn GuestRangeResolver,
     handle: u64,
@@ -754,22 +758,11 @@ pub fn descriptor_table_typed(
         ));
     }
 
-    let mut shape: Option<&'static str> = None;
     for entry in entries {
         if !entry.is_compatible_with(kind) {
             return Err(ResolveError::Unsupported(
                 "the descriptor table entry shape does not match the reflected range kind",
             ));
-        }
-        let name = entry.kind_name();
-        match shape {
-            Some(existing) if existing != name => {
-                return Err(ResolveError::Unsupported(
-                    "the descriptor table mixes buffer and registered-resource entries, \
-                     which one v3 entry tag cannot carry",
-                ));
-            }
-            _ => shape = Some(name),
         }
     }
 
@@ -1603,7 +1596,8 @@ mod tests {
             Err(TableRunError::Unsupported(_))
         ));
         // A buffer after a texture in one SRV range is kept, so the typed
-        // encoder can refuse the mixed table instead of binding a prefix.
+        // encoder carries the mixed table in guest order instead of binding a
+        // prefix.
         let run = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
             match ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize {
                 0 => DescriptorSlot::Texture(DescriptorKind::Srv, 0x3000),
@@ -1719,18 +1713,50 @@ mod tests {
             ),
             Err(ResolveError::Unsupported(_))
         ));
-        // A mixed buffer/texture table has no single wire entry tag.
+        // A sampler entry in a view table stays fatal: no root parameter can
+        // carry a sampler beside views.
         assert!(matches!(
             descriptor_table_typed(
                 &resolver,
-                0x302,
+                0x304,
                 0,
                 0,
                 DescriptorKind::Srv,
-                &[buffer, DescriptorEntry::Texture(0x3000)]
+                &[DescriptorEntry::Sampler(0x5300_0000_0000_0042)]
             ),
             Err(ResolveError::Unsupported(_))
         ));
+        // A mixed buffer/texture table is legal now: the wire tags each entry,
+        // so both shapes are kept in guest order and only the buffer pins.
+        let mixed = descriptor_table_typed(
+            &resolver,
+            0x302,
+            3,
+            7,
+            DescriptorKind::Srv,
+            &[buffer, DescriptorEntry::Texture(0x3000)],
+        )
+        .expect("a mixed buffer/texture table");
+        let (mixed_table, mixed_tokens) = mixed.into_parts();
+        assert_eq!((mixed_table.set, mixed_table.base_register), (3, 7));
+        assert_eq!(mixed_table.kind, DescriptorKind::Srv);
+        assert_eq!(
+            mixed_table.bindings,
+            vec![
+                DescriptorTableEntryV3::Buffer(BufferBinding {
+                    allocation_id: 7,
+                    generation: 1,
+                    offset: 0,
+                    length: 16,
+                }),
+                DescriptorTableEntryV3::Texture(0x3000),
+            ],
+            "the mixed table keeps the guest's order and kinds"
+        );
+        assert_eq!(mixed_tokens.len(), 1, "only the buffer entry pins a range");
+        assert_eq!(resolver.live(), 1);
+        retire_all(&resolver, &mixed_tokens);
+        assert_eq!(resolver.live(), 0, "the mixed table's pin was released");
         // A zero registered handle is refused before any submission.
         assert!(matches!(
             descriptor_table_typed(
@@ -1798,5 +1824,96 @@ mod tests {
         assert_eq!(descriptor_increment(DescriptorKind::Srv), 32);
         assert_eq!(descriptor_increment(DescriptorKind::Uav), 32);
         assert_eq!(descriptor_increment(DescriptorKind::Sampler), 16);
+    }
+
+    #[test]
+    fn a_mixed_buffer_and_texture_table_round_trips_in_guest_order() {
+        use victory_metal::wire_v3::{
+            CommandV3, SubmissionV3, decode_submission_v3, encode_submission_v3,
+        };
+
+        let resolver = FakeResolver::new();
+        let page = resolver.page_address(0);
+        let entries = [
+            DescriptorEntry::Buffer(GuestBinding {
+                address: page + 0x40,
+                len: 0x80,
+            }),
+            DescriptorEntry::Texture(0x3000),
+            DescriptorEntry::Buffer(GuestBinding {
+                address: page,
+                len: 16,
+            }),
+            DescriptorEntry::Texture(0x3001),
+        ];
+        let resolved =
+            descriptor_table_typed(&resolver, 0x200, 4, 2, DescriptorKind::Srv, &entries)
+                .expect("a mixed buffer+texture table");
+        let (table, tokens) = resolved.into_parts();
+        assert_eq!((table.set, table.base_register), (4, 2));
+        assert_eq!(table.kind, DescriptorKind::Srv);
+        assert_eq!(
+            table.bindings,
+            vec![
+                DescriptorTableEntryV3::Buffer(BufferBinding {
+                    allocation_id: 7,
+                    generation: 1,
+                    offset: 0x40,
+                    length: 0x80,
+                }),
+                DescriptorTableEntryV3::Texture(0x3000),
+                DescriptorTableEntryV3::Buffer(BufferBinding {
+                    allocation_id: 7,
+                    generation: 1,
+                    offset: 0,
+                    length: 16,
+                }),
+                DescriptorTableEntryV3::Texture(0x3001),
+            ],
+            "no entry is split, reordered, truncated or padded"
+        );
+        assert_eq!(tokens.len(), 2, "one pin per buffer entry");
+        assert_eq!(resolver.live(), 2);
+
+        let submission = SubmissionV3 {
+            sequence: 1,
+            list: None,
+            commands: vec![CommandV3::SetDescriptorTable(table)],
+        };
+        let frame = encode_submission_v3(&submission).expect("the mixed table encodes");
+        assert_eq!(
+            decode_submission_v3(&frame).expect("the mixed table decodes"),
+            submission,
+            "the wire round trip keeps every entry and its shape"
+        );
+
+        retire_all(&resolver, &tokens);
+        assert_eq!(resolver.live(), 0);
+    }
+
+    #[test]
+    fn a_mixed_table_retires_earlier_pins_when_a_later_entry_is_refused() {
+        let resolver = FakeResolver::new();
+        let page = resolver.page_address(0);
+        let entries = [
+            DescriptorEntry::Buffer(GuestBinding {
+                address: page,
+                len: 16,
+            }),
+            DescriptorEntry::Texture(0x3000),
+            DescriptorEntry::Buffer(GuestBinding {
+                address: page,
+                len: 16,
+            }),
+            DescriptorEntry::Texture(0),
+        ];
+        assert_eq!(
+            descriptor_table_typed(&resolver, 0x400, 0, 0, DescriptorKind::Uav, &entries),
+            Err(ResolveError::Invalid(
+                "a texture table entry's registered handle is zero"
+            ))
+        );
+        assert_eq!(resolver.live(), 0, "both buffer pins were released");
+        assert_eq!(resolver.retires.load(Ordering::Relaxed), 2);
     }
 }
