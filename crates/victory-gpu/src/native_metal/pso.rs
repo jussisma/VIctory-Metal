@@ -1522,30 +1522,84 @@ fn container_entry_point(container: &[u8]) -> Option<String> {
     None
 }
 
-/// The `Program` kind the container's `DXIL` part declares, if its program
-/// header can be read.
+/// The readable numbers of a container's `DXIL` program header.
 ///
 /// A real container's `DXIL` part is a [`victory_shader::DxilProgram`] header
 /// followed by the bitcode, but producers differ in what sits between the
 /// header and the bitcode (a 20-byte digest in newer containers, none in older
 /// ones, Xbox `XDAT` tables in console containers). Only the header is needed
-/// to learn the stage: kind/SM, size in dwords, and the inner `DXIL` magic.
-/// Bitcode well-formedness is deliberately not checked here — the converter is
-/// the authority and answers a named error now that each job is isolated.
-fn dxil_program_kind(container: &[u8]) -> Option<u16> {
+/// to learn the stage and the shader model: kind/SM in the version dword, the
+/// program size in dwords at offset 4, and the bitcode offset/size at 16/20
+/// (both relative to the `DXIL` magic at offset 8). Bitcode well-formedness is
+/// deliberately not checked here — the converter is the authority and answers
+/// a named error now that each job is isolated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DxilHeader {
+    /// The container's own program kind (pixel 0, vertex 1, compute 5,
+    /// mesh 13, amplification 14).
+    kind: u16,
+    /// Shader model major (6 for every DXIL container).
+    major: u8,
+    /// Shader model minor (0, 5, 6, 7, 8, ...).
+    minor: u8,
+    /// The header's bitcode offset, relative to the `DXIL` magic at byte 8.
+    bitcode_offset: u32,
+    /// The header's bitcode size.
+    bitcode_size: u32,
+}
+
+impl DxilHeader {
+    /// Reads the header fields whose bounds are the 24-byte header itself.
+    ///
+    /// This is the census view: it reports the numbers even when the program
+    /// size dword disagrees with the part, because that disagreement is itself
+    /// worth seeing. Validation uses [`Self::checked`].
+    fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 24 || data.get(8..12) != Some(b"DXIL") {
+            return None;
+        }
+        let version = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+        Some(Self {
+            kind: (version >> 16) as u16,
+            major: ((version >> 4) & 0xF) as u8,
+            minor: (version & 0xF) as u8,
+            bitcode_offset: u32::from_le_bytes(data.get(16..20)?.try_into().ok()?),
+            bitcode_size: u32::from_le_bytes(data.get(20..24)?.try_into().ok()?),
+        })
+    }
+
+    /// Reads the header only when its program-size dword agrees with the part.
+    ///
+    /// The stage is derived from a header the converter would also accept as
+    /// bounded; a size that is below the header or past the part means the
+    /// header itself cannot be trusted.
+    fn checked(data: &[u8]) -> Option<Self> {
+        let header = Self::parse(data)?;
+        let size = usize::try_from(u32::from_le_bytes(data.get(4..8)?.try_into().ok()?))
+            .ok()?
+            .checked_mul(4)?;
+        if size < 24 || size > data.len() {
+            return None;
+        }
+        Some(header)
+    }
+
+    /// `kind (Name), SM major.minor`, the bounded form used in refusals.
+    fn summary(self) -> String {
+        format!(
+            "kind {} ({}, SM {}.{})",
+            self.kind,
+            shader_kind_name(self.kind),
+            self.major,
+            self.minor
+        )
+    }
+}
+
+/// The checked `DXIL` program header of a container, if it can be read.
+fn dxil_header(container: &[u8]) -> Option<DxilHeader> {
     let parsed = victory_shader::Container::parse(container).ok()?;
-    let data = parsed.part(victory_shader::FourCC::DXIL)?.data;
-    if data.len() < 24 || data.get(8..12) != Some(b"DXIL") {
-        return None;
-    }
-    let size = usize::try_from(u32::from_le_bytes(data.get(4..8)?.try_into().ok()?))
-        .ok()?
-        .checked_mul(4)?;
-    if size < 24 || size > data.len() {
-        return None;
-    }
-    let version = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
-    Some((version >> 16) as u16)
+    DxilHeader::checked(parsed.part(victory_shader::FourCC::DXIL)?.data)
 }
 
 /// The `Program` kind name of a raw kind code, for refusal reasons.
@@ -1571,6 +1625,145 @@ fn shader_kind_name(raw: u16) -> String {
         other => ShaderKind::Unknown(other),
     };
     format!("{kind:?}")
+}
+
+/// Opt-in structural census of the shader containers the guest validates.
+///
+/// Set `VICTORY_METAL_PART_CENSUS=1` to log one line per distinct container:
+/// its size bucket, its part fourccs with part sizes (at most
+/// [`MAX_CENSUS_PARTS`]) and, for a `DXIL` part, the program kind, shader-model
+/// major/minor and bitcode offset/size from the program header. The line never
+/// carries shader bytes, entry-point names or paths, so it is safe in a devlog.
+/// Off by default: a normal boot logs nothing here.
+pub const PART_CENSUS_ENV: &str = "VICTORY_METAL_PART_CENSUS";
+
+/// Most parts named in one census line; the rest are reported as a count.
+pub const MAX_CENSUS_PARTS: usize = 12;
+
+/// Most distinct containers one process censuses before it stops emitting.
+///
+/// The bound keeps a title with thousands of shaders from flooding a boot log
+/// and keeps the dedup memory fixed; a single truncation line states the cut.
+const MAX_CENSUS_CONTAINERS: usize = 256;
+
+/// The content hashes already censused, and whether the bound was reported.
+struct PartCensusState {
+    seen: Vec<[u8; 32]>,
+    truncated: bool,
+}
+
+static PART_CENSUS: Mutex<PartCensusState> = Mutex::new(PartCensusState {
+    seen: Vec::new(),
+    truncated: false,
+});
+
+/// Whether the opt-in part census is enabled (`VICTORY_METAL_PART_CENSUS=1`).
+fn part_census_enabled() -> bool {
+    std::env::var_os(PART_CENSUS_ENV).is_some_and(|value| value.to_str() == Some("1"))
+}
+
+/// The power-of-two upper bound of a container size, as `<=N KiB`.
+///
+/// A bucket, not the exact size: the census answers "which scale of container"
+/// without printing a byte length that could fingerprint an asset.
+fn container_size_bucket(bytes: usize) -> String {
+    let mut bound = 1024usize;
+    while bytes > bound && bound < (1 << 40) {
+        bound <<= 1;
+    }
+    format!("<={}KiB", bound / 1024)
+}
+
+/// The census line of one container, or `None` if it is not a `DXBC` container.
+///
+/// The returned hash is the full BLAKE3 content hash (the caller dedups on it);
+/// the line prints only its first 16 hex characters. Fields are bounded: at
+/// most [`MAX_CENSUS_PARTS`] parts, each fourcc (4 printable bytes) and a
+/// decimal size, then one `DXIL` header (five small integers). No part data,
+/// entry-point text or path is ever included.
+fn part_census_line(container: &[u8]) -> Option<([u8; 32], String)> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let digest = blake3::hash(container);
+    let hash = *digest.as_bytes();
+    let hex = digest.to_hex();
+    let short = &hex.as_str()[..16];
+    let mut line = format!(
+        "shader container census hash={short} size_bucket={} parts={} [",
+        container_size_bucket(container.len()),
+        parsed.parts.len()
+    );
+    for (index, part) in parsed.parts.iter().take(MAX_CENSUS_PARTS).enumerate() {
+        if index > 0 {
+            line.push(' ');
+        }
+        line.push_str(&format!("{}:{}", part.fourcc, part.data.len()));
+    }
+    if parsed.parts.len() > MAX_CENSUS_PARTS {
+        line.push_str(&format!(" +{} more", parsed.parts.len() - MAX_CENSUS_PARTS));
+    }
+    line.push(']');
+    match parsed
+        .part(victory_shader::FourCC::DXIL)
+        .and_then(|part| DxilHeader::parse(part.data))
+    {
+        Some(header) => line.push_str(&format!(
+            " dxil=kind:{}({}) sm:{}.{} bitcode_offset:{} bitcode_size:{}",
+            header.kind,
+            shader_kind_name(header.kind),
+            header.major,
+            header.minor,
+            header.bitcode_offset,
+            header.bitcode_size
+        )),
+        None => line.push_str(" dxil=none"),
+    }
+    Some((hash, line))
+}
+
+/// Logs the census of `container` once per distinct content, when enabled.
+///
+/// Returns the emitted line (for tests); `None` when the census is off, the
+/// bytes are not a `DXBC` container, this content was already censused, or the
+/// [`MAX_CENSUS_CONTAINERS`] bound was reached. The bound reports itself once.
+fn note_part_census(container: &[u8]) -> Option<String> {
+    if !part_census_enabled() {
+        return None;
+    }
+    let (hash, line) = part_census_line(container)?;
+    {
+        let mut state = PART_CENSUS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.seen.contains(&hash) {
+            return None;
+        }
+        if state.seen.len() >= MAX_CENSUS_CONTAINERS {
+            if state.truncated {
+                return None;
+            }
+            state.truncated = true;
+            drop(state);
+            tracing::info!(
+                target: "victory_pso_census",
+                "shader container census truncated at {MAX_CENSUS_CONTAINERS} distinct containers"
+            );
+            return None;
+        }
+        state.seen.push(hash);
+    }
+    tracing::info!(target: "victory_pso_census", "{}", line);
+    Some(line)
+}
+
+/// Forgets the censused containers (tests only: a process censuses once).
+#[cfg(test)]
+pub(crate) fn reset_part_census() {
+    *PART_CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = PartCensusState {
+        seen: Vec::new(),
+        truncated: false,
+    };
 }
 
 /// Validates `container` as the complete shader container of `stage`.
@@ -1609,30 +1802,35 @@ fn checked_stage_container(
     // here; the bitcode that follows is the converter's to judge.
     let parsed = victory_shader::Container::parse(container)
         .map_err(|error| PipelineError::Container(format!("{}: {error}", stage.label())))?;
+    // Opt-in telemetry: the structural facts of every container this path
+    // validates, so a converter refusal can be read as "kind X, SM Y".
+    note_part_census(container);
     parsed
         .part(victory_shader::FourCC::DXIL)
         .ok_or(PipelineError::NoDxil(stage.label()))?;
 
-    let declared = dxil_program_kind(container);
+    let header = dxil_header(container);
+    let declared = header.map(|header| header.kind);
     let psv = psv0_stage(container);
     let expected = raw_shader_kind(stage.dxil_kind());
-    if let Some(declared) = declared
-        && declared != expected
+    if let Some(header) = header
+        && header.kind != expected
     {
         return Err(PipelineError::Container(format!(
-            "the {} stage's container declares a {} program, not a {} one",
+            "the {} stage's container declares {}, not a {} program",
             stage.label(),
-            shader_kind_name(declared),
+            header.summary(),
             shader_kind_name(expected)
         )));
     }
-    if let (Some(declared), Some(psv)) = (declared, psv)
-        && declared != psv
+    if let (Some(header), Some(psv)) = (header, psv)
+        && header.kind != psv
     {
         return Err(PipelineError::Container(format!(
-            "the {} stage's container Program part (kind {declared}) disagrees with its PSV0 \
-             stage byte ({psv})",
-            stage.label()
+            "the {} stage's container Program part ({}) disagrees with its PSV0 stage byte \
+             ({psv})",
+            stage.label(),
+            header.summary()
         )));
     }
     if let Some(psv) = psv
@@ -3737,12 +3935,165 @@ mod tests {
         }
     }
 
+    /// The opt-in census names the size bucket, every part (capped) and the
+    /// `DXIL` header's kind, shader model and bitcode offset/size. The exact
+    /// line is asserted, so the Boot #20 format is pinned here.
+    #[test]
+    fn a_synthetic_container_yields_the_expected_census_line() {
+        use victory_shader::FourCC;
+
+        let container = dxbc_container(&[
+            (FourCC::ISG1, &[0u8; 40]),
+            (FourCC::DXIL, &dxil_part_sm(13, 6, 8)),
+        ]);
+        let (hash, line) = part_census_line(&container).expect("a DXBC container is censused");
+        assert_eq!(hash, *blake3::hash(&container).as_bytes());
+        let expected = format!(
+            "shader container census hash={} size_bucket=<=1KiB parts=2 [ISG1:40 DXIL:32] \
+             dxil=kind:13(Mesh) sm:6.8 bitcode_offset:16 bitcode_size:8",
+            &blake3::hash(&container).to_hex().as_str()[..16]
+        );
+        assert_eq!(line, expected);
+        assert!(line.is_ascii(), "one printable line: {line}");
+        assert!(!line.contains('\n'), "a census line never wraps: {line}");
+    }
+
+    /// Thirteen parts produce twelve named parts plus a remainder count; the
+    /// line stays bounded instead of listing every part of a large container.
+    #[test]
+    fn the_census_names_at_most_twelve_parts() {
+        use victory_shader::FourCC;
+
+        let bodies: Vec<[u8; 4]> = (0..13).map(|index| [index as u8; 4]).collect();
+        let parts: Vec<(FourCC, &[u8])> = bodies
+            .iter()
+            .map(|body| (FourCC::ISG1, body.as_slice()))
+            .collect();
+        let container = dxbc_container(&parts);
+        let (_, line) = part_census_line(&container).expect("a DXBC container is censused");
+        assert!(line.contains("parts=13"), "{line}");
+        assert_eq!(
+            line.matches("ISG1:").count(),
+            MAX_CENSUS_PARTS,
+            "the list is capped at {MAX_CENSUS_PARTS} parts: {line}"
+        );
+        assert!(line.contains("+1 more"), "{line}");
+    }
+
+    /// The census is off by default, enabled only by the literal `1`, and a
+    /// container's content is censused once even when it is validated again.
+    #[test]
+    fn the_part_census_is_silent_until_enabled_and_censuses_each_container_once() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os(PART_CENSUS_ENV);
+        reset_part_census();
+        let first = dxbc_container(&[(victory_shader::FourCC::DXIL, &dxil_part(5))]);
+        let second = dxbc_container(&[(victory_shader::FourCC::DXIL, &dxil_part(1))]);
+
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::remove_var(PART_CENSUS_ENV);
+        }
+        assert_eq!(note_part_census(&first), None, "the census defaults to off");
+
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var(PART_CENSUS_ENV, "0");
+        }
+        assert_eq!(
+            note_part_census(&first),
+            None,
+            "only the literal `1` enables it"
+        );
+
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var(PART_CENSUS_ENV, "1");
+        }
+        assert!(
+            note_part_census(&first).is_some(),
+            "an enabled census names a new container"
+        );
+        assert!(
+            note_part_census(&second).is_some(),
+            "each distinct content is censused"
+        );
+        assert_eq!(
+            note_part_census(&first),
+            None,
+            "the same content is never censused twice"
+        );
+
+        // The validation path itself censuses: a container censused by
+        // `stage_program` is already known here.
+        reset_part_census();
+        let via_validation = dxbc_container(&[(victory_shader::FourCC::DXIL, &dxil_part(1))]);
+        stage_program(PipelineStage::Vertex, &via_validation).expect("a valid vertex container");
+        assert_eq!(
+            note_part_census(&via_validation),
+            None,
+            "checked_stage_container emits the census"
+        );
+
+        // SAFETY: as above; restore whatever the harness started with.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(PART_CENSUS_ENV, value),
+                None => std::env::remove_var(PART_CENSUS_ENV),
+            }
+        }
+    }
+
+    /// A stage mismatch explains itself with the container's own numbers: the
+    /// program kind and shader model reach `pipeline_first_refusal_reason`,
+    /// bounded to [`MAX_REFUSAL_REASON_BYTES`].
+    #[test]
+    fn a_stage_mismatch_names_the_program_kind_and_shader_model() {
+        use victory_shader::FourCC;
+
+        let container = dxbc_container(&[(FourCC::DXIL, &dxil_part_sm(13, 6, 8))]);
+        match stage_program(PipelineStage::Vertex, &container) {
+            Err(error @ PipelineError::Container(_)) => {
+                let reason = error.to_string();
+                assert!(reason.contains("vertex"), "{reason}");
+                assert!(reason.contains("kind 13"), "{reason}");
+                assert!(reason.contains("SM 6.8"), "{reason}");
+                assert!(reason.contains("Vertex"), "{reason}");
+                assert!(bounded_refusal_reason(&reason).len() <= MAX_REFUSAL_REASON_BYTES);
+            }
+            other => panic!("a mesh container as a vertex stage must be refused, saw {other:?}"),
+        }
+
+        // The Program/PSV0 disagreement keeps the SM too.
+        let psv = psv0_part(5, 0, b"\0");
+        let container = dxbc_container(&[
+            (FourCC::DXIL, &dxil_part_sm(13, 6, 8)),
+            (FourCC::PSV0, &psv),
+        ]);
+        match stage_program(PipelineStage::Mesh, &container) {
+            Err(error @ PipelineError::Container(_)) => {
+                let reason = error.to_string();
+                assert!(reason.contains("SM 6.8"), "{reason}");
+                assert!(reason.contains("disagrees"), "{reason}");
+                assert!(bounded_refusal_reason(&reason).len() <= MAX_REFUSAL_REASON_BYTES);
+            }
+            other => panic!("a disagreed PSV0 stage must be refused, saw {other:?}"),
+        }
+    }
+
     /// A minimal standard-layout `DXIL` part for one container `Program` kind.
     fn dxil_part(kind: u16) -> Vec<u8> {
+        dxil_part_sm(kind, 6, 0)
+    }
+
+    /// A minimal standard-layout `DXIL` part for one `Program` kind and shader
+    /// model.
+    fn dxil_part_sm(kind: u16, major: u8, minor: u8) -> Vec<u8> {
         let bitcode = [0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0];
         let size_dwords = (24 + bitcode.len()) / 4;
         let mut part = Vec::with_capacity(24 + bitcode.len());
-        part.extend_from_slice(&((u32::from(kind) << 16) | 0x0060).to_le_bytes());
+        let version = (u32::from(kind) << 16) | (u32::from(major) << 4) | u32::from(minor);
+        part.extend_from_slice(&version.to_le_bytes());
         part.extend_from_slice(&(size_dwords as u32).to_le_bytes());
         part.extend_from_slice(b"DXIL");
         part.extend_from_slice(&0x100u32.to_le_bytes());
