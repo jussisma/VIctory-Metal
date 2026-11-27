@@ -612,6 +612,105 @@ pub fn register_surface(surface_id: u64, texture_id: u64) -> Result<bool, Native
     client.register_surface(surface_id, texture_id)
 }
 
+/// Registers one guest host-visible allocation with the host (kind 2).
+///
+/// `byte_len` is the whole share file the allocation id names (the guest reads
+/// it from `<share dir>/{id:016x}.bin`), never a page window or a resource
+/// length. A configured endpoint connects on first use; an id the session
+/// already registered is `Ok(true)` without a frame (aliases and placed
+/// resources share the first descriptor), and a refused registration is an
+/// explicit error the caller turns into a structured HRESULT.
+#[cfg(any(windows, test))]
+pub fn register_buffer(allocation_id: u64, byte_len: u64) -> Result<bool, NativeQueueError> {
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    client.register_allocation(allocation_id, byte_len)
+}
+
+/// Whether a live session registered `allocation_id` with the host.
+///
+/// `false` means the range may not be named in a submission yet: the host
+/// validates every binding against its kind 2 registry. No session is `false`.
+#[cfg(any(windows, test))]
+pub fn allocation_registered(allocation_id: u64) -> bool {
+    match LiveConfig::from_env() {
+        Some(Ok(_)) => native_queue()
+            .sink()
+            .client()
+            .is_some_and(|client| client.allocation_registered(allocation_id)),
+        _ => false,
+    }
+}
+
+/// Makes sure the host has `allocation_id` registered, registering it when it
+/// is new (idempotent).
+///
+/// The id comes from the `GuestRangeResolver` seam and the length from the
+/// share file that id names; nothing is fabricated. Allocations that already
+/// exist at or below the requested id are registered first, ascending, because
+/// the host refuses (and closes the session on) a kind 2 id that does not
+/// increase.
+#[cfg(any(windows, test))]
+pub fn ensure_allocation(allocation_id: u64) -> Result<bool, NativeQueueError> {
+    if allocation_id == 0 {
+        return Err(NativeQueueError::Refused(
+            "a buffer registration needs a nonzero allocation id".to_string(),
+        ));
+    }
+    if allocation_registered(allocation_id) {
+        return Ok(true);
+    }
+    let pending = crate::native_metal::pso::shares_up_to(allocation_id)
+        .map_err(NativeQueueError::Refused)?;
+    if !pending.iter().any(|(id, _)| *id == allocation_id) {
+        return Err(NativeQueueError::Refused(format!(
+            "allocation {allocation_id} has no share file in the session's share directory"
+        )));
+    }
+    for (id, byte_len) in pending {
+        register_buffer(id, byte_len)?;
+    }
+    Ok(true)
+}
+
+/// Registers a translated metallib as a native pipeline (kind 4/129).
+///
+/// The bytes are written to `<share dir>/{ticket:016x}.metallib` (temporary
+/// name, then rename, so the host never reads a half-written library) and the
+/// ticket plus entry name go over the wire; the host answers with its native
+/// pipeline id. A configured endpoint connects on first use. Nothing here
+/// reads a resource directory or guesses a ticket: the ticket is the live
+/// session's own next one, and the write path is the launcher's share
+/// directory.
+#[cfg(any(windows, test))]
+pub fn register_pipeline(metallib: &[u8], entry: &str) -> Result<u64, NativeQueueError> {
+    if metallib.is_empty() {
+        return Err(NativeQueueError::Refused(
+            "pipeline registration needs a nonempty metallib".to_string(),
+        ));
+    }
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    let ticket = client.next_pipeline_ticket();
+    let path = crate::native_metal::pso::metallib_path(ticket).ok_or_else(|| {
+        NativeQueueError::Refused(
+            "pipeline registration needs VICTORY_METAL_SHARE_DIR for the host's metallib file"
+                .to_string(),
+        )
+    })?;
+    crate::native_metal::pso::write_metallib(&path, metallib)
+        .map_err(NativeQueueError::Transport)?;
+    client.register_pipeline(ticket, entry)
+}
+
 /// Connects the session queue from the environment exactly once per process.
 ///
 /// Device creation calls this under `VICTORY_BACKEND=metal`. The result is

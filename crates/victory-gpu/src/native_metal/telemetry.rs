@@ -154,6 +154,16 @@ pub struct FrameTelemetry {
     presents_refused: AtomicU64,
     /// Unsupported producer calls, by the wire opcode they needed.
     refusals: Mutex<BTreeMap<u16, u64>>,
+    /// Host allocation registrations the host accepted (kind 2).
+    buffers_registered: AtomicU64,
+    /// Pipeline registrations the host accepted (kind 4/129).
+    psos_registered: AtomicU64,
+    /// PSO translations a `--stdio` pool worker ran (cold).
+    pool_cold: AtomicU64,
+    /// PSO translations the pool's disk cache served (warm).
+    pool_warm: AtomicU64,
+    /// Buffer or pipeline registrations that failed explicitly.
+    registration_failures: AtomicU64,
 }
 
 impl FrameTelemetry {
@@ -327,6 +337,52 @@ impl FrameTelemetry {
         self.presents_refused.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One buffer registration the host accepted (kind 2).
+    pub fn note_buffer_registered(&self) {
+        self.buffers_registered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One PSO registration the host accepted (kind 4/129).
+    pub fn note_pso_registered(&self) {
+        self.psos_registered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One PSO translation a pool worker ran (a cold translation).
+    pub fn note_pool_cold(&self) {
+        self.pool_cold.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One PSO translation the pool's disk cache served (a warm translation).
+    pub fn note_pool_warm(&self) {
+        self.pool_warm.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One buffer or pipeline registration that failed explicitly.
+    pub fn note_registration_failure(&self) {
+        self.registration_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accepted buffer and PSO registrations.
+    pub fn registration_counts(&self) -> (u64, u64) {
+        (
+            self.buffers_registered.load(Ordering::Relaxed),
+            self.psos_registered.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Cold (worker) and warm (cache) pool translations.
+    pub fn pool_translations(&self) -> (u64, u64) {
+        (
+            self.pool_cold.load(Ordering::Relaxed),
+            self.pool_warm.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Registration failures counted so far.
+    pub fn registration_failures(&self) -> u64 {
+        self.registration_failures.load(Ordering::Relaxed)
+    }
+
     /// Successful and refused native submission batches.
     pub fn submit_counts(&self) -> (u64, u64) {
         (
@@ -369,6 +425,11 @@ impl FrameTelemetry {
             submits_refused,
             presents_ok,
             presents_refused,
+            buffers_registered: self.buffers_registered.load(Ordering::Relaxed),
+            psos_registered: self.psos_registered.load(Ordering::Relaxed),
+            pool_cold: self.pool_cold.load(Ordering::Relaxed),
+            pool_warm: self.pool_warm.load(Ordering::Relaxed),
+            registration_failures: self.registration_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -436,6 +497,16 @@ pub struct TelemetrySnapshot {
     pub presents_ok: u64,
     /// Frames the native present path refused.
     pub presents_refused: u64,
+    /// Host buffer registrations the host accepted (kind 2).
+    pub buffers_registered: u64,
+    /// PSO registrations the host accepted (kind 4/129).
+    pub psos_registered: u64,
+    /// PSO translations a pool worker ran (cold).
+    pub pool_cold: u64,
+    /// PSO translations the pool's disk cache served (warm).
+    pub pool_warm: u64,
+    /// Buffer or pipeline registrations that failed explicitly.
+    pub registration_failures: u64,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -456,6 +527,15 @@ impl std::fmt::Display for TelemetrySnapshot {
             f,
             ", submits={}/{} ok/refused, presents={}/{} ok/refused",
             self.submits_ok, self.submits_refused, self.presents_ok, self.presents_refused
+        )?;
+        write!(
+            f,
+            ", registered={} buffers/{} psos, pool={} cold/{} warm, registration_failures={}",
+            self.buffers_registered,
+            self.psos_registered,
+            self.pool_cold,
+            self.pool_warm,
+            self.registration_failures
         )?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))
@@ -536,6 +616,46 @@ pub fn unsupported_opcode_histogram() -> BTreeMap<u16, u64> {
 /// The process-wide hard D3DMetal fallback count.
 pub fn d3dmetal_fallback_count() -> u64 {
     global().d3dmetal_fallback_count()
+}
+
+/// One buffer registration the host accepted (kind 2).
+pub fn note_buffer_registered() {
+    global().note_buffer_registered();
+}
+
+/// One PSO registration the host accepted (kind 4/129).
+pub fn note_pso_registered() {
+    global().note_pso_registered();
+}
+
+/// One cold (worker) PSO translation.
+pub fn note_pool_cold() {
+    global().note_pool_cold();
+}
+
+/// One warm (disk-cache) PSO translation.
+pub fn note_pool_warm() {
+    global().note_pool_warm();
+}
+
+/// One buffer or pipeline registration that failed explicitly.
+pub fn note_registration_failure() {
+    global().note_registration_failure();
+}
+
+/// The process-wide accepted buffer and PSO registration counts.
+pub fn registration_counts() -> (u64, u64) {
+    global().registration_counts()
+}
+
+/// The process-wide cold/warm pool translation counts.
+pub fn pool_translations() -> (u64, u64) {
+    global().pool_translations()
+}
+
+/// The process-wide registration failure count.
+pub fn registration_failures() -> u64 {
+    global().registration_failures()
 }
 
 /// Declares one D3DMetal fallback in the process-wide telemetry.

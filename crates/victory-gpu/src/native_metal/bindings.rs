@@ -30,8 +30,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use victory_metal::wire::BufferBinding;
 use victory_metal::wire_v3::{
-    DescriptorKind, DescriptorTableV3, MAX_DESCRIPTOR_BINDINGS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
-    RootBufferView, RootConstantsV3,
+    DescriptorKind, DescriptorTableV3, IndexBufferBinding, IndexFormat, MAX_DESCRIPTOR_BINDINGS_V3,
+    MAX_ROOT_CONSTANT_BYTES_V3, RootBufferView, RootConstantsV3, VertexBuffer,
 };
 use victory_metal::wire::MAX_RESOURCE_LEN;
 
@@ -189,6 +189,21 @@ fn checked_range(range: &GuestRange) -> Result<(), ResolveError> {
     if !range.size.is_multiple_of(PAGE) {
         return Err(ResolveError::Invalid(
             "the backing window is not a whole number of share pages",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a generation the host's kind 2 registry does not carry.
+///
+/// The host registers every allocation as generation 1
+/// (`victory_metal::guest_ipc::REGISTRATION_GENERATION`) and validates every
+/// binding against it, so a range the provider reports with another generation
+/// is refused here instead of producing a submission the host must reject.
+fn check_generation(range: &GuestRange) -> Result<(), ResolveError> {
+    if range.generation != victory_metal::guest_ipc::REGISTRATION_GENERATION {
+        return Err(ResolveError::Unsupported(
+            "the range's allocation generation is not the host's kind 2 generation",
         ));
     }
     Ok(())
@@ -402,6 +417,85 @@ pub fn root_constants(slot: u16, bytes: &[u8]) -> Result<RootConstantsV3, Resolv
     Ok(RootConstantsV3 {
         slot,
         bytes: bytes.to_vec(),
+    })
+}
+
+/// Resolves and pins one D3D12 vertex-buffer view (`IASetVertexBuffers`).
+///
+/// The title passes the GPU virtual address of the first element and the byte
+/// length visible to the shader; the Wire v3 binding carries the share
+/// allocation, the exact in-allocation offset and that length, so the host can
+/// validate the range against its kind 2 registration. The allocation id and
+/// generation come from the resolver, never from the address.
+pub fn vertex_buffer(
+    resolver: &dyn GuestRangeResolver,
+    address: u64,
+    len: u64,
+    stride: u32,
+) -> Result<Resolved<VertexBuffer>, ResolveError> {
+    if address == 0 {
+        return Err(ResolveError::Invalid("the vertex buffer address is zero"));
+    }
+    if len == 0 {
+        return Err(ResolveError::Invalid("the vertex buffer length is zero"));
+    }
+    if stride == 0 {
+        return Err(ResolveError::Invalid("the vertex buffer stride is zero"));
+    }
+    if len > MAX_RESOURCE_LEN {
+        return Err(ResolveError::Unsupported("the vertex buffer is too large"));
+    }
+    let range = resolver.resolve(address, len)?;
+    checked_range(&range)?;
+    check_generation(&range)?;
+    let offset = binding_offset(&range, address, len)?;
+    let token = resolver.retain(&range)?;
+    Ok(Resolved {
+        entry: VertexBuffer {
+            allocation_id: range.allocation_id,
+            generation: range.generation,
+            offset,
+            stride,
+            length: len,
+        },
+        tokens: vec![token],
+    })
+}
+
+/// Resolves and pins one D3D12 index-buffer view (`IASetIndexBuffer`).
+///
+/// `format` is the wire's element width, converted by the caller from the DXGI
+/// format number; a range the title names but the backing window does not cover
+/// is an explicit error, never a clamped binding.
+pub fn index_buffer(
+    resolver: &dyn GuestRangeResolver,
+    address: u64,
+    len: u64,
+    format: IndexFormat,
+) -> Result<Resolved<IndexBufferBinding>, ResolveError> {
+    if address == 0 {
+        return Err(ResolveError::Invalid("the index buffer address is zero"));
+    }
+    if len == 0 {
+        return Err(ResolveError::Invalid("the index buffer length is zero"));
+    }
+    if len > MAX_RESOURCE_LEN {
+        return Err(ResolveError::Unsupported("the index buffer is too large"));
+    }
+    let range = resolver.resolve(address, len)?;
+    checked_range(&range)?;
+    check_generation(&range)?;
+    let offset = binding_offset(&range, address, len)?;
+    let token = resolver.retain(&range)?;
+    Ok(Resolved {
+        entry: IndexBufferBinding {
+            allocation_id: range.allocation_id,
+            generation: range.generation,
+            offset,
+            length: len,
+            format,
+        },
+        tokens: vec![token],
     })
 }
 

@@ -491,6 +491,12 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// The native host pipeline this PSO registered, registered on first use.
+    /// `None`: not asked for yet; `Some(Ok(id))`: the host's pipeline id;
+    /// `Some(Err(why))`: the explicit reason registration failed (the list
+    /// refuses the bind rather than naming a pointer the host cannot resolve).
+    #[cfg(windows)]
+    native: std::sync::Mutex<Option<Result<u64, String>>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -527,6 +533,130 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// The stages `this` would register with the native host, with their DXIL.
+///
+/// Only the stages the native pipeline registration understands are listed
+/// (vertex, pixel, mesh, compute); a title pipeline carrying hull, domain,
+/// geometry or amplification stages is a graphics PSO the host cannot register,
+/// which the caller refuses explicitly rather than silently dropping a stage.
+#[cfg(windows)]
+pub(crate) fn native_stages(this: This) -> Vec<(&'static str, Vec<u8>)> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    let p = pipeline(this);
+    p.shaders
+        .iter()
+        .filter(|shader| {
+            matches!(
+                shader.stage,
+                "vertex" | "pixel" | "mesh" | "compute"
+            )
+        })
+        .map(|shader| {
+            let container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
+            let mut bytes = container.clone();
+            if bytes.is_empty()
+                && let (Some(full), Some(dir)) = (shader.spilled.get(), SPILL_DIR.get())
+            {
+                bytes = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+            }
+            (shader.stage, bytes)
+        })
+        .collect()
+}
+
+/// Every stage name `this` carries, including the ones the native path cannot
+/// register.
+#[cfg(windows)]
+pub(crate) fn stage_names(this: This) -> Vec<&'static str> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this).shaders.iter().map(|shader| shader.stage).collect()
+}
+
+/// The native host pipeline id of `this`, registering it on first use.
+///
+/// The registration is done once per title pipeline and its result is kept on
+/// the pipeline: a success is the id every `SetComputePipeline`/`Dispatch`
+/// names, and a failure is the explicit reason the list refuses the bind with.
+/// Translation goes through the persistent IRConverter pool
+/// ([`crate::native_metal::pso`]), so a repeated creation of the same shader is
+/// served by a warm worker or the disk cache instead of a new Rosetta process.
+/// The MSL `shader_cache` path is untouched: it keeps serving the draw path it
+/// always served, and is never a native pipeline registration.
+#[cfg(windows)]
+pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
+    if this.is_null() {
+        return Err("no pipeline to register".to_string());
+    }
+    let p = pipeline(this);
+    let mut cell = p.native.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(known) = cell.as_ref() {
+        return known.clone();
+    }
+    let stages = native_stages(this);
+    let all = stage_names(this);
+    if stages.len() != all.len() {
+        let missing: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|stage| !stages.iter().any(|(known, _)| known == stage))
+            .collect();
+        let error = format!(
+            "the native host registers vertex, pixel, mesh and compute stages only; this PSO also \
+             carries {}",
+            missing.join(", ")
+        );
+        crate::native_metal::telemetry::note_registration_failure();
+        *cell = Some(Err(error.clone()));
+        return Err(error);
+    }
+    let programs: Result<Vec<_>, _> = stages
+        .iter()
+        .map(|(stage, container)| {
+            let stage = crate::native_metal::pso::PipelineStage::from_name(stage)
+                .expect("the stages were filtered by name");
+            crate::native_metal::pso::stage_program(stage, container)
+        })
+        .collect();
+    let programs = match programs {
+        Ok(programs) => programs,
+        Err(error) => {
+            crate::native_metal::telemetry::note_registration_failure();
+            let error = error.to_string();
+            *cell = Some(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    match crate::native_metal::pso::register(&programs) {
+        Ok((id, serving)) => {
+            if serving.warm {
+                crate::native_metal::telemetry::note_pool_warm();
+            } else {
+                crate::native_metal::telemetry::note_pool_cold();
+            }
+            crate::native_metal::telemetry::note_pso_registered();
+            tracing::info!(
+                pipeline = ?this,
+                id,
+                warm = serving.warm,
+                "native pipeline registered"
+            );
+            *cell = Some(Ok(id));
+            Ok(id)
+        }
+        Err(error) => {
+            crate::native_metal::telemetry::note_registration_failure();
+            tracing::warn!(pipeline = ?this, %error, "native pipeline registration failed");
+            let error = error.to_string();
+            *cell = Some(Err(error.clone()));
+            Err(error)
+        }
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -668,6 +798,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        native: std::sync::Mutex::new(None),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

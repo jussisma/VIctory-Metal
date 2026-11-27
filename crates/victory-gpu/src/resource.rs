@@ -2048,9 +2048,78 @@ fn native_texture_registration(
     Some(Ok((dimension, format, usage)))
 }
 
+/// The host registration of one buffer, made at creation (kind 2).
+///
+/// The share allocation id comes from the `GuestRangeResolver` seam (the HLE's
+/// `xmem::share`), and the registrable length is the whole share file that id
+/// names; neither is fabricated. Registration is idempotent, so every buffer
+/// placed in one heap costs one frame (the heap's allocation), and aliased or
+/// placed buffers share that first descriptor.
+///
+/// Creation itself never fails for a missing registration: a D3D12 resource may
+/// be created and never bound, and the first bind resolves the range again and
+/// refuses explicitly when the host has no registration (see `list.rs`). The
+/// failure is logged and counted here, so it is never silent, and nothing falls
+/// back to D3DMetal.
 #[cfg(windows)]
-fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
-    let Some(registration) = native_texture_registration(desc) else {
+fn register_native_buffer(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
+    use crate::native_metal::{bindings, queue, telemetry};
+
+    let Some(resolver) = bindings::resolver() else {
+        telemetry::note_registration_failure();
+        tracing::warn!(
+            bytes = desc.width,
+            "VICTORY_BACKEND=metal: a buffer was created without the guest range resolver; \
+             its first bind will be refused (no D3DMetal fallback)"
+        );
+        return S_OK;
+    };
+    let address = resource.data() as u64;
+    let len = desc.width.max(1);
+    let range = match resolver.resolve(address, len) {
+        Ok(range) => range,
+        Err(error) => {
+            telemetry::note_registration_failure();
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                bytes = len,
+                %error,
+                "VICTORY_BACKEND=metal: a buffer's range does not resolve to a share allocation; \
+                 its first bind will be refused"
+            );
+            return S_OK;
+        }
+    };
+    match queue::ensure_allocation(range.allocation_id) {
+        Ok(true) => {
+            telemetry::note_buffer_registered();
+            tracing::debug!(
+                allocation = range.allocation_id,
+                bytes = len,
+                "native buffer registered"
+            );
+        }
+        Ok(false) => {
+            telemetry::note_registration_failure();
+            tracing::warn!(
+                allocation = range.allocation_id,
+                "VICTORY_BACKEND=metal: the host did not register the buffer's allocation"
+            );
+        }
+        Err(error) => {
+            telemetry::note_registration_failure();
+            tracing::warn!(
+                allocation = range.allocation_id,
+                %error,
+                "VICTORY_BACKEND=metal: a buffer could not be registered with the host"
+            );
+        }
+    }
+    S_OK
+}
+
+#[cfg(windows)]
+fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {    let Some(registration) = native_texture_registration(desc) else {
         return S_OK;
     };
     let Ok((dimension, format, usage)) = registration else {
@@ -2145,9 +2214,16 @@ fn hand_out_resource(
     }
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
-        let hr = register_native_texture(&resource, &desc);
-        if hr != S_OK {
-            return hr;
+        if desc.dimension == BUFFER {
+            let hr = register_native_buffer(&resource, &desc);
+            if hr != S_OK {
+                return hr;
+            }
+        } else {
+            let hr = register_native_texture(&resource, &desc);
+            if hr != S_OK {
+                return hr;
+            }
         }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)

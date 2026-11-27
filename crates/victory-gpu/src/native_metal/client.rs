@@ -34,6 +34,22 @@
 //! retried. (An older note described a one-byte status and a length-first
 //! envelope; neither matches `ipc_host.rs`, so this module follows the code.)
 //!
+//! # Registration frames
+//!
+//! | kind | direction | payload | reply |
+//! | ---: | --- | --- | --- |
+//! | 2 | guest to host | `id: u64 LE`, `byte_len: u64 LE` | kind 128, `[0]` |
+//! | 4 | guest to host | `ticket: u64 LE`, `entry_len: u16 LE`, entry | kind 129 |
+//! | 6 | guest to host | `byte_len: u64 LE` (fence page) | kind 128, `[0]` |
+//! | 8 | guest to host | 32-byte texture descriptor | kind 128, `[0]`/`[1]` |
+//! | 9 | guest to host | `surface: u64 LE`, `texture: u64 LE` | kind 128 |
+//!
+//! A kind 2 `byte_len` is the whole share file the id names (the host refuses a
+//! mapping whose length differs, which also closes the session), and ids must
+//! increase: the guest pre-checks that locally so a title can never brick its
+//! session with an id the host cannot accept. Kind 129 is one status byte
+//! (`0` ok, `1` rejected), then the host's `u64` native pipeline id.
+//!
 //! # Configuration
 //!
 //! [`LiveConfig::from_env`] reads `VICTORY_METAL_ENDPOINT` (`host:port`),
@@ -84,8 +100,28 @@ use crate::native_metal::queue::{NativeQueueError, V3Sink};
 pub const KIND_AUTH: u8 = 1;
 /// Frame kind of a version 3 submission request and of its reply.
 pub const KIND_SUBMISSION_V3: u8 = 5;
+/// Frame kind of a host allocation registration (`ipc_host::KIND_REGISTER`).
+pub const KIND_REGISTER: u8 = 2;
+/// Frame kind of an opt-in precompiled pipeline registration
+/// (`ipc_host::KIND_PIPELINE`).
+pub const KIND_PIPELINE: u8 = 4;
+/// Frame kind of the host's pipeline registration reply
+/// (`ipc_host::KIND_PIPELINE_REPLY`).
+pub const KIND_PIPELINE_REPLY: u8 = 129;
 /// Frame kind of an authentication or registration acknowledgement.
 pub const KIND_ACK: u8 = 128;
+/// Exact length of a kind 2 registration payload: `id: u64 LE`, `byte_len: u64 LE`.
+pub const REGISTER_PAYLOAD_LEN: usize = 16;
+/// Fixed ticket and entry-length prefix of a kind 4 payload.
+pub const PIPELINE_HEADER_LEN: usize = 10;
+/// Largest pipeline entry name the host accepts.
+pub const MAX_PIPELINE_ENTRY_LEN: usize = 256;
+/// Status byte of a successful kind 129 pipeline reply.
+pub const PIPELINE_REPLY_OK: u8 = 0;
+/// Status byte of an explicitly rejected pipeline registration.
+pub const PIPELINE_REPLY_REJECTED: u8 = 1;
+/// Exact length of a successful kind 129 reply: status plus `u64` id.
+pub const PIPELINE_REPLY_OK_LEN: usize = 1 + 8;
 /// Frame kind registering the shared completion fence page (`ipc_host`).
 pub const KIND_FENCE_PAGE: u8 = 6;
 /// Frame kind registering a host texture (`ipc_host`).
@@ -423,6 +459,23 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
+/// Whether `entry` is a bounded, path-free Metal function identifier.
+///
+/// The grammar is the host's (`ipc_host` uses `guest_ipc::valid_pipeline_entry`
+/// for the same frame): an ASCII letter or underscore followed by ASCII
+/// letters, digits or underscores, at most [`MAX_PIPELINE_ENTRY_LEN`] bytes.
+pub fn valid_pipeline_entry(entry: &str) -> bool {
+    if entry.is_empty() || entry.len() > MAX_PIPELINE_ENTRY_LEN {
+        return false;
+    }
+    let mut bytes = entry.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 /// The environment configuration of a live session.
 ///
 /// The secret must be present and non-empty; an endpoint alone has nothing to
@@ -578,6 +631,19 @@ pub struct WireV3Client {
     textures: BTreeSet<u64>,
     /// Present surfaces registered with the host in this session.
     surfaces: BTreeSet<u64>,
+    /// Guest allocations registered with the host through kind 2.
+    ///
+    /// The host requires strictly increasing, never reused allocation ids, so
+    /// the set is also the guest's record of what may still be named in a
+    /// submission. Aliased and placed resources inside one allocation resolve
+    /// to the same id and share the first registration.
+    allocations: BTreeSet<u64>,
+    /// The highest allocation id this session registered (0: none).
+    last_allocation: u64,
+    /// The highest pipeline ticket this session registered (0: none).
+    last_pipeline_ticket: u64,
+    /// Native pipeline ids returned by kind 129, by ticket.
+    pipelines: std::collections::BTreeMap<u64, u64>,
 }
 
 impl WireV3Client {
@@ -647,6 +713,10 @@ impl WireV3Client {
             fence_page_path: page,
             textures: BTreeSet::new(),
             surfaces: BTreeSet::new(),
+            allocations: BTreeSet::new(),
+            last_allocation: 0,
+            last_pipeline_ticket: 0,
+            pipelines: std::collections::BTreeMap::new(),
         };
         let mut stream = client.handshake()?;
         client.register_fence_page(&mut stream, client.fence_page_path.clone());
@@ -778,6 +848,10 @@ impl WireV3Client {
         self.fence_page = None;
         self.textures.clear();
         self.surfaces.clear();
+        self.allocations.clear();
+        self.last_allocation = 0;
+        self.last_pipeline_ticket = 0;
+        self.pipelines.clear();
         let page = self.fence_page_path.clone();
         self.register_fence_page(&mut stream, page);
         self.stream = Some(stream);
@@ -888,6 +962,184 @@ impl WireV3Client {
     /// Whether a present surface was accepted by this session.
     pub fn surface_registered(&self, id: u64) -> bool {
         self.surfaces.contains(&id)
+    }
+
+    /// Registers one guest host-visible allocation (transport kind 2).
+    ///
+    /// The payload is exactly `allocation_id: u64 LE, byte_len: u64 LE`, the
+    /// layout of `ipc_host::REGISTER_PAYLOAD_LEN`. `byte_len` must be the
+    /// *whole* share file the id names: the host reopens
+    /// `<share dir>/{id:016x}.bin` and refuses a mapping whose length differs,
+    /// which also closes the session, so the caller derives it from the file
+    /// and never guesses (see `native_metal::pso::share_allocation_len`).
+    ///
+    /// Registration is idempotent: an id this session already registered
+    /// returns `Ok(true)` without touching the wire, which is what aliased and
+    /// placed resources inside one allocation rely on.
+    ///
+    /// The host accepts only ids greater than every id it has seen, and a
+    /// registration it refuses closes the session. An id at or below the last
+    /// accepted one is therefore refused *locally* as an explicit error (the
+    /// host has no kind 2 form that carries an arbitrary id), never sent.
+    pub fn register_allocation(
+        &mut self,
+        allocation_id: u64,
+        byte_len: u64,
+    ) -> Result<bool, NativeQueueError> {
+        if allocation_id == 0 {
+            return Err(NativeQueueError::Refused(
+                "buffer registration needs a nonzero allocation id".to_string(),
+            ));
+        }
+        if byte_len == 0 {
+            return Err(NativeQueueError::Refused(format!(
+                "buffer registration for allocation {allocation_id} names no bytes"
+            )));
+        }
+        if self.allocations.contains(&allocation_id) {
+            return Ok(true);
+        }
+        if allocation_id <= self.last_allocation {
+            return Err(NativeQueueError::Refused(format!(
+                "allocation {allocation_id} is below the last host registration {}; the kind 2 \
+                 form carries no arbitrary id, so the host cannot accept it",
+                self.last_allocation
+            )));
+        }
+        let mut payload = [0u8; REGISTER_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&allocation_id.to_le_bytes());
+        payload[8..16].copy_from_slice(&byte_len.to_le_bytes());
+        let status = self.registration(KIND_REGISTER, &payload, "register allocation")?;
+        if status != REGISTRATION_ACCEPTED {
+            return Err(NativeQueueError::Refused(format!(
+                "the host refused allocation {allocation_id} with status {status}"
+            )));
+        }
+        self.allocations.insert(allocation_id);
+        self.last_allocation = allocation_id;
+        Ok(true)
+    }
+
+    /// Whether this session registered `allocation_id` with the host.
+    pub fn allocation_registered(&self, allocation_id: u64) -> bool {
+        self.allocations.contains(&allocation_id)
+    }
+
+    /// The highest allocation id registered in this session (0: none).
+    pub fn last_allocation(&self) -> u64 {
+        self.last_allocation
+    }
+
+    /// Registers one precompiled library as a pipeline (transport kind 4).
+    ///
+    /// The payload is `ticket: u64 LE, entry_len: u16 LE, entry bytes`; the
+    /// host maps the ticket to `<share dir>/{ticket:016x}.metallib` itself, so
+    /// no path or library bytes cross the wire. The reply is kind 129: one
+    /// status byte, then the native pipeline id.
+    ///
+    /// An explicit host rejection is [`NativeQueueError::Refused`] and leaves
+    /// the session open. A malformed reply is a protocol error and closes it.
+    /// Tickets must be nonzero and strictly increasing, exactly like the
+    /// host's own ledger.
+    pub fn register_pipeline(
+        &mut self,
+        ticket: u64,
+        entry: &str,
+    ) -> Result<u64, NativeQueueError> {
+        if ticket == 0 {
+            return Err(NativeQueueError::Refused(
+                "pipeline registration needs a nonzero ticket".to_string(),
+            ));
+        }
+        if ticket <= self.last_pipeline_ticket {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline ticket {ticket} is not greater than the last accepted ticket {}",
+                self.last_pipeline_ticket
+            )));
+        }
+        if !valid_pipeline_entry(entry) {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline entry `{entry}` is not a bounded ASCII Metal identifier"
+            )));
+        }
+        let entry_len = u16::try_from(entry.len()).expect("entry length is bounded");
+        let mut payload = Vec::with_capacity(PIPELINE_HEADER_LEN + entry.len());
+        payload.extend_from_slice(&ticket.to_le_bytes());
+        payload.extend_from_slice(&entry_len.to_le_bytes());
+        payload.extend_from_slice(entry.as_bytes());
+
+        let Some(mut stream) = self.stream.take() else {
+            return Err(NativeQueueError::Transport(
+                TransportError::NotConnected.to_string(),
+            ));
+        };
+        let result = write_frame(&mut stream, KIND_PIPELINE, &payload, "register pipeline", self.timeout)
+            .and_then(|()| {
+                read_frame(
+                    &mut stream,
+                    "register pipeline",
+                    MAX_PAYLOAD_LEN as usize,
+                    self.timeout,
+                )
+            });
+        match result {
+            Ok((KIND_PIPELINE_REPLY, reply)) => {
+                self.stream = Some(stream);
+                match (reply.first().copied(), reply.len()) {
+                    (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
+                        let id = u64::from_le_bytes(
+                            reply[1..].try_into().expect("eight bytes"),
+                        );
+                        if id == 0 {
+                            return Err(NativeQueueError::Transport(
+                                "the host answered pipeline registration with id zero".to_string(),
+                            ));
+                        }
+                        self.last_pipeline_ticket = ticket;
+                        self.pipelines.insert(ticket, id);
+                        Ok(id)
+                    }
+                    (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
+                        format!("the host rejected pipeline ticket {ticket}"),
+                    )),
+                    _ => Err(NativeQueueError::Transport(format!(
+                        "malformed kind 129 reply of {} byte(s)",
+                        reply.len()
+                    ))),
+                }
+            }
+            Ok((actual, _)) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                self.transport_errors = self.transport_errors.saturating_add(1);
+                Err(NativeQueueError::Transport(
+                    TransportError::UnexpectedKind {
+                        expected: KIND_PIPELINE_REPLY,
+                        actual,
+                    }
+                    .to_string(),
+                ))
+            }
+            Err(error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                self.transport_errors = self.transport_errors.saturating_add(1);
+                Err(NativeQueueError::Transport(error.to_string()))
+            }
+        }
+    }
+
+    /// The native pipeline id a ticket registered, if any.
+    pub fn pipeline_registered(&self, ticket: u64) -> Option<u64> {
+        self.pipelines.get(&ticket).copied()
+    }
+
+    /// The next ticket this session may use, so tickets never repeat.
+    pub fn next_pipeline_ticket(&self) -> u64 {
+        self.last_pipeline_ticket.saturating_add(1).max(1)
+    }
+
+    /// Native pipeline registrations this session made.
+    pub fn pipeline_registrations(&self) -> usize {
+        self.pipelines.len()
     }
 
     /// One registration request/acknowledgement pair on the open stream.
@@ -1819,5 +2071,104 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains(&endpoint), "the endpoint is named: {text}");
         assert!(!text.contains("5a"), "the secret is not named: {text}");
+    }
+
+    /// A kind 2 registration is `id: u64 LE, byte_len: u64 LE`; a repeat of an
+    /// id already accepted sends nothing, and an id that would not increase is
+    /// refused locally instead of closing the host's session.
+    #[test]
+    fn buffer_registration_is_idempotent_and_ascending() {
+        let (sender, receiver) = mpsc::channel::<Vec<(u64, u64)>>();
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let mut seen = Vec::new();
+            while let Some((kind, payload)) = TestHost::try_read_frame(&mut stream) {
+                assert_eq!(kind, KIND_REGISTER, "only kind 2 frames are expected");
+                assert_eq!(payload.len(), REGISTER_PAYLOAD_LEN);
+                let id = u64::from_le_bytes(payload[0..8].try_into().expect("eight bytes"));
+                let len = u64::from_le_bytes(payload[8..16].try_into().expect("eight bytes"));
+                seen.push((id, len));
+                TestHost::write_frame(&mut stream, KIND_ACK, &[0]);
+            }
+            sender.send(seen).expect("report the frames");
+        });
+
+        let mut client =
+            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, None)
+                .expect("authenticated connect");
+        assert_eq!(client.register_allocation(3, 4096), Ok(true));
+        assert_eq!(
+            client.register_allocation(3, 4096),
+            Ok(true),
+            "a repeated range is idempotent"
+        );
+        assert_eq!(client.register_allocation(5, 8192), Ok(true));
+        assert_eq!(client.register_allocation(5, 8192), Ok(true));
+        let refused = client
+            .register_allocation(4, 1024)
+            .expect_err("an id below the last accepted one cannot be sent");
+        assert!(matches!(refused, NativeQueueError::Refused(_)));
+        assert!(client.allocation_registered(5));
+        assert!(!client.allocation_registered(4));
+        assert_eq!(client.last_allocation(), 5);
+        drop(client);
+        assert_eq!(
+            receiver.recv_timeout(TEST_TIMEOUT).expect("frame list"),
+            vec![(3, 4096), (5, 8192)],
+            "two frames, ascending, and nothing for the repeats"
+        );
+    }
+
+    /// A kind 4 frame is `ticket: u64 LE, entry_len: u16 LE, entry`; the host
+    /// answers kind 129 with one status byte and the native pipeline id.
+    #[test]
+    fn pipeline_registration_round_trips_kind_4_and_129() {
+        let (sender, receiver) = mpsc::channel::<Vec<(u64, String)>>();
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let mut seen = Vec::new();
+            for id in [0x51u64, 0x52] {
+                let (kind, payload) = TestHost::read_frame(&mut stream);
+                assert_eq!(kind, KIND_PIPELINE, "one kind 4 request per PSO");
+                assert_eq!(payload.len(), PIPELINE_HEADER_LEN + 4);
+                let ticket = u64::from_le_bytes(payload[0..8].try_into().expect("eight bytes"));
+                let entry_len =
+                    u16::from_le_bytes(payload[8..10].try_into().expect("two bytes"));
+                assert_eq!(usize::from(entry_len), payload.len() - PIPELINE_HEADER_LEN);
+                let entry = String::from_utf8(payload[PIPELINE_HEADER_LEN..].to_vec())
+                    .expect("an ASCII entry");
+                seen.push((ticket, entry));
+                let mut reply = vec![PIPELINE_REPLY_OK];
+                reply.extend_from_slice(&id.to_le_bytes());
+                TestHost::write_frame(&mut stream, KIND_PIPELINE_REPLY, &reply);
+            }
+            sender.send(seen).expect("report the frames");
+        });
+
+        let mut client =
+            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, None)
+                .expect("authenticated connect");
+        assert_eq!(client.next_pipeline_ticket(), 1);
+        assert_eq!(client.register_pipeline(1, "main"), Ok(0x51));
+        assert_eq!(client.pipeline_registered(1), Some(0x51));
+        assert_eq!(client.next_pipeline_ticket(), 2);
+        assert_eq!(client.register_pipeline(2, "main"), Ok(0x52));
+        assert_eq!(client.pipeline_registrations(), 2);
+        assert!(matches!(
+            client.register_pipeline(1, "main"),
+            Err(NativeQueueError::Refused(_))
+        ));
+        assert!(
+            matches!(
+                client.register_pipeline(3, "../escape"),
+                Err(NativeQueueError::Refused(_))
+            ),
+            "an entry that is not a Metal identifier never reaches the wire"
+        );
+        drop(client);
+        assert_eq!(
+            receiver.recv_timeout(TEST_TIMEOUT).expect("frame list"),
+            vec![(1, "main".to_string()), (2, "main".to_string())]
+        );
     }
 }
