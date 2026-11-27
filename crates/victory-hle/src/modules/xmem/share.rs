@@ -62,7 +62,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
-use super::{Direct, PAGE, Section};
+use super::{PAGE, Section};
 
 use victory_gpu::backend::GpuBackend;
 use victory_gpu::native_metal::bindings::{
@@ -74,27 +74,6 @@ pub(crate) const DIRECTORY: &str = "VICTORY_METAL_SHARE_DIR";
 
 /// The only backing generation understood by this first protocol.
 pub(crate) const GENERATION: u64 = 1;
-
-/// Ranges refused because they span more than one backing (or a reserved
-/// gap between backings): the host cannot name them as one allocation run.
-/// A named counter rather than a silent refusal, so a boot trace can show
-/// whether the title still assembles buffers from several allocations.
-static NOT_CONTIGUOUS: AtomicU64 = AtomicU64::new(0);
-
-/// How many ranges have been refused as not one contiguous shared
-/// allocation in this process.
-pub(crate) fn not_contiguous_ranges() -> u64 {
-    NOT_CONTIGUOUS.load(Ordering::Relaxed)
-}
-
-fn not_contiguous() -> ResolveError {
-    let count = NOT_CONTIGUOUS.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::debug!(
-        count,
-        "XMem range spans more than one backing; refusing it"
-    );
-    ResolveError::NotContiguous
-}
 
 /// Attempts at a fresh file name before giving up (a reused directory can
 /// already hold names from an earlier process).
@@ -875,16 +854,10 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
 /// `at` and `len` need not be 64 KiB aligned: the result starts at the page
 /// containing `at` and covers every page the range touches, so the host can
 /// map it. The whole rounded span must be shown by the existing tracked
-/// views (physical-page views, or a whole region handed out by
-/// `XMemVirtualAlloc`/`XMemAllocDefault`) and be one contiguous run of one
-/// backing, all within it. In particular, a range whose last byte is mapped
-/// is still refused if rounding it would reach an unmapped or foreign page:
-/// never grant a page the guest did not map.
-///
-/// A region the provider backed resolves to that one share file; a private
-/// region (the pagefile path) is reported as [`ResolveError::Pagefile`],
-/// never as an invented range. A range spanning two backings is refused as
-/// [`ResolveError::NotContiguous`] and counted.
+/// views and be one contiguous run of pages of one section, all within the
+/// section. In particular, a range whose last byte is mapped is still
+/// refused if rounding it would reach an unmapped or foreign page: never
+/// grant a page the guest did not map.
 ///
 /// This takes the physical-page lock only to inspect and clone what the
 /// views already hold; the returned lease keeps the section (and its file)
@@ -901,99 +874,34 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
     let start = at & !(PAGE - 1);
     let stop = end.checked_add(PAGE - 1).ok_or(ResolveError::OutOfBounds)? & !(PAGE - 1);
     let physical = super::physical();
-
-    enum Tracked<'a> {
-        Direct { base: usize, region: &'a Direct },
-        View { base: usize, size: usize, slice: &'a super::Slice },
-    }
-
-    fn tracked_at<'a>(physical: &'a super::Physical, at: usize) -> Option<Tracked<'a>> {
-        if let Some((base, region)) = direct_at(physical, at) {
-            return Some(Tracked::Direct { base, region });
-        }
-        view_at(physical, at).map(|(base, size, slice)| Tracked::View { base, size, slice })
-    }
-
-    let mut direct: Option<(usize, &Direct)> = None;
     let mut section: Option<Arc<Section>> = None;
     let mut first_index = None;
     let mut next_index = None;
     let mut cursor = start;
     while cursor < stop {
-        match tracked_at(&physical, cursor) {
-            Some(Tracked::Direct { base, region }) => {
-                // One whole region per resolve; a second one is another
-                // backing, not a contiguous run of the first.
-                if direct.is_some() || section.is_some() {
-                    return Err(not_contiguous());
-                }
-                direct = Some((base, region));
-                let region_end = base
-                    .checked_add(region.map_size)
-                    .ok_or(ResolveError::OutOfBounds)?;
-                cursor = region_end.min(stop);
-            }
-            Some(Tracked::View { base, size, slice }) => {
-                if direct.is_some() {
-                    return Err(not_contiguous());
-                }
-                let index = slice
-                    .index
-                    .checked_add((cursor - base) / PAGE)
-                    .ok_or(ResolveError::OutOfBounds)?;
-                match &section {
-                    None => {
-                        section = Some(slice.section.clone());
-                        first_index = Some(index);
-                    }
-                    Some(section) if !Arc::ptr_eq(section, &slice.section) => {
-                        return Err(not_contiguous());
-                    }
-                    Some(_) => {}
-                }
-                if next_index.is_some_and(|next| next != index) {
-                    return Err(not_contiguous());
-                }
-                next_index = index.checked_add(1);
-                let view_end = base.checked_add(size).ok_or(ResolveError::OutOfBounds)?;
-                cursor = view_end.min(stop);
-            }
-            None => return Err(ResolveError::NotMapped),
-        }
-    }
-    if let Some((base, region)) = direct {
-        // Every requested byte must be inside the allocation's real size;
-        // the page-rounded window may use the padding tail the file maps.
-        let visible_end = base
-            .checked_add(region.size)
+        let Some((base, size, slice)) = view_at(&physical, cursor) else {
+            return Err(ResolveError::NotMapped);
+        };
+        let index = slice
+            .index
+            .checked_add((cursor - base) / PAGE)
             .ok_or(ResolveError::OutOfBounds)?;
-        if end > visible_end {
-            return Err(ResolveError::OutOfBounds);
+        match &section {
+            None => {
+                section = Some(slice.section.clone());
+                first_index = Some(index);
+            }
+            Some(section) if !Arc::ptr_eq(section, &slice.section) => {
+                return Err(ResolveError::NotContiguous);
+            }
+            Some(_) => {}
         }
-        let offset = start.checked_sub(base).ok_or(ResolveError::OutOfBounds)?;
-        let length = stop.checked_sub(start).ok_or(ResolveError::OutOfBounds)?;
-        // A region with no backing was a deliberate pagefile fallback: say
-        // so by name instead of naming a file that does not exist.
-        let Some(section) = region.section.clone() else {
-            return Err(ResolveError::Pagefile);
-        };
-        let Some(backing) = section.share.as_ref() else {
-            return Err(ResolveError::Pagefile);
-        };
-        if backing.generation != GENERATION || backing.id == 0 {
-            return Err(ResolveError::Stale);
+        if next_index.is_some_and(|next| next != index) {
+            return Err(ResolveError::NotContiguous);
         }
-        return Ok(Lease {
-            range: Range {
-                id: backing.id,
-                generation: backing.generation,
-                offset: offset as u64,
-                length: length as u64,
-                file_size: region.map_size as u64,
-            },
-            path: backing.path.clone(),
-            section,
-        });
+        next_index = index.checked_add(1);
+        let view_end = base.checked_add(size).ok_or(ResolveError::OutOfBounds)?;
+        cursor = view_end.min(stop);
     }
     let section = section.ok_or(ResolveError::NotMapped)?;
     let offset = first_index
@@ -1041,19 +949,6 @@ fn view_at(
         .next_back()
         .filter(|(base, (size, _))| at < base.wrapping_add(*size))
         .map(|(base, (size, slice))| (*base, *size, slice))
-}
-
-/// The whole region handed out by the allocator that holds `at`, if any.
-fn direct_at(
-    physical: &super::Physical,
-    at: usize,
-) -> Option<(usize, &Direct)> {
-    physical
-        .direct
-        .range(..=at)
-        .next_back()
-        .filter(|(base, region)| at < base.wrapping_add(region.map_size))
-        .map(|(base, region)| (*base, region))
 }
 
 // ---------------------------------------------------------------- the seam
@@ -1245,13 +1140,11 @@ fn uninstall_for_test() {
 mod tests {
     use super::*;
 
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE};
 
     use crate::modules::xmem::{
-        PAGES_64K, VirtualFree, XMemAlloc, XMemAllocatePhysicalPages, XMemFree,
-        XMemFreePhysicalPages, XMemMapPhysicalPages, XMemVirtualAlloc,
+        PAGES_64K, XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages,
+        XMemVirtualAlloc,
     };
 
     /// `n` pages of one new allocation.
@@ -1586,214 +1479,6 @@ mod tests {
         // Dropping the leases and sections leaves every registered file.
         assert!(first_path.exists(), "a backing file must not be unlinked");
         assert!(next_path.exists(), "a backing file must not be unlinked");
-    }
-
-    /// A direct `XMemVirtualAlloc` commit takes the share path: the host maps
-    /// the same file the guest writes, and the guest range resolves to it.
-    /// A non-page-multiple size is rounded for the file and the mapping while
-    /// the guest's real size is kept, so the padding tail never resolves.
-    #[test]
-    fn virtual_allocations_are_share_backed_and_resolve() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let _share = ShareDirectory::configured(directory.path());
-        let size = 3 * PAGE + 0x321; // deliberately not a page multiple
-        let at = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            0, // 40-bit addresses
-            PAGE_READWRITE,
-        );
-        assert!(!at.is_null(), "a share-backed XMemVirtualAlloc failed");
-        let base = at as usize;
-
-        let map_size = {
-            let physical = super::super::physical();
-            let region = physical
-                .direct
-                .get(&base)
-                .expect("the allocation must be tracked as a direct region");
-            assert_eq!(region.size, size, "the guest size is unchanged");
-            assert_eq!(region.map_size, 4 * PAGE, "the file is whole pages");
-            let backing = region
-                .section
-                .as_ref()
-                .and_then(|section| section.share.as_ref())
-                .expect("the provider must back the allocation");
-            assert_ne!(backing.id, 0, "share ids are non-zero");
-            assert_eq!(backing.generation, GENERATION);
-            region.map_size
-        };
-
-        let lease = resolve_guest_range(base, size).expect("the allocation resolves");
-        assert_eq!(lease.range.offset, 0);
-        assert_eq!(lease.range.length, map_size as u64);
-        assert_eq!(lease.file_size(), map_size as u64);
-        assert_eq!(lease.path().parent(), Some(directory.path()));
-        assert_eq!(
-            std::fs::metadata(lease.path()).expect("the share file").len(),
-            map_size as u64,
-            "the share file is rounded to whole pages"
-        );
-
-        // A write through the guest pointer is the same page the host maps.
-        let payload = [0xA5u8, 0x5A, 1, 2, 3, 4];
-        // SAFETY: the allocation is `size` writable bytes.
-        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), at.cast::<u8>(), payload.len()) };
-        let bytes = std::fs::read(lease.path()).expect("the written share file");
-        assert_eq!(&bytes[..payload.len()], &payload);
-
-        // The padding tail is not part of the guest's real size.
-        assert_eq!(
-            resolve_guest_range(base, size + 1).unwrap_err(),
-            ResolveError::OutOfBounds
-        );
-        assert_eq!(
-            resolve_guest_range(base + map_size, PAGE).unwrap_err(),
-            ResolveError::NotMapped
-        );
-        drop(lease);
-
-        // Freeing releases the region and its share backing.
-        let before = live();
-        assert_eq!(VirtualFree(at, 0, MEM_RELEASE), 1);
-        assert!(
-            !super::super::physical().direct.contains_key(&base),
-            "the freed region must be forgotten"
-        );
-        assert_eq!(live(), before - 1, "the share backing is released");
-    }
-
-    /// With no share provider a direct allocation stays private, and the
-    /// resolver says so by name instead of claiming it is unmapped or
-    /// fabricating an allocation id.
-    #[test]
-    fn virtual_allocations_without_a_directory_are_pagefile() {
-        let _share = ShareDirectory::unconfigured();
-        let size = PAGE + 0x123;
-        let at = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            size,
-            MEM_RESERVE | MEM_COMMIT,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!at.is_null(), "a private XMemVirtualAlloc failed");
-        let base = at as usize;
-        {
-            let physical = super::super::physical();
-            let region = physical
-                .direct
-                .get(&base)
-                .expect("the private allocation must be tracked");
-            assert!(region.section.is_none(), "no provider, no share backing");
-            assert_eq!(region.map_size, 2 * PAGE);
-        }
-        assert_eq!(
-            resolve_guest_range(base, PAGE).unwrap_err(),
-            ResolveError::Pagefile
-        );
-        assert_eq!(VirtualFree(at, 0, MEM_RELEASE), 1);
-        assert!(!super::super::physical().direct.contains_key(&base));
-    }
-
-    /// A range that starts in a direct allocation and continues into another
-    /// backing is refused as `NotContiguous` and counted: never resolved as a
-    /// truncated run of the first allocation, never a partial success.
-    #[test]
-    fn a_range_spanning_two_backings_is_refused_and_counted() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let _share = ShareDirectory::configured(directory.path());
-        let at = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            PAGE,
-            MEM_RESERVE | MEM_COMMIT,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!at.is_null());
-        let base = at as usize;
-        assert!(resolve_guest_range(base, PAGE).is_ok(), "one page resolves");
-
-        // A second backing immediately after the allocation.
-        let share = SyntheticShare::new(1);
-        let view = FakeView::install(
-            base + PAGE,
-            PAGE,
-            super::super::Slice {
-                section: share.section.clone(),
-                index: 0,
-            },
-        );
-        let before = not_contiguous_ranges();
-        assert_eq!(
-            resolve_guest_range(base, 2 * PAGE).unwrap_err(),
-            ResolveError::NotContiguous,
-            "two backings must not resolve as one run"
-        );
-        assert_eq!(
-            not_contiguous_ranges(),
-            before + 1,
-            "the refusal must be counted"
-        );
-        drop(view);
-
-        // The direct allocation still resolves on its own, and frees.
-        assert!(resolve_guest_range(base, PAGE).is_ok());
-        assert_eq!(VirtualFree(at, 0, MEM_RELEASE), 1);
-    }
-
-    /// `XMemAlloc`/`XMemAllocDefault` blocks take the share path too, so a
-    /// placed buffer in allocator memory (not physical pages) resolves; the
-    /// header marker makes the matching free release the whole region.
-    #[test]
-    fn default_allocations_are_share_backed_and_resolve() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let _share = ShareDirectory::configured(directory.path());
-        let attributes = 1u64 << 29; // a graphics memory type, default alignment
-        let size = 0x4CE0;
-        let pointer = XMemAlloc(size, attributes);
-        assert!(!pointer.is_null(), "XMemAlloc failed");
-        let base = pointer as usize & !(PAGE - 1);
-
-        let before = live();
-        {
-            let physical = super::super::physical();
-            let region = physical
-                .direct
-                .get(&base)
-                .expect("the block must live in its own region");
-            assert_eq!(region.size, size + 16, "size plus the header's alignment");
-            assert_eq!(region.map_size, PAGE);
-            assert!(
-                region.section.is_some(),
-                "a configured directory must back the block"
-            );
-        }
-
-        let lease = resolve_guest_range(pointer as usize, size)
-            .expect("the allocator block resolves to host-visible backing");
-        assert_eq!(lease.range.offset, 0, "the containing page");
-        assert_eq!(lease.range.length, PAGE as u64);
-        assert_eq!(lease.path().parent(), Some(directory.path()));
-
-        // Writes through the pointer reach the share file.
-        // SAFETY: `size` writable bytes were allocated.
-        unsafe { pointer.cast::<u8>().write_bytes(0x5A, size) };
-        let bytes = std::fs::read(lease.path()).expect("the written share file");
-        let within = pointer as usize - base;
-        assert!(
-            bytes[within..within + size].iter().all(|&b| b == 0x5A),
-            "the heap block's bytes must land in its share file"
-        );
-        drop(lease);
-
-        XMemFree(pointer, attributes);
-        assert!(
-            !super::super::physical().direct.contains_key(&base),
-            "the freed block must be forgotten"
-        );
-        assert_eq!(live(), before - 1, "the share backing is released");
     }
 
     /// A compute view hands the resolver a byte range, not pages. A range
