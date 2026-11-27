@@ -48,6 +48,9 @@ pub enum SurfaceFormat {
     /// 8-bit BGRA, the IOSurface format the presenter renders into.
     #[default]
     Bgra8Unorm,
+    /// 16-bit float RGBA, the title's SDR-presented FP16 back-buffer
+    /// (`DXGI_FORMAT_R16G16B16A16_FLOAT`, `MTLPixelFormatRGBA16Float` 115).
+    Rgba16Float,
 }
 
 impl SurfaceFormat {
@@ -55,6 +58,7 @@ impl SurfaceFormat {
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
             Self::Bgra8Unorm => 4,
+            Self::Rgba16Float => 8,
         }
     }
 
@@ -62,6 +66,20 @@ impl SurfaceFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bgra8Unorm => "bgra8unorm",
+            Self::Rgba16Float => "rgba16float",
+        }
+    }
+
+    /// The surface format for a kind 8 host format code, when it has its own
+    /// surface format.
+    ///
+    /// Only the FP16 present target (code 9) differs from the BGRA8 default;
+    /// any other code returns `None` so the caller keeps the existing
+    /// behaviour rather than silently coercing an unknown format.
+    pub const fn from_host_format_code(code: u8) -> Option<Self> {
+        match code {
+            9 => Some(Self::Rgba16Float),
+            _ => None,
         }
     }
 }
@@ -543,6 +561,22 @@ mod tests {
         assert_eq!(swapchain.next_frame_index(), 0);
         assert_eq!(swapchain.sync_interval(), SyncInterval::Immediate);
         assert_eq!(swapchain.in_flight(), None);
+    }
+
+    /// A 16F present target keeps its format: host code 9 selects
+    /// `SurfaceFormat::Rgba16Float`, not a BGRA8 replacement.
+    #[test]
+    fn an_fp16_target_selects_an_rgba16_float_surface() {
+        let format = SurfaceFormat::from_host_format_code(9)
+            .expect("host code 9 names an RGBA16Float surface");
+        assert_eq!(format, SurfaceFormat::Rgba16Float);
+        assert_eq!(format.bytes_per_pixel(), 8);
+        assert_eq!(format.as_str(), "rgba16float");
+        let swapchain = NativeSwapchain::new(12, 2560, 1440, format, GpuBackend::Metal)
+            .expect("a 2560x1440 FP16 surface is valid");
+        assert_eq!(swapchain.format(), SurfaceFormat::Rgba16Float);
+        assert_eq!(SurfaceFormat::from_host_format_code(0), None);
+        assert_eq!(SurfaceFormat::from_host_format_code(10), None);
     }
 
     #[test]

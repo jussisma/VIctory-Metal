@@ -2013,7 +2013,7 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 /// guest memory until a descriptor table names it, at which point
 /// [`texture_table_registration`] supplies the same codes. `None` means "no
 /// host object": a buffer, or a texture the native path never names directly.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn native_texture_registration(
     desc: &ResourceDesc,
 ) -> Option<Result<(u8, u8, u8), &'static str>> {
@@ -2100,7 +2100,7 @@ pub(crate) fn texture_table_registration(
 }
 
 /// Maps a texture description to the kind 8 `(dimension, format, usage)` codes.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn texture_registration_codes(
     desc: &ResourceDesc,
     usage: u8,
@@ -2122,6 +2122,10 @@ fn texture_registration_codes(
         24 => 6,
         40 => 7,
         20 => 8,
+        // DXGI_FORMAT_R16G16B16A16_FLOAT: the title's SDR-presented FP16
+        // back-buffer. Host code 9 decodes to `TextureFormat::Rgba16Float`
+        // (`MTLPixelFormatRGBA16Float`, 115).
+        10 => 9,
         _ => return Err("texture registration: format has no host code"),
     };
     Ok((dimension, format, usage))
@@ -2906,6 +2910,32 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// The title's SDR-presented FP16 back-buffer (`DXGI_FORMAT` 10,
+    /// `R16G16B16A16_FLOAT`) maps to kind 8 host format code 9. Boot #1
+    /// refused it as "format has no host code"; 2560x1440 must now register.
+    #[test]
+    fn a_fp16_present_target_registers_with_host_code_9() {
+        let desc = ResourceDesc {
+            flags: 0x4, // ALLOW_UNORDERED_ACCESS in the console's flag encoding
+            ..texture(2560, 1440, 10, 1)
+        };
+        assert_eq!(native_texture_registration(&desc), Some(Ok((1, 9, 1))));
+    }
+
+    /// A format outside the kind 8 table still refuses explicitly, so no
+    /// format falls back to a default host code.
+    #[test]
+    fn an_unmapped_texture_format_still_refuses_explicitly() {
+        let desc = ResourceDesc {
+            flags: 0x4,
+            ..texture(2560, 1440, 11, 1) // R8G8B8A8_UINT, no host code
+        };
+        assert_eq!(
+            native_texture_registration(&desc),
+            Some(Err("texture registration: format has no host code"))
+        );
     }
 
     fn heap(size: u64) -> This {

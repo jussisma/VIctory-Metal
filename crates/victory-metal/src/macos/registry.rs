@@ -67,7 +67,6 @@ use std::mem;
 use crate::abi::VmBufferId;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
-use crate::macos::render::PixelFormat;
 use crate::transport::MetalError;
 use crate::wire_v3::{
     BlendAttachment, BlendFactor, BlendOperation, BlendState, CompareFunction, CullMode,
@@ -240,6 +239,9 @@ pub enum TextureFormat {
     Rgba8Srgb,
     /// `MTLPixelFormatBGRA8Unorm`.
     Bgra8Unorm,
+    /// `MTLPixelFormatRGBA16Float` (DXGI_FORMAT_R16G16B16A16_FLOAT, the
+    /// title's FP16 present/render target).
+    Rgba16Float,
     /// `MTLPixelFormatRG11B10Float`.
     Rg11g11b10Float,
     /// `MTLPixelFormatRGB10A2Unorm`.
@@ -270,6 +272,7 @@ impl TextureFormat {
             Self::Rgba8Unorm => 70,
             Self::Rgba8Srgb => 71,
             Self::Bgra8Unorm => 80,
+            Self::Rgba16Float => 115,
             Self::Rg11g11b10Float => 92,
             Self::Rgb10a2Unorm => 90,
             Self::R32Float => 55,
@@ -320,6 +323,7 @@ impl TextureFormat {
             Self::Rgba8Unorm => 7,
             Self::Rgba8Srgb => 8,
             Self::Bgra8Unorm => 9,
+            Self::Rgba16Float => 17,
             Self::Rg11g11b10Float => 10,
             Self::Rgb10a2Unorm => 11,
             Self::R32Float => 12,
@@ -343,6 +347,7 @@ impl TextureFormat {
             7 => Self::Rgba8Unorm,
             8 => Self::Rgba8Srgb,
             9 => Self::Bgra8Unorm,
+            17 => Self::Rgba16Float,
             10 => Self::Rg11g11b10Float,
             11 => Self::Rgb10a2Unorm,
             12 => Self::R32Float,
@@ -2756,7 +2761,7 @@ fn set_attachment_formats(
         )));
     }
     for (index, format) in state.color_formats.iter().enumerate() {
-        let pixel_format = attachment_pixel_format(*format)?;
+        let (pixel_format, _) = attachment_pixel_format(*format)?;
         let attachment = unsafe {
             objc::msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index)
         };
@@ -2769,7 +2774,7 @@ fn set_attachment_formats(
             objc::msg_send_void_usize(
                 attachment,
                 objc::sel(c"setPixelFormat:"),
-                pixel_format.mtl_pixel_format(),
+                pixel_format,
             );
             // Blending is pipeline state in Metal. The shared
             // (`IndependentBlendEnable = FALSE`) form applies entry 0 to every
@@ -2801,18 +2806,18 @@ fn set_attachment_formats(
         }
     }
     if let Some(format) = state.depth_format {
-        let pixel_format = attachment_pixel_format(format)?;
+        let (pixel_format, has_stencil) = attachment_pixel_format(format)?;
         unsafe {
             objc::msg_send_void_usize(
                 descriptor,
                 objc::sel(c"setDepthAttachmentPixelFormat:"),
-                pixel_format.mtl_pixel_format(),
+                pixel_format,
             );
-            if pixel_format.has_stencil() {
+            if has_stencil {
                 objc::msg_send_void_usize(
                     descriptor,
                     objc::sel(c"setStencilAttachmentPixelFormat:"),
-                    pixel_format.mtl_pixel_format(),
+                    pixel_format,
                 );
             }
         }
@@ -2820,12 +2825,20 @@ fn set_attachment_formats(
     Ok(())
 }
 
-fn attachment_pixel_format(format: TextureFormat) -> Result<PixelFormat, RegistryError> {
+/// The `MTLPixelFormat` of one pipeline attachment and whether it carries a
+/// stencil plane.
+///
+/// Only formats that can legitimately back a colour or depth attachment are
+/// accepted. RGBA16Float is a colour format (`MTLPixelFormatRGBA16Float`,
+/// 115), never depth; block-compressed and depth formats stay out of the
+/// colour path exactly as before.
+fn attachment_pixel_format(format: TextureFormat) -> Result<(usize, bool), RegistryError> {
     match format {
-        TextureFormat::Rgba8Unorm => Ok(PixelFormat::Rgba8Unorm),
-        TextureFormat::Bgra8Unorm => Ok(PixelFormat::Bgra8Unorm),
-        TextureFormat::Depth32Float => Ok(PixelFormat::Depth32Float),
-        TextureFormat::Depth32FloatStencil8 => Ok(PixelFormat::Depth32FloatStencil8),
+        TextureFormat::Rgba8Unorm
+        | TextureFormat::Bgra8Unorm
+        | TextureFormat::Rgba16Float
+        | TextureFormat::Depth32Float => Ok((format.mtl_pixel_format(), false)),
+        TextureFormat::Depth32FloatStencil8 => Ok((format.mtl_pixel_format(), true)),
         _ => Err(RegistryError::Unsupported(
             "attachment format is not supported by the render pipeline path",
         )),
@@ -3173,6 +3186,7 @@ mod tests {
             (TextureFormat::Rgba8Unorm, 70),
             (TextureFormat::Rgba8Srgb, 71),
             (TextureFormat::Bgra8Unorm, 80),
+            (TextureFormat::Rgba16Float, 115),
             (TextureFormat::Rg11g11b10Float, 92),
             (TextureFormat::Rgb10a2Unorm, 90),
             (TextureFormat::R32Float, 55),
@@ -3188,6 +3202,23 @@ mod tests {
             assert_eq!(TextureFormat::from_code(format.code()), Some(format));
         }
         assert_eq!(TextureFormat::from_code(200), None);
+    }
+
+    /// A 2560x1440 RGBA16Float colour target (the title's format-10
+    /// back-buffer) is a valid registry texture and a valid 115 attachment;
+    /// no GPU is touched.
+    #[test]
+    fn a_2560x1440_rgba16_float_colour_target_is_accepted() {
+        let mut target = desc();
+        target.width = 2560;
+        target.height = 1440;
+        target.format = TextureFormat::Rgba16Float;
+        target.usage = TextureUsage::color_attachment();
+        assert!(target.validate().is_ok());
+        assert!(matches!(
+            attachment_pixel_format(target.format),
+            Ok((115, false))
+        ));
     }
 
     #[test]

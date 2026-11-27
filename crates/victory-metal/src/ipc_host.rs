@@ -2565,6 +2565,10 @@ fn texture_format_from_code(code: u8) -> Option<TextureFormat> {
         6 => TextureFormat::Rgb10a2Unorm,
         7 => TextureFormat::Depth32Float,
         8 => TextureFormat::Depth32FloatStencil8,
+        // RGBA16Float (DXGI_FORMAT_R16G16B16A16_FLOAT), the title's
+        // SDR-presented FP16 back-buffer. Code 10 and above stay unsupported
+        // and are rejected before the executor sees a descriptor.
+        9 => TextureFormat::Rgba16Float,
         _ => return None,
     })
 }
@@ -4677,5 +4681,55 @@ mod tests {
         let state = host.executor.state();
         assert!(state.v3_submissions.is_empty());
         assert_eq!(state.v3_executions, 0);
+    }
+
+    /// Builds one kind 8 payload for the format-code tests.
+    fn texture_registration_payload(format: u8) -> [u8; TEXTURE_REG_PAYLOAD_LEN] {
+        let mut payload = [0u8; TEXTURE_REG_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&0x21u64.to_le_bytes()); // id
+        payload[8..12].copy_from_slice(&1u32.to_le_bytes()); // generation
+        payload[12] = 1; // 2D
+        payload[13] = format;
+        payload[14] = 1; // colour attachment
+        payload[15] = 1; // sample count
+        payload[16..20].copy_from_slice(&2560u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&1440u32.to_le_bytes());
+        payload[24..28].copy_from_slice(&1u32.to_le_bytes()); // depth
+        payload[28..30].copy_from_slice(&1u16.to_le_bytes()); // mip levels
+        payload[30..32].copy_from_slice(&1u16.to_le_bytes()); // array layers
+        payload
+    }
+
+    /// Guest kind 8 code 9 is the title's FP16 present target: the host
+    /// decodes it to `TextureFormat::Rgba16Float`, whose Metal pixel format is
+    /// `MTLPixelFormatRGBA16Float` (115), and accepts the 2560x1440 descriptor.
+    #[test]
+    fn host_code_9_is_an_rgba16_float_present_target() {
+        assert_eq!(
+            texture_format_from_code(9),
+            Some(TextureFormat::Rgba16Float)
+        );
+        assert_eq!(TextureFormat::Rgba16Float.mtl_pixel_format(), 115);
+        assert!(!TextureFormat::Rgba16Float.is_depth_stencil());
+        assert!(!TextureFormat::Rgba16Float.is_block_compressed());
+        assert!(TextureFormat::Rgba16Float.is_color_render_target());
+
+        let request = decode_texture_request(&texture_registration_payload(9))
+            .expect("a 2560x1440 RGBA16Float colour target is a valid registration");
+        assert_eq!(request.desc.format, TextureFormat::Rgba16Float);
+        assert_eq!((request.desc.width, request.desc.height), (2560, 1440));
+    }
+
+    /// Codes 10 and above are still refused explicitly: the decoder returns
+    /// no format, so no default host format can be substituted.
+    #[test]
+    fn host_format_codes_above_9_are_refused() {
+        for code in 10..=u8::MAX {
+            assert_eq!(texture_format_from_code(code), None, "code {code}");
+            assert!(
+                decode_texture_request(&texture_registration_payload(code)).is_none(),
+                "code {code}"
+            );
+        }
     }
 }

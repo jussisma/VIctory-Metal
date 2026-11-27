@@ -44,7 +44,7 @@ use crate::native_metal::client::{LiveConfig, WireV3Client};
 #[cfg(feature = "diagnostics")]
 use crate::native_metal::present::guard_native_only;
 use crate::native_metal::present::{
-    InFlightFrame, NativeSwapchain, PresentError, PresentedSurface, SurfacePresenter,
+    InFlightFrame, NativeSwapchain, PresentError, PresentedSurface, SurfaceFormat, SurfacePresenter,
     present_surface,
 };
 use crate::native_metal::producer::ProducerError;
@@ -529,6 +529,10 @@ pub fn native_queue_install_client(client: WireV3Client) {
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_reset() {
     native_queue().reset(NativeSink::Disconnected(DisconnectedSink));
+    TEXTURE_FORMATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Connects the session queue on first use, if the environment names a host.
@@ -580,12 +584,13 @@ pub fn register_texture(
     {
         // Several title resources share one memory (placed views and
         // aliases); the host registers the handle once.
+        note_texture_format(id, format);
         return Ok(true);
     }
     let client = queue.sink_mut().client_mut().ok_or_else(|| {
         NativeQueueError::Transport("no live Wire v3 host session".to_string())
     })?;
-    client.register_texture(
+    let accepted = client.register_texture(
         id,
         generation,
         dimension,
@@ -597,7 +602,39 @@ pub fn register_texture(
         depth,
         mip_levels,
         array_layers,
-    )
+    )?;
+    if accepted {
+        // Remember the host format so a headless surface installed from the
+        // presented target keeps its own format (FP16 stays FP16).
+        note_texture_format(id, format);
+    }
+    Ok(accepted)
+}
+
+/// Host format codes of registered textures, keyed by handle.
+///
+/// A title that names no surface in the environment presents a target texture
+/// instead (see the guest `Present` entry point); the surface installed for it
+/// must carry that texture's format, never a BGRA8 replacement.
+#[cfg(any(windows, test, target_os = "macos"))]
+static TEXTURE_FORMATS: std::sync::Mutex<std::collections::BTreeMap<u64, u8>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(any(windows, test, target_os = "macos"))]
+fn note_texture_format(id: u64, format: u8) {
+    TEXTURE_FORMATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, format);
+}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+fn texture_format_code(id: u64) -> Option<u8> {
+    TEXTURE_FORMATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .copied()
 }
 
 /// Registers a texture handle as a present surface with the host.
@@ -1122,8 +1159,25 @@ pub fn native_queue_has_presenter() -> bool {
 pub fn present_registered() -> Result<PresentedSurface, NativeQueueError> {
     let mut slot = PRESENT.lock().unwrap_or_else(|e| e.into_inner());
     let result = match slot.as_mut() {
-        Some(presenter) => presenter.present(),
-        None => Err(NativeQueueError::NoSwapchain),
+        Some(presenter) => {
+            let format = presenter.swapchain().format();
+            let result = presenter.present();
+            if result.is_ok() {
+                tracing::debug!(
+                    surface = presenter.swapchain().surface_id(),
+                    format = format.as_str(),
+                    "native frame presented in its target format"
+                );
+            }
+            result
+        }
+        None => {
+            tracing::warn!(
+                surface_installed = "none",
+                "VICTORY_BACKEND=metal: present refused: no native surface is installed"
+            );
+            Err(NativeQueueError::NoSwapchain)
+        }
     };
     match &result {
         Ok(_) => crate::native_metal::telemetry::note_present_ok(),
@@ -1244,12 +1298,40 @@ pub fn install_present_from_env() -> Result<bool, NativeQueueError> {
         .unwrap_or(surface_id);
     let width = number("VICTORY_METAL_SURFACE_WIDTH").unwrap_or(3840) as u32;
     let height = number("VICTORY_METAL_SURFACE_HEIGHT").unwrap_or(2160) as u32;
-    install_wire_present(surface_id, texture_id, width, height)?;
+    install_wire_present_as(
+        surface_id,
+        texture_id,
+        width,
+        height,
+        SurfaceOrigin::Env,
+    )?;
     Ok(true)
+}
+
+/// Where an installed surface's identity and extent came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceOrigin {
+    /// The launcher's environment (`VICTORY_METAL_SURFACE*`).
+    Env,
+    /// The target texture the title presented (the environment named none).
+    Target,
+}
+
+impl SurfaceOrigin {
+    /// The label reported in present telemetry.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Target => "target",
+        }
+    }
 }
 
 /// Installs a [`WirePresenter`] over a headless swapchain (tests and the
 /// launcher path).
+///
+/// The surface format follows the target texture's registered host format when
+/// it is known (code 9 = RGBA16Float); otherwise the BGRA8 default is kept.
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn install_wire_present(
     surface_id: u64,
@@ -1257,13 +1339,36 @@ pub fn install_wire_present(
     width: u32,
     height: u32,
 ) -> Result<(), NativeQueueError> {
-    let swapchain = NativeSwapchain::new(
+    install_wire_present_as(
         surface_id,
+        texture_id,
         width,
         height,
-        crate::native_metal::present::SurfaceFormat::Bgra8Unorm,
-        GpuBackend::Metal,
-    )?;
+        SurfaceOrigin::Target,
+    )
+}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+fn install_wire_present_as(
+    surface_id: u64,
+    texture_id: u64,
+    width: u32,
+    height: u32,
+    origin: SurfaceOrigin,
+) -> Result<(), NativeQueueError> {
+    let format = texture_format_code(texture_id)
+        .and_then(SurfaceFormat::from_host_format_code)
+        .unwrap_or(SurfaceFormat::Bgra8Unorm);
+    let swapchain = NativeSwapchain::new(surface_id, width, height, format, GpuBackend::Metal)?;
+    tracing::info!(
+        surface = surface_id,
+        texture = texture_id,
+        width,
+        height,
+        format = format.as_str(),
+        surface_installed = origin.as_str(),
+        "native present surface installed"
+    );
     install_present(NativePresenter::new(
         swapchain,
         Box::new(WirePresenter::new(surface_id, texture_id)),
@@ -1493,6 +1598,23 @@ mod tests {
         );
         let _ = take_present();
         assert_eq!(present_registered(), Err(NativeQueueError::NoSwapchain));
+    }
+
+    /// A registered 16F target installs a headless RGBA16Float surface of the
+    /// target's extent: the present path does not coerce it to BGRA8.
+    #[test]
+    fn a_registered_fp16_target_installs_an_rgba16_float_surface() {
+        let _serial = serialized();
+        let _ = take_present();
+        note_texture_format(0x16f, 9);
+        install_wire_present(0x16f, 0x16f, 2560, 1440).expect("install the wire presenter");
+        let installed = take_present().expect("the presenter is installed");
+        assert_eq!(installed.swapchain().format(), SurfaceFormat::Rgba16Float);
+        assert_eq!(
+            (installed.swapchain().width(), installed.swapchain().height()),
+            (2560, 1440)
+        );
+        native_queue_reset();
     }
 
     // ------------------------------------------------------------ live sink
