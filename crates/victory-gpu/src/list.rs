@@ -305,6 +305,145 @@ fn refuse_unregistered(this: This, why: &'static str, error: impl std::fmt::Disp
     });
 }
 
+/// Refuses a native binding whose guest range could not be resolved.
+///
+/// The operation is expressible; the guest address names no range the resolver
+/// can pin, so the title sees `E_FAIL` (not `E_NOTIMPL`) with the exact
+/// resolver error in the log.
+#[cfg(windows)]
+fn refuse_unresolved(this: This, why: &'static str, error: impl std::fmt::Display) {
+    tracing::warn!(error = %error, "{why}");
+    with_metal(this, |_| {
+        Err(crate::native_metal::producer::ProducerError::unresolved(why))
+    });
+}
+
+/// Why a compute root buffer view could not be resolved for recording.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComputeBindingRefusal {
+    /// The resolver could not map the guest address to a share range.
+    Unresolved(crate::native_metal::bindings::ResolveError),
+    /// The host's kind 2 registry does not know the resolved allocation.
+    Unregistered(String),
+}
+
+#[cfg(any(windows, test))]
+impl ComputeBindingRefusal {
+    /// The producer error the recording is refused with.
+    ///
+    /// Both cases are `E_FAIL`: the operation is expressible, the guest
+    /// backing is what is missing.
+    fn producer_error(&self, operation: &'static str) -> crate::native_metal::producer::ProducerError {
+        match self {
+            Self::Unresolved(_) => {
+                crate::native_metal::producer::ProducerError::unresolved(operation)
+            }
+            Self::Unregistered(_) => {
+                crate::native_metal::producer::ProducerError::unregistered(operation)
+            }
+        }
+    }
+}
+
+/// Resolves and pins one compute root CBV/SRV/UAV and checks the host
+/// registry.
+///
+/// The guest call carries only the GPU virtual address (the compute root
+/// signature declares the extent), so the view covers the rest of the page
+/// window the address resolves into, like the graphics path. `registered`
+/// answers whether the allocation is visible to the host; a refusal retires the
+/// pin the resolution took, so a refused call leaves no backing pinned.
+#[cfg(any(windows, test))]
+fn resolve_compute_root_view(
+    resolver: &dyn crate::native_metal::bindings::GuestRangeResolver,
+    slot: u16,
+    address: u64,
+    registered: impl FnOnce(u64) -> Result<(), String>,
+) -> Result<
+    crate::native_metal::bindings::Resolved<victory_metal::wire_v3::RootBufferView>,
+    ComputeBindingRefusal,
+> {
+    use crate::native_metal::bindings;
+    let resolved = bindings::root_buffer_view_page(resolver, slot, address)
+        .map_err(ComputeBindingRefusal::Unresolved)?;
+    if let Err(why) = registered(resolved.entry.allocation_id) {
+        bindings::retire_all(resolver, &resolved.tokens);
+        return Err(ComputeBindingRefusal::Unregistered(why));
+    }
+    Ok(resolved)
+}
+
+/// Resolves and records a compute root CBV/SRV/UAV as a Wire v3 root buffer
+/// view, pinning its guest backing until the queue retires the list.
+///
+/// This is the compute mirror of [`bind_graphics_root_view`]: an unresolved
+/// range or an allocation the host has not registered is `E_FAIL` with a named
+/// reason, and an empty range is refused by the producer with its opcode.
+#[cfg(windows)]
+fn bind_compute_root_view(this: This, slot: u32, address: u64) {
+    use crate::native_metal::{bindings, queue};
+    let Ok(slot) = u16::try_from(slot) else {
+        with_metal(this, |p| {
+            p.refuse(
+                "SetComputeRoot*View: the root parameter slot does not fit the wire",
+                Some(victory_metal::wire_v3::OP_SET_ROOT_BUFFER_VIEW),
+            )
+        });
+        return;
+    };
+    let Some(resolver) = bindings::resolver() else {
+        refuse_unresolved(
+            this,
+            "a compute root view needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let resolved = match resolve_compute_root_view(&*resolver, slot, address, |allocation_id| {
+        queue::ensure_allocation(allocation_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            match &refusal {
+                ComputeBindingRefusal::Unresolved(error) => {
+                    tracing::warn!(error = %error, "a compute root view could not be resolved");
+                }
+                ComputeBindingRefusal::Unregistered(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "a compute root view's allocation is not registered with the host"
+                    );
+                    crate::native_metal::telemetry::note_registration_failure();
+                }
+            }
+            let operation = match &refusal {
+                ComputeBindingRefusal::Unresolved(_) => {
+                    "a compute root view could not be resolved"
+                }
+                ComputeBindingRefusal::Unregistered(_) => {
+                    "a compute root view's allocation is not registered with the host"
+                }
+            };
+            with_metal(this, |_| Err(refusal.producer_error(operation)));
+            return;
+        }
+    };
+    let (view, tokens) = resolved.into_parts();
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_compute_root_buffer_view(view);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
+}
+
 /// Resolves and records a graphics root CBV/SRV/UAV as a Wire v3 root buffer
 /// view, pinning its guest backing until the queue retires the list.
 ///
@@ -546,8 +685,7 @@ fn buffer_entry(
 /// signature, which the native path does not track yet, so a table that
 /// visibly reaches a second same-kind descriptor is refused instead of
 /// mis-bound. Sampler and texture tables are refused for the same reason
-/// (Wire v3 tables carry buffer ranges only). Compute tables are refused
-/// because the producer has no compute root binding yet.
+/// (Wire v3 tables carry buffer ranges only).
 #[cfg(windows)]
 fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     use crate::native_metal::bindings;
@@ -625,6 +763,110 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     let mut recorded = None;
     with_metal(this, |producer| {
         let result = producer.set_graphics_descriptor_table(table);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
+}
+
+/// Resolves and records a compute descriptor table, pinning every referenced
+/// buffer's guest backing until the queue retires the list.
+///
+/// The rules are the graphics table's: the root parameter slot is the Metal
+/// buffer index, only a one-entry table is recorded (a table's descriptor count
+/// and register assignment come from the root signature, which the native path
+/// does not track yet), and sampler or texture tables are refused. A table
+/// whose entry kind is not expressible increments the opcode histogram with
+/// [`victory_metal::wire_v3::OP_DESCRIPTOR_TABLE`].
+#[cfg(windows)]
+fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
+    use crate::native_metal::{bindings, queue};
+    let Ok(slot) = u16::try_from(slot) else {
+        with_metal(this, |p| {
+            p.refuse(
+                "SetComputeRootDescriptorTable: the table slot does not fit the wire",
+                Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
+            )
+        });
+        return;
+    };
+    if handle == 0 {
+        with_metal(this, |p| {
+            p.refuse(
+                "SetComputeRootDescriptorTable: the table handle is zero",
+                Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
+            )
+        });
+        return;
+    }
+    let Some(resolver) = bindings::resolver() else {
+        refuse_unresolved(
+            this,
+            "a compute descriptor table needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let (kind, descriptor) = match table_entry(handle) {
+        Ok(entry) => entry,
+        Err(why) => {
+            tracing::warn!(%why, "a compute descriptor table entry is not expressible");
+            with_metal(this, |p| {
+                p.refuse(
+                    "SetComputeRootDescriptorTable: the table entry kind is not expressible",
+                    Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
+                )
+            });
+            return;
+        }
+    };
+    // A second same-kind slot at the next descriptor address means this may be
+    // a multi-entry table; its register assignment is not known.
+    if let Some(next_handle) = handle.checked_add(32)
+        && let Ok((next_kind, next)) = table_entry(next_handle)
+        && next_kind == kind
+        && next.address != 0
+    {
+        with_metal(this, |p| {
+            p.refuse(
+                "SetComputeRootDescriptorTable: a multi-entry table has no tracked register layout",
+                Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
+            )
+        });
+        return;
+    }
+    let resolved = match bindings::descriptor_table(
+        &*resolver,
+        handle,
+        slot,
+        slot,
+        kind,
+        &[descriptor],
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            refuse_unresolved(this, "a compute descriptor table could not be resolved", error);
+            return;
+        }
+    };
+    let (table, tokens) = resolved.into_parts();
+    for binding in &table.bindings {
+        if let Err(error) = queue::ensure_allocation(binding.allocation_id) {
+            bindings::retire_all(&*resolver, &tokens);
+            refuse_unregistered(
+                this,
+                "a compute descriptor table's allocation is not registered with the host",
+                error,
+            );
+            return;
+        }
+    }
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_compute_descriptor_table(table);
         recorded = Some(result.is_ok());
         result
     });
@@ -2436,15 +2678,7 @@ mod state {
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         if metal() {
-            // The producer has no compute root table binding yet, so the
-            // guest call is refused explicitly rather than recorded with no
-            // effect (ADR-008).
-            with_metal(this, |p| {
-                p.refuse(
-                    "SetComputeRootDescriptorTable: no compute root table binding",
-                    Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
-                )
-            });
+            super::bind_compute_descriptor_table(this, slot, handle);
             return;
         }
         with_state(this, |_, s| s.set_table(true, slot, handle));
@@ -2521,12 +2755,7 @@ mod state {
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
         if metal() {
-            with_metal(this, |p| {
-                p.refuse(
-                    "SetComputeRoot*View: no compute root view binding",
-                    Some(victory_metal::wire_v3::OP_SET_ROOT_BUFFER_VIEW),
-                )
-            });
+            super::bind_compute_root_view(this, slot, address);
             return;
         }
         with_state(this, |_, s| s.set_view(true, slot, address));
@@ -3361,5 +3590,145 @@ mod tests {
         assert!(!read_only_transition(&transition(0, NON_PIXEL, COMMON)));
         assert!(!read_only_transition(&transition(2, NON_PIXEL, PIXEL)));
         assert!(!read_only_transition(&UAV_BARRIER));
+    }
+
+    // ------------------------------------------------ compute root bindings
+
+    /// A resolver over one synthetic share page for the compute-root helper.
+    struct ComputePageResolver {
+        address: u64,
+        pins: std::sync::Mutex<Vec<u64>>,
+        next: std::sync::atomic::AtomicU64,
+    }
+
+    impl ComputePageResolver {
+        fn new(address: u64) -> Self {
+            Self {
+                address,
+                pins: std::sync::Mutex::new(Vec::new()),
+                next: std::sync::atomic::AtomicU64::new(1),
+            }
+        }
+
+        fn live(&self) -> usize {
+            self.pins.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+    }
+
+    impl crate::native_metal::bindings::GuestRangeResolver for ComputePageResolver {
+        fn resolve(
+            &self,
+            guest_address: u64,
+            len: u64,
+        ) -> Result<crate::native_metal::bindings::GuestRange, crate::native_metal::bindings::ResolveError>
+        {
+            use crate::native_metal::bindings::{GuestRange, ResolveError, PAGE};
+            let within = guest_address.checked_sub(self.address);
+            let fits = within.is_some_and(|within| {
+                within < PAGE && len != 0 && within.saturating_add(len) <= PAGE
+            });
+            if !fits {
+                return Err(ResolveError::Unmapped {
+                    address: guest_address,
+                    len,
+                });
+            }
+            Ok(GuestRange {
+                allocation_id: 7,
+                generation: 1,
+                byte_offset: 0,
+                size: PAGE,
+            })
+        }
+
+        fn retain(
+            &self,
+            _range: &crate::native_metal::bindings::GuestRange,
+        ) -> Result<u64, crate::native_metal::bindings::ResolveError> {
+            let token = self.next.fetch_add(1, Ordering::Relaxed);
+            self.pins
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(token);
+            Ok(token)
+        }
+
+        fn retire(&self, token: u64) -> Result<(), crate::native_metal::bindings::ResolveError> {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            match pins.iter().position(|held| *held == token) {
+                Some(index) => {
+                    pins.remove(index);
+                    Ok(())
+                }
+                None => Err(crate::native_metal::bindings::ResolveError::Retire(
+                    "the token is unknown or already retired",
+                )),
+            }
+        }
+    }
+
+    /// A compute root view resolves to the page window at the exact offset,
+    /// pins its backing once, and both refusal kinds are `E_FAIL` with a named
+    /// reason: an unregistered allocation and an unmapped address.
+    #[test]
+    fn compute_root_views_pin_and_refuse_unregistered_or_unmapped() {
+        use crate::native_metal::bindings::PAGE;
+        use crate::native_metal::producer::ProducerError;
+
+        let resolver = ComputePageResolver::new(0x1_0000_0000);
+        let address = resolver.address + 0x40;
+        let resolved = resolve_compute_root_view(&resolver, 2, address, |allocation_id| {
+            (allocation_id == 7)
+                .then_some(())
+                .ok_or_else(|| "no share file".to_string())
+        })
+        .expect("a registered allocation");
+        assert_eq!(resolved.entry.slot, 2);
+        assert_eq!(resolved.entry.allocation_id, 7);
+        assert_eq!(resolved.entry.generation, 1);
+        assert_eq!(resolved.entry.offset, 0x40, "the in-page byte is exact");
+        assert_eq!(resolved.entry.length, PAGE - 0x40);
+        assert_eq!(resolved.tokens.len(), 1);
+        assert_eq!(resolver.live(), 1);
+
+        let refusal = resolve_compute_root_view(&resolver, 0, resolver.address, |_| {
+            Err("no share file".to_string())
+        })
+        .expect_err("an unregistered allocation is refused");
+        assert!(matches!(refusal, ComputeBindingRefusal::Unregistered(_)));
+        let error = refusal.producer_error(
+            "a compute root view's allocation is not registered with the host",
+        );
+        assert_eq!(
+            error,
+            ProducerError::Unregistered {
+                operation: "a compute root view's allocation is not registered with the host"
+            }
+        );
+        assert_eq!(error.hresult(), 0x8000_4005_u32 as i32);
+        assert_eq!(
+            resolver.live(),
+            1,
+            "the refused binding's pin was released"
+        );
+
+        let refusal = resolve_compute_root_view(&resolver, 0, resolver.address + 2 * PAGE, |_| {
+            Ok(())
+        })
+        .expect_err("an unmapped address is refused");
+        assert!(matches!(refusal, ComputeBindingRefusal::Unresolved(_)));
+        let error = refusal.producer_error("a compute root view could not be resolved");
+        assert_eq!(
+            error,
+            ProducerError::Unresolved {
+                operation: "a compute root view could not be resolved"
+            }
+        );
+        assert_eq!(error.hresult(), 0x8000_4005_u32 as i32);
+        assert_eq!(resolver.live(), 1, "an unresolved range pins nothing");
+
+        // Clean up the pin the successful resolution holds.
+        crate::native_metal::bindings::retire_all(&resolver, &resolved.tokens);
+        assert_eq!(resolver.live(), 0);
     }
 }

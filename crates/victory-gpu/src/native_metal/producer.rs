@@ -45,7 +45,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use victory_metal::wire::{
-    Dispatch3d, DispatchMesh, ListIdentity, Reply, ReplyStatus, ResourceBarrier, WireError,
+    BufferBinding, Dispatch3d, DispatchMesh, ListIdentity, Reply, ReplyStatus, ResourceBarrier,
+    WireError, MAX_BINDINGS_PER_DISPATCH,
 };
 pub use victory_metal::wire::BarrierEntry;
 use victory_metal::wire_v3::{
@@ -299,6 +300,15 @@ pub enum ProducerError {
         /// Operation whose binding named it.
         operation: &'static str,
     },
+    /// A binding's guest range could not be resolved to a share allocation.
+    ///
+    /// The operation is supported; the guest address names no range the
+    /// resolver can pin, so the submission the host would receive could only
+    /// be refused. The title sees `E_FAIL`, not `E_NOTIMPL`.
+    Unresolved {
+        /// Operation whose binding could not be resolved.
+        operation: &'static str,
+    },
     /// A draw or dispatch ran without a pipeline of that stage.
     MissingPipeline {
         /// Stage the command needs (`graphics`, `compute`, `mesh`).
@@ -348,6 +358,12 @@ impl ProducerError {
         Self::Unregistered { operation }
     }
 
+    /// A binding whose guest range the resolver could not map: `E_FAIL`,
+    /// because the operation is supported and the backing is what is missing.
+    pub fn unresolved(operation: &'static str) -> Self {
+        Self::Unresolved { operation }
+    }
+
     /// An unsupported operation that would need `opcode`.
     pub fn unsupported_opcode(operation: &'static str, opcode: u16) -> Self {
         Self::Unsupported {
@@ -394,6 +410,10 @@ impl fmt::Display for ProducerError {
             Self::Unregistered { operation } => write!(
                 f,
                 "{operation}: the binding's allocation is not registered with the host"
+            ),
+            Self::Unresolved { operation } => write!(
+                f,
+                "{operation}: the binding could not be resolved to a guest allocation"
             ),
             Self::MissingPipeline { stage } => write!(f, "a {stage} command has no pipeline"),
             Self::NoRenderTargets { operation } => {
@@ -553,7 +573,8 @@ pub struct MetalProducer {
     compute_pipeline: Option<u64>,
     mesh_pipeline: Option<u64>,
     compute_constants: BTreeMap<u16, Vec<u8>>,
-    compute_dirty: BTreeSet<u16>,
+    compute_views: BTreeMap<u16, RootBufferView>,
+    compute_tables: BTreeMap<(u16, u16), DescriptorTableV3>,
     compute_local_size: Option<[u32; 3]>,
     emitted_compute_pipeline: Option<u64>,
     emitted_mesh_pipeline: Option<u64>,
@@ -572,7 +593,8 @@ impl MetalProducer {
             compute_pipeline: None,
             mesh_pipeline: None,
             compute_constants: BTreeMap::new(),
-            compute_dirty: BTreeSet::new(),
+            compute_views: BTreeMap::new(),
+            compute_tables: BTreeMap::new(),
             compute_local_size: None,
             emitted_compute_pipeline: None,
             emitted_mesh_pipeline: None,
@@ -1032,6 +1054,9 @@ impl MetalProducer {
     }
 
     /// `SetComputeRoot32BitConstants`: merges the words into the slot.
+    ///
+    /// Root constants are inline root arguments, not buffer bindings: they are
+    /// emitted before every dispatch so each compute segment carries them.
     pub fn set_compute_root_constants(
         &mut self,
         slot: u32,
@@ -1040,7 +1065,53 @@ impl MetalProducer {
     ) -> Result<(), ProducerError> {
         let merge = merge_constants(&self.compute_constants, slot, values, offset)?;
         self.compute_constants.insert(slot as u16, merge);
-        self.compute_dirty.insert(slot as u16);
+        Ok(())
+    }
+
+    /// A compute root CBV/SRV/UAV (already resolved to an allocation).
+    ///
+    /// The guest call names only a GPU virtual address; `list.rs` resolves it
+    /// through the `GuestRangeResolver`, pins the backing and refuses an
+    /// unresolved or unregistered allocation before this call. A view at slot
+    /// `i` is Metal `[[buffer(i)]]`, matching the backend's graphics
+    /// convention.
+    pub fn set_compute_root_buffer_view(
+        &mut self,
+        view: RootBufferView,
+    ) -> Result<(), ProducerError> {
+        ResourceId::new(view.allocation_id, view.generation)?;
+        if view.length == 0 {
+            return Err(ProducerError::unsupported_opcode(
+                "SetComputeRoot*View: empty range",
+                OP_SET_ROOT_BUFFER_VIEW,
+            ));
+        }
+        self.compute_views.insert(view.slot, view);
+        Ok(())
+    }
+
+    /// A compute descriptor table (already resolved to buffer ranges).
+    pub fn set_compute_descriptor_table(
+        &mut self,
+        table: DescriptorTableV3,
+    ) -> Result<(), ProducerError> {
+        if table.bindings.is_empty() {
+            return Err(ProducerError::unsupported_opcode(
+                "SetComputeRootDescriptorTable: empty table",
+                OP_DESCRIPTOR_TABLE,
+            ));
+        }
+        for binding in &table.bindings {
+            ResourceId::new(binding.allocation_id, binding.generation)?;
+            if binding.length == 0 {
+                return Err(ProducerError::unsupported_opcode(
+                    "SetComputeRootDescriptorTable: empty range",
+                    OP_DESCRIPTOR_TABLE,
+                ));
+            }
+        }
+        self.compute_tables
+            .insert((table.set, table.base_register), table);
         Ok(())
     }
 
@@ -1266,6 +1337,7 @@ impl MetalProducer {
             self.emitted_compute_pipeline = Some(pipeline_id);
         }
         self.flush_compute_state()?;
+        self.note_unbound_dispatch();
         self.push(CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
             pipeline_id,
             arguments,
@@ -1303,11 +1375,13 @@ impl MetalProducer {
             self.emitted_compute_pipeline = Some(pipeline_id);
         }
         self.flush_compute_state()?;
+        let bindings = self.compute_bindings();
+        self.note_unbound_dispatch();
         self.push(CommandV3::Dispatch3d(Dispatch3d {
             pipeline_id,
             group_counts: [x, y, z],
             threads_per_group,
-            bindings: Vec::new(),
+            bindings,
         }))
     }
 
@@ -1700,16 +1774,60 @@ impl MetalProducer {
     }
 
     fn flush_compute_state(&mut self) -> Result<(), ProducerError> {
-        let slots = std::mem::take(&mut self.compute_dirty);
-        for slot in slots {
-            if let Some(bytes) = self.compute_constants.get(&slot) {
-                self.push(CommandV3::SetRootConstants(RootConstantsV3 {
-                    slot,
-                    bytes: bytes.clone(),
-                }))?;
-            }
+        // Each dispatch may start a new compute segment (a render pass in
+        // between splits them), so every current root argument is re-emitted
+        // instead of relying on state from an earlier segment.
+        let constants: Vec<(u16, Vec<u8>)> = self
+            .compute_constants
+            .iter()
+            .map(|(slot, bytes)| (*slot, bytes.clone()))
+            .collect();
+        for (slot, bytes) in constants {
+            self.push(CommandV3::SetRootConstants(RootConstantsV3 { slot, bytes }))?;
+        }
+        let views: Vec<RootBufferView> = self.compute_views.values().copied().collect();
+        for view in views {
+            self.push(CommandV3::SetRootBufferView(view))?;
+        }
+        let tables: Vec<DescriptorTableV3> = self.compute_tables.values().cloned().collect();
+        for table in tables {
+            self.push(CommandV3::SetDescriptorTable(table))?;
         }
         Ok(())
+    }
+
+    /// The buffer bindings a dispatch carries in `[[buffer(0)]]` order.
+    ///
+    /// The wire binds this list at `[[buffer(0)]]`, `[[buffer(1)]]`, ..., so
+    /// only the contiguous run of root views from slot 0 can ride on the
+    /// dispatch. Every view is also emitted as a stateful `SetRootBufferView`
+    /// at its own slot, which covers a sparse set (a descriptor table or a
+    /// root constant at an earlier slot) without mis-binding.
+    fn compute_bindings(&self) -> Vec<BufferBinding> {
+        self.compute_views
+            .iter()
+            .enumerate()
+            .take(MAX_BINDINGS_PER_DISPATCH)
+            .take_while(|(index, (slot, _))| usize::from(**slot) == *index)
+            .map(|(_, (_, view))| BufferBinding {
+                allocation_id: view.allocation_id,
+                generation: view.generation,
+                offset: view.offset,
+                length: view.length,
+            })
+            .collect()
+    }
+
+    /// Makes a dispatch with no recorded buffer binding visible in telemetry.
+    ///
+    /// The producer cannot see a pipeline's declared root layout, so it cannot
+    /// prove a kernel expected a buffer; it can prove the recording produced
+    /// none. The named counter keeps that from being a silent empty dispatch
+    /// (`Dispatch3d.bindings` empty and no compute descriptor table).
+    fn note_unbound_dispatch(&self) {
+        if self.compute_views.is_empty() && self.compute_tables.is_empty() {
+            crate::native_metal::telemetry::note_compute_dispatch_without_bindings();
+        }
     }
 }
 
@@ -1940,10 +2058,11 @@ mod tests {
     use super::*;
     use crate::backend::GpuBackend;
     use victory_metal::wire_v3::{
-        decode_submission_v3, IndirectCountBuffer, OP_DRAW_INDEXED_INSTANCED, OP_END_RENDER_PASS,
-        OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH,
-        OP_EXECUTE_INDIRECT_DRAW, OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_SET_COMPUTE_PIPELINE,
-        OP_SET_GRAPHICS_PIPELINE, OP_SET_MESH_PIPELINE,
+        decode_submission_v3, DescriptorKind, IndirectCountBuffer, OP_DESCRIPTOR_TABLE,
+        OP_DRAW_INDEXED_INSTANCED, OP_END_RENDER_PASS, OP_EXECUTE_INDIRECT_DISPATCH,
+        OP_EXECUTE_INDIRECT_DISPATCH_MESH, OP_EXECUTE_INDIRECT_DRAW,
+        OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_ROOT_CONSTANTS, OP_SET_COMPUTE_PIPELINE,
+        OP_SET_GRAPHICS_PIPELINE, OP_SET_MESH_PIPELINE, OP_SET_ROOT_BUFFER_VIEW,
     };
 
     fn resource(allocation_id: u64) -> ResourceId {
@@ -2604,5 +2723,396 @@ mod tests {
         ));
         let bytes = MetalProducer::encode(&submission).expect("encode");
         assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    // ------------------------------------------------- compute root bindings
+
+    fn compute_view(slot: u16, allocation_id: u64) -> RootBufferView {
+        RootBufferView {
+            slot,
+            allocation_id,
+            generation: 1,
+            offset: 0,
+            length: 64,
+        }
+    }
+
+    fn compute_binding(allocation_id: u64) -> BufferBinding {
+        BufferBinding {
+            allocation_id,
+            generation: 1,
+            offset: 0,
+            length: 64,
+        }
+    }
+
+    fn compute_producer(list_id: u64) -> MetalProducer {
+        let mut producer = MetalProducer::new(list_id, 1).expect("producer");
+        producer.set_compute_pipeline(0xb00).expect("compute pipeline");
+        producer
+            .set_compute_threadgroup_size([64, 1, 1])
+            .expect("threadgroup size");
+        producer
+    }
+
+    /// A compute root UAV reaches the dispatch as exactly one binding, with
+    /// the resolved allocation, generation, offset and length.
+    #[test]
+    fn a_compute_root_view_produces_one_dispatch_binding() {
+        let mut producer = compute_producer(30);
+        let mut view = compute_view(0, 0x4000);
+        view.offset = 0x80;
+        view.length = 0x120;
+        producer
+            .set_compute_root_buffer_view(view)
+            .expect("compute root view");
+        producer.dispatch(2, 1, 1).expect("dispatch");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_SET_COMPUTE_PIPELINE,
+                OP_SET_ROOT_BUFFER_VIEW,
+                OP_DISPATCH_3D,
+            ]
+        );
+        match &submission.commands[1] {
+            CommandV3::SetRootBufferView(recorded) => assert_eq!(*recorded, view),
+            other => panic!("second command is {other:?}"),
+        }
+        match &submission.commands[2] {
+            CommandV3::Dispatch3d(dispatch) => assert_eq!(
+                dispatch.bindings,
+                vec![BufferBinding {
+                    allocation_id: 0x4000,
+                    generation: 1,
+                    offset: 0x80,
+                    length: 0x120,
+                }]
+            ),
+            other => panic!("third command is {other:?}"),
+        }
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    /// Two views set in call order produce two bindings in that order, and
+    /// each is also emitted at its own slot for a sparse root signature.
+    #[test]
+    fn two_compute_root_views_produce_two_bindings_in_call_order() {
+        let mut producer = compute_producer(31);
+        producer
+            .set_compute_root_buffer_view(compute_view(0, 0x4000))
+            .expect("first view");
+        producer
+            .set_compute_root_buffer_view(compute_view(1, 0x5000))
+            .expect("second view");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_SET_COMPUTE_PIPELINE,
+                OP_SET_ROOT_BUFFER_VIEW,
+                OP_SET_ROOT_BUFFER_VIEW,
+                OP_DISPATCH_3D,
+            ]
+        );
+        let views: Vec<u16> = submission
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                CommandV3::SetRootBufferView(view) => Some(view.slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(views, vec![0, 1], "stateful views keep their slots");
+        match &submission.commands[3] {
+            CommandV3::Dispatch3d(dispatch) => assert_eq!(
+                dispatch.bindings,
+                vec![compute_binding(0x4000), compute_binding(0x5000)]
+            ),
+            other => panic!("last command is {other:?}"),
+        }
+    }
+
+    /// A view at a slot after a gap is still bound at its own slot; the
+    /// dispatch payload only carries the contiguous run from slot 0 (the wire
+    /// binds it at `[[buffer(0)]]`), so nothing is mis-bound.
+    #[test]
+    fn a_sparse_compute_view_is_bound_at_its_own_slot() {
+        let mut producer = compute_producer(32);
+        producer
+            .set_compute_root_constants(0, &[7], 0)
+            .expect("slot 0 constants");
+        producer
+            .set_compute_root_buffer_view(compute_view(2, 0x6000))
+            .expect("slot 2 view");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+
+        let submission = producer.flush().expect("flush");
+        match &submission.commands[2] {
+            CommandV3::SetRootBufferView(view) => assert_eq!(view.slot, 2),
+            other => panic!("third command is {other:?}"),
+        }
+        match &submission.commands[3] {
+            CommandV3::Dispatch3d(dispatch) => {
+                assert!(
+                    dispatch.bindings.is_empty(),
+                    "a slot 2 view is not [[buffer(0)]]"
+                );
+            }
+            other => panic!("fourth command is {other:?}"),
+        }
+    }
+
+    /// Root constants stay inline and are re-emitted before every dispatch,
+    /// alongside the bindings.
+    #[test]
+    fn compute_constants_and_bindings_reach_every_dispatch() {
+        let mut producer = compute_producer(33);
+        producer
+            .set_compute_root_constants(2, &[0x1122_3344, 0x5566_7788], 0)
+            .expect("root constants");
+        producer
+            .set_compute_root_buffer_view(compute_view(0, 0x4000))
+            .expect("root view");
+        producer.dispatch(1, 1, 1).expect("first dispatch");
+        producer.dispatch(1, 1, 1).expect("second dispatch");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_SET_COMPUTE_PIPELINE,
+                OP_ROOT_CONSTANTS,
+                OP_SET_ROOT_BUFFER_VIEW,
+                OP_DISPATCH_3D,
+                OP_ROOT_CONSTANTS,
+                OP_SET_ROOT_BUFFER_VIEW,
+                OP_DISPATCH_3D,
+            ]
+        );
+        match &submission.commands[1] {
+            CommandV3::SetRootConstants(constants) => {
+                assert_eq!(constants.slot, 2);
+                assert_eq!(
+                    constants.bytes,
+                    [0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+                );
+            }
+            other => panic!("second command is {other:?}"),
+        }
+        for index in [3, 6] {
+            match &submission.commands[index] {
+                CommandV3::Dispatch3d(dispatch) => {
+                    assert_eq!(dispatch.bindings, vec![compute_binding(0x4000)]);
+                }
+                other => panic!("command {index} is {other:?}"),
+            }
+        }
+    }
+
+    /// A compute descriptor table is recorded at its root slot before the
+    /// dispatch; its ranges are the table's, not dispatch bindings.
+    #[test]
+    fn a_compute_descriptor_table_precedes_the_dispatch() {
+        let mut producer = compute_producer(34);
+        let table = DescriptorTableV3 {
+            set: 1,
+            base_register: 1,
+            kind: DescriptorKind::Uav,
+            bindings: vec![BufferBinding {
+                allocation_id: 0x7000,
+                generation: 1,
+                offset: 16,
+                length: 256,
+            }],
+        };
+        producer
+            .set_compute_descriptor_table(table.clone())
+            .expect("compute table");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_SET_COMPUTE_PIPELINE,
+                OP_DESCRIPTOR_TABLE,
+                OP_DISPATCH_3D,
+            ]
+        );
+        match &submission.commands[1] {
+            CommandV3::SetDescriptorTable(recorded) => assert_eq!(*recorded, table),
+            other => panic!("second command is {other:?}"),
+        }
+        match &submission.commands[2] {
+            CommandV3::Dispatch3d(dispatch) => assert!(
+                dispatch.bindings.is_empty(),
+                "a table's ranges ride on the table, not [[buffer(0)]]"
+            ),
+            other => panic!("last command is {other:?}"),
+        }
+    }
+
+    /// A dispatch with no compute root view or table is counted by name, so an
+    /// empty-binding dispatch is visible instead of silent.
+    #[test]
+    fn a_compute_dispatch_without_bindings_is_counted() {
+        use crate::native_metal::telemetry;
+
+        let before = telemetry::compute_dispatches_without_bindings();
+        let mut producer = compute_producer(35);
+        producer.dispatch(1, 1, 1).expect("unbound dispatch");
+        producer.flush().expect("flush");
+        assert_eq!(
+            telemetry::compute_dispatches_without_bindings(),
+            before + 1,
+            "an unbound dispatch must be counted"
+        );
+
+        let before = telemetry::compute_dispatches_without_bindings();
+        let mut producer = compute_producer(36);
+        producer
+            .set_compute_root_buffer_view(compute_view(0, 0x4000))
+            .expect("bound view");
+        producer.dispatch(1, 1, 1).expect("bound dispatch");
+        producer.flush().expect("flush");
+        assert_eq!(
+            telemetry::compute_dispatches_without_bindings(),
+            before,
+            "a bound dispatch must not be counted"
+        );
+    }
+
+    /// The compute dispatch that writes the indirect argument buffer is
+    /// ordered before the indirect draw that reads it, with the barrier the
+    /// title recorded between them, and both name the same allocation.
+    #[test]
+    fn a_compute_dispatch_precedes_the_indirect_draw_it_feeds() {
+        let arguments = arguments(1, false);
+        let mut producer = compute_producer(37);
+        producer
+            .set_compute_root_buffer_view(compute_view(0, arguments.allocation_id))
+            .expect("argument buffer as UAV");
+        producer.dispatch(1, 1, 1).expect("compute culling");
+        producer
+            .resource_barrier(&[BarrierEntry {
+                allocation_id: arguments.allocation_id,
+                generation: 1,
+                offset: 0,
+                length: 64,
+                before_state: 0x8,
+                after_state: 0x40,
+            }])
+            .expect("UAV barrier");
+        let (colors, depth) = targets();
+        producer.set_render_targets(&colors, depth).expect("targets");
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        producer
+            .execute_indirect_draw(arguments)
+            .expect("indirect draw");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        let dispatch_at = opcodes
+            .iter()
+            .position(|opcode| *opcode == OP_DISPATCH_3D)
+            .expect("compute dispatch");
+        let barrier_at = opcodes
+            .iter()
+            .position(|opcode| *opcode == OP_RESOURCE_BARRIER)
+            .expect("barrier");
+        let indirect_at = opcodes
+            .iter()
+            .position(|opcode| *opcode == OP_EXECUTE_INDIRECT_DRAW)
+            .expect("indirect draw");
+        assert!(
+            dispatch_at < barrier_at && barrier_at < indirect_at,
+            "dispatch -> barrier -> indirect draw, got {opcodes:?}"
+        );
+        match &submission.commands[dispatch_at] {
+            CommandV3::Dispatch3d(dispatch) => assert_eq!(
+                dispatch.bindings,
+                vec![compute_binding(arguments.allocation_id)],
+                "the dispatch writes the buffer the indirect draw reads"
+            ),
+            other => panic!("command {dispatch_at} is {other:?}"),
+        }
+        match &submission.commands[indirect_at] {
+            CommandV3::ExecuteIndirectDraw(draw) => {
+                assert_eq!(draw.arguments.allocation_id, arguments.allocation_id)
+            }
+            other => panic!("command {indirect_at} is {other:?}"),
+        }
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    /// An unregistered or unresolved compute binding is `E_FAIL` with a named
+    /// reason, and a list that recorded it submits nothing.
+    #[test]
+    fn an_unregistered_or_unresolved_compute_binding_is_e_fail() {
+        const E_FAIL: i32 = 0x8000_4005_u32 as i32;
+        for error in [
+            ProducerError::unregistered(
+                "a compute root view's allocation is not registered with the host",
+            ),
+            ProducerError::unresolved("a compute root view could not be resolved"),
+        ] {
+            assert_eq!(error.hresult(), E_FAIL, "the title sees E_FAIL");
+            assert_eq!(error.opcode(), None, "no opcode is invented");
+
+            let mut list = MetalList::new(38).expect("list");
+            list.note_error(error);
+            let closed = list.close().expect_err("close reports the refusal");
+            assert_eq!(closed.hresult(), E_FAIL);
+            assert!(
+                list.take().is_empty(),
+                "a refused list submits nothing (exactly-once)"
+            );
+        }
+    }
+
+    /// A view or table that names no live allocation is refused before it can
+    /// reach a dispatch.
+    #[test]
+    fn invalid_compute_bindings_are_refused() {
+        let mut producer = compute_producer(39);
+        let error = producer
+            .set_compute_root_buffer_view(RootBufferView {
+                slot: 0,
+                allocation_id: 0,
+                generation: 1,
+                offset: 0,
+                length: 64,
+            })
+            .expect_err("zero allocation");
+        assert_eq!(
+            error,
+            ProducerError::InvalidResource {
+                operation: "resource identity"
+            }
+        );
+        let error = producer
+            .set_compute_descriptor_table(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Cbv,
+                bindings: Vec::new(),
+            })
+            .expect_err("empty table");
+        assert_eq!(error.opcode(), Some(OP_DESCRIPTOR_TABLE));
+        assert!(
+            producer.commands().is_empty(),
+            "a refusal leaves no command"
+        );
     }
 }

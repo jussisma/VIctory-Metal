@@ -164,8 +164,14 @@ pub struct FrameTelemetry {
     pool_warm: AtomicU64,
     /// Buffer or pipeline registrations that failed explicitly.
     registration_failures: AtomicU64,
+    /// Compute dispatches recorded with no root view or descriptor table.
+    ///
+    /// The producer cannot see a pipeline's declared root layout, so it reports
+    /// the one fact it has: the recording produced no compute buffer binding
+    /// (inline root constants are not buffer bindings). A nonzero count makes an
+    /// empty-binding dispatch visible instead of silent.
+    compute_dispatches_without_bindings: AtomicU64,
 }
-
 impl FrameTelemetry {
     /// Empty telemetry.
     pub fn new() -> Self {
@@ -362,6 +368,18 @@ impl FrameTelemetry {
         self.registration_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One compute dispatch recorded with no root view or descriptor table.
+    pub fn note_compute_dispatch_without_bindings(&self) {
+        self.compute_dispatches_without_bindings
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Compute dispatches recorded with no root view or descriptor table.
+    pub fn compute_dispatches_without_bindings(&self) -> u64 {
+        self.compute_dispatches_without_bindings
+            .load(Ordering::Relaxed)
+    }
+
     /// Accepted buffer and PSO registrations.
     pub fn registration_counts(&self) -> (u64, u64) {
         (
@@ -430,6 +448,7 @@ impl FrameTelemetry {
             pool_cold: self.pool_cold.load(Ordering::Relaxed),
             pool_warm: self.pool_warm.load(Ordering::Relaxed),
             registration_failures: self.registration_failures.load(Ordering::Relaxed),
+            compute_dispatches_without_bindings: self.compute_dispatches_without_bindings(),
         }
     }
 
@@ -507,6 +526,8 @@ pub struct TelemetrySnapshot {
     pub pool_warm: u64,
     /// Buffer or pipeline registrations that failed explicitly.
     pub registration_failures: u64,
+    /// Compute dispatches recorded with no root view or descriptor table.
+    pub compute_dispatches_without_bindings: u64,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -530,12 +551,14 @@ impl std::fmt::Display for TelemetrySnapshot {
         )?;
         write!(
             f,
-            ", registered={} buffers/{} psos, pool={} cold/{} warm, registration_failures={}",
+            ", registered={} buffers/{} psos, pool={} cold/{} warm, registration_failures={}, \
+             compute_unbound={}",
             self.buffers_registered,
             self.psos_registered,
             self.pool_cold,
             self.pool_warm,
-            self.registration_failures
+            self.registration_failures,
+            self.compute_dispatches_without_bindings
         )?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))
@@ -643,6 +666,11 @@ pub fn note_registration_failure() {
     global().note_registration_failure();
 }
 
+/// One compute dispatch recorded with no root view or descriptor table.
+pub fn note_compute_dispatch_without_bindings() {
+    global().note_compute_dispatch_without_bindings();
+}
+
 /// The process-wide accepted buffer and PSO registration counts.
 pub fn registration_counts() -> (u64, u64) {
     global().registration_counts()
@@ -656,6 +684,11 @@ pub fn pool_translations() -> (u64, u64) {
 /// The process-wide registration failure count.
 pub fn registration_failures() -> u64 {
     global().registration_failures()
+}
+
+/// The process-wide count of compute dispatches without a root binding.
+pub fn compute_dispatches_without_bindings() -> u64 {
+    global().compute_dispatches_without_bindings()
 }
 
 /// Declares one D3DMetal fallback in the process-wide telemetry.
@@ -915,6 +948,25 @@ mod tests {
 
     /// The snapshot names the unsupported opcodes and the submit/present
     /// statuses the native path observed, with the hard fallback count.
+    /// An empty-binding compute dispatch is a named count, not silence.
+    #[test]
+    fn unbound_compute_dispatches_are_counted_by_name() {
+        let telemetry = telemetry();
+        assert_eq!(telemetry.compute_dispatches_without_bindings(), 0);
+        telemetry.note_compute_dispatch_without_bindings();
+        telemetry.note_compute_dispatch_without_bindings();
+        assert_eq!(telemetry.compute_dispatches_without_bindings(), 2);
+
+        let line = telemetry.snapshot().to_string();
+        assert!(line.contains("compute_unbound=2"), "{line}");
+        telemetry.reset();
+        assert_eq!(
+            telemetry.compute_dispatches_without_bindings(),
+            2,
+            "the count is a session total, like the submit counters"
+        );
+    }
+
     #[test]
     fn the_snapshot_carries_refusals_and_submit_present_statuses() {
         let telemetry = telemetry();
