@@ -628,6 +628,20 @@ pub(crate) enum View {
     Placed(bool, [u32; 14], [u32; 16]),
 }
 
+impl View {
+    /// A stable small code per view kind (ADR-036 trace; never the payload).
+    fn tag(&self) -> u64 {
+        match self {
+            View::Constant(..) => 1,
+            View::Shader(..) => 2,
+            View::Unordered(..) => 3,
+            View::Sampler(_) => 4,
+            View::ConsoleSampler(_) => 5,
+            View::Placed(..) => 6,
+        }
+    }
+}
+
 /// Every distinct view in use; a descriptor holds a tag, an index into it
 /// and the entry's generation, which survive titles copying descriptors as
 /// bytes. A view of a resource lives as long as the resource: when the
@@ -671,8 +685,16 @@ impl View {
 
 fn record(handle: u64, view: View) {
     if handle == 0 {
+        abi_trace::record("DescriptorWrite", &[0, 0, 0]);
         return;
     }
+    // ADR-036: every descriptor write, by where it lands (the two address
+    // halves) and what it is. A write the title then cannot read back, or a
+    // heap slot outside the memory it was handed, shows up here.
+    abi_trace::record(
+        "DescriptorWrite",
+        &[handle & 0xffff_ffff, handle >> 32, view.tag()],
+    );
     // A view seen before, as most are: its entry is found under the shared
     // lock, which keeps `forget` from making it stale while it is written.
     let known = {
