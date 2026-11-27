@@ -37,7 +37,7 @@
 //! answers itself for every percentile; an empty window answers zero.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -145,6 +145,274 @@ impl std::fmt::Display for TelemetryError {
 
 impl std::error::Error for TelemetryError {}
 
+/// Maximum bytes of one first-failure line (name, HRESULT, arguments).
+///
+/// The record itself is a fixed-size struct; this bounds the readable form,
+/// so a pathological name is truncated on a character boundary instead of
+/// growing the log line.
+pub const MAX_CALL_FAILURE_BYTES: usize = 160;
+
+/// Scalar arguments a failure record keeps.
+pub const MAX_CALL_FAILURE_ARGS: usize = 3;
+
+/// The names the instrumented GPU exports pass to the failure latch.
+///
+/// All names are static: the latch keeps no title text, paths or memory.
+pub mod call_names {
+    /// `ID3D12Device::CreateDescriptorHeap`.
+    pub const CREATE_DESCRIPTOR_HEAP: &str = "CreateDescriptorHeap";
+    /// `ID3D12DescriptorHeap::GetCPUDescriptorHandleForHeapStart`.
+    pub const GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START: &str =
+        "GetCPUDescriptorHandleForHeapStart";
+    /// `ID3D12DescriptorHeap::GetGPUDescriptorHandleForHeapStart`.
+    pub const GET_GPU_DESCRIPTOR_HANDLE_FOR_HEAP_START: &str =
+        "GetGPUDescriptorHandleForHeapStart";
+    /// `ID3D12Device::CreateConstantBufferView`.
+    pub const CREATE_CONSTANT_BUFFER_VIEW: &str = "CreateConstantBufferView";
+    /// `ID3D12Device::CreateShaderResourceView`.
+    pub const CREATE_SHADER_RESOURCE_VIEW: &str = "CreateShaderResourceView";
+    /// `ID3D12Device::CreateUnorderedAccessView`.
+    pub const CREATE_UNORDERED_ACCESS_VIEW: &str = "CreateUnorderedAccessView";
+    /// `ID3D12Device::CreateRenderTargetView`.
+    pub const CREATE_RENDER_TARGET_VIEW: &str = "CreateRenderTargetView";
+    /// `ID3D12Device::CreateDepthStencilView`.
+    pub const CREATE_DEPTH_STENCIL_VIEW: &str = "CreateDepthStencilView";
+    /// `ID3D12Device::CopyDescriptorsSimple`.
+    pub const COPY_DESCRIPTORS_SIMPLE: &str = "CopyDescriptorsSimple";
+    /// `ID3D12Resource::Map`.
+    pub const MAP: &str = "Map";
+    /// `ID3D12Resource::Unmap`.
+    pub const UNMAP: &str = "Unmap";
+    /// `ID3D12Device::CreateCommittedResource`.
+    pub const CREATE_COMMITTED_RESOURCE: &str = "CreateCommittedResource";
+    /// `ID3D12Device::CreatePlacedResource`.
+    pub const CREATE_PLACED_RESOURCE: &str = "CreatePlacedResource";
+    /// `ID3D12Device::CreateReservedResource`.
+    pub const CREATE_RESERVED_RESOURCE: &str = "CreateReservedResource";
+    /// `ID3D12Device9::CreatePlacedResourceX`/`CreateAtAddress`.
+    pub const CREATE_AT_ADDRESS: &str = "CreateAtAddress";
+    /// `ID3D12Resource::GetGPUVirtualAddress`.
+    pub const GET_GPU_VIRTUAL_ADDRESS: &str = "GetGPUVirtualAddress";
+}
+
+/// The fixed set of names the histogram counts, in a stable order.
+///
+/// A failure can only be counted under a known name, so the histogram never
+/// grows and its contents do not depend on the order calls failed in.
+pub const CALL_FAILURE_NAMES: &[&str] = &[
+    call_names::CREATE_DESCRIPTOR_HEAP,
+    call_names::GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START,
+    call_names::GET_GPU_DESCRIPTOR_HANDLE_FOR_HEAP_START,
+    call_names::CREATE_CONSTANT_BUFFER_VIEW,
+    call_names::CREATE_SHADER_RESOURCE_VIEW,
+    call_names::CREATE_UNORDERED_ACCESS_VIEW,
+    call_names::CREATE_RENDER_TARGET_VIEW,
+    call_names::CREATE_DEPTH_STENCIL_VIEW,
+    call_names::COPY_DESCRIPTORS_SIMPLE,
+    call_names::MAP,
+    call_names::UNMAP,
+    call_names::CREATE_COMMITTED_RESOURCE,
+    call_names::CREATE_PLACED_RESOURCE,
+    call_names::CREATE_RESERVED_RESOURCE,
+    call_names::CREATE_AT_ADDRESS,
+    call_names::GET_GPU_VIRTUAL_ADDRESS,
+];
+
+/// The first failing GPU call, kept once for the telemetry snapshot.
+///
+/// Fixed-size and copied out by value, so reading it never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallFailure {
+    /// The export's static name.
+    pub name: &'static str,
+    /// The HRESULT the export returned (0 when it returned `S_OK` and left a
+    /// required output zero or null).
+    pub hr: i32,
+    /// Up to [`MAX_CALL_FAILURE_ARGS`] compact scalar arguments.
+    pub args: [u64; MAX_CALL_FAILURE_ARGS],
+}
+
+impl CallFailure {
+    /// The record as one line, at most [`MAX_CALL_FAILURE_BYTES`] bytes.
+    pub fn line(&self) -> String {
+        let mut text = format!(
+            "{} hr={:#x} args=[{:#x},{:#x},{:#x}]",
+            self.name, self.hr as u32, self.args[0], self.args[1], self.args[2]
+        );
+        if text.len() > MAX_CALL_FAILURE_BYTES {
+            let mut end = MAX_CALL_FAILURE_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        text
+    }
+}
+
+const FIRST_EMPTY: u64 = 0;
+const FIRST_WRITING: u64 = 1;
+const FIRST_READY: u64 = 2;
+
+/// The single bounded first-failure record, published with one atomic claim.
+///
+/// The first thread to move `state` from empty to writing owns every field;
+/// later failures only count. A reader sees the record only once `state` is
+/// `ready`, published with release/acquire.
+#[derive(Debug, Default)]
+struct FirstCallFailure {
+    state: AtomicU64,
+    name: AtomicUsize,
+    name_len: AtomicUsize,
+    hr: AtomicI32,
+    args: [AtomicU64; MAX_CALL_FAILURE_ARGS],
+}
+
+impl FirstCallFailure {
+    /// Claims the record for `failure`; false if another failure owns it.
+    fn claim(&self, failure: CallFailure) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                FIRST_EMPTY,
+                FIRST_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.name.store(failure.name.as_ptr() as usize, Ordering::Relaxed);
+        self.name_len.store(failure.name.len(), Ordering::Relaxed);
+        self.hr.store(failure.hr, Ordering::Relaxed);
+        for (slot, value) in self.args.iter().zip(failure.args) {
+            slot.store(value, Ordering::Relaxed);
+        }
+        self.state.store(FIRST_READY, Ordering::Release);
+        true
+    }
+
+    /// The recorded failure, if the record is complete.
+    fn get(&self) -> Option<CallFailure> {
+        if self.state.load(Ordering::Acquire) != FIRST_READY {
+            return None;
+        }
+        let pointer = self.name.load(Ordering::Relaxed) as *const u8;
+        let len = self.name_len.load(Ordering::Relaxed);
+        // SAFETY: the only names the latch accepts are `&'static str`, so the
+        // bytes stay valid for the process.
+        let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(pointer, len)) };
+        let mut args = [0u64; MAX_CALL_FAILURE_ARGS];
+        for (slot, value) in self.args.iter().zip(args.iter_mut()) {
+            *value = slot.load(Ordering::Relaxed);
+        }
+        Some(CallFailure {
+            name,
+            hr: self.hr.load(Ordering::Relaxed),
+            args,
+        })
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        self.state.store(FIRST_EMPTY, Ordering::Relaxed);
+    }
+}
+
+/// A bounded, lock-free latch over failing GPU calls.
+///
+/// Every failure moves [`Self::count`], its name's slot in a fixed
+/// [`CALL_FAILURE_NAMES`] histogram and, for the first failure only, a
+/// fixed-size [`CallFailure`]. Repeated failures of one name only count.
+#[derive(Debug, Default)]
+pub struct CallFailureLatch {
+    total: AtomicU64,
+    by_name: [AtomicU64; CALL_FAILURE_NAMES.len()],
+    first: FirstCallFailure,
+}
+
+/// Saturating increment returning the previous value.
+fn bump(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(1))
+        })
+        .unwrap_or(u64::MAX)
+}
+
+/// The histogram slot for `name`, if it is one of [`CALL_FAILURE_NAMES`].
+fn call_failure_index(name: &str) -> Option<usize> {
+    CALL_FAILURE_NAMES.iter().position(|&known| known == name)
+}
+
+impl CallFailureLatch {
+    /// Records one failing call and logs the first failure of its name.
+    pub fn note(&self, name: &'static str, hr: i32, args: [u64; MAX_CALL_FAILURE_ARGS]) {
+        bump(&self.total);
+        let first_for_name = match call_failure_index(name) {
+            Some(index) => bump(&self.by_name[index]) == 0,
+            None => false,
+        };
+        if first_for_name {
+            tracing::warn!(
+                call = name,
+                hr = format_args!("{:#010x}", hr as u32),
+                arg0 = args[0],
+                arg1 = args[1],
+                arg2 = args[2],
+                "GPU call failed"
+            );
+        }
+        self.first.claim(CallFailure { name, hr, args });
+    }
+
+    /// Records `hr` only when it is a failure, so a successful export adds
+    /// nothing.
+    pub fn note_result(
+        &self,
+        name: &'static str,
+        hr: i32,
+        args: [u64; MAX_CALL_FAILURE_ARGS],
+    ) {
+        if hr < 0 {
+            self.note(name, hr, args);
+        }
+    }
+
+    /// Failing calls recorded so far.
+    pub fn count(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Failures by export name, in the fixed names' sorted order.
+    pub fn histogram(&self) -> BTreeMap<&'static str, u64> {
+        CALL_FAILURE_NAMES
+            .iter()
+            .zip(self.by_name.iter())
+            .filter_map(|(&name, count)| {
+                let count = count.load(Ordering::Relaxed);
+                (count > 0).then_some((name, count))
+            })
+            .collect()
+    }
+
+    /// The one bounded first failure, if any has happened.
+    pub fn first(&self) -> Option<CallFailure> {
+        self.first.get()
+    }
+
+    /// Clears the latch (tests only).
+    #[cfg(test)]
+    pub(crate) fn reset(&self) {
+        self.total.store(0, Ordering::Relaxed);
+        for count in &self.by_name {
+            count.store(0, Ordering::Relaxed);
+        }
+        self.first.reset();
+    }
+}
+
 /// The window and histogram one [`FrameTelemetry`] keeps.
 #[derive(Debug, Default)]
 struct Window {
@@ -197,6 +465,8 @@ pub struct FrameTelemetry {
     /// (inline root constants are not buffer bindings). A nonzero count makes an
     /// empty-binding dispatch visible instead of silent.
     compute_dispatches_without_bindings: AtomicU64,
+    /// The bounded first-failure latch over the create and map boundary.
+    call_failures: CallFailureLatch,
 }
 impl FrameTelemetry {
     /// Empty telemetry.
@@ -460,6 +730,45 @@ impl FrameTelemetry {
             .load(Ordering::Relaxed)
     }
 
+    /// Records one failing GPU call in the bounded latch.
+    ///
+    /// The first failure of each name is logged once at warn; repeated
+    /// failures of that name only count.
+    pub fn note_call_failure(
+        &self,
+        name: &'static str,
+        hr: i32,
+        args: [u64; MAX_CALL_FAILURE_ARGS],
+    ) {
+        self.call_failures.note(name, hr, args);
+    }
+
+    /// Records `hr` only if it is a failure.
+    pub fn note_call_result(&self, name: &'static str, hr: i32, args: [u64; MAX_CALL_FAILURE_ARGS]) {
+        self.call_failures.note_result(name, hr, args);
+    }
+
+    /// Failing GPU calls recorded so far.
+    pub fn call_failure_count(&self) -> u64 {
+        self.call_failures.count()
+    }
+
+    /// Failing GPU calls by export name.
+    pub fn call_failure_histogram(&self) -> BTreeMap<&'static str, u64> {
+        self.call_failures.histogram()
+    }
+
+    /// The one bounded first failure, if any.
+    pub fn first_call_failure(&self) -> Option<CallFailure> {
+        self.call_failures.first()
+    }
+
+    /// Clears the failure latch (tests only).
+    #[cfg(test)]
+    pub(crate) fn reset_call_failures(&self) {
+        self.call_failures.reset();
+    }
+
     /// Accepted buffer and PSO registrations.
     pub fn registration_counts(&self) -> (u64, u64) {
         (
@@ -532,6 +841,8 @@ impl FrameTelemetry {
             compute_dispatches_without_bindings: self.compute_dispatches_without_bindings(),
             host_errors: self.host_error_count(),
             last_host_error: self.last_host_error(),
+            call_failures: self.call_failures.count(),
+            first_call_failure: self.call_failures.first(),
         }
     }
 
@@ -626,6 +937,10 @@ pub struct TelemetrySnapshot {
     pub host_errors: u64,
     /// The most recent bounded host error, if any.
     pub last_host_error: Option<HostError>,
+    /// Failing GPU calls recorded so far (session total).
+    pub call_failures: u64,
+    /// The one bounded first failure, if any.
+    pub first_call_failure: Option<CallFailure>,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -679,6 +994,15 @@ impl std::fmt::Display for TelemetrySnapshot {
                 ", last_host_error=sequence {}: {}",
                 error.sequence, error.reason
             )?;
+        }
+        write!(f, ", call_failures={}", self.call_failures)?;
+        match &self.first_call_failure {
+            Some(failure) => write!(
+                f,
+                " first_call_failure={} hr={:#x}",
+                failure.name, failure.hr as u32
+            )?,
+            None => write!(f, " first_call_failure=none hr=0x0")?,
         }
         Ok(())
     }
@@ -860,6 +1184,31 @@ pub fn registration_failures() -> u64 {
 /// The process-wide count of compute dispatches without a root binding.
 pub fn compute_dispatches_without_bindings() -> u64 {
     global().compute_dispatches_without_bindings()
+}
+
+/// Records one failing GPU call in the process-wide latch.
+pub fn note_call_failure(name: &'static str, hr: i32, args: [u64; MAX_CALL_FAILURE_ARGS]) {
+    global().note_call_failure(name, hr, args);
+}
+
+/// Records a GPU call's `hr` in the process-wide latch only if it failed.
+pub fn note_call_result(name: &'static str, hr: i32, args: [u64; MAX_CALL_FAILURE_ARGS]) {
+    global().note_call_result(name, hr, args);
+}
+
+/// The process-wide count of failing GPU calls.
+pub fn call_failure_count() -> u64 {
+    global().call_failure_count()
+}
+
+/// The process-wide histogram of failing GPU calls by export name.
+pub fn call_failure_histogram() -> BTreeMap<&'static str, u64> {
+    global().call_failure_histogram()
+}
+
+/// The process-wide bounded first failure, if any.
+pub fn first_call_failure() -> Option<CallFailure> {
+    global().first_call_failure()
 }
 
 /// Declares one D3DMetal fallback in the process-wide telemetry.
@@ -1260,6 +1609,121 @@ mod tests {
         assert!(line.contains("last_host_error=sequence 10"), "{line}");
         assert!(!line.contains('\n'), "the log line must stay one line: {line}");
     }
+
+    /// A failure is counted once per call, once per name, and the first one
+    /// keeps its name, HRESULT and scalar arguments.
+    #[test]
+    fn call_failures_are_counted_once_per_name_and_keep_one_record() {
+        use crate::object::S_OK;
+
+        let telemetry = telemetry();
+        telemetry.note_call_failure(call_names::MAP, S_OK, [7, 8, 9]);
+        telemetry.note_call_failure(call_names::MAP, S_OK, [7, 8, 9]);
+        telemetry.note_call_failure(call_names::CREATE_DESCRIPTOR_HEAP, -1, [4, 5, 6]);
+
+        assert_eq!(telemetry.call_failure_count(), 3);
+        assert_eq!(
+            telemetry.call_failure_histogram(),
+            BTreeMap::from([
+                (call_names::CREATE_DESCRIPTOR_HEAP, 1),
+                (call_names::MAP, 2),
+            ])
+        );
+        assert_eq!(
+            telemetry.first_call_failure(),
+            Some(CallFailure {
+                name: call_names::MAP,
+                hr: S_OK,
+                args: [7, 8, 9],
+            }),
+            "only the first failure is kept"
+        );
+
+        let line = telemetry.snapshot().to_string();
+        assert!(line.contains("call_failures=3"), "{line}");
+        assert!(
+            line.contains("call_failures=3 first_call_failure=Map hr=0x0"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "one line: {line}");
+    }
+
+    /// A successful call records nothing.
+    #[test]
+    fn a_successful_call_records_nothing() {
+        use crate::object::S_OK;
+
+        let telemetry = telemetry();
+        telemetry.note_call_result(call_names::MAP, S_OK, [1, 2, 3]);
+        telemetry.note_call_result(call_names::CREATE_DESCRIPTOR_HEAP, 1, [0, 0, 0]);
+
+        assert_eq!(telemetry.call_failure_count(), 0);
+        assert_eq!(telemetry.call_failure_histogram(), BTreeMap::new());
+        assert_eq!(telemetry.first_call_failure(), None);
+
+        let line = telemetry.snapshot().to_string();
+        assert!(line.contains("call_failures=0"), "{line}");
+        assert!(line.contains("first_call_failure=none hr=0x0"), "{line}");
+    }
+
+    /// The first-failure record is bounded: a long static name is truncated
+    /// on a character boundary, never growing the snapshot line.
+    #[test]
+    fn the_first_failure_record_is_bounded() {
+        const LONG_NAME: &str = "CreateSomethingWithAnExtremelyLongExportNameThatKeepsGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoingAndGoing";
+
+        let telemetry = telemetry();
+        telemetry.note_call_failure(LONG_NAME, -1, [u64::MAX, 0, 1]);
+
+        let first = telemetry.first_call_failure().expect("a failure");
+        assert_eq!(first.name, LONG_NAME, "the static name itself is kept");
+        let line = first.line();
+        assert!(line.len() <= MAX_CALL_FAILURE_BYTES, "{} bytes", line.len());
+        assert!(line.is_char_boundary(line.len()));
+        assert!(!line.contains('\n'));
+        assert!(
+            LONG_NAME.len() > MAX_CALL_FAILURE_BYTES,
+            "the fixture is long enough to truncate"
+        );
+    }
+
+    /// The histogram is the same whatever order the failures arrived in.
+    #[test]
+    fn the_call_failure_histogram_is_deterministic() {
+        let first = telemetry();
+        for (name, count) in [
+            (call_names::MAP, 3),
+            (call_names::CREATE_DESCRIPTOR_HEAP, 1),
+            (call_names::COPY_DESCRIPTORS_SIMPLE, 2),
+        ] {
+            for _ in 0..count {
+                first.note_call_failure(name, -1, [0; MAX_CALL_FAILURE_ARGS]);
+            }
+        }
+
+        let second = telemetry();
+        for (name, count) in [
+            (call_names::COPY_DESCRIPTORS_SIMPLE, 2),
+            (call_names::CREATE_DESCRIPTOR_HEAP, 1),
+            (call_names::MAP, 3),
+        ] {
+            for _ in 0..count {
+                second.note_call_failure(name, -1, [0; MAX_CALL_FAILURE_ARGS]);
+            }
+        }
+
+        assert_eq!(first.call_failure_histogram(), second.call_failure_histogram());
+        assert_eq!(
+            first.call_failure_histogram().keys().copied().collect::<Vec<_>>(),
+            vec![
+                call_names::COPY_DESCRIPTORS_SIMPLE,
+                call_names::CREATE_DESCRIPTOR_HEAP,
+                call_names::MAP,
+            ],
+            "sorted, not insertion order"
+        );
+    }
+
 
     #[test]
     fn the_global_recorders_reach_the_process_telemetry() {

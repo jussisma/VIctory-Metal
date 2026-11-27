@@ -15,6 +15,8 @@ use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
 };
+#[cfg(any(windows, test, target_os = "macos"))]
+use crate::native_metal::telemetry::{self, call_names};
 
 /// The interfaces every device child also answers for.
 pub(crate) const PAGEABLE_IIDS: [Iid; 3] = [
@@ -2435,6 +2437,46 @@ impl Drop for Resource {
 }
 
 pub(crate) extern "system" fn create_committed(
+    this: This,
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    desc: *const ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let result = create_committed_impl(this, heap, heap_flags, desc, state, clear, iid, out);
+    #[cfg(any(windows, test, target_os = "macos"))]
+    {
+        // SAFETY: read only to name the failing arguments; null is tolerated.
+        let (dimension, width, format) = unsafe { desc.as_ref() }
+            .map(|desc| {
+                (
+                    u64::from(desc.dimension),
+                    desc.width,
+                    u64::from(desc.format),
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        telemetry::note_call_result(
+            call_names::CREATE_COMMITTED_RESOURCE,
+            result,
+            [dimension, width, format],
+        );
+        if result == S_OK && out.is_null() {
+            telemetry::note_call_failure(
+                call_names::CREATE_COMMITTED_RESOURCE,
+                result,
+                [dimension, width, format],
+            );
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_committed_impl(
     _: This,
     heap: *const HeapProperties,
     heap_flags: u32,
@@ -2544,6 +2586,38 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 /// a view of that memory. `D3D12_RESOURCE_DESC1` starts like the plain
 /// description; its sampler feedback region is not needed.
 pub(crate) extern "system" fn create_at_address(
+    this: This,
+    address: u64,
+    desc: *const ResourceDesc,
+    layout: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let result = create_at_address_impl(this, address, desc, layout, clear, iid, out);
+    #[cfg(any(windows, test, target_os = "macos"))]
+    {
+        // SAFETY: read only to name the failing arguments; null is tolerated.
+        let (dimension, width) = unsafe { desc.as_ref() }
+            .map(|desc| (u64::from(desc.dimension), desc.width))
+            .unwrap_or((0, 0));
+        telemetry::note_call_result(
+            call_names::CREATE_AT_ADDRESS,
+            result,
+            [address, dimension, width],
+        );
+        if result == S_OK && out.is_null() {
+            telemetry::note_call_failure(
+                call_names::CREATE_AT_ADDRESS,
+                result,
+                [address, dimension, width],
+            );
+        }
+    }
+    result
+}
+
+fn create_at_address_impl(
     _: This,
     address: u64,
     desc: *const ResourceDesc,
@@ -2655,6 +2729,40 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
 }
 
 pub(crate) extern "system" fn create_placed(
+    this: This,
+    heap: This,
+    offset: u64,
+    desc: *const ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let result = create_placed_impl(this, heap, offset, desc, state, clear, iid, out);
+    #[cfg(any(windows, test, target_os = "macos"))]
+    {
+        // SAFETY: read only to name the failing arguments; null is tolerated.
+        let (dimension, width) = unsafe { desc.as_ref() }
+            .map(|desc| (u64::from(desc.dimension), desc.width))
+            .unwrap_or((0, 0));
+        telemetry::note_call_result(
+            call_names::CREATE_PLACED_RESOURCE,
+            result,
+            [offset, dimension, width],
+        );
+        if result == S_OK && out.is_null() {
+            telemetry::note_call_failure(
+                call_names::CREATE_PLACED_RESOURCE,
+                result,
+                [offset, dimension, width],
+            );
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_placed_impl(
     _: This,
     heap: This,
     offset: u64,
@@ -2715,14 +2823,35 @@ extern "system" fn resource_release(this: This) -> u32 {
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.
+///
+/// A resource whose memory is null would hand the title a null pointer while
+/// returning `S_OK`; the documented behaviour is kept and the failure is
+/// recorded so the store through that pointer is no longer silent.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        let data = resource(this).data();
+        #[cfg(any(windows, test, target_os = "macos"))]
+        if data.is_null() {
+            telemetry::note_call_failure(call_names::MAP, S_OK, [0, 0, 0]);
+        }
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write(resource(this).data()) };
+        unsafe { out.write(data) };
     }
     S_OK
 }
-extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
+
+extern "system" fn unmap(this: This, sub: u32, _written: *const c_void) {
+    #[cfg(any(windows, test, target_os = "macos"))]
+    if this.is_null() {
+        telemetry::note_call_failure(
+            call_names::UNMAP,
+            crate::object::S_OK,
+            [u64::from(sub), 0, 0],
+        );
+    }
+    #[cfg(not(any(windows, test, target_os = "macos")))]
+    let _ = (this, sub);
+}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
@@ -2767,6 +2896,18 @@ pub(crate) extern "system" fn custom_heap_properties(
 extern "system" fn gpu_address(this: This) -> u64 {
     let r = resource(this);
     let at = r.data() as u64;
+    #[cfg(any(windows, test, target_os = "macos"))]
+    if at == 0 {
+        telemetry::note_call_failure(
+            call_names::GET_GPU_VIRTUAL_ADDRESS,
+            S_OK,
+            [
+                u64::from(r.desc.dimension),
+                r.desc.width,
+                u64::from(r.desc.flags),
+            ],
+        );
+    }
     // The console's GPU addresses fit in 40 bits; its ray-tracing builder
     // refuses others (diagnostics: which memory breaks that).
     #[cfg(feature = "diagnostics")]
@@ -2871,6 +3012,49 @@ mod tests {
     #[test]
     fn a_null_view_has_no_alias_source() {
         assert_eq!(alias_source(std::ptr::null()), None);
+    }
+
+    /// A resource whose backing address is null still maps to a null pointer
+    /// (the documented behaviour), but the failure is recorded: the title's
+    /// store through that pointer is no longer silent.
+    #[test]
+    fn mapping_a_null_data_resource_records_the_failure_and_still_returns_s_ok() {
+        let desc = buffer(64);
+        let resource = Box::new(Resource {
+            object: Object::new(&RESOURCE_FUNCTIONS),
+            desc,
+            heap: PROPERTIES,
+            heap_flags: 0,
+            backing: Backing::Address(std::ptr::null_mut()),
+            #[cfg(windows)]
+            host: std::sync::Mutex::new(None),
+            #[cfg(windows)]
+            made_with: (0, None),
+        });
+        let this: This = Box::into_raw(resource) as This;
+
+        let telemetry = crate::native_metal::telemetry::global();
+        telemetry.reset_call_failures();
+        let mut mapped = 0x1usize as *mut u8;
+        let hr = map(this, 0, std::ptr::null(), &mut mapped);
+
+        assert_eq!(hr, S_OK, "Map keeps its documented HRESULT");
+        assert!(mapped.is_null(), "Map still writes the null pointer");
+        assert_eq!(telemetry.call_failure_count(), 1);
+        assert_eq!(
+            telemetry.first_call_failure().map(|failure| failure.name),
+            Some(crate::native_metal::telemetry::call_names::MAP)
+        );
+        assert_eq!(
+            telemetry.call_failure_histogram(),
+            std::collections::BTreeMap::from([(
+                crate::native_metal::telemetry::call_names::MAP,
+                1
+            )])
+        );
+
+        // SAFETY: made by `Box::into_raw` just above.
+        unsafe { drop(Box::from_raw(this.cast_mut().cast::<Resource>())) };
     }
 
     #[test]
