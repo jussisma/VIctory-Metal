@@ -287,15 +287,48 @@ fn hooks() -> [usize; 2] {
     unsafe { (at as *const [usize; 2]).read() }
 }
 
+/// ADR-036: the range an allocation landed in, never its value (addresses are
+/// ASLR-dependent, so a trace may compare classes but not pointers).
+fn address_class(pointer: *mut c_void) -> u64 {
+    let at = pointer as usize as u64;
+    match at {
+        0 => 0,
+        _ if at < 1 << 32 => 1,
+        _ if at < 1 << 40 => 2,
+        _ => 3,
+    }
+}
+
+/// One bounded trace line per allocation when `VICTORY_GUEST_ABI_TRACE` is on.
+/// Values: `[size, attributes, address_class, used_title_hook]`. A title that
+/// asserts on its own allocator's return is then visible as class 0.
+fn trace_alloc(size: usize, attributes: u64, pointer: *mut c_void, hook: usize) {
+    victory_gpu::native_metal::abi_trace::record(
+        "XMemAlloc",
+        &[
+            size as u64,
+            attributes,
+            address_class(pointer),
+            u64::from(hook != 0),
+        ],
+    );
+}
+
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     match hooks()[0] {
-        0 => XMemAllocDefault(size, attributes),
+        0 => {
+            let pointer = XMemAllocDefault(size, attributes);
+            trace_alloc(size, attributes, pointer, 0);
+            pointer
+        }
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
+            let pointer = alloc(size, attributes);
+            trace_alloc(size, attributes, pointer, hook);
+            pointer
         }
     }
 }
@@ -310,6 +343,10 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
             free(address, attributes)
         }
     }
+    victory_gpu::native_metal::abi_trace::record(
+        "XMemFree",
+        &[address_class(address), attributes],
+    );
 }
 
 /// The system allocator behind [`XMemAlloc`].
