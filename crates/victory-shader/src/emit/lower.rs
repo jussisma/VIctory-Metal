@@ -186,6 +186,16 @@ pub(crate) fn lower_pruned(
     if parts.narrow_waves && !parts.host_wave32 {
         return Err(ShaderError::Options(NARROW_WAVES_WITHOUT_HOST_WAVE32));
     }
+    // An amplification program shares the compute record slot but is not a
+    // compute program: its payload and dispatch grid are not expressible on
+    // the compute lowering, which would silently drop them. Fail closed here
+    // too, so a direct `lower` caller cannot take that path.
+    if parts.native.stage == HwStage::As {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an amplification (object) program",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad, keep).run() {

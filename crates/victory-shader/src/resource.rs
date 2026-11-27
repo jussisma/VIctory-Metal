@@ -482,15 +482,16 @@ impl<'a> Tracer<'a> {
 
     /// The scalar loads from the root signature's memory ([`USER_DATA`])
     /// and the user-data byte offset each reads at (an error for a computed
-    /// one). Compute programs only: they get 16 user SGPRs, and one whose
-    /// parameters do not fit reads them through the pointer in user data
-    /// 0-1 (its high dword masked to the 40-bit address).
+    /// one). Compute and amplification programs only: they get 16 user
+    /// SGPRs, and one whose parameters do not fit reads them through the
+    /// pointer in user data 0-1 (its high dword masked to the 40-bit
+    /// address).
     fn spill_loads(&self) -> Vec<(Site, Result<u32, &'static str>)> {
         let input = |r| self.p.inputs.iter().find(|i| i.0 == r).map(|i| i.1);
         let (Some(lo), Some(hi)) = (input(Reg::S(0)), input(Reg::S(1))) else {
             return Vec::new();
         };
-        if self.stage != HwStage::Cs
+        if !matches!(self.stage, HwStage::Cs | HwStage::As)
             || !self.layout.iter().any(|p| p.user_data >= 16)
             || self.layout.iter().any(|p| p.user_data < 2 && p.sgprs > 0)
         {
@@ -551,7 +552,7 @@ impl<'a> Tracer<'a> {
 
     /// The value holding dword `dword` of root parameter `param`.
     fn param_word(&self, param: usize, dword: u32) -> Option<Value> {
-        if self.layout[param].user_data >= 16 && self.stage == HwStage::Cs {
+        if self.layout[param].user_data >= 16 && matches!(self.stage, HwStage::Cs | HwStage::As) {
             return self.first_spilled.get(&(param, dword)).copied();
         }
         let reg = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8);

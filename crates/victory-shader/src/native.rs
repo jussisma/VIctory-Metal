@@ -15,6 +15,25 @@
 //! payload +0x00 u64 graphics slot count (6)
 //!         +0x08 u64 record offsets: LS HS ES GS VS PS (0x08..0x30),
 //!               mesh 0x48, compute 0x60; unused ones are 0xDEADBEEF_DEADBEEF
+//!
+//! An amplification (object) program has no slot of its own: the payload's
+//! six graphics slots, mesh (0x48) and compute (0x60) are the only record
+//! slots the compiler writes (`GRAPHICS_SLOT_COUNT` is 6). It is stored in
+//! the compute slot (payload +0x60) and is told apart from a compute program
+//! by the `DXIL` part's program header kind (14, `ShaderKind::Amplification`),
+//! not by an offset of its own: an amplification program is a thread-group
+//! dispatch, not a merged graphics wave, so the compute slot is the only
+//! dispatch slot the payload has. `programs` therefore reads the kind from
+//! the part header and reports a +0x60 record as [`HwStage::As`] for kind 14
+//! and [`HwStage::Cs`] for kind 5; the other slots keep their documented
+//! stages, so one payload can carry the AS, MS and PS records of a mesh
+//! pipeline. A kind-14 container whose records include no +0x60 record is
+//! malformed: the AS program is never read from the GS slot (which stays
+//! [`HwStage::Gs`]). This is the documented fallback for the missing slot: no
+//! shipped amplification container was available in the repository to confirm
+//! a dedicated offset, so a container that disproves the rule fails parsing
+//! instead of being lowered as a geometry or compute program.
+//!
 //! record  +0x00 u64 code offset, +0x08 u64 code size (payload-relative),
 //!         +0x14 u32 flags: bit 5 wave32 (else wave64)
 //!         +0x28 u64 root layout table, +0x30 u64 used-resource table
@@ -79,7 +98,10 @@ const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
 const FSSM_HEADER: usize = 0x10;
 const GRAPHICS_SLOT_COUNT: u64 = 6;
-/// Where each stage's record offset sits in the FSSM payload.
+/// Where each hardware stage's record offset sits in the FSSM payload. The
+/// compute slot also carries an amplification program's record (see the
+/// module docs); the program header kind selects between [`HwStage::As`] and
+/// [`HwStage::Cs`].
 const SLOTS: [(HwStage, usize); 8] = [
     (HwStage::Ls, 0x08),
     (HwStage::Hs, 0x10),
@@ -91,6 +113,10 @@ const SLOTS: [(HwStage, usize); 8] = [
     (HwStage::Cs, 0x60),
 ];
 const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+/// The record slot an amplification program shares with a compute program.
+const AS_SLOT: usize = 0x60;
+/// `ShaderKind::Amplification`'s raw value in the program header.
+const AMPLIFICATION_KIND: u16 = 14;
 const RECORD_SIZE: u64 = 0x54;
 const RECORD_FLAGS: usize = 0x14;
 const FLAG_WAVE32: u32 = 1 << 5;
@@ -147,15 +173,26 @@ pub enum HwStage {
     /// Mesh shader.
     Ms,
     Cs,
+    /// Amplification (object) program. It is dispatched as a thread group
+    /// and has no per-vertex I/O; its FSSM record shares the compute slot
+    /// (see the module docs) and the program header kind distinguishes it
+    /// from [`HwStage::Cs`].
+    As,
 }
 
 impl HwStage {
     /// The SGPR holding user-data dword `index`: merged stages (and mesh
     /// shaders, which run as one) have 8 system SGPRs first.
+    ///
+    /// An amplification program has none: it is dispatched as a thread group
+    /// like a compute program, so its user data starts at s0 and its group
+    /// ids and thread-group info follow it only as `COMPUTE_PGM_RSRC2`
+    /// enables them. The 8-SGPR preamble belongs to the merged graphics wave
+    /// (LS/HS/ES/GS) and to mesh, not to a single dispatch stage.
     pub fn user_sgpr(self, index: u8) -> u8 {
         match self {
             HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index + 8,
-            HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::As => index,
         }
     }
 }
@@ -280,6 +317,24 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// An amplification (object) program: no per-vertex I/O, a thread-group
+    /// dispatch whose payload lives in LDS.
+    As(AmplificationIo),
+}
+
+/// An amplification program's dispatch settings and payload memory.
+///
+/// The program runs one thread group, writes a payload and dispatches mesh
+/// thread groups. Its stage data is therefore read like a compute program's
+/// (`COMPUTE_PGM_RSRC2` and the thread-group size at the compute record's
+/// stage-data offsets), and the record's LDS bytes (`+0x4c`) are the payload
+/// memory the mesh thread groups read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmplificationIo {
+    /// User SGPRs, enabled system SGPRs, thread ids and LDS size.
+    pub compute: ComputeIo,
+    /// The payload memory: the record's LDS bytes (`record + 0x4c`).
+    pub payload_bytes: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -430,6 +485,10 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
+    // The `DXIL` program header names the API stage; the FSSM slot names the
+    // hardware stage. They disagree for an amplification program, whose
+    // record shares the compute slot (see the module docs).
+    let kind = (u32_at(part, 0)? >> 16) as u16;
     let count = u32_at(part, XDAT_OFFSET + 4)? as usize;
     if count > MAX_XDAT_ENTRIES {
         return Err(Malformed("implausible XDAT entry count"));
@@ -443,7 +502,17 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        out.extend(programs(&unpack(blob)?, kind)?);
+    }
+    // A kind-14 container carries an amplification program in its compute
+    // slot. If it has programs but none there, the container's own kind and
+    // its records disagree: fail closed instead of reading the record as the
+    // graphics or compute program its slot happens to name.
+    if kind == AMPLIFICATION_KIND && !out.is_empty() && !out.iter().any(|p| p.stage == HwStage::As)
+    {
+        return Err(Malformed(
+            "an amplification container without an amplification program",
+        ));
     }
     Ok(out)
 }
@@ -587,7 +656,7 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     Ok(out)
 }
 
-fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+fn programs(fssm: &[u8], kind: u16) -> Result<Vec<NativeProgram>, ShaderError> {
     if fssm.get(0..4) != Some(b"FSSM") {
         return Err(Malformed("native blob lacks FSSM magic"));
     }
@@ -602,11 +671,19 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         return Err(Malformed("unexpected FSSM slot count"));
     }
     let mut out = Vec::new();
-    for (stage, at) in SLOTS {
+    for (slot_stage, at) in SLOTS {
         let start = u64_at(payload, at)?;
         if start == ABSENT {
             continue;
         }
+        // An amplification program's record is the compute slot's; the other
+        // slots keep their documented stages (an AS+MS+PS pipeline shares one
+        // payload). The GS slot is never read as an amplification program.
+        let stage = if kind == AMPLIFICATION_KIND && at == AS_SLOT {
+            HwStage::As
+        } else {
+            slot_stage
+        };
         let record =
             bytes(payload, start, RECORD_SIZE).ok_or(Malformed("FSSM record out of bounds"))?;
         let code = bytes(payload, u64_at(record, 0)?, u64_at(record, 8)?)
@@ -671,6 +748,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::As => as_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -792,6 +870,37 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     }))
 }
 
+/// An amplification program's dispatch: its compute-shaped stage data and
+/// the payload memory the record declares.
+///
+/// It has no per-vertex inputs or outputs. The dispatch needs a thread-group
+/// size in every component; a record without one has no dispatch grid to run
+/// and is rejected rather than lowered as a zero-sized group.
+fn as_io(data: &[u8], payload_bytes: u32) -> Result<StageIo, ShaderError> {
+    let threads = [
+        u32_at(data, CS_THREADS)?,
+        u32_at(data, CS_THREADS + 4)?,
+        u32_at(data, CS_THREADS + 8)?,
+    ];
+    if threads.contains(&0) {
+        return Err(Malformed(
+            "an amplification program without a dispatch grid",
+        ));
+    }
+    if threads.iter().any(|&n| n > 1024) {
+        return Err(Malformed(
+            "an amplification program with an implausible dispatch grid",
+        ));
+    }
+    Ok(StageIo::As(AmplificationIo {
+        compute: ComputeIo {
+            rsrc2: u32_at(data, CS_RSRC2)?,
+            threads,
+        },
+        payload_bytes,
+    }))
+}
+
 /// For entries already sized by `as_chunks`.
 fn le32(entry: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(entry[at..at + 4].try_into().unwrap())
@@ -812,6 +921,9 @@ pub(crate) mod tests {
     const VGPRS: u32 = 28;
 
     fn slot(stage: HwStage) -> usize {
+        if stage == HwStage::As {
+            return AS_SLOT;
+        }
         SLOTS.iter().find(|s| s.0 == stage).unwrap().1
     }
 
@@ -875,7 +987,14 @@ pub(crate) mod tests {
 
     /// `DXIL` part data: program header, XDAT index, then the blobs.
     fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
+        part_with_kind(0, blobs)
+    }
+
+    /// [`part`] with `kind` in the program header (0 pixel, 5 compute, 14
+    /// amplification).
+    fn part_with_kind(kind: u16, blobs: &[(u32, &[u8])]) -> Vec<u8> {
         let mut out = vec![0u8; XDAT_OFFSET];
+        out[..4].copy_from_slice(&(u32::from(kind) << 16 | 0x66).to_le_bytes());
         out.extend_from_slice(b"XDAT");
         out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
         out.extend_from_slice(&0x24u32.to_le_bytes());
@@ -1037,6 +1156,103 @@ pub(crate) mod tests {
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].stage, stage);
         }
+    }
+
+    const AS_CODE: [u8; 8] = [21, 22, 23, 24, 25, 26, 27, 28];
+
+    /// An amplification blob: the record at the compute slot with 8 lanes per
+    /// group, 4 user SGPRs and `payload_bytes` of payload memory.
+    fn amplification_blob(payload_bytes: u32) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::As, &AS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::As);
+        blob[e + CS_RSRC2..][..4].copy_from_slice(&(4u32 << 1).to_le_bytes());
+        let threads = [8u32.to_le_bytes(), 1u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        blob[e + CS_THREADS..][..12].copy_from_slice(&threads);
+        let record = e - RECORD_SIZE as usize;
+        blob[record + RECORD_LDS..][..4].copy_from_slice(&payload_bytes.to_le_bytes());
+        blob
+    }
+
+    #[test]
+    fn finds_amplification_program_in_the_compute_slot() {
+        let blob = amplification_blob(240);
+        let data = part_with_kind(AMPLIFICATION_KIND, &[(KIND_NATIVE, &xbch(&blob))]);
+        let found = native_programs(&data).unwrap();
+        assert_eq!(found.len(), 1);
+        let p = &found[0];
+        assert_eq!(p.stage, HwStage::As);
+        assert_eq!(p.code, AS_CODE);
+        assert_eq!(
+            p.io,
+            StageIo::As(AmplificationIo {
+                compute: ComputeIo {
+                    rsrc2: 4 << 1,
+                    threads: [8, 1, 1],
+                },
+                payload_bytes: 240,
+            })
+        );
+        // The payload count comes from the record's LDS bytes at +0x4c.
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + AS_SLOT).unwrap() as usize;
+        assert_eq!(u32_at(&blob, record + RECORD_LDS).unwrap(), 240);
+    }
+
+    #[test]
+    fn rejects_amplification_without_a_dispatch_grid() {
+        let mut blob = amplification_blob(0);
+        let e = stage_data_at(&blob, HwStage::As);
+        blob[e + CS_THREADS..][..12].fill(0);
+        let data = part_with_kind(AMPLIFICATION_KIND, &[(KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(
+            native_programs(&data),
+            Err(Malformed(
+                "an amplification program without a dispatch grid"
+            ))
+        );
+    }
+
+    #[test]
+    fn amplification_kind_selects_the_compute_slot_not_a_graphics_slot() {
+        // The same compute-slot record is a compute program for kind 5 and an
+        // amplification program for kind 14.
+        let blob = amplification_blob(64);
+        let as_part = part_with_kind(AMPLIFICATION_KIND, &[(KIND_NATIVE, &xbch(&blob))]);
+        let cs_part = part_with_kind(5, &[(KIND_NATIVE, &xbch(&blob))]);
+        assert_eq!(native_programs(&as_part).unwrap()[0].stage, HwStage::As);
+        assert_eq!(native_programs(&cs_part).unwrap()[0].stage, HwStage::Cs);
+
+        // A kind-14 container with no compute-slot record is never read as a
+        // geometry program: the record and the container's kind disagree, so
+        // parsing fails closed.
+        let gs = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let data = part_with_kind(AMPLIFICATION_KIND, &[(KIND_NATIVE, &xbch(&gs))]);
+        assert_eq!(
+            native_programs(&data),
+            Err(Malformed(
+                "an amplification container without an amplification program"
+            ))
+        );
+    }
+
+    #[test]
+    fn an_amplification_set_parses_as_as_ms_ps() {
+        let mut blob = fssm(&[
+            (HwStage::As, &AS_CODE),
+            (HwStage::Ms, &VS_CODE),
+            (HwStage::Ps, &PS_CODE),
+        ]);
+        let e = stage_data_at(&blob, HwStage::As);
+        let threads = [8u32.to_le_bytes(), 1u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        blob[e + CS_THREADS..][..12].copy_from_slice(&threads);
+        let data = part_with_kind(AMPLIFICATION_KIND, &[(KIND_NATIVE, &xbch(&blob))]);
+        let stages: Vec<_> = native_programs(&data)
+            .unwrap()
+            .iter()
+            .map(|p| p.stage)
+            .collect();
+        assert_eq!(stages, [HwStage::Ps, HwStage::Ms, HwStage::As]);
+        assert!(!stages.contains(&HwStage::Gs), "{stages:?}");
+        assert!(!stages.contains(&HwStage::Cs), "{stages:?}");
     }
 
     #[test]
