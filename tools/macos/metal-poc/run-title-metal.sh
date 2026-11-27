@@ -11,25 +11,39 @@
 # driven through this single entry point.
 #
 # Usage:
-#   run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep]
-#                      [--print-env] -- <exe> [guest args...]
+#   run-title-metal.sh [--window|--headless] [--frames N] [--out DIR]
+#                      [--keep-session] [--print-env] -- <exe> [guest args...]
 #
-#   --window    pass `--window` to the host so the native window presents
-#   --headless  force headless (default); refuses together with --window
-#   --frames N  diagnostic frame count, exported as VICTORY_FRAME_MEASURED
-#   --out DIR   directory for guest.log, host.log, telemetry.json, summary.txt
-#               (default: a fresh mktemp directory, printed on exit)
-#   --keep      keep the isolated session directory (share dir, wineprefix)
-#   --print-env print the resolved endpoint, share dir and fence page as
-#               `LAUNCH_ENV key=value` lines before the guest starts. The
-#               session secret is never printed. ADR-031's wrapper reads them
-#               for its own summary; other callers do not need the flag.
+#   --window        pass `--window` to the host so the native window presents
+#   --headless      force headless (default); refuses together with --window
+#   --frames N      diagnostic frame count, exported as VICTORY_FRAME_MEASURED
+#   --out DIR       directory for guest.log, host.log, telemetry.json, summary.txt
+#                   (default: this run's own mktemp directory). A caller-supplied
+#                   directory is never removed; the default one is removed on
+#                   exit unless --keep-session is given.
+#   --keep-session  keep the isolated session directory (share dir, wineprefix)
+#                   and the default --out directory. `--keep` and
+#                   VICTORY_KEEP_LOGS=1 / VICTORY_KEEP_SESSION=1 are the same
+#                   opt-in (historical aliases). Removal is the default on every
+#                   exit path, including setup failure, guest failure, the
+#                   internal timeout and INT/TERM/HUP.
+#   --print-env     print the resolved endpoint, share dir and fence page as
+#                   `LAUNCH_ENV key=value` lines before the guest starts. The
+#                   session secret is never printed. ADR-031's wrapper reads them
+#                   for its own summary; other callers do not need the flag.
 #
 # Environment overrides are honoured where they are meaningful (WINE, DXC_DIR,
 # TOOLCHAIN_ROOT, VICTORY_METAL_IRCONVERTER, VICTORY_FRAME_WARMUP,
-# VICTORY_FRAME_MEASURED, and the gate asset paths). The connection variables
-# (`VICTORY_BACKEND`, port, secret, share dir, fence page) are owned by this
-# launcher.
+# VICTORY_FRAME_MEASURED, and the gate asset paths). VICTORY_BACKEND selects the
+# guest backend: `metal` (default, the native path) or `d3d12` (the D3D12 host
+# reference path, which is what `abi-diff.py` diffs against). Any other value is
+# a usage error before anything is created. The rest of the connection variables
+# (port, secret, share dir, fence page) are owned by this launcher.
+#
+# With VICTORY_BACKEND=d3d12 the native daemon is not started (it can only serve
+# a metal guest) and the D3DMetal DLL override is exported so the guest reaches
+# Apple's translation layer. The summary reports the native-only host fields as
+# `n/a`; the run's verdict then comes from the guest, not from host telemetry.
 #
 # Exit codes:
 #   0  guest exited 0, no D3DMetal fallback/module and, in gate mode, a clean
@@ -42,13 +56,18 @@
 #  13  a child started by this run survived cleanup (orphan); the
 #      `PROCESS_ORPHAN_SURVIVED` line names it. See `process-hygiene.sh`.
 #  14  the host daemon exited non-zero on its own
-#  15  the diagnostic summary could not be produced (e.g. host telemetry lost)
+#  15  the diagnostic summary could not be produced (e.g. host telemetry lost;
+#      never raised in d3d12 reference mode, which has no host telemetry)
 # 130  interrupted by SIGINT; 143 by SIGTERM; 129 by SIGHUP
 #
-# Logs may be kept with `--keep` or `VICTORY_KEEP_LOGS=1`; children are still
-# reaped and the orphan assertion still runs.
+# The session directory is removed on every exit path unless --keep-session (or
+# one of its aliases) is given; children are still reaped and the orphan
+# assertion still runs when the session is kept.
 #
-# One GPU task at a time: the script takes /tmp/victory-gpu.lock.
+# One GPU task at a time: the script takes /tmp/victory-gpu.lock. A hermetic
+# test may point VICTORY_GPU_LOCK at a private directory (the same ownership
+# protocol and owner record apply); a live run keeps the default so concurrent
+# GPU gates serialise.
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -61,15 +80,19 @@ export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
 usage() {
     cat <<'USAGE'
-usage: run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep] [--print-env] -- <exe> [guest args...]
+usage: run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep-session] [--print-env] -- <exe> [guest args...]
 
-  --window      open the native window and present the guest's surface
-  --headless    force headless presentation (default); conflicts with --window
-  --frames N    diagnostic frame count (exported as VICTORY_FRAME_MEASURED)
-  --out DIR     keep guest.log, host.log, telemetry.json and summary.txt here
-  --keep        keep the isolated session directory (share dir, wineprefix)
-  --print-env   print LAUNCH_ENV endpoint/share_dir/fence_page lines
+  --window        open the native window and present the guest's surface
+  --headless      force headless presentation (default); conflicts with --window
+  --frames N      diagnostic frame count (exported as VICTORY_FRAME_MEASURED)
+  --out DIR       keep guest.log, host.log, telemetry.json and summary.txt here
+  --keep-session  keep the session directory and the default --out directory
+                  (--keep, VICTORY_KEEP_LOGS=1 and VICTORY_KEEP_SESSION=1 alias it)
+  --print-env     print LAUNCH_ENV backend/endpoint/share_dir/fence_page lines
   -h, --help
+
+VICTORY_BACKEND selects the guest backend: metal (default) or d3d12 (the D3D12
+host reference path). Any other value is a usage error.
 USAGE
 }
 
@@ -103,7 +126,7 @@ while [ "$#" -gt 0 ]; do
             OUT="$2"
             shift 2
             ;;
-        --keep)
+        --keep-session|--keep)
             KEEP=1
             shift
             ;;
@@ -146,6 +169,20 @@ case "$FRAMES" in
     0) echo "run-title-metal.sh: --frames must be a positive integer" >&2; exit 2 ;;
 esac
 
+# The guest backend is resolved before anything is created, so a typo is a
+# usage error with no temp directory to clean up. An inherited value wins: the
+# ADR-031 wrapper selects d3d12 for the reference run through the environment.
+BACKEND="${VICTORY_BACKEND:-metal}"
+case "$BACKEND" in
+    metal|d3d12) ;;
+    *)
+        echo "run-title-metal.sh: unsupported VICTORY_BACKEND=$BACKEND (expected metal or d3d12)" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+export VICTORY_BACKEND="$BACKEND"
+
 GUEST_EXE="$1"
 shift
 # The remaining positional parameters are the guest arguments and stay intact
@@ -159,14 +196,129 @@ esac
 
 cd "$ROOT"
 
+# --- Session state ---------------------------------------------------------
+# Everything cleanup needs exists before the first directory is created, so the
+# EXIT trap can be installed before this run owns any path on disk.
+HOST_PID=""
+GUEST_PID=""
+HOST_RC=0
+GUEST_RC=0
+GUEST_TIMED_OUT=0
+HOST_TERMINATED=0
+HOST_READY_LINE=""
+WINDOW_SIZE=""
+PORT=""
+MODE="title"
+GATE_MODE=0
+POOL_STATUS="skipped"
+POOL_SUMMARY=""
+ABI_STATUS="skipped"
+ABI_SUMMARY=""
+HOST_STARTED=0
+LOCK="${VICTORY_GPU_LOCK:-/tmp/victory-gpu.lock}"
+WORK=""
+OUT_OWNED=0
+
+fail_setup() {
+    echo "run-title-metal.sh: FAIL: $1" >&2
+    exit 3
+}
+
+# Remove exactly the session directory this run created. WORK is the literal
+# `mktemp` result, so it is the ownership proof; there is no wildcard sweep of
+# $TMPDIR. The suffix check rejects a mutated or empty value instead of letting
+# a bug turn into a deletion of something else.
+remove_session_work() {
+    [ -n "${WORK:-}" ] || return 0
+    [ -e "$WORK" ] || return 0
+    case "$WORK" in
+        */victory-title.????????) ;;
+        *)
+            echo "run-title-metal.sh: WARN: refusing to remove unexpected session path $WORK" >&2
+            return 1
+            ;;
+    esac
+    if victory_hygiene_keep_logs; then
+        echo "run-title-metal.sh: kept session files in $WORK"
+        return 0
+    fi
+    victory_hygiene_remove_work || true
+    if [ -e "$WORK" ]; then
+        # One ownership-proven retry: the helper only reports a survivor.
+        rm -rf -- "$WORK" 2>/dev/null || true
+    fi
+    if [ -e "$WORK" ]; then
+        echo "run-title-metal.sh: WARN: session directory survived removal: $WORK" >&2
+        return 1
+    fi
+    echo "run-title-metal.sh: removed the session directory (use --keep-session to keep it)"
+    return 0
+}
+
+# A diagnostics directory this run created itself (no --out) is removed with
+# the same rule. A caller-supplied --out is never touched.
+remove_owned_out() {
+    [ "${OUT_OWNED:-0}" = 1 ] || return 0
+    [ -n "${OUT:-}" ] || return 0
+    [ -e "$OUT" ] || return 0
+    case "$OUT" in
+        */victory-title-out.????????) ;;
+        *)
+            echo "run-title-metal.sh: WARN: refusing to remove unexpected diagnostics path $OUT" >&2
+            return 1
+            ;;
+    esac
+    if victory_hygiene_keep_logs; then
+        echo "run-title-metal.sh: kept diagnostics in $OUT"
+        return 0
+    fi
+    rm -rf -- "$OUT" 2>/dev/null || true
+    if [ -e "$OUT" ]; then
+        echo "run-title-metal.sh: WARN: diagnostics directory survived removal: $OUT" >&2
+        return 1
+    fi
+    return 0
+}
+
+cleanup() {
+    status=$?
+    # The EXIT trap owns teardown: ignore further signals and disable `set -e`
+    # so a second signal, a failing helper or a full disk cannot abort the
+    # session removal. Traps are cleared only for the final exit.
+    trap '' INT TERM HUP
+    set +e
+    # Stop the private prefix's wineserver first so its guests do not linger.
+    if [ -n "${WORK:-}" ] && [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
+        WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
+    fi
+    # Reap every PID this launcher started (host daemon, Wine guest, helper
+    # children): TERM, bounded wait, KILL survivors, bounded wait. The unique
+    # temp dir is then the ownership proof for any leftover grandchild.
+    victory_hygiene_reap || true
+    victory_hygiene_reap_marker "${WORK:-}" || true
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_lock_release || true
+    remove_session_work || true
+    remove_owned_out || true
+    trap - EXIT INT TERM HUP
+    victory_hygiene_finalize "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 if [ -n "$OUT" ]; then
     case "$OUT" in
         /*) ;;
         *) OUT="$START_DIR/$OUT" ;;
     esac
     mkdir -p "$OUT" || { echo "run-title-metal.sh: cannot create --out $OUT" >&2; exit 2; }
+    OUT_OWNED=0
 else
-    OUT="$(mktemp -d "${TMPDIR:-/tmp}/victory-title-out.XXXXXXXX")"
+    OUT="$(mktemp -d "${TMPDIR:-/tmp}/victory-title-out.XXXXXXXX")" \
+        || fail_setup "cannot create the default diagnostics directory"
+    OUT_OWNED=1
 fi
 OUT="$(cd "$OUT" && pwd)"
 
@@ -185,7 +337,8 @@ if [ -z "${WINE:-}" ]; then
 fi
 export WINE
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/victory-title.XXXXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/victory-title.XXXXXXXX")" \
+    || fail_setup "cannot create the session directory"
 SHARE="$WORK/share"
 SECRET="$WORK/secret.hex"
 FENCE_PAGE="$SHARE/gpu-fence.v1.page"
@@ -195,64 +348,21 @@ GUEST_LOG="$OUT/guest.log"
 SUMMARY="$OUT/summary.txt"
 GUEST_REPORT="$SHARE/live-gate.report"
 FRAMES_CSV="$SHARE/live-gate.frames.csv"
-HOST_PID=""
-GUEST_PID=""
-HOST_RC=0
-GUEST_RC=0
-GUEST_TIMED_OUT=0
-HOST_TERMINATED=0
-HOST_READY_LINE=""
-PORT=""
-MODE="title"
-GATE_MODE=0
-POOL_STATUS="skipped"
-POOL_SUMMARY=""
-ABI_STATUS="skipped"
-ABI_SUMMARY=""
-HOST_STARTED=0
-LOCK="/tmp/victory-gpu.lock"
 victory_hygiene_work "$WORK"
-
-fail_setup() {
-    echo "run-title-metal.sh: FAIL: $1" >&2
-    exit 3
-}
-
-cleanup() {
-    status=$?
-    trap - EXIT INT TERM HUP
-    # Stop the private prefix's wineserver first so its guests do not linger.
-    if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
-        WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
-    fi
-    # Reap every PID this launcher started (host daemon, Wine guest, helper
-    # children): TERM, bounded wait, KILL survivors, bounded wait. The unique
-    # temp dir is then the ownership proof for any leftover grandchild.
-    victory_hygiene_reap
-    victory_hygiene_reap_marker "$WORK"
-    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
-    victory_hygiene_lock_release
-    victory_hygiene_remove_work
-    if victory_hygiene_keep_logs; then
-        echo "run-title-metal.sh: diagnostics in $OUT"
-    fi
-    victory_hygiene_finalize "$status"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
 
 # --- Serialise exclusive GPU work ------------------------------------------
 victory_hygiene_lock_acquire "$LOCK"
 
 mkdir -m 700 "$SHARE"
-if ! command -v openssl >/dev/null 2>&1; then
-    fail_setup "openssl is required for the fresh host secret"
+SECRET_HEX=""
+if [ "$BACKEND" = metal ]; then
+    if ! command -v openssl >/dev/null 2>&1; then
+        fail_setup "openssl is required for the fresh host secret"
+    fi
+    openssl rand -hex 32 >"$SECRET" || fail_setup "cannot generate the host secret"
+    chmod 600 "$SECRET"
+    SECRET_HEX="$(cat "$SECRET")"
 fi
-openssl rand -hex 32 >"$SECRET" || fail_setup "cannot generate the host secret"
-chmod 600 "$SECRET"
-SECRET_HEX="$(cat "$SECRET")"
 
 winpath() {
     printf 'Z:%s' "$(printf '%s' "$1" | tr '/' '\\')"
@@ -269,13 +379,15 @@ case "$TARGET_DIR" in
 esac
 HOST_BIN="$TARGET_DIR/aarch64-apple-darwin/debug/victory_metal_host"
 
-if [ ! -x "$HOST_BIN" ]; then
+if [ "$BACKEND" = metal ] && [ ! -x "$HOST_BIN" ]; then
     echo "run-title-metal.sh: building the ARM64 victory_metal_host (missing $HOST_BIN)..."
     if ! victory_hygiene_run cargo build --locked -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host; then
         fail_setup "the ARM64 host daemon did not build"
     fi
 fi
-[ -x "$HOST_BIN" ] || fail_setup "missing $HOST_BIN after the build"
+if [ "$BACKEND" = metal ] && [ ! -x "$HOST_BIN" ]; then
+    fail_setup "missing $HOST_BIN after the build"
+fi
 
 # --- Gate detection --------------------------------------------------------
 GATE_MODE=0
@@ -647,12 +759,17 @@ EOS
     fi
 }
 
-if [ "$GATE_MODE" = 1 ]; then
+if [ "$GATE_MODE" = 1 ] && [ "$BACKEND" = metal ]; then
     echo "run-title-metal.sh: preparing the gate DXIL pool and reflection ABIs..."
     pool_stage >"$WORK/pool.log" 2>&1 || true
     cat "$WORK/pool.log"
     POOL_SUMMARY="$(sed -n 's/^POOL_SUMMARY //p' "$WORK/pool.log" | tail -1)"
     build_abis
+elif [ "$GATE_MODE" = 1 ]; then
+    # The metallib pool and VAB1 ABIs are native-metal artifacts and cannot be
+    # built without starting the native daemon's toolchain; the reference run
+    # records what the D3D12 path returned instead.
+    echo "run-title-metal.sh: VICTORY_BACKEND=d3d12: skipping the native metallib/ABI pool"
 fi
 
 # --- Start the ARM64 daemon ------------------------------------------------
@@ -674,32 +791,37 @@ start_host() {
     HOST_STARTED=1
 }
 
-echo "run-title-metal.sh: starting the ARM64 victory-metal-host daemon..."
-start_host
+if [ "$BACKEND" = metal ]; then
+    echo "run-title-metal.sh: starting the ARM64 victory-metal-host daemon..."
+    start_host
 
-ready=0
-waited=0
-while [ "$waited" -lt 600 ]; do
-    if grep -q '^victory-metal-host: ready port=' "$HOST_LOG" 2>/dev/null; then
-        ready=1
-        break
+    ready=0
+    waited=0
+    while [ "$waited" -lt 600 ]; do
+        if grep -q '^victory-metal-host: ready port=' "$HOST_LOG" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        if ! kill -0 "$HOST_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if [ "$ready" -ne 1 ]; then
+        echo "run-title-metal.sh: FAIL: the host daemon did not become ready (pid $HOST_PID)" >&2
+        cat "$HOST_LOG" >&2 || true
+        exit 3
     fi
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-        break
-    fi
-    sleep 0.1
-    waited=$((waited + 1))
-done
-if [ "$ready" -ne 1 ]; then
-    echo "run-title-metal.sh: FAIL: the host daemon did not become ready (pid $HOST_PID)" >&2
-    cat "$HOST_LOG" >&2 || true
-    exit 3
+    HOST_READY_LINE="$(grep '^victory-metal-host: ready port=' "$HOST_LOG" | tail -1)"
+    PORT="$(printf '%s\n' "$HOST_READY_LINE" | sed -n 's/^victory-metal-host: ready port=\([0-9][0-9]*\).*$/\1/p')"
+    [ -n "$PORT" ] || fail_setup "the host did not publish its port"
+    WINDOW_SIZE="$(printf '%s\n' "$HOST_READY_LINE" | sed -n 's/.* window=\([0-9][0-9]*x[0-9][0-9]*\).*/\1/p')"
+    echo "run-title-metal.sh: host ready: $HOST_READY_LINE"
+else
+    echo "run-title-metal.sh: VICTORY_BACKEND=d3d12: reference mode, no native host daemon"
+    : >"$HOST_LOG"
 fi
-HOST_READY_LINE="$(grep '^victory-metal-host: ready port=' "$HOST_LOG" | tail -1)"
-PORT="$(printf '%s\n' "$HOST_READY_LINE" | sed -n 's/^victory-metal-host: ready port=\([0-9][0-9]*\).*$/\1/p')"
-[ -n "$PORT" ] || fail_setup "the host did not publish its port"
-WINDOW_SIZE="$(printf '%s\n' "$HOST_READY_LINE" | sed -n 's/.* window=\([0-9][0-9]*x[0-9][0-9]*\).*/\1/p')"
-echo "run-title-metal.sh: host ready: $HOST_READY_LINE"
 
 compute_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.compute.id" 2>/dev/null | tail -1)"
 graphics_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.graphics.id" 2>/dev/null | tail -1)"
@@ -707,13 +829,22 @@ graphics_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.g
 # --- Guest environment -----------------------------------------------------
 export WINEPREFIX="$WORK/wineprefix"
 export WINEDEBUG="${WINEDEBUG:--all}"
-export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+if [ "$BACKEND" = metal ]; then
+    export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+else
+    # The reference run needs Apple's translation layer, exactly like
+    # tools/macos/victory.sh, instead of Wine's builtin D3D12.
+    export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+fi
 
 # Host-owned connection values always win: they describe this exact daemon.
-export VICTORY_BACKEND=metal
-export VICTORY_METAL_PORT="$PORT"
-export VICTORY_METAL_ENDPOINT="127.0.0.1:$PORT"
-export VICTORY_METAL_SECRET="$SECRET_HEX"
+# The d3d12 reference has no daemon, so it exports no endpoint/secret at all.
+export VICTORY_BACKEND="$BACKEND"
+if [ "$BACKEND" = metal ]; then
+    export VICTORY_METAL_PORT="$PORT"
+    export VICTORY_METAL_ENDPOINT="127.0.0.1:$PORT"
+    export VICTORY_METAL_SECRET="$SECRET_HEX"
+fi
 export VICTORY_METAL_SHARE_DIR="$(winpath "$SHARE")"
 export VICTORY_METAL_FENCE_PAGE="$(winpath "$FENCE_PAGE")"
 export VICTORY_FRAME_MEASURED="${FRAMES:-${VICTORY_FRAME_MEASURED:-120}}"
@@ -722,8 +853,12 @@ export VICTORY_FRAME_WARMUP="${VICTORY_FRAME_WARMUP:-20}"
 # ADR-031's wrapper reads these resolved values for its own summary. The
 # session secret is deliberately not part of this block.
 if [ "$PRINT_ENV" = 1 ]; then
-    echo "LAUNCH_ENV backend=metal"
-    echo "LAUNCH_ENV endpoint=127.0.0.1:$PORT"
+    echo "LAUNCH_ENV backend=$BACKEND"
+    if [ "$BACKEND" = metal ]; then
+        echo "LAUNCH_ENV endpoint=127.0.0.1:$PORT"
+    else
+        echo "LAUNCH_ENV endpoint=none"
+    fi
     echo "LAUNCH_ENV share_dir=$SHARE"
     echo "LAUNCH_ENV fence_page=$FENCE_PAGE"
 fi
@@ -753,7 +888,7 @@ if [ "$GATE_MODE" = 1 ]; then
 fi
 
 # --- Run the Win64 guest under Wine ----------------------------------------
-echo "run-title-metal.sh: running the Win64 guest under Wine (mode=$MODE, frames=$VICTORY_FRAME_MEASURED, warmup=$VICTORY_FRAME_WARMUP)..."
+echo "run-title-metal.sh: running the Win64 guest under Wine (backend=$BACKEND, mode=$MODE, frames=$VICTORY_FRAME_MEASURED, warmup=$VICTORY_FRAME_WARMUP)..."
 GUEST_TIMEOUT="${GUEST_TIMEOUT:-900}"
 # Capture the guest output to guest.log and echo it afterwards: POSIX sh has no
 # pipefail, so a `| tee` pipeline would hide the guest exit status.
@@ -782,31 +917,33 @@ GUEST_PID=""
 cat "$GUEST_LOG" 2>/dev/null || true
 
 # --- Let the daemon finish its `--once` session, then stop it --------------
-host_deadline=$(( $(date +%s) + 20 ))
-while kill -0 "$HOST_PID" 2>/dev/null; do
-    if [ "$(date +%s)" -ge "$host_deadline" ]; then
-        echo "run-title-metal.sh: WARN: the host did not exit after the guest; stopping it" >&2
-        kill "$HOST_PID" 2>/dev/null || true
+if [ "$HOST_STARTED" = 1 ]; then
+    host_deadline=$(( $(date +%s) + 20 ))
+    while kill -0 "$HOST_PID" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$host_deadline" ]; then
+            echo "run-title-metal.sh: WARN: the host did not exit after the guest; stopping it" >&2
+            kill "$HOST_PID" 2>/dev/null || true
+            HOST_TERMINATED=1
+            break
+        fi
+        sleep 0.1
+    done
+    HOST_RC=0
+    victory_hygiene_wait_pid "$HOST_PID" 10 || HOST_RC=$?
+    if [ "$HOST_RC" -eq 124 ]; then
+        HOST_RC=143
         HOST_TERMINATED=1
-        break
     fi
-    sleep 0.1
-done
-HOST_RC=0
-victory_hygiene_wait_pid "$HOST_PID" 10 || HOST_RC=$?
-if [ "$HOST_RC" -eq 124 ]; then
-    HOST_RC=143
-    HOST_TERMINATED=1
+    victory_hygiene_untrack "$HOST_PID"
+    HOST_PID=""
 fi
-victory_hygiene_untrack "$HOST_PID"
-HOST_PID=""
 
 # --- Structured summary ----------------------------------------------------
 SUMMARY_RC=0
 python3 - "$FRAMES_CSV" "$GUEST_REPORT" "$TELEMETRY" "$GUEST_RC" "$HOST_RC" \
     "$MODE" "$WINDOW" "$WINDOW_SIZE" "$FRAMES" "$SUMMARY" "$HOST_TERMINATED" \
     "$GUEST_TIMED_OUT" "$HOST_READY_LINE" "$GUEST_LOG" "$POOL_STATUS" \
-    "$ABI_STATUS" "$graphics_id" "$compute_id" <<'PY' || SUMMARY_RC=$?
+    "$ABI_STATUS" "$graphics_id" "$compute_id" "$BACKEND" <<'PY' || SUMMARY_RC=$?
 import json
 import math
 import os
@@ -815,11 +952,14 @@ import sys
 (csv_path, report_path, telemetry_path, guest_rc, host_rc, mode, window,
  window_size, frames_cli, summary_path, host_terminated, guest_timed_out,
  ready_line, guest_log, pool_status, abi_status, graphics_id,
- compute_id) = sys.argv[1:19]
+ compute_id, backend) = sys.argv[1:20]
 guest_rc = int(guest_rc)
 host_rc = int(host_rc)
 host_terminated = host_terminated == "1"
 guest_timed_out = guest_timed_out == "1"
+# The daemon, its telemetry and the D3DMetal fallback assertions describe the
+# native metal path only. A d3d12 run is D3DMetal by design and has no host.
+check_host = backend == "metal"
 
 values = []
 if os.path.exists(csv_path):
@@ -890,17 +1030,17 @@ if guest_timed_out:
     problem = (10, "guest exceeded the launcher timeout")
 elif guest_rc != 0:
     problem = (10, f"guest exited {guest_rc}")
-elif not telemetry_ok:
+elif check_host and not telemetry_ok:
     problem = (15, "host telemetry missing; cannot prove d3dmetal_fallback_count=0")
-elif host_fallback not in (0, "0"):
+elif check_host and host_fallback not in (0, "0"):
     problem = (11, f"host d3dmetal_fallback_count={host_fallback}")
-elif guest_fallback is not None and guest_fallback not in (0, "0"):
+elif check_host and guest_fallback is not None and guest_fallback not in (0, "0"):
     problem = (11, f"guest d3dmetal_fallback_count={guest_fallback}")
-elif guest_module is not None and guest_module not in (0, "0"):
-    problem = (11, f"guest d3dmetal_module={guest_module}")
-elif host_loaded not in (False, 0):
+elif check_host and guest_module is not None and guest_module not in (0, "0"):
+    problem = (11, f"guest_d3dmetal_module={guest_module}")
+elif check_host and host_loaded not in (False, 0):
     problem = (11, f"host d3dmetal_loaded={host_loaded}")
-elif host_images:
+elif check_host and host_images:
     problem = (11, "host d3dmetal_images=" + ",".join(map(str, host_images)))
 elif host_rc != 0 and not host_terminated:
     problem = (14, f"host exited {host_rc}")
@@ -919,6 +1059,7 @@ window_value = window_size if (window == "1" and window_size) else ("none" if wi
 
 lines = [
     "launcher=run-title-metal",
+    f"backend={backend}",
     f"status={status}",
     f"exit_code={exit_code}",
     f"reason={reason}",
