@@ -27,7 +27,10 @@
 //! [`PipelineKey::from_parts`] is a BLAKE3 digest over a length-prefixed
 //! canonical encoding of the metallib, entry point, stage and caller state. The
 //! key keeps the canonical bytes, so duplicate detection compares bytes rather
-//! than trusting a 256-bit digest. [`PipelineRegistry`] creates at most one
+//! than trusting a 256-bit digest. [`PipelineKey::from_stages`] is the
+//! one-library-per-stage form: it hashes every stage's metallib and entry, so a
+//! graphics pipeline whose pixel library changed is a different key even when
+//! the vertex library is identical. [`PipelineRegistry`] creates at most one
 //! Metal pipeline object per key; repeated registration returns the existing
 //! handle and counts the reuse.
 //!
@@ -38,6 +41,10 @@
 //! load, an entry point that does not exist, or an entry point whose
 //! `MTLFunction.functionType` does not match the requested stage is always an
 //! explicit error: the registry never substitutes a different entry point.
+//! [`PipelineRegistry::register_graphics_stages`] and
+//! [`PipelineRegistry::register_mesh_stages`] take one [`StageLibrary`] per
+//! stage, so a persistent compiler that emits one metallib per stage registers
+//! without a combined library.
 
 use std::collections::HashMap;
 use std::mem;
@@ -152,6 +159,19 @@ pub enum RegistryError {
     /// The named entry point is missing or has the wrong `MTLFunctionType`.
     #[error("entry point `{0}` was not found or has the wrong stage")]
     EntryPointNotFound(String),
+    /// A stage's entry point is missing from that stage's own library.
+    ///
+    /// The stage is named so a per-stage registration failure is diagnosable:
+    /// the vertex library may resolve while the pixel library does not.
+    #[error(
+        "the {stage} stage entry point `{entry}` was not found or has the wrong type in its library"
+    )]
+    MissingStageFunction {
+        /// Stage whose function could not be resolved.
+        stage: &'static str,
+        /// Entry point the stage asked for.
+        entry: String,
+    },
     /// The opaque pipeline state blob is malformed.
     #[error("pipeline state blob is invalid: {0}")]
     InvalidState(&'static str),
@@ -1190,6 +1210,75 @@ impl PipelineStage {
     }
 }
 
+/// The role one shader function plays in a registered pipeline.
+///
+/// A version 2 registration carries one library per stage, so the registry
+/// resolves every function in its own library instead of assuming one metallib
+/// holds both render stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FunctionRole {
+    /// Vertex function of a graphics pipeline.
+    Vertex,
+    /// Fragment (pixel) function of a graphics or mesh pipeline.
+    Fragment,
+    /// Mesh function of a mesh pipeline.
+    Mesh,
+    /// Object function of a mesh pipeline that declares an object stage.
+    Object,
+    /// Kernel function of a compute pipeline.
+    Kernel,
+}
+
+impl FunctionRole {
+    /// Stable one-byte encoding used by [`PipelineKey::from_stages`].
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Vertex => 0,
+            Self::Fragment => 1,
+            Self::Mesh => 2,
+            Self::Object => 3,
+            Self::Kernel => 4,
+        }
+    }
+
+    /// Stage name used by entry-point and library diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "pixel",
+            Self::Mesh => "mesh",
+            Self::Object => "object",
+            Self::Kernel => "compute",
+        }
+    }
+
+    /// The `MTLFunctionType` this role must declare.
+    const fn mtl_function_type(self) -> usize {
+        match self {
+            Self::Vertex => MTL_FUNCTION_TYPE_VERTEX,
+            Self::Fragment => MTL_FUNCTION_TYPE_FRAGMENT,
+            Self::Mesh => MTL_FUNCTION_TYPE_MESH,
+            Self::Object => MTL_FUNCTION_TYPE_OBJECT,
+            Self::Kernel => MTL_FUNCTION_TYPE_KERNEL,
+        }
+    }
+}
+
+/// One shader function and the `.metallib` that contains it.
+///
+/// The version 2 wire frame names one ticket (one library file) per stage, so a
+/// pipeline may be built from distinct libraries. Nothing here concatenates
+/// them or requires them to be equal.
+#[derive(Debug, Clone, Copy)]
+pub struct StageLibrary<'a> {
+    /// Role this function plays in the pipeline.
+    pub role: FunctionRole,
+    /// The stage's own metallib bytes.
+    pub metallib: &'a [u8],
+    /// Entry point resolved inside `metallib`.
+    pub entry: &'a str,
+}
+
 /// Content-addressed pipeline key.
 ///
 /// The key retains the canonical byte encoding as well as the BLAKE3 digest, so
@@ -1217,6 +1306,37 @@ impl PipelineKey {
     /// Exact canonical bytes hashed by [`Self::digest`].
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
+    }
+
+    /// Hashes one library per stage.
+    ///
+    /// Unlike [`Self::from_parts`], every stage's role, metallib and entry
+    /// point participate, so a changed pixel library is a different key even
+    /// when the vertex library is unchanged. Stages are ordered by role before
+    /// hashing, so the same stage set listed in another order maps to the same
+    /// object.
+    pub fn from_stages(stages: &[StageLibrary<'_>], stage: PipelineStage, state: &[u8]) -> Self {
+        let mut ordered: Vec<&StageLibrary<'_>> = stages.iter().collect();
+        ordered.sort_by_key(|entry| entry.role.code());
+        let mut canonical = Vec::with_capacity(
+            32 + state.len()
+                + ordered
+                    .iter()
+                    .map(|entry| entry.metallib.len() + entry.entry.len() + 9)
+                    .sum::<usize>(),
+        );
+        canonical.extend_from_slice(b"VPS2");
+        canonical.extend_from_slice(&2u16.to_le_bytes());
+        canonical.push(stage.code());
+        canonical.push(u8::try_from(ordered.len()).expect("stage count exceeds u8"));
+        for entry in ordered {
+            canonical.push(entry.role.code());
+            push_length_prefixed(&mut canonical, entry.metallib);
+            push_length_prefixed(&mut canonical, entry.entry.as_bytes());
+        }
+        push_length_prefixed(&mut canonical, state);
+        let digest = *blake3::hash(&canonical).as_bytes();
+        Self { canonical, digest }
     }
 
     /// BLAKE3 digest of the canonical bytes.
@@ -1575,6 +1695,117 @@ impl PipelineRegistry {
         self.register(key, metallib, entry, state, PipelineStage::Mesh, parsed)
     }
 
+    /// Registers (or reuses) a graphics pipeline from one library per stage.
+    ///
+    /// `stages` must carry exactly the vertex and fragment functions, each with
+    /// its own metallib and entry point; the fragment entry must be the one the
+    /// [`PipelineState`] blob names. Every function is resolved in its own
+    /// library, then one `MTLRenderPipelineState` is created from them.
+    pub fn register_graphics_stages(
+        &mut self,
+        key: PipelineKey,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+    ) -> Result<PipelineId, RegistryError> {
+        let parsed = PipelineState::decode_for(state, PipelineStage::Graphics)?;
+        require_entries(&parsed, PipelineStage::Graphics)?;
+        validate_stage_set(
+            stages,
+            &[FunctionRole::Vertex, FunctionRole::Fragment],
+            PipelineStage::Graphics,
+            &parsed,
+        )?;
+        self.register_stages(key, stages, state, PipelineStage::Graphics, parsed)
+    }
+
+    /// Registers (or reuses) a mesh pipeline from one library per stage.
+    ///
+    /// `stages` must carry the mesh and fragment functions and, when the
+    /// [`PipelineState`] names an object entry, the object function too. Each
+    /// function is resolved in its own library.
+    pub fn register_mesh_stages(
+        &mut self,
+        key: PipelineKey,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+    ) -> Result<PipelineId, RegistryError> {
+        let parsed = PipelineState::decode_for(state, PipelineStage::Mesh)?;
+        require_entries(&parsed, PipelineStage::Mesh)?;
+        let roles: &[FunctionRole] = if parsed.object_entry.is_some() {
+            &[
+                FunctionRole::Mesh,
+                FunctionRole::Object,
+                FunctionRole::Fragment,
+            ]
+        } else {
+            &[FunctionRole::Mesh, FunctionRole::Fragment]
+        };
+        validate_stage_set(stages, roles, PipelineStage::Mesh, &parsed)?;
+        self.register_stages(key, stages, state, PipelineStage::Mesh, parsed)
+    }
+
+    /// Registers (or reuses) a compute pipeline from one library per stage.
+    ///
+    /// A compute pipeline has one kernel function; the staged form exists so a
+    /// frame built from several stage files never has to assume the kernel is
+    /// in the first library. `state` stays opaque for compute and still
+    /// participates in the key.
+    pub fn register_compute_stages(
+        &mut self,
+        key: PipelineKey,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+    ) -> Result<PipelineId, RegistryError> {
+        validate_stage_set(
+            stages,
+            &[FunctionRole::Kernel],
+            PipelineStage::Compute,
+            &PipelineState::default(),
+        )?;
+        self.register_stages(
+            key,
+            stages,
+            state,
+            PipelineStage::Compute,
+            PipelineState::default(),
+        )
+    }
+
+    /// Creates (or reuses) the object for one per-stage registration.
+    fn register_stages(
+        &mut self,
+        key: PipelineKey,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+        stage: PipelineStage,
+        parsed_state: PipelineState,
+    ) -> Result<PipelineId, RegistryError> {
+        if stages.iter().any(|entry| entry.entry.is_empty()) {
+            return Err(RegistryError::EntryPointNotFound(String::new()));
+        }
+        let expected = PipelineKey::from_stages(stages, stage, state);
+        if key != expected {
+            return Err(RegistryError::KeyMismatch);
+        }
+        if let Some(existing) = self.pipelines.get_mut(&key) {
+            existing.reuse_count += 1;
+            self.reused += 1;
+            return Ok(existing.id);
+        }
+
+        let _pool = AutoreleasePool::new();
+        let object = match stage {
+            PipelineStage::Graphics => {
+                create_graphics_pso_stages(self.device.as_raw(), stages, &parsed_state)?
+            }
+            PipelineStage::Mesh => {
+                create_mesh_pso_stages(self.device.as_raw(), stages, &parsed_state)?
+            }
+            PipelineStage::Compute => create_compute_pso_stages(self.device.as_raw(), stages)?,
+        };
+        Ok(self.insert_pipeline(key, stage, object, parsed_state, state))
+    }
+
     fn register(
         &mut self,
         key: PipelineKey,
@@ -1608,6 +1839,18 @@ impl PipelineRegistry {
             }
         };
 
+        Ok(self.insert_pipeline(key, stage, object, parsed_state, state))
+    }
+
+    /// Records one created object under its content key.
+    fn insert_pipeline(
+        &mut self,
+        key: PipelineKey,
+        stage: PipelineStage,
+        object: ObjcObject,
+        parsed_state: PipelineState,
+        state: &[u8],
+    ) -> PipelineId {
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.created += 1;
@@ -1622,7 +1865,7 @@ impl PipelineRegistry {
         };
         self.by_id.insert(id.0, key.clone());
         self.pipelines.insert(key, entry);
-        Ok(id)
+        id
     }
 
     /// Borrows the pipeline registered under `id`.
@@ -1795,12 +2038,21 @@ fn create_compute_pso(
 ) -> Result<ObjcObject, RegistryError> {
     let library = load_library(device, metallib, "compute")?;
     let function = new_function(&library, entry, MTL_FUNCTION_TYPE_KERNEL)?;
+    build_compute_pso(device, function.as_raw(), entry)
+}
+
+/// Creates one `MTLComputePipelineState` from an already-resolved kernel.
+fn build_compute_pso(
+    device: objc::Id,
+    function: objc::Id,
+    entry: &str,
+) -> Result<ObjcObject, RegistryError> {
     let mut err = objc::empty_id();
     let raw = unsafe {
         objc::msg_send_id_err(
             device,
             objc::sel(c"newComputePipelineStateWithFunction:error:"),
-            function.as_raw(),
+            function,
             &mut err,
         )
     };
@@ -1810,6 +2062,16 @@ fn create_compute_pso(
             "compute `{entry}` pipeline: {message}"
         )))
     })
+}
+
+/// Creates a compute pipeline from a per-stage library set.
+fn create_compute_pso_stages(
+    device: objc::Id,
+    stages: &[StageLibrary<'_>],
+) -> Result<ObjcObject, RegistryError> {
+    let kernel_stage = stage_with_role(stages, FunctionRole::Kernel)?;
+    let (_kernel_library, kernel) = stage_function(device, kernel_stage)?;
+    build_compute_pso(device, kernel.as_raw(), kernel_stage.entry)
 }
 
 fn create_graphics_pso(
@@ -1825,7 +2087,49 @@ fn create_graphics_pso(
         .as_deref()
         .ok_or(RegistryError::InvalidState("missing fragment entry point"))?;
     let fragment = new_function(&library, fragment_entry, MTL_FUNCTION_TYPE_FRAGMENT)?;
+    build_graphics_pso(
+        device,
+        vertex.as_raw(),
+        fragment.as_raw(),
+        vertex_entry,
+        fragment_entry,
+        state,
+    )
+}
 
+/// Creates a graphics pipeline from one library per stage.
+///
+/// The vertex function comes from the vertex stage's library and the fragment
+/// function from the pixel stage's library; the two libraries need not be the
+/// same file and are never concatenated.
+fn create_graphics_pso_stages(
+    device: objc::Id,
+    stages: &[StageLibrary<'_>],
+    state: &PipelineState,
+) -> Result<ObjcObject, RegistryError> {
+    let vertex_stage = stage_with_role(stages, FunctionRole::Vertex)?;
+    let fragment_stage = stage_with_role(stages, FunctionRole::Fragment)?;
+    let (_vertex_library, vertex) = stage_function(device, vertex_stage)?;
+    let (_fragment_library, fragment) = stage_function(device, fragment_stage)?;
+    build_graphics_pso(
+        device,
+        vertex.as_raw(),
+        fragment.as_raw(),
+        vertex_stage.entry,
+        fragment_stage.entry,
+        state,
+    )
+}
+
+/// Creates one `MTLRenderPipelineState` from already-resolved functions.
+fn build_graphics_pso(
+    device: objc::Id,
+    vertex: objc::Id,
+    fragment: objc::Id,
+    vertex_entry: &str,
+    fragment_entry: &str,
+    state: &PipelineState,
+) -> Result<ObjcObject, RegistryError> {
     let descriptor_class = objc::class(c"MTLRenderPipelineDescriptor");
     if descriptor_class.is_null() {
         return Err(RegistryError::Unsupported(
@@ -1839,15 +2143,11 @@ fn create_graphics_pso(
         ))
     })?;
     unsafe {
-        objc::msg_send_void_1(
-            descriptor.as_raw(),
-            objc::sel(c"setVertexFunction:"),
-            vertex.as_raw(),
-        );
+        objc::msg_send_void_1(descriptor.as_raw(), objc::sel(c"setVertexFunction:"), vertex);
         objc::msg_send_void_1(
             descriptor.as_raw(),
             objc::sel(c"setFragmentFunction:"),
-            fragment.as_raw(),
+            fragment,
         );
     }
     set_attachment_formats(descriptor.as_raw(), state)?;
@@ -1873,6 +2173,73 @@ fn create_mesh_pso(
     device: objc::Id,
     metallib: &[u8],
     mesh_entry: &str,
+    state: &PipelineState,
+) -> Result<ObjcObject, RegistryError> {
+    let library = load_library(device, metallib, "mesh")?;
+    let mesh = new_function(&library, mesh_entry, MTL_FUNCTION_TYPE_MESH)?;
+    let fragment_entry = state
+        .fragment_entry
+        .as_deref()
+        .ok_or(RegistryError::InvalidState("missing fragment entry point"))?;
+    let fragment = new_function(&library, fragment_entry, MTL_FUNCTION_TYPE_FRAGMENT)?;
+    let object = match state.object_entry.as_deref() {
+        Some(entry) => Some(new_function(&library, entry, MTL_FUNCTION_TYPE_OBJECT)?),
+        None => None,
+    };
+    build_mesh_pso(
+        device,
+        mesh.as_raw(),
+        fragment.as_raw(),
+        object.as_ref().map(ObjcObject::as_raw),
+        mesh_entry,
+        fragment_entry,
+        state,
+    )
+}
+
+/// Creates a mesh pipeline from one library per stage.
+///
+/// The mesh, optional object and fragment functions each come from their own
+/// stage's library; a frame that names an object entry must carry an object
+/// stage, which the role validation has already enforced.
+fn create_mesh_pso_stages(
+    device: objc::Id,
+    stages: &[StageLibrary<'_>],
+    state: &PipelineState,
+) -> Result<ObjcObject, RegistryError> {
+    let mesh_stage = stage_with_role(stages, FunctionRole::Mesh)?;
+    let fragment_stage = stage_with_role(stages, FunctionRole::Fragment)?;
+    let (_mesh_library, mesh) = stage_function(device, mesh_stage)?;
+    let (_fragment_library, fragment) = stage_function(device, fragment_stage)?;
+    let object = match state.object_entry.as_deref() {
+        Some(_) => {
+            let object_stage = stage_with_role(stages, FunctionRole::Object)?;
+            let (library, function) = stage_function(device, object_stage)?;
+            Some((library, function))
+        }
+        None => None,
+    };
+    build_mesh_pso(
+        device,
+        mesh.as_raw(),
+        fragment.as_raw(),
+        object
+            .as_ref()
+            .map(|(_library, function)| function.as_raw()),
+        mesh_stage.entry,
+        fragment_stage.entry,
+        state,
+    )
+}
+
+/// Creates one `MTLRenderPipelineState` with a mesh descriptor.
+fn build_mesh_pso(
+    device: objc::Id,
+    mesh: objc::Id,
+    fragment: objc::Id,
+    object: Option<objc::Id>,
+    mesh_entry: &str,
+    fragment_entry: &str,
     state: &PipelineState,
 ) -> Result<ObjcObject, RegistryError> {
     let descriptor_class = objc::class(c"MTLMeshRenderPipelineDescriptor");
@@ -1921,18 +2288,6 @@ fn create_mesh_pso(
         ));
     }
 
-    let library = load_library(device, metallib, "mesh")?;
-    let mesh = new_function(&library, mesh_entry, MTL_FUNCTION_TYPE_MESH)?;
-    let fragment_entry = state
-        .fragment_entry
-        .as_deref()
-        .ok_or(RegistryError::InvalidState("missing fragment entry point"))?;
-    let fragment = new_function(&library, fragment_entry, MTL_FUNCTION_TYPE_FRAGMENT)?;
-    let object = match state.object_entry.as_deref() {
-        Some(entry) => Some(new_function(&library, entry, MTL_FUNCTION_TYPE_OBJECT)?),
-        None => None,
-    };
-
     let raw = unsafe { objc::msg_send_id_0(descriptor_class, objc::sel(c"new")) };
     let descriptor = ObjcObject::from_retained(raw).ok_or_else(|| {
         RegistryError::Metal(MetalError::InternalError(
@@ -1940,22 +2295,14 @@ fn create_mesh_pso(
         ))
     })?;
     unsafe {
-        objc::msg_send_void_1(
-            descriptor.as_raw(),
-            objc::sel(c"setMeshFunction:"),
-            mesh.as_raw(),
-        );
+        objc::msg_send_void_1(descriptor.as_raw(), objc::sel(c"setMeshFunction:"), mesh);
         objc::msg_send_void_1(
             descriptor.as_raw(),
             objc::sel(c"setFragmentFunction:"),
-            fragment.as_raw(),
+            fragment,
         );
-        if let Some(object) = object.as_ref() {
-            objc::msg_send_void_1(
-                descriptor.as_raw(),
-                objc::sel(c"setObjectFunction:"),
-                object.as_raw(),
-            );
+        if let Some(object) = object {
+            objc::msg_send_void_1(descriptor.as_raw(), objc::sel(c"setObjectFunction:"), object);
             objc::msg_send_void_usize(
                 descriptor.as_raw(),
                 objc::sel(c"setMaxTotalThreadsPerObjectThreadgroup:"),
@@ -1997,6 +2344,95 @@ fn create_mesh_pso(
             "mesh `{mesh_entry}` / `{fragment_entry}` pipeline: {message}"
         )))
     })
+}
+
+/// Rejects a stage set that cannot describe one pipeline of `stage`'s family.
+///
+/// Every role must appear exactly once, no other role may appear, and the
+/// fragment/object entries must be the ones the [`PipelineState`] blob names, so
+/// the created functions and the content key cannot disagree.
+fn validate_stage_set(
+    stages: &[StageLibrary<'_>],
+    expected: &[FunctionRole],
+    stage: PipelineStage,
+    parsed: &PipelineState,
+) -> Result<(), RegistryError> {
+    if stages.len() != expected.len() {
+        return Err(RegistryError::InvalidState(match stage {
+            PipelineStage::Graphics => {
+                "graphics pipelines need exactly a vertex and a fragment stage"
+            }
+            PipelineStage::Mesh => {
+                "mesh pipelines need a mesh and fragment stage, plus the object stage the state names"
+            }
+            PipelineStage::Compute => "compute pipelines need exactly one kernel stage",
+        }));
+    }
+    for role in expected {
+        if stages.iter().filter(|entry| entry.role == *role).count() != 1 {
+            return Err(RegistryError::InvalidState(
+                "a pipeline stage is missing or repeated",
+            ));
+        }
+    }
+    if stages
+        .iter()
+        .any(|entry| !expected.contains(&entry.role))
+    {
+        return Err(RegistryError::InvalidState(
+            "a stage does not belong to this pipeline family",
+        ));
+    }
+    for entry in stages {
+        let declared = match entry.role {
+            FunctionRole::Fragment => Some(parsed.fragment_entry.as_deref()),
+            FunctionRole::Object => Some(parsed.object_entry.as_deref()),
+            _ => None,
+        };
+        if let Some(declared) = declared
+            && declared != Some(entry.entry)
+        {
+            return Err(RegistryError::InvalidState(match entry.role {
+                FunctionRole::Fragment => {
+                    "the fragment stage entry point does not match the pipeline state"
+                }
+                _ => "the object stage entry point does not match the pipeline state",
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Borrows the stage that plays `role`.
+fn stage_with_role<'a, 'b: 'a>(
+    stages: &'a [StageLibrary<'b>],
+    role: FunctionRole,
+) -> Result<&'a StageLibrary<'b>, RegistryError> {
+    stages
+        .iter()
+        .find(|entry| entry.role == role)
+        .ok_or(RegistryError::InvalidState("a pipeline stage is missing"))
+}
+
+/// Resolves one stage's function inside that stage's own library.
+///
+/// The library is returned alongside the function so the caller can keep it
+/// alive until the pipeline descriptor has consumed the function.
+fn stage_function(
+    device: objc::Id,
+    stage: &StageLibrary<'_>,
+) -> Result<(ObjcObject, ObjcObject), RegistryError> {
+    let library = load_library(device, stage.metallib, stage.role.label())?;
+    let function = new_function(&library, stage.entry, stage.role.mtl_function_type()).map_err(
+        |error| match error {
+            RegistryError::EntryPointNotFound(_) => RegistryError::MissingStageFunction {
+                stage: stage.role.label(),
+                entry: stage.entry.to_string(),
+            },
+            other => other,
+        },
+    )?;
+    Ok((library, function))
 }
 
 fn set_attachment_formats(
@@ -2754,6 +3190,100 @@ mod tests {
             PipelineState::decode(&empty.encode(PipelineStage::Compute)).unwrap(),
             empty
         );
+    }
+
+    #[test]
+    fn staged_pipeline_key_covers_every_stage_library() {
+        let vertex = StageLibrary {
+            role: FunctionRole::Vertex,
+            metallib: b"vertex metallib",
+            entry: "vs_main",
+        };
+        let pixel_a = StageLibrary {
+            role: FunctionRole::Fragment,
+            metallib: b"pixel metallib",
+            entry: "ps_main",
+        };
+        let pixel_b = StageLibrary {
+            role: FunctionRole::Fragment,
+            metallib: b"other pixel metallib",
+            entry: "ps_main",
+        };
+        let state = b"graphics state";
+        let with_a =
+            PipelineKey::from_stages(&[vertex, pixel_a], PipelineStage::Graphics, state);
+        assert_eq!(
+            with_a,
+            PipelineKey::from_stages(&[pixel_a, vertex], PipelineStage::Graphics, state),
+            "stage order does not change the key"
+        );
+        let with_b =
+            PipelineKey::from_stages(&[vertex, pixel_b], PipelineStage::Graphics, state);
+        assert_ne!(
+            with_a, with_b,
+            "a changed pixel library is a different pipeline"
+        );
+        assert_ne!(
+            with_a,
+            PipelineKey::from_parts(b"vertex metallib", "vs_main", PipelineStage::Graphics, state),
+            "the single-library key covers neither stage's separate library"
+        );
+        let single = StageLibrary {
+            role: FunctionRole::Kernel,
+            metallib: b"compute metallib",
+            entry: "cs_main",
+        };
+        assert_ne!(
+            PipelineKey::from_stages(&[single], PipelineStage::Compute, state),
+            PipelineKey::from_stages(&[single], PipelineStage::Graphics, state),
+            "the pipeline family participates in the key"
+        );
+    }
+
+    #[test]
+    fn staged_role_validation_rejects_wrong_sets_and_entries() {
+        let state = PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            fragment_entry: Some("ps_main".to_string()),
+            ..PipelineState::default()
+        }
+        .encode(PipelineStage::Graphics);
+        let parsed = PipelineState::decode_for(&state, PipelineStage::Graphics).unwrap();
+        let vertex = StageLibrary {
+            role: FunctionRole::Vertex,
+            metallib: b"vs",
+            entry: "vs_main",
+        };
+        let pixel = StageLibrary {
+            role: FunctionRole::Fragment,
+            metallib: b"ps",
+            entry: "ps_main",
+        };
+        let expected = [FunctionRole::Vertex, FunctionRole::Fragment];
+        assert!(validate_stage_set(&[vertex, pixel], &expected, PipelineStage::Graphics, &parsed).is_ok());
+
+        let wrong_role = StageLibrary {
+            role: FunctionRole::Mesh,
+            metallib: b"ms",
+            entry: "ms_main",
+        };
+        assert!(matches!(
+            validate_stage_set(&[vertex, wrong_role], &expected, PipelineStage::Graphics, &parsed),
+            Err(RegistryError::InvalidState(_))
+        ));
+        let missing = StageLibrary {
+            role: FunctionRole::Fragment,
+            metallib: b"ps",
+            entry: "ps_other",
+        };
+        assert!(matches!(
+            validate_stage_set(&[vertex, missing], &expected, PipelineStage::Graphics, &parsed),
+            Err(RegistryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            validate_stage_set(&[vertex], &expected, PipelineStage::Graphics, &parsed),
+            Err(RegistryError::InvalidState(_))
+        ));
     }
 
     #[test]
