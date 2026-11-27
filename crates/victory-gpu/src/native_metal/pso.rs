@@ -33,12 +33,24 @@
 //!
 //! # Entry point
 //!
-//! The kind 4 entry name is the DXIL entry the converter was told to convert
-//! and the name the host looks up in the metallib. The container does not
-//! spell it out, and every container this repository has converted uses
-//! `main`, so that is the default; `VICTORY_METAL_PSO_ENTRY` overrides it for
-//! a title that names its entry differently. (Hypothesis, not verified against
-//! a real title's container yet.)
+//! The entry name is the DXIL entry the converter was told to convert and the
+//! name the host looks up in the metallib. It is read from the container's own
+//! `PSV0` table (the runtime-info entry-point string offset and the string
+//! table it points into), never guessed: `VICTORY_METAL_PSO_ENTRY` is only an
+//! explicit override, and `main` is only the fallback for a container that
+//! predates that table.
+//!
+//! # What the converter is handed
+//!
+//! `IRObjectCreateFromDXIL` takes a *complete* `DXBC` container, the bytes a
+//! D3D12 title passes as `D3D12_SHADER_BYTECODE`. Handing it a bare `DXIL`
+//! part (the program header and bitcode without the container) crashes the
+//! converter child, which surfaces as a worker exit and refuses every title
+//! PSO. [`stage_program`] therefore keeps the whole container and validates it
+//! before anything is translated or uploaded: `DXBC` magic, a bounded size, a
+//! `DXIL` part whose `Program` kind agrees with the requested stage, and a
+//! `PSV0` stage byte that agrees with it too. A mismatch is a named
+//! [`PipelineError::Container`] refusal, never a worker exit.
 //!
 //! # Where the pool can run
 //!
@@ -54,7 +66,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 use victory_metal::compiler_pool::PoolConfig;
@@ -113,6 +127,33 @@ impl PipelineStage {
         }
     }
 
+    /// The DXIL `Program` kind a container of this stage must declare.
+    ///
+    /// These are the container's own program kinds (pixel 0, vertex 1, compute
+    /// 5, mesh 13, amplification 14), not the converter's stage codes:
+    /// IRConverter numbers mesh 5 and compute 8. A container whose `DXIL` part
+    /// declares another kind is refused instead of being sent.
+    pub const fn dxil_kind(self) -> victory_shader::ShaderKind {
+        match self {
+            Self::Vertex => victory_shader::ShaderKind::Vertex,
+            Self::Pixel => victory_shader::ShaderKind::Pixel,
+            Self::Mesh => victory_shader::ShaderKind::Mesh,
+            Self::Object => victory_shader::ShaderKind::Amplification,
+            Self::Compute => victory_shader::ShaderKind::Compute,
+        }
+    }
+
+    /// The stage name used in refusal reasons and diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Pixel => "pixel",
+            Self::Mesh => "mesh",
+            Self::Object => "object/amplification",
+            Self::Compute => "compute",
+        }
+    }
+
     /// The stage name the title pipeline uses (`pipeline::Shader::stage`).
     ///
     /// The console names the object stage an amplification shader, and that is
@@ -129,13 +170,16 @@ impl PipelineStage {
     }
 }
 
-/// One stage of a title PSO: its DXIL and the entry point the converter and
-/// the host both name.
+/// One stage of a title PSO: its complete shader container and the entry point
+/// the converter and the host both name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageProgram {
     /// The stage this program belongs to.
     pub stage: PipelineStage,
-    /// Raw DXIL bytes (the container's `DXIL` part).
+    /// The complete `DXBC` container the converter consumes (the container's
+    /// `DXIL` part is its program; the container also carries `PSV0` and the
+    /// signatures). A bare `DXIL` part is never valid here: IRConverter's
+    /// `IRObjectCreateFromDXIL` takes the whole container.
     pub dxil: Vec<u8>,
     /// Entry point name inside the DXIL module.
     pub entry: String,
@@ -1223,9 +1267,35 @@ fn build_pool() -> CompilerPool {
 
 /// The process-wide pool. One pool means one persistent worker set for the
 /// whole run (ADR-018); it is created from the environment on first use.
+#[cfg(not(test))]
 fn pool() -> &'static CompilerPool {
     static POOL: OnceLock<CompilerPool> = OnceLock::new();
     POOL.get_or_init(build_pool)
+}
+
+/// The test binary's pool, rebuildable between tests.
+///
+/// The production pool is a `OnceLock` because one worker set must serve the
+/// whole run; a unit test that must drive the real converter needs the pool to
+/// read the environment it just set, so the test build keeps the pool behind a
+/// mutex and [`reset_pool`] discards it. A discarded pool is leaked on
+/// purpose: its workers see EOF when the test process closes their stdin and
+/// exit, and no test may hold a reference to it across a reset.
+#[cfg(test)]
+static TEST_POOL: Mutex<Option<&'static CompilerPool>> = Mutex::new(None);
+
+#[cfg(test)]
+fn pool() -> &'static CompilerPool {
+    let mut slot = TEST_POOL.lock().unwrap_or_else(|error| error.into_inner());
+    *slot.get_or_insert_with(|| Box::leak(Box::new(build_pool())))
+}
+
+/// Discards the test binary's pool so the next use rebuilds it from the
+/// current environment (tests only).
+#[cfg(test)]
+fn reset_pool() {
+    let mut slot = TEST_POOL.lock().unwrap_or_else(|error| error.into_inner());
+    *slot = None;
 }
 
 /// The pool's statistics before and after one translation, so a caller can say
@@ -1328,40 +1398,268 @@ pub fn write_metallib(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-/// The DXIL part and entry point of one shader container.
+/// Largest shader container the converter is handed.
 ///
-/// A container with no `DXIL` part (console GCN only) is
-/// [`PipelineError::NoDxil`]: there is nothing the converter could translate.
-pub fn stage_program(
-    stage: PipelineStage,
-    container: &[u8],
-) -> Result<StageProgram, PipelineError> {
-    let parsed = victory_shader::Container::parse(container)
-        .map_err(|error| PipelineError::Container(error.to_string()))?;
-    let part = parsed
-        .part(victory_shader::FourCC::DXIL)
-        .ok_or(PipelineError::NoDxil(match stage {
-            PipelineStage::Vertex => "vertex",
-            PipelineStage::Pixel => "pixel",
-            PipelineStage::Mesh => "mesh",
-            PipelineStage::Object => "object",
-            PipelineStage::Compute => "compute",
-        }))?;
-    Ok(StageProgram {
-        stage,
-        dxil: part.data.to_vec(),
-        entry: entry_point(),
-    })
+/// It matches the pool's `MAX_JOB_DXIL_BYTES` and the host translator's
+/// upload bound, so a container the guest accepts is one the host accepts.
+pub const MAX_STAGE_CONTAINER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest accepted entry-point name, matching the converter's own limit.
+pub const MAX_ENTRY_POINT_NAME_BYTES: usize = 256;
+
+const _: () = assert!(MAX_STAGE_CONTAINER_BYTES as u64 == MAX_HOST_STAGE_BYTES);
+
+/// The entry point used when neither an override nor the container names one.
+pub const DEFAULT_ENTRY_POINT: &str = "main";
+
+/// A `PSV0` runtime-info size that carries the entry-point string offset.
+///
+/// DXC writes 52: the size field itself plus the 48-byte runtime info, then the
+/// entry-point string offset. The repository's own emitter writes 48 (no entry
+/// name), which is why [`container_entry_point`] returns `None` there.
+const PSV0_RUNTIME_INFO_WITH_ENTRY: u32 = 52;
+
+/// Offset of the entry-point string offset inside a `PSV0` part.
+const PSV0_ENTRY_OFFSET: usize = 52;
+
+/// The raw `Program` kind code of a DXIL program header.
+const fn raw_shader_kind(kind: victory_shader::ShaderKind) -> u16 {
+    use victory_shader::ShaderKind;
+    match kind {
+        ShaderKind::Pixel => 0,
+        ShaderKind::Vertex => 1,
+        ShaderKind::Geometry => 2,
+        ShaderKind::Hull => 3,
+        ShaderKind::Domain => 4,
+        ShaderKind::Compute => 5,
+        ShaderKind::Library => 6,
+        ShaderKind::RayGeneration => 7,
+        ShaderKind::Intersection => 8,
+        ShaderKind::AnyHit => 9,
+        ShaderKind::ClosestHit => 10,
+        ShaderKind::Miss => 11,
+        ShaderKind::Callable => 12,
+        ShaderKind::Mesh => 13,
+        ShaderKind::Amplification => 14,
+        ShaderKind::Node => 15,
+        ShaderKind::Unknown(raw) => raw,
+    }
 }
 
-/// The entry point named in every converted DXIL module this repository has
-/// seen (`main`), overridable with `VICTORY_METAL_PSO_ENTRY`.
-pub fn entry_point() -> String {
+/// The stage byte of the container's own `PSV0` part, when it carries one.
+///
+/// The part starts with the runtime-info size, then the info; its stage byte
+/// is `info[24]` (offset 28 of the part). `PSV0`'s stage numbering is the DXIL
+/// program kind (pixel 0, vertex 1, compute 5, mesh 13, amplification 14).
+fn psv0_stage(container: &[u8]) -> Option<u16> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let psv = parsed.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+    if size < 28 || usize::try_from(size).ok()? > psv.len() {
+        return None;
+    }
+    psv.get(28).map(|byte| u16::from(*byte))
+}
+
+/// The entry point the container's own `PSV0` table names, if it carries one.
+///
+/// `PSV0` holds the entry-point string offset at [`PSV0_ENTRY_OFFSET`] and a
+/// NUL-separated string table, preceded by its `u32` size, after the runtime
+/// info and the resource/signature records. The name is resolved by that
+/// offset against a table whose declared size, leading empty string and string
+/// bounds all agree; a container without that table (the repository's own
+/// emitter) yields `None` instead of a guess.
+fn container_entry_point(container: &[u8]) -> Option<String> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let psv = parsed.part(victory_shader::FourCC::PSV0)?.data;
+    let runtime_info = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?);
+    if runtime_info != PSV0_RUNTIME_INFO_WITH_ENTRY {
+        return None;
+    }
+    let entry = usize::try_from(u32::from_le_bytes(
+        psv.get(PSV0_ENTRY_OFFSET..PSV0_ENTRY_OFFSET + 4)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    // The table's size field is the `u32` immediately before it.
+    for start in (PSV0_ENTRY_OFFSET + 4..psv.len()).step_by(4) {
+        let Some(size) = psv
+            .get(start - 4..start)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .and_then(|size| usize::try_from(size).ok())
+        else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        if end > psv.len() {
+            continue;
+        }
+        let table = &psv[start..end];
+        if table.first() != Some(&0) || entry >= table.len() {
+            continue;
+        }
+        // The name must start a whole string in the table.
+        if entry != 0 && table[entry - 1] != 0 {
+            continue;
+        }
+        let name = &table[entry..];
+        let Some(length) = name.iter().position(|byte| *byte == 0) else {
+            continue;
+        };
+        let name = &name[..length];
+        if name.is_empty() || name.len() > MAX_ENTRY_POINT_NAME_BYTES {
+            continue;
+        }
+        if !name.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+            continue;
+        }
+        return std::str::from_utf8(name).ok().map(str::to_string);
+    }
+    None
+}
+
+/// Validates `container` as the complete shader container of `stage`.
+///
+/// IRConverter's `IRObjectCreateFromDXIL` takes the whole `DXBC` container: a
+/// bare `DXIL` part (program header plus bitcode) crashes the converter child
+/// instead of answering. The container's own `Program` part and `PSV0` stage
+/// byte must both name `stage`; a disagreement is a named refusal here, never
+/// a worker exit or a wrong library.
+fn checked_stage_container(
+    stage: PipelineStage,
+    container: &[u8],
+) -> Result<(), PipelineError> {
+    if container.is_empty() {
+        return Err(PipelineError::NoDxil(stage.label()));
+    }
+    if container.len() > MAX_STAGE_CONTAINER_BYTES {
+        return Err(PipelineError::Container(format!(
+            "the {} container is {} bytes, over the {MAX_STAGE_CONTAINER_BYTES}-byte converter \
+             limit",
+            stage.label(),
+            container.len()
+        )));
+    }
+    if container.get(..4) != Some(&b"DXBC"[..]) {
+        return Err(PipelineError::Container(format!(
+            "the {} stage is not a complete DXBC container: the converter takes the whole \
+             container (`DXBC` magic), never a bare DXIL part",
+            stage.label()
+        )));
+    }
+    let parsed = victory_shader::Container::parse(container)
+        .map_err(|error| PipelineError::Container(format!("{}: {error}", stage.label())))?;
+    let part = parsed
+        .part(victory_shader::FourCC::DXIL)
+        .ok_or(PipelineError::NoDxil(stage.label()))?;
+    let program = victory_shader::DxilProgram::parse(part.data).map_err(|error| {
+        PipelineError::Container(format!(
+            "the {} stage's DXIL part is malformed: {error}",
+            stage.label()
+        ))
+    })?;
+    if program.kind != stage.dxil_kind() {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's container declares a {:?} program, not a {:?} one",
+            stage.label(),
+            program.kind,
+            stage.dxil_kind()
+        )));
+    }
+    let declared = raw_shader_kind(program.kind);
+    if let Some(psv) = psv0_stage(container)
+        && psv != declared
+    {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's container Program part (kind {declared}) disagrees with its PSV0 \
+             stage byte ({psv})",
+            stage.label()
+        )));
+    }
+    Ok(())
+}
+
+/// The explicit `VICTORY_METAL_PSO_ENTRY` override, when one is set.
+fn explicit_entry_point() -> Option<String> {
     std::env::var("VICTORY_METAL_PSO_ENTRY")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "main".to_string())
+}
+
+/// Validates the entry point a [`StageProgram`] will name to the converter.
+fn checked_entry(program: &StageProgram) -> Result<(), PipelineError> {
+    if program.entry.is_empty() {
+        return Err(PipelineError::Container(format!(
+            "the {} stage has no entry point",
+            program.stage.label()
+        )));
+    }
+    if program.entry.len() > MAX_ENTRY_POINT_NAME_BYTES {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's entry point is {} bytes, over the {MAX_ENTRY_POINT_NAME_BYTES}-byte \
+             converter limit",
+            program.stage.label(),
+            program.entry.len()
+        )));
+    }
+    if program.entry.as_bytes().contains(&0) {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's entry point contains a NUL",
+            program.stage.label()
+        )));
+    }
+    Ok(())
+}
+
+/// Validates a [`StageProgram`] before any bytes reach a converter.
+///
+/// Every path that hands a program to `victory-irconverter` (the in-process
+/// pool and the host-translation upload) calls this first, so a container that
+/// is not a complete `DXBC` container, names another stage, or carries no
+/// usable entry point is a bounded [`PipelineError`] instead of a converter
+/// crash the pool can only report as `WorkerExited`.
+pub fn validate_stage_program(program: &StageProgram) -> Result<(), PipelineError> {
+    checked_stage_container(program.stage, &program.dxil)?;
+    checked_entry(program)
+}
+
+/// The complete shader container and entry point of one title stage.
+///
+/// A container with no `DXIL` part (console GCN only) is
+/// [`PipelineError::NoDxil`]: there is nothing the converter could translate.
+/// The returned [`StageProgram`] keeps the whole container, because that is
+/// what the converter consumes, and names the entry point the container's own
+/// `PSV0` table exports; `main` is only the fallback for a container without
+/// that table (see [`container_entry_point`]).
+pub fn stage_program(
+    stage: PipelineStage,
+    container: &[u8],
+) -> Result<StageProgram, PipelineError> {
+    checked_stage_container(stage, container)?;
+    let entry = explicit_entry_point()
+        .or_else(|| container_entry_point(container))
+        .unwrap_or_else(|| DEFAULT_ENTRY_POINT.to_string());
+    let program = StageProgram {
+        stage,
+        dxil: container.to_vec(),
+        entry,
+    };
+    checked_entry(&program)?;
+    Ok(program)
+}
+
+/// The entry point named in every converted DXIL module this repository has
+/// seen (`main`), overridable with `VICTORY_METAL_PSO_ENTRY`.
+///
+/// [`stage_program`] prefers the container's own `PSV0` name over this; the
+/// helper is kept for callers that build a [`StageProgram`] themselves.
+pub fn entry_point() -> String {
+    explicit_entry_point().unwrap_or_else(|| DEFAULT_ENTRY_POINT.to_string())
 }
 
 /// The pool statistics, for telemetry and tests.
@@ -1427,6 +1725,7 @@ fn translate_error(error: PoolError) -> PipelineError {
 /// This is the metallib-only API; a pipeline that needs root bindings uses
 /// [`translate_with_reflection`].
 pub fn translate(program: &StageProgram) -> Result<(Vec<u8>, PoolServing), PipelineError> {
+    validate_stage_program(program)?;
     let before = pool().stats();
     let job = compile_job(program);
     let metallib = pool().compile(&job).map_err(translate_error)?;
@@ -1450,6 +1749,7 @@ pub fn translate(program: &StageProgram) -> Result<(Vec<u8>, PoolServing), Pipel
 pub fn translate_with_reflection(
     program: &StageProgram,
 ) -> Result<(CompiledShader, PoolServing), PipelineError> {
+    validate_stage_program(program)?;
     let before = pool().stats();
     let job = compile_job(program);
     let compiled = pool()
@@ -1742,6 +2042,12 @@ fn register_with_host_translation(
     let share = share_dir().ok_or(PipelineError::NoShareDir)?;
     let stage_codes: Vec<PipelineStage> = programs.iter().map(|program| program.stage).collect();
     let kind = pipeline_kind(&stage_codes)?;
+    // Validate every stage before uploading any file: the host hands these
+    // bytes to its own converter, which crashes on anything but a complete
+    // container, so a malformed stage must be a named refusal here.
+    for program in programs {
+        validate_stage_program(program)?;
+    }
     let mut uploaded: Vec<(u8, String, &str)> = Vec::with_capacity(programs.len());
     for program in programs {
         let file = upload_host_stage(&share, &program.dxil)?;
@@ -2837,22 +3143,16 @@ mod tests {
             std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
             std::env::remove_var("VICTORY_METAL_IRCONVERTER");
         }
+        reset_pool();
         reset_census();
 
-        let vertex = b"unique-vertex-dxil-for-host-translation".to_vec();
-        let pixel = b"unique-pixel-dxil-for-host-translation".to_vec();
-        let programs = [
-            StageProgram {
-                stage: PipelineStage::Vertex,
-                dxil: vertex.clone(),
-                entry: "vs_main".to_string(),
-            },
-            StageProgram {
-                stage: PipelineStage::Pixel,
-                dxil: pixel.clone(),
-                entry: "ps_main".to_string(),
-            },
-        ];
+        let vertex_program = stage_program(PipelineStage::Vertex, &fixture(PipelineStage::Vertex))
+            .expect("the vertex fixture is a complete container");
+        let pixel_program = stage_program(PipelineStage::Pixel, &fixture(PipelineStage::Pixel))
+            .expect("the pixel fixture is a complete container");
+        let vertex = vertex_program.dxil.clone();
+        let pixel = pixel_program.dxil.clone();
+        let programs = [vertex_program, pixel_program];
         let (id, serving) =
             register_with_details(&programs, &PipelineDetails::default()).expect("host registration");
         assert_eq!(id, 0x5151);
@@ -2869,12 +3169,12 @@ mod tests {
             (
                 client::PIPELINE_STAGE_VERTEX,
                 format!("stages/{}.bin", blake3::hash(&vertex).to_hex()),
-                "vs_main",
+                "main",
             ),
             (
                 client::PIPELINE_STAGE_PIXEL,
                 format!("stages/{}.bin", blake3::hash(&pixel).to_hex()),
-                "ps_main",
+                "main",
             ),
         ];
         assert_eq!(decoded.stages.len(), 2);
@@ -2920,11 +3220,9 @@ mod tests {
             std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
             std::env::remove_var("VICTORY_METAL_IRCONVERTER");
         }
-        let programs = [StageProgram {
-            stage: PipelineStage::Compute,
-            dxil: b"unique-compute-dxil-without-a-share-dir".to_vec(),
-            entry: "main".to_string(),
-        }];
+        reset_pool();
+        let programs = [stage_program(PipelineStage::Compute, &fixture(PipelineStage::Compute))
+            .expect("the compute fixture is a complete container")];
         let error = register_with_details(&programs, &PipelineDetails::default())
             .expect_err("no converter and no share dir must refuse");
         assert!(
@@ -3013,4 +3311,605 @@ mod tests {
             "C:\\tools\\victory-irconverter.exe"
         )));
     }
+
+    // ---- ADR-045 item 3: the converter's stage contract ---------------------
+
+    /// Decodes a whitespace-tolerant hex fixture.
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        let digits: Vec<u8> = text
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        assert_eq!(digits.len() % 2, 0, "odd hex fixture length");
+        digits
+            .chunks_exact(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
+                let lo = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
+                (hi << 4) | lo
+            })
+            .collect()
+    }
+
+    /// The complete synthetic containers the converter is proven against: a
+    /// vertex, a pixel and a compute stage compiled from this repository's own
+    /// HLSL with the checked-in `dxc`. Nothing here comes from a title.
+    /// Vertex: a complete `DXBC` container the converter accepts (stage 1).
+    const VS_CONTAINER_HEX: &str = "445842432b75a5e9ffdd7cf6479eedd423d0139901000000c40b0000070000003c0000004c00000088000000f0000000\
+        940100007c06000098060000534649300800000000000000000000004953473134000000010000000800000000000000\
+        2800000000000000060000000100000000000000010100000000000053565f5665727465784944004f53473160000000\
+        02000000080000000000000048000000000000000100000003000000000000000f000000000000000000000054000000\
+        00000000000000000300000001000000030c00000000000053565f506f736974696f6e00544558434f4f524400000000\
+        505356309c000000340000000100000000000000000000000000000000000000ffffffff010000000102000102000000\
+        0000000000000000000000000a000000000000001000000000544558434f4f5244006d61696e00000100000000000000\
+        100000000000000000000000010041010100000000000000000000000100440303040000010000000000000001014200\
+        030200003300000000000000000000000000000053544154e004000060000100380100004458494c0001000010000000\
+        c80400004243c0de210c00002f0100000b82200002000000130000000781239141c80449061032399201840c25050819\
+        1e048b628010450242920b42841032143808184b0a32428848901420434688a500193242e4480e901122c4504151818c\
+        e183e58a0421460651180000060000001b8ce0ffffffff074002a80d84f0ffffffff0320010000004918000002000000\
+        1382604220000000892000000f00000032220809206485041322a484041322e384a19014124c888c0b84844c10302300\
+        25008a3902309823408a313343433503500c98193ac281801c180000131472c08774608736688779680372c0870daf50\
+        0e6dd00e7a500e6d000f7a300772a0077320076d900e71a0077320076d900e78a0077320076d900e7160077a300772d0\
+        06e9300772a0077320076d900e7640077a600774d006e6100776a0077320076d600e7320077a300772d006e6600774a0\
+        077640076de00e78a0077160077a300772a007764007439e0008000000000000000000863c0510000100000000000000\
+        0c791020000400000000000000c802010b000000321e981419114c908c092647c604439a121801288632288f12212a85\
+        121801288932288422a01d6b088c390079180000650000001a034c90460213c48e0c6feced4d0c24c625c745c60626c7\
+        a50604052646cc46268c8ce6266543104c1086618230101b8481d820100405bbb909c2506c180e84982008c00660c340\
+        2ccb8680d9300c4a334158a00dc143a22d2ccd8dcb94d59755991c5d195e12d1048148260884b221202608c43241188c\
+        0dc2356c580869a22a6ba0080bdb10645ca6acbea0dee6d2e8d2dedc2608043341209a0902e14c10866383707d1b1662\
+        e3baca1b3cc2020322544558434f4f52441304e2d9205cd786651003ceaac6601883c122830d421894c1864133036043\
+        a14467000034ccd8dec2e8e658a4b9cdd1cd4d100684c65cdad9171b198db9b4b3af393a1675696e74731b943440d460\
+        0dd8606803c40dae2a6c6c766d2e6964656e745382a00a199e8b5d99dc5cda9bdb9480684286e76217c6665726372528\
+        ea90e1b9cca1859195c935bd9195b14d09904a64782e74797065416e6e6f746174696f6e735382a60e199e8b5d5ad95d\
+        12d9145d185dd994e0a94386e752e646279707f596e64637372538832e64782e636f756e746572735302370079180000\
+        4c0000003308801cc4e11c6614013d88433884c38c4280077978077398710ce6000fed100ef4800e330c421ec2c11dce\
+        a11c6630053d88433884831bcc033dc8433d8c033dcc788c7470077b08077948877070077a700376788770208719cc11\
+        0eec900ee1300f6e300fe3f00ef0500e3310c41dde211cd8211dc2611e6630893bbc833bd04339b4033cbc833c84033b\
+        ccf0147660077b680737688772680737808770908770600776280776f8057678877780875f0887711887729887799881\
+        2ceef00eeee00ef5c00eec300362c8a11ce4a11ccca11ce4a11cdc611cca211cc4811dca6106d6904339c84339984339\
+        c84339b8c33894433888033b94c32fbc833cfc823bd4033bb0c30cc421077c70037a288776808719d1430ef8e006e420\
+        0ee7e006f6100ef2c00ee1900fef500ff4000000712000000b00000016300d97ef3cfee20083d83cd4e423b76d02d570\
+        f9cee34b93131128353dd4e417b76d000403200d00000000000000004841534814000000000000006c2e0d6a5faa63fa\
+        be82e6a999fe1bd94458494c2405000060000100490100004458494c00010000100000000c0500004243c0de210c0000\
+        400100000b82200002000000130000000781239141c80449061032399201840c250508191e048b628010450242920b42\
+        841032143808184b0a32428848901420434688a500193242e4480e901122c4504151818ce183e58a0421460651180000\
+        060000001b8ce0ffffffff074002a80d84f0ffffffff0320010000004918000002000000138260422000000089200000\
+        0f00000032220809206485041322a484041322e384a19014124c888c0b84844c1030230025008a3902309823408a3133\
+        43433503500c98193ac281801c180000131472c08774608736688779680372c0870daf500e6dd00e7a500e6d000f7a30\
+        0772a0077320076d900e71a0077320076d900e78a0077320076d900e7160077a300772d006e9300772a0077320076d90\
+        0e7640077a600774d006e6100776a0077320076d600e7320077a300772d006e6600774a0077640076de00e78a0077160\
+        077a300772a007764007439e0000000000000000000000863c05100001000000000000000c7910200004000000000000\
+        00c802010b000000321e981419114c908c092647c604439a1218012889622883f2202a85121801288932288422a01d6b\
+        088c3900791800004c0000001a034c90460213c48e0c6feced4d0c24c625c745c60626c7a50604052646cc46268c8ce6\
+        266543104c1086618230101b848198200cc506613028d8cd4d100663c38024c40461813604cb04410048b485a5b97199\
+        b2fab22a93a32bc34b229a2010c90481503604c40481582608c3b141a0860d0bf14091340d1131551b028bcb94d517d4\
+        db5c1a5dda9bdb0481602608443341209c09c2806c10286ec3426099266dc3464c1d11aa22aca1a72729a20902f16c10\
+        286ac3327cd92481c10006c314061b044f0c360cd718001b8ac6210300a8c2c666d7e6924656e646372508aa90e1b9d8\
+        95c9cda5bdb94d09882664782e76616c7665725302a30e199ecb1c5a1859995cd31b5919db9420a94386e76297567697\
+        443645174657362558ea90e1b994b9d1c9e541bda5b9d1cd4d09c800791800004c0000003308801cc4e11c6614013d88\
+        433884c38c4280077978077398710ce6000fed100ef4800e330c421ec2c11dcea11c6630053d88433884831bcc033dc8\
+        433d8c033dcc788c7470077b08077948877070077a700376788770208719cc110eec900ee1300f6e300fe3f00ef0500e\
+        3310c41dde211cd8211dc2611e6630893bbc833bd04339b4033cbc833c84033bccf0147660077b680737688772680737\
+        808770908770600776280776f8057678877780875f08877118877298877998812ceef00eeee00ef5c00eec300362c8a1\
+        1ce4a11ccca11ce4a11cdc611cca211cc4811dca6106d6904339c84339984339c84339b8c33894433888033b94c32fbc\
+        833cfc823bd4033bb0c30cc421077c70037a288776808719d1430ef8e006e4200ee7e006f6100ef2c00ee1900fef500f\
+        f4000000712000000b00000016300d97ef3cfee20083d83cd4e423b76d02d570f9cee34b93131128353dd4e417b76d00\
+        0403200d0000000061200000280000001304412c100000000800000034a550048530034037460082200882c118010882\
+        20fe0b23006304200882f80723060900826050604655394505d75590e80557452c7ac1950d8a7c4c58e463c2021f1318\
+        f88c1824000882011206d2f761c28841028020182061207d5f168c1824000882011206d2f751cc884102802018206120\
+        7d9fb58c182400088201120612187cd83162900020080648184860f06505020000000000";
+
+    /// Pixel: a complete `DXBC` container the converter accepts (stage 2).
+    const PS_CONTAINER_HEX: &str = "44584243b080005e3971ca36961a47a6a2b4ce16010000005c0a0000070000003c0000004c00000088000000c4000000\
+        50010000c4050000e0050000534649300800000000000000000000004953473134000000010000000800000000000000\
+        28000000000000000100000003000000000000000f0000000000000053565f506f736974696f6e004f53473134000000\
+        01000000080000000000000028000000000000004000000003000000000000000f0000000000000053565f5461726765\
+        740000005053563084000000340000000000000000000000000000000000000000000000ffffffff0000000001010001\
+        01000000000000000000000000000000010000000000000008000000006d61696e000000010000000000000010000000\
+        000000000000000001004403030400000000000000000000010044100300000000000000000000000000000000000000\
+        535441546c040000600000001b0100004458494c0001000010000000540400004243c0de210c0000120100000b822000\
+        02000000130000000781239141c80449061032399201840c250508191e048b628010450242920b42841032143808184b\
+        0a32428848901420434688a500193242e4480e901122c4504151818ce183e58a0421460651180000030000001b88e0ff\
+        ffffff0740020000491800000100000013820000892000000e00000032220809206485041322a484041322e384a19014\
+        124c888c0b84844c1028230025008a39023098234066008a013343453610900603000000131472c08774608736688779\
+        680372c0870daf500e6dd00e7a500e6d000f7a300772a0077320076d900e71a0077320076d900e78a0077320076d900e\
+        7160077a300772d006e9300772a0077320076d900e7640077a600774d006e6100776a0077320076d600e7320077a3007\
+        72d006e6600774a0077640076de00e78a0077160077a300772a007764007439e0008000000000000000000863c061000\
+        0100000000000000648100000b000000321e981019114c908c092647c604439a121801288632288f522804a292288342\
+        18012810cab10c820000000079180000550000001a034c90460213c48e0c6feced4d0c24c625c745c60626c7a5060405\
+        2646cc46268c8ce6266543104c10066182300c1b8481d820100405b8b909c2406c180e84982008c00660c3402ccb8680\
+        d9300c4a3341489c0dc143a22d2ccd8dcb94d517d4db5c1a5dda9bdb048148260884b221202608c4324120980d0b214d\
+        54650d1671011b028cc994d5175598dc5919dd0481682608433141188c0d02d76d58086ddaaa6bb088cbdb107c1b860c\
+        0c800d8512850100b048739ba39b9b200c078db9b4b3af39ba09c2806c20c6800ccac00caab0b1d9b5b9a49195b9d14d\
+        09822a64782e76657273696f6e5302a209199e8b5d189b5d99dc94a0a84386e7328716465626d7f44656c63625402a91\
+        e1b9d0e5c19505b9b9bdd185d1a5bdb9cd4d099a3a64782e76696577496453746174655382a70e199e4b991b9d5c1ed4\
+        5b9a1bdddc94200cba90e1b98cbdd5b9d195c9cd4d09cc00791800004c0000003308801cc4e11c6614013d88433884c3\
+        8c4280077978077398710ce6000fed100ef4800e330c421ec2c11dcea11c6630053d88433884831bcc033dc8433d8c03\
+        3dcc788c7470077b08077948877070077a700376788770208719cc110eec900ee1300f6e300fe3f00ef0500e3310c41d\
+        de211cd8211dc2611e6630893bbc833bd04339b4033cbc833c84033bccf0147660077b68073768877268073780877090\
+        8770600776280776f8057678877780875f08877118877298877998812ceef00eeee00ef5c00eec300362c8a11ce4a11c\
+        cca11ce4a11cdc611cca211cc4811dca6106d6904339c84339984339c84339b8c33894433888033b94c32fbc833cfc82\
+        3bd4033bb0c30cc421077c70037a288776808719d1430ef8e006e4200ee7e006f6100ef2c00ee1900fef500ff4000000\
+        712000000600000016500d97ef3cbe3439118152d3434d7e71db06403000d20000000000484153481400000000000000\
+        a305c4dc465b505c9b96d84be325e5b74458494c74040000600000001d0100004458494c00010000100000005c040000\
+        4243c0de210c0000140100000b82200002000000130000000781239141c80449061032399201840c250508191e048b62\
+        8010450242920b42841032143808184b0a32428848901420434688a500193242e4480e901122c4504151818ce183e58a\
+        0421460651180000030000001b88e0ffffffff0740020000491800000100000013820000892000000e00000032220809\
+        206485041322a484041322e384a19014124c888c0b84844c1028230025008a39023098234066008a0133434536109006\
+        03000000131472c08774608736688779680372c0870daf500e6dd00e7a500e6d000f7a300772a0077320076d900e71a0\
+        077320076d900e78a0077320076d900e7160077a300772d006e9300772a0077320076d900e7640077a600774d006e610\
+        0776a0077320076d600e7320077a300772d006e6600774a0077640076de00e78a0077160077a300772a007764007439e\
+        0000000000000000000000863c0610000100000000000000648100000b000000321e981019114c908c092647c604439a\
+        1218012889622883f2202a89322884118002a11ccb2008000000000079180000420000001a034c90460213c48e0c6fec\
+        ed4d0c24c625c745c60626c7a50604052646cc46268c8ce6266543104c10066182300c1b848198200cc406613028c0cd\
+        4d108662c38024c40421693604cb04410048b485a5b97199b2fa827a9b4ba34b7b739b2010c80481483604c404815026\
+        08c4b261211e2892a66122286043503199b2faa20a933b2ba39b2010cc0461302608c3b141c8b40d0b714198440d1341\
+        6d1b026ec36075c086a2713c00a8c2c666d7e6924656e646372508aa90e1b9d895c9cda5bdb94d09882664782e76616c\
+        7665725302a30e199ecb1c5a1859995cd31b5919db9420a94386e76297567697443645174657362558ea90e1b994b9d1\
+        c9e541bda5b9d1cd4d093c00791800004c0000003308801cc4e11c6614013d88433884c38c4280077978077398710ce6\
+        000fed100ef4800e330c421ec2c11dcea11c6630053d88433884831bcc033dc8433d8c033dcc788c7470077b08077948\
+        877070077a700376788770208719cc110eec900ee1300f6e300fe3f00ef0500e3310c41dde211cd8211dc2611e663089\
+        3bbc833bd04339b4033cbc833c84033bccf0147660077b680737688772680737808770908770600776280776f8057678\
+        877780875f08877118877298877998812ceef00eeee00ef5c00eec300362c8a11ce4a11ccca11ce4a11cdc611cca211c\
+        c4811dca6106d6904339c84339984339c84339b8c33894433888033b94c32fbc833cfc823bd4033bb0c30cc421077c70\
+        037a288776808719d1430ef8e006e4200ee7e006f6100ef2c00ee1900fef500ff4000000712000000600000016500d97\
+        ef3cbe3439118152d3434d7e71db06403000d20061200000130000001304412c100000000400000034a5405402454035\
+        46008220887f00002306090082606044c4f31cc18841028020181811f13c433062900020080646443c8f108c18240008\
+        82811111cf93040800000000";
+
+    /// Compute: a complete `DXBC` container the converter accepts (stage 8).
+    const CS_CONTAINER_HEX: &str = "44584243131f46e559fc8bb24fb844b0e487365c01000000400b0000070000003c0000004c0000005c0000006c000000\
+        dc000000200600003c06000053464930080000000000000000000000495347310800000000000000080000004f534731\
+        0800000000000000080000005053563068000000340000000000000000000000000000000000000000000000ffffffff\
+        050000000000000000000000400000000100000001000000010000000100000018000000080000000000000000000000\
+        000000000c0000000000000008000000006d61696e00000000000000535441543c050000600005004f0100004458494c\
+        0001000010000000240500004243c0de210c0000460100000b82200002000000130000000781239141c8044906103239\
+        9201840c250508191e048b628014450242920b42a41032143808184b0a32528848901420434688a500193242e4480e90\
+        9122c4504151818ce183e58a0429460651180000080000001b8ce0ffffffff074002a80d86f0ffffffff032001d50662\
+        f8ffffffff019000491800000300000013826042204c080600000000892000002500000032224809206485049322a484\
+        049322e384a19014124c8a8c0b84a44c10482300250014e608c0a00c630c22730408997b86cb9fb08790fc1068868540\
+        c19923088a81861923912a0a18688c31c630c4060266328371608770988779700359b88559a00779a88771a0877a9087\
+        72200751a8077330877290073ea8077798877438077728077200837470077af003140c7a7304a000131472c087746087\
+        36688779680372c0870daf500e6dd00e7a500e6d000f7a300772a0077320076d900e71a0077320076d900e78a0077320\
+        076d900e7160077a300772d006e9300772a0077320076d900e7640077a600774d006e6100776a0077320076d600e7320\
+        077a300772d006e6600774a0077640076de00e78a0077160077a300772a007764007439e000800000000000000000086\
+        3c04100001000000000000000c79142000040000000000000018f23040000c000000000000009005020000000c000000\
+        321e981419114c908c092647c604431a253002500c85510865500ea5300350800145406904806281109c01a037030000\
+        791800005b0000001a034c90460213c48e0c6feced4d0c24c625c745c60626c7a50604052646cc46268c8ce626654310\
+        4c1006628230141b8481d820100485b1b909c2606c180e849820401189b3a73aba09c2704c1092678230201b84c1d9b0\
+        10ca421003d334cdb32180361040040013844762803641189209c2a04c10866583815015615d138481d92010d98640db\
+        2010db86c1c1b80d033175130401d8006c18083000830d41186c18864f0c48b485a5b94d1022688230341b063318860d\
+        045106ce196c283e320024346091e63647374722cd8d6e6e8230384ce8caf0bee6e8dee4ca36186a80ac011bb4c15085\
+        8dcdaecd258daccc8d6e4a105421c373b12b939b4b7b739b12104dc8f05cecc2d8eccae4a604451d323c9739b430b232\
+        b9a637b232b6290152860ccf45ae6ceead4e6eac6c6e4a105522c373a1cb832b0b72737ba30ba34b7b739b9b22746250\
+        870ccfa5cc8d4e2e0fea2dcd8d6e6e4a80065dc8f05cc6deeadce8cae4e6a6046d000000791800004c0000003308801c\
+        c4e11c6614013d88433884c38c4280077978077398710ce6000fed100ef4800e330c421ec2c11dcea11c6630053d8843\
+        3884831bcc033dc8433d8c033dcc788c7470077b08077948877070077a700376788770208719cc110eec900ee1300f6e\
+        300fe3f00ef0500e3310c41dde211cd8211dc2611e6630893bbc833bd04339b4033cbc833c84033bccf0147660077b68\
+        0737688772680737808770908770600776280776f8057678877780875f08877118877298877998812ceef00eeee00ef5\
+        c00eec300362c8a11ce4a11ccca11ce4a11cdc611cca211cc4811dca6106d6904339c84339984339c84339b8c3389443\
+        3888033b94c32fbc833cfc823bd4033bb0c30cc421077c70037a288776808719d1430ef8e006e4200ee7e006f6100ef2\
+        c00ee1900fef500ff4000000712000000e00000036500d97ef3c7e40150511b19313113e72db26200d97ef3cbe1011c0\
+        448440332c840548c3e53b8f3f1d11010ce2e023b76d000403200d0000000000484153481400000000000000d58deaf6\
+        1d33caaf2e2a8053a1d91dd64458494cfc040000600005003f0100004458494c0001000010000000e40400004243c0de\
+        210c0000360100000b82200002000000130000000781239141c80449061032399201840c250508191e048b6280144502\
+        42920b42a41032143808184b0a32528848901420434688a500193242e4480e909122c4504151818ce183e58a04294606\
+        51180000080000001b8ce0ffffffff074002a80d86f0ffffffff032001d50662f8ffffffff0190004918000003000000\
+        13826042204c080600000000892000002500000032224809206485049322a484049322e384a19014124c8a8c0b84a44c\
+        10482300250014e608c0a00c630c22730408997b86cb9fb08790fc1068868540c19923088a81861923912a0a18688c31\
+        c630c4060266328371608770988779700359b88559a00779a88771a0877a908772200751a8077330877290073ea80777\
+        98877438077728077200837470077af003140c7a7304a000131472c08774608736688779680372c0870daf500e6dd00e\
+        7a500e6d000f7a300772a0077320076d900e71a0077320076d900e78a0077320076d900e7160077a300772d006e93007\
+        72a0077320076d900e7640077a600774d006e6100776a0077320076d600e7320077a300772d006e6600774a007764007\
+        6de00e78a0077160077a300772a007764007439e0000000000000000000000863c04100001000000000000000c791420\
+        00040000000000000018f23040000c000000000000009005020000000a000000321e981019114c908c092647c604431a\
+        2530025012c5501885508001944600281608c1190000000079180000390000001a034c90460213c48e0c6feced4d0c24\
+        c625c745c60626c7a50604052646cc46268c8ce6266543104c1006628230141b848198200cc6066130288ccd4d108663\
+        c38024c404016a084c10066482902c138421d9200ccf8685581882181ac771a00d41b4810024009820080089b6b034b7\
+        0942c44c100665c3700dc30682b01e6c434155c094556163b36b7349232b73a39b120455c8f05ceccae4e6d2dedca604\
+        4413323c17bb3036bb32b9298151870ccf650e2d8cac4caee98dac8c6d4a909421c373912b9b7bab931b2b9b9b124875\
+        c8f05ccadce8e4f2a0ded2dce8e6a60419000000791800004c0000003308801cc4e11c6614013d88433884c38c428007\
+        7978077398710ce6000fed100ef4800e330c421ec2c11dcea11c6630053d88433884831bcc033dc8433d8c033dcc788c\
+        7470077b08077948877070077a700376788770208719cc110eec900ee1300f6e300fe3f00ef0500e3310c41dde211cd8\
+        211dc2611e6630893bbc833bd04339b4033cbc833c84033bccf0147660077b6807376887726807378087709087706007\
+        76280776f8057678877780875f08877118877298877998812ceef00eeee00ef5c00eec300362c8a11ce4a11ccca11ce4\
+        a11cdc611cca211cc4811dca6106d6904339c84339984339c84339b8c33894433888033b94c32fbc833cfc823bd4033b\
+        b0c30cc421077c70037a288776808719d1430ef8e006e4200ee7e006f6100ef2c00ee1900fef500ff400000071200000\
+        0e00000036500d97ef3c7e40150511b19313113e72db26200d97ef3cbe1011c0448440332c840548c3e53b8f3f1d1101\
+        0ce2e023b76d000403200d0061200000120000001304412c10000000040000003466004aae7403caa01c4a31804c0900\
+        230609008260a04c460041ca88810180201810951155604805068c1834000882016319c44005cbb21408000000000000";
+
+    /// One fixture container, by the stage it declares.
+    fn fixture(stage: PipelineStage) -> Vec<u8> {
+        hex_bytes(match stage {
+            PipelineStage::Vertex => VS_CONTAINER_HEX,
+            PipelineStage::Pixel => PS_CONTAINER_HEX,
+            PipelineStage::Compute => CS_CONTAINER_HEX,
+            other => panic!("no synthetic fixture for {other:?}"),
+        })
+    }
+
+    /// Builds a `DXBC` container from parts (the shader crate's builder is
+    /// test-only).
+    fn dxbc_container(parts: &[(victory_shader::FourCC, &[u8])]) -> Vec<u8> {
+        const HEADER: usize = 0x20;
+        let table = HEADER + 4 * parts.len();
+        let total = table + parts.iter().map(|(_, data)| 8 + data.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        let mut offset = table;
+        for (_, data) in parts {
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + data.len();
+        }
+        for (fourcc, data) in parts {
+            out.extend_from_slice(&fourcc.0);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// A `PSV0` part in the DXC runtime-info shape: a 52-byte size (itself and
+    /// the 48-byte info), a stage byte at info[24], the entry-point string
+    /// offset, then a sized NUL-separated string table.
+    fn psv0_part(stage: u8, entry_offset: u32, table: &[u8]) -> Vec<u8> {
+        let mut psv = Vec::with_capacity(64 + table.len());
+        psv.extend_from_slice(&52u32.to_le_bytes());
+        let mut info = [0u8; 48];
+        info[24] = stage;
+        psv.extend_from_slice(&info);
+        psv.extend_from_slice(&entry_offset.to_le_bytes());
+        psv.extend_from_slice(&0u32.to_le_bytes()); // no bound resources
+        psv.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        psv.extend_from_slice(table);
+        psv
+    }
+
+    /// The whole container is what the converter consumes, and the entry name
+    /// is the one the container's own `PSV0` table exports.
+    #[test]
+    fn the_whole_container_is_kept_and_its_entry_table_is_used() {
+        for stage in [
+            PipelineStage::Vertex,
+            PipelineStage::Pixel,
+            PipelineStage::Compute,
+        ] {
+            let container = fixture(stage);
+            let program = stage_program(stage, &container)
+                .unwrap_or_else(|error| panic!("{stage:?}: {error}"));
+            assert_eq!(program.entry, "main", "{stage:?}: PSV0 entry");
+            assert_eq!(
+                program.dxil, container,
+                "{stage:?}: the converter gets the complete container, not its DXIL part"
+            );
+            assert_eq!(
+                container_entry_point(&container).as_deref(),
+                Some("main"),
+                "{stage:?}: the name comes from the container table"
+            );
+        }
+
+        // A table that names another export is reported as it is, not guessed.
+        let table = b"\0vs_main\0";
+        let psv = psv0_part(1, 1, table);
+        let container = dxbc_container(&[(victory_shader::FourCC::PSV0, &psv)]);
+        assert_eq!(
+            container_entry_point(&container).as_deref(),
+            Some("vs_main")
+        );
+
+        // The repository's own emitter writes a 48-byte runtime info with no
+        // entry offset: no name is invented out of the binding table.
+        let mut emitter = psv.clone();
+        emitter[..4].copy_from_slice(&48u32.to_le_bytes());
+        let container = dxbc_container(&[(victory_shader::FourCC::PSV0, &emitter)]);
+        assert_eq!(container_entry_point(&container), None);
+    }
+
+    /// A bare `DXIL` part is the shape that crashes the converter child. It is
+    /// a bounded refusal before the pool is asked, naming the container form.
+    #[test]
+    fn a_bare_dxil_part_is_a_named_refusal_before_any_converter() {
+        let container = fixture(PipelineStage::Compute);
+        let parsed = victory_shader::Container::parse(&container).expect("the fixture parses");
+        let part = parsed
+            .part(victory_shader::FourCC::DXIL)
+            .expect("the fixture has a DXIL part");
+        assert_ne!(
+            part.data.get(..4),
+            Some(&b"DXBC"[..]),
+            "the bare part has no container magic"
+        );
+
+        match stage_program(PipelineStage::Compute, part.data) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("complete DXBC container"), "{reason}");
+            }
+            other => panic!("a bare DXIL part must be refused, saw {other:?}"),
+        }
+
+        // The translation path refuses the same bytes before dispatching a job,
+        // so the pool can never report it as a worker exit.
+        let program = StageProgram {
+            stage: PipelineStage::Compute,
+            dxil: part.data.to_vec(),
+            entry: "main".to_string(),
+        };
+        let error = validate_stage_program(&program).expect_err("a bare part is invalid");
+        assert!(matches!(error, PipelineError::Container(_)), "{error:?}");
+        assert_eq!(RefusalClass::of(&error), RefusalClass::Container);
+        match translate(&program) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("complete DXBC container"), "{reason}");
+            }
+            other => panic!("translate must refuse a bare part, saw {other:?}"),
+        }
+    }
+
+    /// A container whose `Program` part declares another stage is refused with
+    /// both names; the stage is never relabelled or reordered.
+    #[test]
+    fn a_container_of_another_stage_is_refused_by_name() {
+        let container = fixture(PipelineStage::Compute);
+        match stage_program(PipelineStage::Vertex, &container) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("vertex"), "{reason}");
+                assert!(reason.contains("Compute"), "{reason}");
+            }
+            other => panic!("a compute container as a vertex stage must be refused, saw {other:?}"),
+        }
+    }
+
+    /// A minimal standard-layout `DXIL` part for one container `Program` kind.
+    fn dxil_part(kind: u16) -> Vec<u8> {
+        let bitcode = [0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0];
+        let size_dwords = (24 + bitcode.len()) / 4;
+        let mut part = Vec::with_capacity(24 + bitcode.len());
+        part.extend_from_slice(&((u32::from(kind) << 16) | 0x0060).to_le_bytes());
+        part.extend_from_slice(&(size_dwords as u32).to_le_bytes());
+        part.extend_from_slice(b"DXIL");
+        part.extend_from_slice(&0x100u32.to_le_bytes());
+        part.extend_from_slice(&16u32.to_le_bytes());
+        part.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
+        part.extend_from_slice(&bitcode);
+        part
+    }
+
+    /// Each of the converter's five stages maps to the container `Program`
+    /// kind it declares; the container kind is never confused with the
+    /// converter stage code (converter 5 is mesh, container kind 5 is compute).
+    #[test]
+    fn each_stage_maps_to_its_own_program_kind() {
+        for (stage, kind) in [
+            (PipelineStage::Vertex, 1u16),
+            (PipelineStage::Pixel, 0),
+            (PipelineStage::Mesh, 13),
+            (PipelineStage::Object, 14),
+            (PipelineStage::Compute, 5),
+        ] {
+            let container = dxbc_container(&[(victory_shader::FourCC::DXIL, &dxil_part(kind))]);
+            let program = stage_program(stage, &container)
+                .unwrap_or_else(|error| panic!("{stage:?} kind {kind}: {error}"));
+            assert_eq!(
+                program.entry, "main",
+                "{stage:?}: a container with no PSV0 table falls back to `main`"
+            );
+        }
+
+        let container = dxbc_container(&[(victory_shader::FourCC::DXIL, &dxil_part(5))]);
+        match stage_program(PipelineStage::Mesh, &container) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("mesh"), "{reason}");
+                assert!(reason.contains("Compute"), "{reason}");
+            }
+            other => panic!("a compute container must not pass as mesh, saw {other:?}"),
+        }
+    }
+
+    /// Every container refusal is a named, bounded `Container`/`NoDxil`
+    /// reason, so a boot's `pipeline_first_refusal_reason` names the malformed
+    /// form instead of a converter worker exit.
+    #[test]
+    fn every_container_refusal_names_its_reason() {
+        use victory_shader::FourCC;
+
+        // No bytes at all is "no DXIL", not a converter job.
+        assert!(matches!(
+            stage_program(PipelineStage::Compute, b""),
+            Err(PipelineError::NoDxil(_))
+        ));
+
+        // A container over the converter's limit is refused by size.
+        let oversized = vec![0u8; MAX_STAGE_CONTAINER_BYTES + 1];
+        match stage_program(PipelineStage::Compute, &oversized) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("limit"), "{reason}");
+            }
+            other => panic!("an oversized container must be refused, saw {other:?}"),
+        }
+
+        // Neither a non-container nor a corrupt container reaches the pool.
+        for bytes in [
+            b"not a container".as_slice(),
+            b"DXBC and then nothing at all".as_slice(),
+        ] {
+            match stage_program(PipelineStage::Compute, bytes) {
+                Err(PipelineError::Container(reason)) => {
+                    assert!(!reason.is_empty(), "the reason is named");
+                }
+                other => panic!("{bytes:?} must be refused, saw {other:?}"),
+            }
+        }
+
+        // A `DXIL` part the program-header parser rejects is malformed.
+        let container = dxbc_container(&[(FourCC::DXIL, &[0u8; 32])]);
+        match stage_program(PipelineStage::Compute, &container) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("malformed"), "{reason}");
+            }
+            other => panic!("a malformed DXIL part must be refused, saw {other:?}"),
+        }
+
+        // The entry point a caller supplies is bounded and NUL-free.
+        let mut program =
+            stage_program(PipelineStage::Compute, &fixture(PipelineStage::Compute))
+                .expect("the compute fixture is a complete container");
+        for (entry, needle) in [
+            (String::new(), "no entry point"),
+            ("a".repeat(MAX_ENTRY_POINT_NAME_BYTES + 1), "limit"),
+            ("a\0b".to_string(), "NUL"),
+        ] {
+            program.entry = entry;
+            match validate_stage_program(&program) {
+                Err(error @ PipelineError::Container(_)) => {
+                    assert!(error.to_string().contains(needle), "{error}");
+                    assert_eq!(RefusalClass::of(&error), RefusalClass::Container);
+                    assert!(
+                        bounded_refusal_reason(&error.to_string()).len() <= MAX_REFUSAL_REASON_BYTES
+                    );
+                }
+                other => panic!("entry {needle:?} must be refused, saw {other:?}"),
+            }
+        }
+    }
+
+    /// The `Program` part and the container's `PSV0` stage byte must agree;
+    /// a container whose two tables disagree is refused, not trusted.
+    #[test]
+    fn a_psv0_stage_byte_that_disagrees_with_the_program_is_refused() {
+        let mut container = fixture(PipelineStage::Compute);
+        let at = container
+            .windows(4)
+            .position(|window| window == b"PSV0")
+            .expect("the fixture has a PSV0 part")
+            + 8;
+        assert_eq!(container[at + 28], 5, "the fixture is a compute PSV0");
+        container[at + 28] = 1;
+        match stage_program(PipelineStage::Compute, &container) {
+            Err(PipelineError::Container(reason)) => {
+                assert!(reason.contains("PSV0"), "{reason}");
+            }
+            other => panic!("a disagreed PSV0 stage must be refused, saw {other:?}"),
+        }
+    }
+
+    /// The hermetic contract proof: a vertex+pixel set and a compute stage,
+    /// reachable exactly as `pipeline.rs` builds them, translate through the
+    /// real `--stdio` converter pool and answer a non-empty metallib and the
+    /// converter's own reflection.
+    #[test]
+    fn complete_synthetic_containers_translate_through_the_pool() {
+        let Some(worker) = converter_worker_for_test() else {
+            eprintln!(
+                "skipped: no x86_64 victory-irconverter (build it with `cargo build -p \
+                 victory-metal --bin victory-irconverter --target x86_64-apple-darwin`)"
+            );
+            return;
+        };
+        let Some(converter) = converter_library_for_test() else {
+            eprintln!("skipped: no libmetalirconverter.dylib (VICTORY_METAL_IRCONVERTER)");
+            return;
+        };
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let cache = TempShare::new();
+        // SAFETY: the test holds `ENV_LOCK`; every other test that reads these
+        // variables takes the same lock.
+        unsafe {
+            std::env::set_var("VICTORY_IRCONVERTER_WORKER", &worker);
+            std::env::set_var("VICTORY_METAL_IRCONVERTER", &converter);
+            std::env::set_var("VICTORY_METAL_SHADER_CACHE", &cache.0);
+        }
+        reset_pool();
+
+        // The two stage sets `pipeline.rs` builds: a graphics PSO (vertex +
+        // pixel) and a compute PSO. Each stage is a separate converter job, as
+        // `register_with_details` dispatches them.
+        for (set, shader_types) in [
+            (
+                &[PipelineStage::Vertex, PipelineStage::Pixel][..],
+                &["Vertex", "Fragment"][..],
+            ),
+            (&[PipelineStage::Compute][..], &["Compute"][..]),
+        ] {
+            for (stage, shader_type) in set.iter().copied().zip(shader_types) {
+                let program = stage_program(stage, &fixture(stage))
+                    .unwrap_or_else(|error| panic!("{stage:?}: {error}"));
+                let (compiled, serving) = translate_with_reflection(&program)
+                    .unwrap_or_else(|error| panic!("{stage:?} through the pool: {error}"));
+                assert!(
+                    compiled.metallib.len() > 4 && compiled.metallib.starts_with(b"MTLB"),
+                    "{stage:?}: the converter answered a serialized metallib"
+                );
+                assert!(
+                    !serving.warm,
+                    "{stage:?}: a cold temp cache never serves a translation warm"
+                );
+                let reflection =
+                    std::str::from_utf8(&compiled.reflection).expect("reflection is UTF-8 JSON");
+                assert!(
+                    reflection.contains(&format!("\"ShaderType\":\"{shader_type}\"")),
+                    "{stage:?}: reflection reports {shader_type}: {reflection}"
+                );
+                assert!(
+                    reflection.contains("\"EntryPoint\":\"main\""),
+                    "{stage:?}: reflection names the container's entry: {reflection}"
+                );
+            }
+        }
+
+        // The work really ran in workers of the pool, not in the cache.
+        let stats = pool_stats();
+        assert_eq!(stats.worker_jobs, 3, "three cold stages ran in workers");
+        assert_eq!(stats.errors, 0, "no worker failed");
+
+        // SAFETY: the test holds `ENV_LOCK`.
+        unsafe {
+            std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
+            std::env::remove_var("VICTORY_METAL_IRCONVERTER");
+            std::env::remove_var("VICTORY_METAL_SHADER_CACHE");
+        }
+        reset_pool();
+    }
+
+    /// The x86_64 Rosetta worker built from this worktree, when it exists.
+    fn converter_worker_for_test() -> Option<PathBuf> {
+        std::env::var_os("VICTORY_IRCONVERTER_WORKER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(Path::parent)?
+                    .join("target/x86_64-apple-darwin/debug/victory-irconverter");
+                path.is_file().then_some(path)
+            })
+    }
+
+    /// Apple's x86_64 converter library, from the documented search order.
+    fn converter_library_for_test() -> Option<PathBuf> {
+        std::env::var_os("VICTORY_METAL_IRCONVERTER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::var_os("D3DMETAL_RES")
+                    .map(|root| PathBuf::from(root).join("libmetalirconverter.dylib"))
+                    .filter(|path| path.is_file())
+            })
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    PathBuf::from(home).join(
+                        "Library/Caches/victory-macos/target/wine-cx/lib/external/\
+                         D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib",
+                    )
+                })
+            })
+            .filter(|path| path.is_file())
+    }
+
 }
