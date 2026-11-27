@@ -16,6 +16,9 @@ crate-type = ["rlib", "cdylib"]
 thiserror.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+# Host-side vertex-layout derivation parses the translated vertex shader's
+# DXIL `ISG1` input signature (`macos::vertex_layout`).
+victory-shader = { path = "../victory-shader" }
 
 [lints]
 workspace = true
@@ -23,4 +26,3 @@ workspace = true
 [dev-dependencies]
 # Host-side shader proofs: the mesh/compute unblocking tasks translate real
 # DXIL and then execute it through IRConverter on the ARM64 Metal GPU.
-victory-shader = { path = "../victory-shader" }

@@ -27,28 +27,33 @@
 
 #![cfg(target_os = "macos")]
 
+mod c14_fixtures;
+
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::null_mut;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use victory_metal::MetalTransport;
 use victory_metal::VmBufferId;
+use victory_metal::compiler_pool::{CompileJob, CompilerPool, PoolConfig};
 use victory_metal::macos::bindings::{
     ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
 };
 use victory_metal::macos::device::{DirectMetalTransport, EncoderStats, PipelineAbi};
 use victory_metal::macos::registry::{
-    PipelineStage, TextureDesc, TextureDimension, TextureFormat, TextureUsage,
+    FunctionRole, PipelineStage, StageLibrary, TextureDesc, TextureDimension, TextureFormat,
+    TextureUsage,
 };
 use victory_metal::wire::ListIdentity;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, DepthStencilAttachment, DrawState, LoadOp,
-    PipelineRef, PrimitiveTopology, RootBufferView, RootConstantsV3, ScissorRect, StoreOp,
-    SubmissionV3, Viewport,
+    BeginRenderPass, ColorAttachment, CommandV3, DepthStencilAttachment, DrawIndexedState,
+    DrawState, IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, PrimitiveTopology,
+    RootBufferView, RootConstantsV3, ScissorRect, StoreOp, SubmissionV3, VertexBuffer,
+    VertexBufferSet, Viewport,
 };
 
 const EDGE: u32 = 64;
@@ -515,6 +520,529 @@ fn graphics_mrt_depth_registry_pixels_are_exact() {
         native,
         allocations_in_set,
         fallback
+    );
+}
+
+/// Two-attribute MSL graphics pipeline. Attribute 0 is the position and
+/// attribute 1 the colour; the colour is `[[flat]]` so the whole primitive
+/// takes one provoking-vertex colour and the readback is exact, not
+/// interpolation-dependent.
+const VERTEX_DESCRIPTOR_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VIn {
+    float4 position [[attribute(0)]];
+    float4 color [[attribute(1)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+    float4 color [[flat]];
+};
+
+struct MrtOut {
+    float4 a [[color(0)]];
+    float4 b [[color(1)]];
+};
+
+vertex VOut vd_vertex(VIn in [[stage_in]]) {
+    VOut out;
+    out.position = in.position;
+    out.color = in.color;
+    return out;
+}
+
+fragment MrtOut vd_fragment(VOut in [[stage_in]]) {
+    MrtOut out;
+    out.a = in.color;
+    out.b = in.color;
+    return out;
+}
+"#;
+
+/// The exact layout the host derives for the MSL above: float4 at offset 0,
+/// float4 at offset 16, both in buffer 0, stride 32.
+fn two_attribute_layout() -> (
+    victory_metal::macos::vertex_layout::VertexLayout,
+    u32,
+) {
+    use victory_metal::macos::vertex_layout::{
+        VertexAttribute, VertexFormat, VertexLayout,
+    };
+    let position = VertexFormat::with_components(VertexFormat::FLOAT, 4).unwrap();
+    let color = VertexFormat::with_components(VertexFormat::FLOAT, 4).unwrap();
+    let layout = VertexLayout::from_attributes(vec![
+        VertexAttribute {
+            index: 0,
+            format: position,
+            offset: 0,
+            buffer_index: 0,
+            stride: 32,
+        },
+        VertexAttribute {
+            index: 1,
+            format: color,
+            offset: 16,
+            buffer_index: 0,
+            stride: 32,
+        },
+    ])
+    .expect("a two-attribute layout");
+    (layout, 32)
+}
+
+/// Exact-value proof that a host-derived vertex descriptor is enough for
+/// Metal to create the PSO and fetch two attributes: draw one indexed
+/// triangle whose vertices carry distinct colours, and assert the flat
+/// provoking-vertex colour in every pixel.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn graphics_vertex_descriptor_registers_and_draws_exact_pixels() {
+    let dir = TempDir::new("submit-v3-vertex-descriptor");
+    let Some(metallib) = compile_metallib(dir.path(), "vertex-descriptor", VERTEX_DESCRIPTOR_MSL)
+    else {
+        eprintln!(
+            "PARTIAL: Apple Metal toolchain (metal/metallib) not found; vertex-descriptor proof skipped"
+        );
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    const TARGET: u64 = 0x2000;
+    transport
+        .register_registry_texture(TARGET, rgba8_desc(EDGE, EDGE))
+        .expect("registry colour target must create");
+
+    let (layout, stride) = two_attribute_layout();
+    let pipeline_state = victory_metal::macos::registry::PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("vd_fragment".to_string()),
+        vertex_layout: Some(layout),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+
+    const HANDLE: u64 = 0x6000;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "vd_vertex",
+            &pipeline_state,
+            PipelineAbi::graphics(None, None),
+        )
+        .expect("the vertex descriptor must let Metal create the pipeline");
+
+    // Three interleaved vertices: position (float4) then colour (float4).
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    let corners = [
+        [-1.0f32, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let colours = [RED, GREEN, BLUE];
+    let mut vertices = Vec::with_capacity(3 * stride as usize);
+    for (corner, colour) in corners.iter().zip(colours.iter()) {
+        for value in corner.iter().chain(colour.iter()) {
+            vertices.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    assert_eq!(vertices.len(), 3 * stride as usize);
+
+    let mut vertex_page = HostPage::new(16 * 1024);
+    vertex_page.write(0, &vertices);
+    // SAFETY: `vertex_page` is a live 16 KiB page that outlives the submission.
+    let vertex_id = unsafe { transport.register_zerocopy(vertex_page.raw(), 16 * 1024) }
+        .expect("vertex page must register");
+
+    let indices: [u16; 3] = [0, 1, 2];
+    let mut index_page = HostPage::new(16 * 1024);
+    let mut index_bytes = Vec::with_capacity(6);
+    for index in indices {
+        index_bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    index_page.write(0, &index_bytes);
+    // SAFETY: `index_page` is a live 16 KiB page that outlives the submission.
+    let index_id = unsafe { transport.register_zerocopy(index_page.raw(), 16 * 1024) }
+        .expect("index page must register");
+
+    let mut snapshot = HashMap::new();
+    snapshot.insert((1u64, 1u32), VmBufferId(TARGET));
+    snapshot.insert((2u64, 1u32), vertex_id);
+    snapshot.insert((3u64, 1u32), index_id);
+
+    let submission = SubmissionV3 {
+        sequence: 111,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(1, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetVertexBuffers(VertexBufferSet {
+                start_slot: 0,
+                buffers: vec![VertexBuffer {
+                    allocation_id: 2,
+                    generation: 1,
+                    offset: 0,
+                    stride,
+                    length: vertices.len() as u64,
+                }],
+            }),
+            CommandV3::SetIndexBuffer(IndexBufferBinding {
+                allocation_id: 3,
+                generation: 1,
+                offset: 0,
+                length: index_bytes.len() as u64,
+                format: IndexFormat::Uint16,
+            }),
+            CommandV3::DrawIndexed(DrawIndexedState {
+                index_count: 3,
+                instance_count: 1,
+                start_index: 0,
+                base_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &snapshot)
+        .expect("the vertex-descriptor pass must execute");
+    assert_eq!(
+        reply.status,
+        victory_metal::wire::ReplyStatus::Ok,
+        "vertex-descriptor submission status"
+    );
+    assert_eq!(stats.render_encoders, 1, "one render encoder");
+
+    transport
+        .wait_for_gpu()
+        .expect("the vertex-descriptor pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("vertex-descriptor target readback");
+    // Metal's flat interpolation takes the first (provoking) vertex; RED must
+    // cover the whole triangle, proving the layout's offset and buffer index.
+    assert_uniform(&pixels, [255, 0, 0, 255], "vertex descriptor target");
+
+    transport
+        .unregister_buffer(vertex_id)
+        .expect("unregister the vertex page");
+    transport
+        .unregister_buffer(index_id)
+        .expect("unregister the index page");
+    eprintln!(
+        "vertex-descriptor proof on {}: {} pixels = {:?}, stride {}",
+        info.name_str(),
+        pixels.len(),
+        pixels[0],
+        stride
+    );
+}
+
+/// Parses a whitespace-free lowercase hex string.
+fn unhex(hex: &str) -> Vec<u8> {
+    assert!(hex.len() % 2 == 0, "hex string has an odd length");
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("valid hex pair"))
+        .collect()
+}
+
+/// Apple's x86_64 IRConverter library, if the environment names one.
+fn converter_library() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_METAL_IRCONVERTER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::var_os("D3DMETAL_RES")
+                .map(|root| PathBuf::from(root).join("libmetalirconverter.dylib"))
+                .filter(|path| path.is_file())
+        })
+        .or_else(|| {
+            let path = PathBuf::from(std::env::var_os("HOME")?).join(
+                "Library/Caches/victory-macos/target/wine-cx/lib/external/\
+                 D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib",
+            );
+            path.is_file().then_some(path)
+        })
+}
+
+/// The x86_64 `victory-irconverter --stdio` worker, if it has been built.
+fn converter_worker() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_IRCONVERTER_WORKER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/x86_64-apple-darwin/debug/victory-irconverter");
+            path.is_file().then_some(path)
+        })
+}
+
+/// Sets a converter environment variable for the life of one test.
+struct ConverterEnv {
+    name: &'static str,
+    old: Option<OsString>,
+}
+
+impl ConverterEnv {
+    fn set(name: &'static str, value: &Path) -> Self {
+        let old = std::env::var_os(name);
+        // SAFETY: this binary runs with --test-threads=1 and no other test
+        // reads these variables at the same time.
+        unsafe { std::env::set_var(name, value) };
+        Self { name, old }
+    }
+}
+
+impl Drop for ConverterEnv {
+    fn drop(&mut self) {
+        // SAFETY: see `ConverterEnv::set`.
+        unsafe {
+            match &self.old {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+}
+
+/// Converter-backed proof: translate this repository's own two-attribute DXIL
+/// vertex and pixel stages with the real Metal Shader Converter, register the
+/// graphics PSO from the derived layout, and draw the indexed triangle.
+///
+/// The translated vertex function reports Metal attribute indices 11 and 12
+/// (`POSITION` float3, `COLOR0` float4), which is the index base
+/// `VertexLayout::from_dxil_container` derives. The translated shaders contain
+/// no title bytes; the DXIL fixture is this repository's own HLSL.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn converted_vertex_descriptor_pso_links_and_draws_exact_pixels() {
+    use victory_metal::macos::vertex_layout::{VertexFormat, VertexLayout};
+
+    let Some(converter) = converter_library() else {
+        eprintln!(
+            "PARTIAL: no libmetalirconverter.dylib (set VICTORY_METAL_IRCONVERTER or D3DMETAL_RES); converter-backed vertex-descriptor proof skipped"
+        );
+        return;
+    };
+    let Some(worker) = converter_worker() else {
+        eprintln!(
+            "PARTIAL: no x86_64 victory-irconverter worker; build it with `cargo build -p victory-metal --bin victory-irconverter --target x86_64-apple-darwin`; converter-backed vertex-descriptor proof skipped"
+        );
+        return;
+    };
+    let _env = ConverterEnv::set("VICTORY_METAL_IRCONVERTER", &converter);
+
+    let vertex_dxil = unhex(c14_fixtures::VERTEX_DXIL_HEX);
+    let pixel_dxil = unhex(c14_fixtures::PIXEL_DXIL_HEX);
+    let layout = VertexLayout::from_dxil_container(&vertex_dxil)
+        .expect("the two-attribute vertex signature lays out");
+    let float3 = VertexFormat::with_components(VertexFormat::FLOAT, 3).unwrap();
+    let float4 = VertexFormat::with_components(VertexFormat::FLOAT, 4).unwrap();
+    assert_eq!(layout.attributes().len(), 2);
+    assert_eq!(layout.attributes()[0].index, 11);
+    assert_eq!(layout.attributes()[0].format, float3);
+    assert_eq!(layout.attributes()[0].offset, 0);
+    assert_eq!(layout.attributes()[1].index, 12);
+    assert_eq!(layout.attributes()[1].format, float4);
+    assert_eq!(layout.attributes()[1].offset, 12);
+    assert_eq!(layout.attributes()[0].stride, 28);
+
+    let config = PoolConfig {
+        workers: 1,
+        queue_depth: 4,
+        job_timeout: Duration::from_secs(120),
+        cache_dir: None,
+        converter_version: "victory-metal-test/c14-vertex-descriptor/1".to_string(),
+    };
+    let pool = CompilerPool::new(config, Some(worker));
+    let vertex = pool
+        .compile_with_reflection(&CompileJob {
+            id: 1,
+            stage: 1,
+            entry: "main",
+            dxil: &vertex_dxil,
+        })
+        .expect("the two-attribute vertex stage must translate");
+    let pixel = pool
+        .compile_with_reflection(&CompileJob {
+            id: 2,
+            stage: 2,
+            entry: "main",
+            dxil: &pixel_dxil,
+        })
+        .expect("the pixel stage must translate");
+    assert!(vertex.metallib.starts_with(b"MTLB"), "vertex metallib");
+    assert!(pixel.metallib.starts_with(b"MTLB"), "pixel metallib");
+    assert!(!vertex.reflection.is_empty() && !pixel.reflection.is_empty());
+
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+    const TARGET: u64 = 0x2100;
+    transport
+        .register_registry_texture(TARGET, rgba8_desc(EDGE, EDGE))
+        .expect("registry colour target must create");
+
+    let state = victory_metal::macos::registry::PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("main".to_string()),
+        vertex_layout: Some(layout.clone()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+    const HANDLE: u64 = 0x6100;
+    transport
+        .register_content_hashed_graphics_pipeline_stages(
+            HANDLE,
+            &[
+                StageLibrary {
+                    role: FunctionRole::Vertex,
+                    metallib: &vertex.metallib,
+                    entry: "main",
+                },
+                StageLibrary {
+                    role: FunctionRole::Fragment,
+                    metallib: &pixel.metallib,
+                    entry: "main",
+                },
+            ],
+            &state,
+            PipelineAbi::graphics(None, None),
+        )
+        .expect("the converter attribute indices must match the derived layout");
+
+    // POSITION float3 at offset 0, COLOR0 float4 at offset 12, stride 28.
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    let corners = [
+        [-1.0f32, -1.0, 0.0],
+        [3.0, -1.0, 0.0],
+        [-1.0, 3.0, 0.0],
+    ];
+    let colours = [RED, GREEN, BLUE];
+    let stride = layout.attributes()[0].stride;
+    let mut vertices = vec![0u8; 3 * stride as usize];
+    for (index, (corner, colour)) in corners.iter().zip(colours.iter()).enumerate() {
+        let base = index * stride as usize;
+        for (component, value) in corner.iter().enumerate() {
+            vertices[base + component * 4..base + component * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        for (component, value) in colour.iter().enumerate() {
+            let at = base + 12 + component * 4;
+            vertices[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    let mut vertex_page = HostPage::new(16 * 1024);
+    vertex_page.write(0, &vertices);
+    // SAFETY: `vertex_page` is a live 16 KiB page that outlives the submission.
+    let vertex_id = unsafe { transport.register_zerocopy(vertex_page.raw(), 16 * 1024) }
+        .expect("vertex page must register");
+    let mut index_page = HostPage::new(16 * 1024);
+    let mut index_bytes = Vec::new();
+    for index in [0u16, 1, 2] {
+        index_bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    index_page.write(0, &index_bytes);
+    // SAFETY: `index_page` is a live 16 KiB page that outlives the submission.
+    let index_id = unsafe { transport.register_zerocopy(index_page.raw(), 16 * 1024) }
+        .expect("index page must register");
+
+    let mut snapshot = HashMap::new();
+    snapshot.insert((1u64, 1u32), VmBufferId(TARGET));
+    snapshot.insert((2u64, 1u32), vertex_id);
+    snapshot.insert((3u64, 1u32), index_id);
+    let submission = SubmissionV3 {
+        sequence: 112,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(1, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetVertexBuffers(VertexBufferSet {
+                start_slot: 0,
+                buffers: vec![VertexBuffer {
+                    allocation_id: 2,
+                    generation: 1,
+                    offset: 0,
+                    stride,
+                    length: vertices.len() as u64,
+                }],
+            }),
+            CommandV3::SetIndexBuffer(IndexBufferBinding {
+                allocation_id: 3,
+                generation: 1,
+                offset: 0,
+                length: index_bytes.len() as u64,
+                format: IndexFormat::Uint16,
+            }),
+            CommandV3::DrawIndexed(DrawIndexedState {
+                index_count: 3,
+                instance_count: 1,
+                start_index: 0,
+                base_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &snapshot)
+        .expect("the converter-backed pass must execute");
+    assert_eq!(
+        reply.status,
+        victory_metal::wire::ReplyStatus::Ok,
+        "converter-backed submission status"
+    );
+    assert_eq!(stats.render_encoders, 1, "one render encoder");
+    transport
+        .wait_for_gpu()
+        .expect("the converter-backed pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("converter-backed target readback");
+    // The shader's flat colour takes the first vertex; RED proves both the
+    // float3 position fetch at index 11/offset 0 and the float4 colour fetch
+    // at index 12/offset 12.
+    assert_uniform(&pixels, [255, 0, 0, 255], "converter-backed target");
+
+    transport
+        .unregister_buffer(vertex_id)
+        .expect("unregister the vertex page");
+    transport
+        .unregister_buffer(index_id)
+        .expect("unregister the index page");
+    eprintln!(
+        "converter-backed vertex-descriptor proof on {}: vertex {} bytes, pixel {} bytes, {} pixels = {:?}",
+        info.name_str(),
+        vertex.metallib.len(),
+        pixel.metallib.len(),
+        pixels.len(),
+        pixels[0]
     );
 }
 
