@@ -30,8 +30,48 @@
 //! | 5 | host to guest | one complete encoded [`crate::wire::Reply`] |
 //! | 6 | guest to host | `byte_len: u64 LE`, must be 4096; shared fence page |
 //! | 7 | guest to host | one version 3 request envelope, no reply frame |
+//! | 8 | guest to host | `texture registration` (below) |
+//! | 9 | guest to host | `surface registration` (below) |
 //! | 128 | host to guest | one byte: 0 = accepted, 1 = rejected |
 //! | 129 | host to guest | one byte status, then `pipeline_id: u64 LE` on success |
+//!
+//! # Texture and present-surface registration
+//!
+//! Kind 8 carries a fixed 32-byte texture registration:
+//!
+//! | offset | size | field |
+//! | ---: | ---: | --- |
+//! | 0 | 8 | texture id, nonzero |
+//! | 8 | 4 | generation, nonzero |
+//! | 12 | 1 | dimension: 0=1D, 1=2D, 2=2D array, 3=cube, 4=cube array, 5=3D |
+//! | 13 | 1 | format: see [`texture_format_from_code`] |
+//! | 14 | 1 | usage: 0=sampled, 1=colour attachment, 2=depth attachment, 3=storage |
+//! | 15 | 1 | sample count: 1, 2, 4 or 8 |
+//! | 16 | 4 | width |
+//! | 20 | 4 | height |
+//! | 24 | 4 | depth |
+//! | 28 | 2 | mip levels, at least 1 |
+//! | 30 | 2 | array layers, at least 1 |
+//!
+//! The host creates the texture through
+//! [`DirectMetalTransport::register_registry_texture`] and remembers its
+//! generation. A later v3 `BeginRenderPass` colour or depth attachment names
+//! `(id, generation)`, exactly like a registered buffer allocation; the session
+//! allocation snapshot resolves that pair to the texture handle. Duplicate ids
+//! (including an id already used by a buffer allocation), zero extents, zero
+//! mip/layer counts, an unsupported dimension/format/usage and an out-of-range
+//! sample count are refused with status 1 and create no GPU work.
+//!
+//! Kind 9 carries `surface_id: u64 LE` and `texture_id: u64 LE`. The texture
+//! must already have been registered by kind 8; the host registers it as a
+//! present surface through
+//! [`DirectMetalTransport::register_present_surface`]. A duplicate surface id or
+//! an unregistered texture is refused with status 1.
+//!
+//! Unlike kinds 2 and 6, kinds 8 and 9 answer every request with kind 128 and
+//! leave the session open on a rejection, so a guest can correct a descriptor
+//! and retry. No path crosses the wire: the texture is device-created from the
+//! validated descriptor.
 //!
 //! # Shared completion fence page (ADR-012)
 //!
@@ -156,6 +196,8 @@ use crate::cmdlist::{ListLedger, RingError};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::device::DirectMetalTransport;
+use crate::macos::objc::{self, ObjcObject};
+use crate::macos::registry::{TextureDesc, TextureDimension, TextureFormat, TextureUsage};
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
@@ -194,6 +236,18 @@ pub const KIND_PIPELINE_REPLY: u8 = 129;
 pub const KIND_FENCE_PAGE: u8 = 6;
 /// Frame kind for a fire-and-forget version 3 submission with no reply frame.
 pub const KIND_SUBMISSION_ASYNC: u8 = 7;
+/// Frame kind for host texture registration.
+pub const KIND_TEXTURE_REG: u8 = 8;
+/// Frame kind for present-surface registration.
+pub const KIND_SURFACE_REG: u8 = 9;
+/// Exact length of a texture registration payload.
+pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
+/// Exact length of a present-surface registration payload.
+pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
+/// Status byte of an accepted texture or surface registration.
+pub const REGISTRATION_ACCEPTED: u8 = 0;
+/// Status byte of a rejected texture or surface registration.
+pub const REGISTRATION_REJECTED: u8 = 1;
 /// Fixed file name of the shared fence page inside the canonical share dir.
 pub const FENCE_PAGE_FILE_NAME: &str = "gpu-fence.v1.page";
 /// Exact length of a fence page registration payload (`byte_len: u64 LE`).
@@ -362,6 +416,27 @@ pub trait BatchExecutor {
             "pipeline registration is not enabled by this executor",
         ))
     }
+
+    /// Creates a registry texture under `id`.
+    ///
+    /// The default deliberately refuses the request, so texture registration is
+    /// opt-in for an executor that owns an ADR-013 registry. A rejection must
+    /// leave the existing handle space untouched.
+    fn register_texture(&self, _id: u64, _desc: TextureDesc) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "texture registration is not enabled by this executor",
+        ))
+    }
+
+    /// Registers an already-created registry texture as a present surface.
+    ///
+    /// The default deliberately refuses the request. The surface maps a wire
+    /// `surface_id` to a live texture handle so a v3 `Present` can validate it.
+    fn register_surface(&self, _surface_id: u64, _texture_id: u64) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "surface registration is not enabled by this executor",
+        ))
+    }
 }
 
 impl BatchExecutor for DirectMetalTransport {
@@ -400,6 +475,32 @@ impl BatchExecutor for DirectMetalTransport {
 
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
         DirectMetalTransport::load_metallib(self, metallib, entry)
+    }
+
+    fn register_texture(&self, id: u64, desc: TextureDesc) -> Result<(), MetalError> {
+        DirectMetalTransport::register_registry_texture(self, id, desc)
+    }
+
+    fn register_surface(&self, surface_id: u64, texture_id: u64) -> Result<(), MetalError> {
+        // The registry texture already lives in `state.textures` (see
+        // `register_registry_texture`); retain that exact object and wrap it in
+        // a `RenderTarget` so the existing `register_present_surface` path can
+        // insert it into the surface table. No device or render module change is
+        // needed, and the surface always aliases the already-registered texture.
+        let retained = {
+            let state = self.lock_state()?;
+            let texture = state.textures.get(&texture_id).ok_or_else(|| {
+                MetalError::NotFound(format!("texture handle {texture_id} is not registered"))
+            })?;
+            // SAFETY: `texture` is a live retained MTLTexture owned by the
+            // locked device state; `retain` returns it with one extra +1.
+            unsafe { objc::msg_send_id_0(texture.as_raw(), objc::sel(c"retain")) }
+        };
+        let retained = ObjcObject::from_retained(retained).ok_or_else(|| {
+            MetalError::InternalError("registered texture retain returned null".to_string())
+        })?;
+        let target = crate::macos::render::RenderTarget::from_objc(retained)?;
+        DirectMetalTransport::register_present_surface(self, surface_id, &target)
     }
 }
 
@@ -566,6 +667,14 @@ struct RegisteredAllocation {
     _mapping: FileMapping,
 }
 
+/// Metadata of a texture registered through kind 8.
+#[derive(Debug, Clone, Copy)]
+struct RegisteredTexture {
+    /// Generation the guest named in the registration; v3 attachments must
+    /// repeat it so a stale handle can never resolve.
+    generation: u32,
+}
+
 /// Summary of one completed session, for launcher diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSummary {
@@ -589,6 +698,10 @@ pub struct IpcHost<E: BatchExecutor> {
     page_size: usize,
     executor: E,
     allocations: BTreeMap<u64, RegisteredAllocation>,
+    /// Textures registered by kind 8, keyed by the handle a v3 attachment names.
+    textures: BTreeMap<u64, RegisteredTexture>,
+    /// Present surfaces registered by kind 9, mapped to their texture handle.
+    surfaces: BTreeMap<u64, u64>,
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
     /// Opt-in shared completion page registered by kind 6.
@@ -625,6 +738,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             page_size,
             executor,
             allocations: BTreeMap::new(),
+            textures: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
             fence_page: None,
@@ -688,6 +803,14 @@ impl<E: BatchExecutor> IpcHost<E> {
                     write_frame(&mut stream, KIND_ACK, &[0])?;
                 }
                 KIND_SUBMISSION_ASYNC => self.serve_async_submission(&payload)?,
+                KIND_TEXTURE_REG => {
+                    let status = self.register_texture(&payload);
+                    write_frame(&mut stream, KIND_ACK, &[status])?;
+                }
+                KIND_SURFACE_REG => {
+                    let status = self.register_surface(&payload);
+                    write_frame(&mut stream, KIND_ACK, &[status])?;
+                }
                 KIND_PIPELINE => {
                     let reply = self.register_pipeline(&payload);
                     write_frame(&mut stream, KIND_PIPELINE_REPLY, &reply)?;
@@ -791,6 +914,62 @@ impl<E: BatchExecutor> IpcHost<E> {
         mapping.page().begin_session();
         self.fence_page = Some(mapping);
         Ok(())
+    }
+
+    /// Registers a texture through the executor's ADR-013 registry.
+    ///
+    /// Returns the kind-128 status byte. Every validation failure is an
+    /// explicit rejection rather than a session close, and no executor call is
+    /// made unless the descriptor is fully validated, so a refused registration
+    /// can never create GPU work or replace an existing handle.
+    fn register_texture(&mut self, payload: &[u8]) -> u8 {
+        let Some(request) = decode_texture_request(payload) else {
+            return REGISTRATION_REJECTED;
+        };
+        if request.id == 0 || request.generation == 0 {
+            return REGISTRATION_REJECTED;
+        }
+        // One handle space: a texture may not shadow a buffer allocation or an
+        // earlier texture, and the snapshot key `(id, generation)` must be
+        // unambiguous.
+        if self.allocations.contains_key(&request.id)
+            || self.textures.contains_key(&request.id)
+        {
+            return REGISTRATION_REJECTED;
+        }
+        if self.executor.register_texture(request.id, request.desc).is_err() {
+            return REGISTRATION_REJECTED;
+        }
+        self.textures.insert(
+            request.id,
+            RegisteredTexture {
+                generation: request.generation,
+            },
+        );
+        REGISTRATION_ACCEPTED
+    }
+
+    /// Registers an already-registered texture as a present surface.
+    ///
+    /// Returns the kind-128 status byte. The texture id must have been accepted
+    /// by [`Self::register_texture`]; a surface id may only be used once.
+    fn register_surface(&mut self, payload: &[u8]) -> u8 {
+        if payload.len() != SURFACE_REG_PAYLOAD_LEN {
+            return REGISTRATION_REJECTED;
+        }
+        let surface_id = read_u64(payload, 0);
+        let texture_id = read_u64(payload, 8);
+        if surface_id == 0 || texture_id == 0 {
+            return REGISTRATION_REJECTED;
+        }
+        if self.surfaces.contains_key(&surface_id) || !self.textures.contains_key(&texture_id) {
+            return REGISTRATION_REJECTED;
+        }
+        if self.executor.register_surface(surface_id, texture_id).is_err() {
+            return REGISTRATION_REJECTED;
+        }
+        self.surfaces.insert(surface_id, texture_id);
+        REGISTRATION_ACCEPTED
     }
 
     /// Publishes a version 3 submission's sequence before device execution.
@@ -985,10 +1164,17 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn allocation_snapshot(&self) -> HashMap<(u64, u32), VmBufferId> {
-        self.allocations
+        let mut snapshot: HashMap<(u64, u32), VmBufferId> = self
+            .allocations
             .iter()
             .map(|(&id, allocation)| ((id, BASE_GENERATION), allocation.buffer_id))
-            .collect()
+            .collect();
+        // Textures join the same snapshot with their own generation; the v3
+        // attachment resolver then finds the registry texture by handle.
+        for (&id, texture) in &self.textures {
+            snapshot.insert((id, texture.generation), VmBufferId(id));
+        }
+        snapshot
     }
 
     fn execute_v3(
@@ -1091,7 +1277,12 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn reference_valid(&self, allocation_id: u64, generation: u32) -> bool {
-        generation == BASE_GENERATION && self.allocations.contains_key(&allocation_id)
+        if self.allocations.contains_key(&allocation_id) {
+            return generation == BASE_GENERATION;
+        }
+        self.textures
+            .get(&allocation_id)
+            .is_some_and(|texture| generation == texture.generation)
     }
 
     fn range_valid(&self, allocation_id: u64, generation: u32, offset: u64, length: u64) -> bool {
@@ -1339,6 +1530,108 @@ fn decode_pipeline_request(payload: &[u8]) -> Option<(u64, &str)> {
     }
     let entry = std::str::from_utf8(&payload[PIPELINE_HEADER_LEN..]).ok()?;
     valid_pipeline_entry(entry).then_some((ticket, entry))
+}
+
+/// One validated kind 8 texture registration.
+struct TextureRequest {
+    id: u64,
+    generation: u32,
+    desc: TextureDesc,
+}
+
+/// Decodes a kind 8 payload into a validated [`TextureDesc`].
+///
+/// The length is exact, every enum code is range-checked and zero extents,
+/// zero mip/layer counts and unsupported sample counts are refused before the
+/// executor is called.
+fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
+    if payload.len() != TEXTURE_REG_PAYLOAD_LEN {
+        return None;
+    }
+    let id = read_u64(payload, 0);
+    let generation = read_u32(payload, 8);
+    let dimension = texture_dimension_from_code(payload[12])?;
+    let format = texture_format_from_code(payload[13])?;
+    let usage = texture_usage_from_code(payload[14])?;
+    let sample_count = u32::from(payload[15]);
+    let width = read_u32(payload, 16);
+    let height = read_u32(payload, 20);
+    let depth = read_u32(payload, 24);
+    let mip_levels = u32::from(read_u16(payload, 28));
+    let array_layers = u32::from(read_u16(payload, 30));
+    if width == 0 || height == 0 || depth == 0 {
+        return None;
+    }
+    if mip_levels == 0 || array_layers == 0 {
+        return None;
+    }
+    if !matches!(sample_count, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    Some(TextureRequest {
+        id,
+        generation,
+        desc: TextureDesc {
+            width,
+            height,
+            depth,
+            mip_levels,
+            sample_count,
+            array_layers,
+            dimension,
+            format,
+            usage,
+            label: None,
+        },
+    })
+}
+
+/// Maps a kind 8 dimension code to a registry dimension.
+fn texture_dimension_from_code(code: u8) -> Option<TextureDimension> {
+    Some(match code {
+        0 => TextureDimension::D1,
+        1 => TextureDimension::D2,
+        2 => TextureDimension::D2Array,
+        3 => TextureDimension::Cube,
+        4 => TextureDimension::CubeArray,
+        5 => TextureDimension::D3,
+        _ => return None,
+    })
+}
+
+/// Maps a kind 8 format code to a registry format.
+///
+/// The codes are a stable, documented subset of the registry formats; a code
+/// outside this table is an explicit "unsupported format" rejection.
+fn texture_format_from_code(code: u8) -> Option<TextureFormat> {
+    Some(match code {
+        0 => TextureFormat::Rgba8Unorm,
+        1 => TextureFormat::Bgra8Unorm,
+        2 => TextureFormat::Rgba8Srgb,
+        3 => TextureFormat::R32Float,
+        4 => TextureFormat::R16Float,
+        5 => TextureFormat::Rg11g11b10Float,
+        6 => TextureFormat::Rgb10a2Unorm,
+        7 => TextureFormat::Depth32Float,
+        8 => TextureFormat::Depth32FloatStencil8,
+        _ => return None,
+    })
+}
+
+/// Maps a kind 8 usage code to a registry usage set.
+fn texture_usage_from_code(code: u8) -> Option<TextureUsage> {
+    Some(match code {
+        0 => TextureUsage::sampled(),
+        1 => TextureUsage::color_attachment(),
+        2 => TextureUsage::depth_attachment(),
+        3 => TextureUsage {
+            shader_read: true,
+            shader_write: true,
+            render_target: false,
+            depth_stencil: false,
+        },
+        _ => return None,
+    })
 }
 
 fn reject_ack(stream: &mut TcpStream) {
