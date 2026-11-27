@@ -3299,28 +3299,22 @@ mod state {
     }
 
     /// 0x248: a pixel-shader depth-order hint. Wire v3 carries no command for
-    /// it, so it is refused by name instead of silently dropped.
-    pub(super) extern "system" fn pixel_depth_order(this: This, _order: u32) {
+    /// it, so the producer records the value and counts it; the hint is never
+    /// a refusal and never drops a draw.
+    pub(super) extern "system" fn pixel_depth_order(this: This, order: u32) {
         if metal() {
             with_metal(this, |producer| {
-                producer.refuse(
-                    "SetPixelShaderDepthOrder: no Wire v3 command for the depth-order hint",
-                    None,
-                )
+                producer.set_pixel_shader_depth_order(order)
             });
         }
     }
 
-    /// 0x3e0: a shading-rate hint. Wire v3 carries no command for it, so it is
-    /// refused by name instead of silently dropped.
-    pub(super) extern "system" fn shading_rate(this: This, _flags: u32) {
+    /// 0x3e0: a shading-rate hint. Wire v3 carries no command for it, so the
+    /// producer records the value and counts it; the hint is never a refusal
+    /// and never drops a draw.
+    pub(super) extern "system" fn shading_rate(this: This, flags: u32) {
         if metal() {
-            with_metal(this, |producer| {
-                producer.refuse(
-                    "SetShadingRate: no Wire v3 command for shading-rate hints",
-                    None,
-                )
-            });
+            with_metal(this, |producer| producer.set_shading_rate(flags));
         }
     }
 
@@ -3470,12 +3464,9 @@ mod state {
                 Some(view) => {
                     super::bind_index_buffer(this, view.address, u64::from(view.size), view.format)
                 }
-                None => with_metal(this, |p| {
-                    p.refuse(
-                        "IASetIndexBuffer(null)",
-                        Some(victory_metal::wire_v3::OP_SET_INDEX_BUFFER),
-                    )
-                }),
+                // A null view is D3D12's legal unbind: clear the recorded
+                // binding (no wire command) and count it, never a refusal.
+                None => with_metal(this, |p| p.unbind_index_buffer()),
             }
             return;
         }

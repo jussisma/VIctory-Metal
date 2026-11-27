@@ -100,7 +100,8 @@ use victory_metal::wire_v3::{
     MAX_COLOR_ATTACHMENTS, MAX_COMMANDS_V3, MAX_INDIRECT_COMMANDS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
     MAX_VERTEX_BUFFERS, OP_BEGIN_RENDER_PASS, OP_COPY_BUFFER, OP_COPY_BUFFER_TO_TEXTURE,
     OP_COPY_TEXTURE, OP_COPY_TEXTURE_REGION, OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH,
-    OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH, OP_EXECUTE_INDIRECT_DRAW,
+    OP_DRAW_INDEXED_INSTANCED, OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+    OP_EXECUTE_INDIRECT_DRAW,
     OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_PRESENT, OP_RESOURCE_BARRIER,
     OP_ROOT_CONSTANTS, OP_SET_INDEX_BUFFER, OP_SET_PRIMITIVE_TOPOLOGY, OP_SET_ROOT_BUFFER_VIEW,
     OP_SET_SCISSOR, OP_SET_VIEWPORT, OP_SET_VERTEX_BUFFERS,
@@ -181,26 +182,102 @@ fn checked_identity(
     })
 }
 
-/// `IASetPrimitiveTopology`'s number as a version 3 topology.
+/// What `IASetPrimitiveTopology` asks the native path to do with one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologyChange {
+    /// A topology the Wire v3 stream expresses directly.
+    Map(PrimitiveTopology),
+    /// `D3D12_PRIMITIVE_TOPOLOGY_UNDEFINED`: leave the recorded topology alone.
+    Undefined,
+    /// A valid D3D12 value the Metal path cannot express (strips with
+    /// adjacency, control-point patch lists, or a reserved enum gap). It is an
+    /// accepted, non-fatal hint: the title keeps drawing with the topology it
+    /// last set, exactly as D3D12 "no change" state would.
+    Named(&'static str),
+}
+
+/// `IASetPrimitiveTopology`'s number as a [`TopologyChange`].
 ///
-/// Console-only topologies (rectangles, line loops, quads, quad strips) have
-/// no native equivalent: the D3D12 path draws them as a triangle list, but
-/// the native path refuses them instead of changing the geometry the title
-/// asked for.
-fn primitive_topology(value: u32) -> Result<PrimitiveTopology, ProducerError> {
+/// The full D3D12 enum is accepted: `0` is undefined (no change), `1..=5` map
+/// to the five Wire v3 topologies, adjacency (`10..=13`), control-point patch
+/// lists (`33..=64`) and the reserved gaps are named state hints, never
+/// refusals. A value outside `0..=64` is the only refusal.
+fn primitive_topology(value: u32) -> Result<TopologyChange, ProducerError> {
     Ok(match value {
-        1 => PrimitiveTopology::PointList,
-        2 => PrimitiveTopology::LineList,
-        3 => PrimitiveTopology::LineStrip,
-        4 => PrimitiveTopology::TriangleList,
-        5 => PrimitiveTopology::TriangleStrip,
+        0 => TopologyChange::Undefined,
+        1 => TopologyChange::Map(PrimitiveTopology::PointList),
+        2 => TopologyChange::Map(PrimitiveTopology::LineList),
+        3 => TopologyChange::Map(PrimitiveTopology::LineStrip),
+        4 => TopologyChange::Map(PrimitiveTopology::TriangleList),
+        5 => TopologyChange::Map(PrimitiveTopology::TriangleStrip),
+        10 => TopologyChange::Named("LINELIST_ADJ"),
+        11 => TopologyChange::Named("LINESTRIP_ADJ"),
+        12 => TopologyChange::Named("TRIANGLELIST_ADJ"),
+        13 => TopologyChange::Named("TRIANGLESTRIP_ADJ"),
+        33..=64 => TopologyChange::Named("a control-point patch list"),
+        6..=9 | 14..=32 => TopologyChange::Named("a reserved D3D12 topology value"),
         _ => {
             return Err(ProducerError::unsupported_opcode(
-                "IASetPrimitiveTopology: no native equivalent",
+                "IASetPrimitiveTopology: topology value outside the D3D12 enum",
                 OP_SET_PRIMITIVE_TOPOLOGY,
             ));
         }
     })
+}
+
+/// Draw-list state that D3D12 allows but Wire v3 has no command for.
+///
+/// These are hints or legal unbinds, not failures: counting them under their
+/// own names keeps a boot's refusal budget for real errors and makes the
+/// state changes visible in the log. A counter is logged at powers of two, so
+/// the log stays bounded however long a title runs.
+pub mod hint_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// `IASetIndexBuffer(null)`: the index buffer was unbound.
+    pub const DRAW_LIST_INDEX_UNBIND: usize = 0;
+    /// `SetPixelShaderDepthOrder`: a recorded depth-order hint.
+    pub const DEPTH_ORDER_HINTS: usize = 1;
+    /// `SetShadingRate`: a recorded shading-rate hint.
+    pub const SHADING_RATE_HINTS: usize = 2;
+    /// A topology D3D12 defines but Wire v3 cannot express.
+    pub const TOPOLOGY_HINTS: usize = 3;
+    /// `D3D12_PRIMITIVE_TOPOLOGY_UNDEFINED`: no change to the topology.
+    pub const TOPOLOGY_UNDEFINED: usize = 4;
+
+    /// The static counter names, in the order of the constants above.
+    pub const NAMES: [&str; 5] = [
+        "draw_list_index_unbind",
+        "depth_order_hints",
+        "shading_rate_hints",
+        "topology_hints",
+        "topology_undefined",
+    ];
+
+    static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
+
+    /// Counts one hint and logs the whole census at powers of two.
+    pub(crate) fn note(outcome: usize) -> u64 {
+        let count = COUNTS[outcome].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            let [index_unbind, depth_order, shading_rate, topology, undefined] =
+                std::array::from_fn(|i| COUNTS[i].load(Relaxed));
+            tracing::info!(
+                draw_list_index_unbind = index_unbind,
+                depth_order_hints = depth_order,
+                shading_rate_hints = shading_rate,
+                topology_hints = topology,
+                topology_undefined = undefined,
+                "draw-list hint census"
+            );
+        }
+        count
+    }
+
+    /// The counters, in [`NAMES`] order.
+    pub fn counts() -> [u64; NAMES.len()] {
+        std::array::from_fn(|i| COUNTS[i].load(Relaxed))
+    }
 }
 
 /// A DXGI index format number as a version 3 element width.
@@ -634,6 +711,10 @@ struct GraphicsState {
     constants: BTreeMap<u16, Vec<u8>>,
     views: BTreeMap<u16, RootBufferView>,
     tables: BTreeMap<(u16, u16), DescriptorTableV3>,
+    /// Last `SetPixelShaderDepthOrder` value, kept for a consistent read.
+    pixel_shader_depth_order: Option<u32>,
+    /// Last `SetShadingRate` value, kept for a consistent read.
+    shading_rate: Option<u32>,
 }
 
 /// Which parts of [`GraphicsState`] still need a command in the current pass.
@@ -703,6 +784,9 @@ pub struct MetalProducer {
     dirty: GraphicsDirty,
     graphics_root_signature: Option<u64>,
     compute_root_signature: Option<u64>,
+    /// An explicit `IASetIndexBuffer(null)` cleared the binding, so a
+    /// subsequent indexed draw has no buffer to read (a real error).
+    index_unbound: bool,
     compute_pipeline: Option<u64>,
     mesh_pipeline: Option<u64>,
     compute_constants: BTreeMap<u16, Vec<u8>>,
@@ -726,6 +810,7 @@ impl MetalProducer {
             dirty: GraphicsDirty::default(),
             graphics_root_signature: None,
             compute_root_signature: None,
+            index_unbound: false,
             compute_pipeline: None,
             mesh_pipeline: None,
             compute_constants: BTreeMap::new(),
@@ -1043,8 +1128,53 @@ impl MetalProducer {
     }
 
     /// `IASetPrimitiveTopology` with a D3D12 topology number.
+    ///
+    /// Every D3D12 value is accepted: the five Wire v3 topologies are recorded
+    /// as before, `UNDEFINED` leaves the recorded topology alone, and the
+    /// non-expressible values (adjacency, patch lists, reserved gaps) are
+    /// counted hints rather than a refusal of the whole list.
     pub fn set_topology_value(&mut self, topology: u32) -> Result<(), ProducerError> {
-        self.set_topology(primitive_topology(topology)?)
+        match primitive_topology(topology)? {
+            TopologyChange::Map(topology) => self.set_topology(topology),
+            TopologyChange::Undefined => {
+                hint_census::note(hint_census::TOPOLOGY_UNDEFINED);
+                Ok(())
+            }
+            TopologyChange::Named(_) => {
+                hint_census::note(hint_census::TOPOLOGY_HINTS);
+                Ok(())
+            }
+        }
+    }
+
+    /// `SetPixelShaderDepthOrder`: a hint Wire v3 carries no command for.
+    ///
+    /// The value is recorded so a later read sees what the title set, and the
+    /// call is counted; it never refuses and never drops a draw.
+    pub fn set_pixel_shader_depth_order(&mut self, order: u32) -> Result<(), ProducerError> {
+        self.graphics.pixel_shader_depth_order = Some(order);
+        hint_census::note(hint_census::DEPTH_ORDER_HINTS);
+        Ok(())
+    }
+
+    /// The last `SetPixelShaderDepthOrder` value, when the title set one.
+    pub fn pixel_shader_depth_order(&self) -> Option<u32> {
+        self.graphics.pixel_shader_depth_order
+    }
+
+    /// `SetShadingRate`: a hint Wire v3 carries no command for.
+    ///
+    /// Recorded and counted like [`set_pixel_shader_depth_order`], never a
+    /// refusal.
+    pub fn set_shading_rate(&mut self, flags: u32) -> Result<(), ProducerError> {
+        self.graphics.shading_rate = Some(flags);
+        hint_census::note(hint_census::SHADING_RATE_HINTS);
+        Ok(())
+    }
+
+    /// The last `SetShadingRate` value, when the title set one.
+    pub fn shading_rate(&self) -> Option<u32> {
+        self.graphics.shading_rate
     }
 
     /// `IASetPrimitiveTopology` with a version 3 topology.
@@ -1195,6 +1325,21 @@ impl MetalProducer {
         ResourceId::new(binding.allocation_id, binding.generation)?;
         self.graphics.index = Some(binding);
         self.dirty.index = true;
+        self.index_unbound = false;
+        Ok(())
+    }
+
+    /// `IASetIndexBuffer(null)`: unbind the index buffer.
+    ///
+    /// Wire v3 has no unbind command, so this only clears the recorded binding;
+    /// nothing is emitted. It is a legal D3D12 unbind, not a refusal, and is
+    /// counted as [`hint_census::DRAW_LIST_INDEX_UNBIND`]. A later indexed draw
+    /// has no buffer to read and is refused then, which is a real error.
+    pub fn unbind_index_buffer(&mut self) -> Result<(), ProducerError> {
+        self.graphics.index = None;
+        self.dirty.index = false;
+        self.index_unbound = true;
+        hint_census::note(hint_census::DRAW_LIST_INDEX_UNBIND);
         Ok(())
     }
 
@@ -1220,6 +1365,7 @@ impl MetalProducer {
             format: index_format(format)?,
         });
         self.dirty.index = true;
+        self.index_unbound = false;
         Ok(())
     }
 
@@ -1403,6 +1549,12 @@ impl MetalProducer {
     ) -> Result<(), ProducerError> {
         if index_count == 0 || instance_count == 0 {
             return Ok(());
+        }
+        if self.graphics.index.is_none() && self.index_unbound {
+            return Err(ProducerError::unsupported_opcode(
+                "DrawIndexed: no index buffer after IASetIndexBuffer(null)",
+                OP_DRAW_INDEXED_INSTANCED,
+            ));
         }
         self.require_graphics_pipeline()?;
         self.open_pass("draw")?;
@@ -3656,8 +3808,8 @@ mod tests {
             .expect_err("a dispatch with no compute pipeline is refused");
         assert_eq!(error, ProducerError::MissingPipeline { stage: "compute" });
         let error = producer
-            .set_topology_value(17)
-            .expect_err("console rectangles have no native topology");
+            .set_topology_value(65)
+            .expect_err("a value outside the D3D12 enum has no topology");
         assert!(matches!(error, ProducerError::Unsupported { .. }));
         let error = producer
             .refuse("ExecuteIndirect", None)
@@ -4673,5 +4825,229 @@ mod tests {
             producer.commands().is_empty(),
             "a refusal leaves no command"
         );
+    }
+
+    // ------------------------------------------ draw-list hint state (Boot #13)
+
+    /// The four Boot #13 draw-list calls are state changes, not refusals: a
+    /// null index buffer unbinds, the two hints record their value, and both
+    /// the undefined topology and an adjacency topology are accepted without a
+    /// command. No named refusal is counted and no command is emitted.
+    #[test]
+    fn the_four_boot_refusal_cases_are_named_counters_not_refusals() {
+        let before = hint_census::counts();
+        let refusals_before = crate::native_metal::telemetry::named_refusal_histogram();
+        let mut producer = MetalProducer::new(40, 1).expect("producer");
+
+        producer.unbind_index_buffer().expect("a null index is a legal unbind");
+        producer
+            .set_pixel_shader_depth_order(2)
+            .expect("a depth-order hint");
+        producer.set_shading_rate(3).expect("a shading-rate hint");
+        producer
+            .set_topology_value(0)
+            .expect("UNDEFINED is no change");
+        producer
+            .set_topology_value(10)
+            .expect("adjacency is a named hint");
+
+        assert_eq!(
+            producer.pixel_shader_depth_order(),
+            Some(2),
+            "the depth-order value is recorded"
+        );
+        assert_eq!(
+            producer.shading_rate(),
+            Some(3),
+            "the shading-rate value is recorded"
+        );
+        assert!(
+            producer.graphics.topology.is_none(),
+            "neither UNDEFINED nor an adjacency hint changes the topology"
+        );
+        assert!(
+            producer.commands().is_empty(),
+            "none of the four emits a wire command"
+        );
+
+        let after = hint_census::counts();
+        assert_eq!(
+            [
+                after[hint_census::DRAW_LIST_INDEX_UNBIND]
+                    - before[hint_census::DRAW_LIST_INDEX_UNBIND],
+                after[hint_census::DEPTH_ORDER_HINTS] - before[hint_census::DEPTH_ORDER_HINTS],
+                after[hint_census::SHADING_RATE_HINTS] - before[hint_census::SHADING_RATE_HINTS],
+                after[hint_census::TOPOLOGY_HINTS] - before[hint_census::TOPOLOGY_HINTS],
+                after[hint_census::TOPOLOGY_UNDEFINED] - before[hint_census::TOPOLOGY_UNDEFINED],
+            ],
+            [1, 1, 1, 1, 1],
+            "every accepted call is counted under its own name"
+        );
+        assert_eq!(
+            crate::native_metal::telemetry::named_refusal_histogram(),
+            refusals_before,
+            "none of the four is a refusal"
+        );
+    }
+
+    /// Every value of the D3D12 primitive-topology enum (`0..=64`) is either
+    /// mapped to a Wire v3 topology or accepted as a named hint: zero refusals.
+    #[test]
+    fn every_d3d12_topology_value_is_mapped_or_an_accepted_hint() {
+        let refusals_before = crate::native_metal::telemetry::named_refusal_histogram();
+        let mut mapped = 0;
+        let mut hints = 0;
+        let mut undefined = 0;
+        for value in 0..=64u32 {
+            let before = hint_census::counts();
+            let mut producer = MetalProducer::new(41, 1).expect("producer");
+            producer
+                .set_topology_value(value)
+                .unwrap_or_else(|error| panic!("topology {value} was refused: {error}"));
+
+            let expected = match value {
+                0 => {
+                    undefined += 1;
+                    None
+                }
+                1 => {
+                    mapped += 1;
+                    Some(PrimitiveTopology::PointList)
+                }
+                2 => {
+                    mapped += 1;
+                    Some(PrimitiveTopology::LineList)
+                }
+                3 => {
+                    mapped += 1;
+                    Some(PrimitiveTopology::LineStrip)
+                }
+                4 => {
+                    mapped += 1;
+                    Some(PrimitiveTopology::TriangleList)
+                }
+                5 => {
+                    mapped += 1;
+                    Some(PrimitiveTopology::TriangleStrip)
+                }
+                _ => {
+                    hints += 1;
+                    None
+                }
+            };
+            assert_eq!(
+                producer.graphics.topology, expected,
+                "topology {value} recorded the wrong mapping"
+            );
+            let after = hint_census::counts();
+            assert_eq!(
+                after[hint_census::TOPOLOGY_HINTS] > before[hint_census::TOPOLOGY_HINTS],
+                value > 5,
+                "topology {value} hint count"
+            );
+            assert_eq!(
+                after[hint_census::TOPOLOGY_UNDEFINED] > before[hint_census::TOPOLOGY_UNDEFINED],
+                value == 0,
+                "topology {value} undefined count"
+            );
+            assert!(
+                producer.commands().is_empty(),
+                "topology {value} emits no command before a draw"
+            );
+        }
+        assert_eq!((mapped, hints, undefined), (5, 59, 1));
+        assert_eq!(
+            crate::native_metal::telemetry::named_refusal_histogram(),
+            refusals_before,
+            "the whole enum is accepted without a refusal"
+        );
+    }
+
+    /// A valid topology still lowers to the same `SetPrimitiveTopology` command
+    /// as before: accepting the rest of the enum changes nothing for `1..=5`.
+    #[test]
+    fn a_mapped_topology_still_emits_the_same_wire_command() {
+        for (value, expected) in [
+            (1, PrimitiveTopology::PointList),
+            (2, PrimitiveTopology::LineList),
+            (3, PrimitiveTopology::LineStrip),
+            (4, PrimitiveTopology::TriangleList),
+            (5, PrimitiveTopology::TriangleStrip),
+        ] {
+            let mut producer = MetalProducer::new(42, 1).expect("producer");
+            let (colors, depth) = targets();
+            producer
+                .set_render_targets(&colors, depth)
+                .expect("render targets");
+            producer.set_pipeline(0x900).expect("pipeline");
+            producer
+                .set_topology_value(value)
+                .expect("a mapped topology");
+            producer.draw(3, 1, 0, 0).expect("draw");
+
+            let submission = flush_for_wire(&mut producer);
+            assert!(
+                submission.commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        CommandV3::SetPrimitiveTopology(topology) if *topology == expected
+                    )
+                }),
+                "topology {value} did not emit {expected:?}"
+            );
+        }
+    }
+
+    /// `IASetIndexBuffer(null)` after a valid binding clears it without a
+    /// command; the following indexed draw then has no buffer to read and is
+    /// refused by name (that one is a real error). Re-binding clears the error
+    /// state again.
+    #[test]
+    fn a_null_index_unbind_clears_the_binding_and_a_later_indexed_draw_refuses() {
+        let mut producer = MetalProducer::new(43, 1).expect("producer");
+        producer
+            .set_index_buffer_at(0x20_0000, 256, 57)
+            .expect("a valid index buffer");
+        let before = hint_census::counts();
+        producer
+            .unbind_index_buffer()
+            .expect("a null index is a legal unbind");
+        assert_eq!(producer.graphics.index, None, "the binding was cleared");
+        assert!(
+            producer.commands().is_empty(),
+            "an unbind emits no wire command"
+        );
+        let after = hint_census::counts();
+        assert_eq!(
+            after[hint_census::DRAW_LIST_INDEX_UNBIND]
+                - before[hint_census::DRAW_LIST_INDEX_UNBIND],
+            1,
+            "the unbind is counted by name"
+        );
+
+        let error = producer
+            .draw_indexed(3, 1, 0, 0, 0)
+            .expect_err("an indexed draw with no index buffer is a real error");
+        assert_eq!(
+            error.operation(),
+            Some("DrawIndexed: no index buffer after IASetIndexBuffer(null)")
+        );
+        assert_eq!(error.opcode(), Some(OP_DRAW_INDEXED_INSTANCED));
+        assert!(
+            producer.commands().is_empty(),
+            "the refused draw leaves no command"
+        );
+
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        producer
+            .set_index_buffer_at(0x20_0000, 256, 57)
+            .expect("re-bound index buffer");
+        producer
+            .draw_indexed(3, 1, 0, 0, 0)
+            .expect("a re-bound index buffer draws again");
     }
 }
