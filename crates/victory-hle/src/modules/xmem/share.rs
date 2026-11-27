@@ -1,16 +1,21 @@
 //! Opt-in host-visible backing for XMem physical pages.
 //!
-//! Production XMem physical pages live in the pagefile, which another
-//! process cannot name. A native host process (the Metal renderer) needs a
-//! file it can map: set `VICTORY_METAL_SHARE_DIR` to a session-private,
-//! Win-visible directory and every physical-page allocation is backed by a
-//! file there instead. The guest still maps those pages through the existing
+//! By default XMem physical pages live in the pagefile, which another process
+//! cannot name. A native host process (the Metal renderer) needs a file it can
+//! map: set `VICTORY_METAL_SHARE_DIR` to a session-private, Win-visible
+//! directory and every physical-page allocation is backed by a file there
+//! instead. This holds in every build, the diagnostics guest the launcher runs
+//! included. The guest still maps those pages through the existing
 //! placeholder views; only the backing changes.
 //!
 //! The directory is the whole contract: it must belong to this session and
 //! be cleaned up by the harness. Files are named `{id:016x}.bin`, where the
 //! id is monotonic and never reused. [`Backing::generation`] is fixed at 1
 //! for this first protocol, so a stale id can never name a new allocation.
+//! The directory is resolved once per process, at the first section creation,
+//! so a session that sets it before D3D12 device creation needs no later
+//! lookup. Tests (and only tests) re-read it so one can set or clear the
+//! variable between sections.
 //!
 //! Unset (or empty), the provider is off and the pagefile path is unchanged.
 //! A configured provider that cannot create or map its file falls back to the
@@ -26,7 +31,10 @@
 //!
 //! Sparse files matter here: the console allocates multi-GiB heaps, so the
 //! file is sized with `set_len` and its pages are never written ahead of the
-//! guest. Only small synthetic sizes are exercised by the tests below.
+//! guest. An allocation whose size is not a whole number of 64 KiB pages is
+//! rounded up for the file only; its section keeps the real size, so the
+//! padding tail is never guest-visible. Only small synthetic sizes are
+//! exercised by the tests below.
 //!
 //! A resolved [`Lease`] may be retained for a submission with
 //! [`Lease::retain`]. The registry keeps the section, and with it the share
@@ -49,8 +57,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 use super::{PAGE, Section};
 
@@ -85,6 +95,16 @@ pub(crate) const SUBMISSIONS_CAPACITY_ENV: &str = "VICTORY_XMEM_RETIRED_CAPACITY
 /// The next share id; ids are monotonic and never reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Share backings alive in this process. Every one owns a file in the share
+/// directory, so the count makes a leaked section observable in the
+/// diagnostics trace.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of share files currently backing a live section.
+pub(crate) fn live() -> usize {
+    LIVE.load(Ordering::Relaxed)
+}
+
 /// A host-visible file behind one physical-page section.
 ///
 /// Dropping it closes the file handle but never unlinks the file: a host
@@ -99,12 +119,32 @@ pub(crate) struct Backing {
     _file: File,
 }
 
+impl Backing {
+    /// Takes ownership of a fresh share file and counts it as live until the
+    /// last lease and section drop it.
+    fn new(id: u64, generation: u64, path: PathBuf, file: File) -> Arc<Self> {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Backing {
+            id,
+            generation,
+            path,
+            _file: file,
+        })
+    }
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Why a configured share provider could not back an allocation.
 #[derive(Debug)]
 pub(crate) enum Failure {
     /// `VICTORY_METAL_SHARE_DIR` is unset or empty.
     Unconfigured,
-    /// Size is zero or not whole 64 KiB pages.
+    /// Size is zero or rounding it up to whole 64 KiB pages overflows.
     Size(usize),
     /// The directory could not be created.
     Directory { path: PathBuf, error: io::Error },
@@ -122,7 +162,12 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::Unconfigured => write!(f, "{DIRECTORY} is not set"),
-            Failure::Size(size) => write!(f, "{size} is not a non-zero multiple of {PAGE}"),
+            Failure::Size(size) => {
+                write!(
+                    f,
+                    "{size} is zero or cannot be rounded up to whole {PAGE}-byte pages"
+                )
+            }
             Failure::Directory { path, error } => {
                 write!(f, "creating {} failed: {error}", path.display())
             }
@@ -685,13 +730,42 @@ impl std::fmt::Display for ResolveError {
     }
 }
 
-/// The configured directory, if any. Read per allocation rather than cached:
-/// the variable is the session's switch, and tests and tools set it around a
-/// run.
-fn directory() -> Option<PathBuf> {
+// A test's per-thread share directory override: `Some(Some(path))` configures
+// the provider and `Some(None)` forces it unconfigured, whatever the process
+// environment says. Absent, the tests fall back to the variable itself.
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_OVERRIDE: std::cell::RefCell<Option<Option<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The directory variable as this process currently sees it.
+fn read_directory() -> Option<PathBuf> {
     std::env::var_os(DIRECTORY)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// The configured directory, if any.
+///
+/// A non-test build resolves it once, at the first section creation, so every
+/// later section sees the same session directory even if something changes
+/// the environment (the launcher sets it before the process starts). Tests
+/// re-read it so a test can set or clear the variable between sections, and
+/// they may install a thread-local override instead.
+fn directory() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(directory) = DIRECTORY_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return directory;
+        }
+        return read_directory();
+    }
+    #[cfg(not(test))]
+    {
+        static RESOLVED: OnceLock<Option<PathBuf>> = OnceLock::new();
+        RESOLVED.get_or_init(read_directory).clone()
+    }
 }
 
 /// A fresh, monotonic, non-zero id. `None` only if the counter would wrap.
@@ -701,34 +775,44 @@ fn next_id() -> Option<u64> {
         .ok()
 }
 
-/// Backs a new physical-page section of `size` with a file in the configured
-/// directory and maps it.
+/// Backs a new physical-page section of `size` bytes with a file in the
+/// configured directory and maps it.
 ///
-/// The caller falls back to the pagefile on any error; the error stays
-/// precise so the fallback is never mistaken for a shared section. A file
-/// created before a later failure remains on disk for harness cleanup (it is
-/// never reused, because ids are not).
+/// `size` is the allocation's real size. The file and its section are sized to
+/// the next whole 64 KiB page instead, but the returned [`Section`] keeps
+/// `size`, so the padding tail is never guest-visible. The caller falls back
+/// to the pagefile on any error; the error stays precise so the fallback is
+/// never mistaken for a shared section. A file created before a later failure
+/// is removed again, so a failed allocation leaves no file for a section that
+/// never existed.
 pub(crate) fn section(size: usize) -> Result<Arc<Section>, Failure> {
     install_if_metal();
     let Some(directory) = directory() else {
         return Err(Failure::Unconfigured);
     };
-    if size == 0 || !size.is_multiple_of(PAGE) {
+    if size == 0 {
         return Err(Failure::Size(size));
     }
+    let map_size = size
+        .checked_next_multiple_of(PAGE)
+        .ok_or(Failure::Size(size))?;
     std::fs::create_dir_all(&directory).map_err(|error| Failure::Directory {
         path: directory.clone(),
         error,
     })?;
-    let (id, file, path) = create_file(&directory, size)?;
-    let backing = Arc::new(Backing {
-        id,
-        generation: GENERATION,
-        path,
-        _file: file,
-    });
-    super::file_section(&backing._file, size, Some(backing.clone()))
-        .ok_or_else(|| Failure::Mapping(io::Error::last_os_error()))
+    let (id, file, path) = create_file(&directory, map_size)?;
+    let backing = Backing::new(id, GENERATION, path, file);
+    match super::file_section_sized(&backing._file, size, map_size, Some(backing.clone())) {
+        Some(section) => Ok(section),
+        None => {
+            let error = io::Error::last_os_error();
+            let path = backing.path.clone();
+            drop(backing);
+            // Nothing can have leased a section that was never returned.
+            let _ = std::fs::remove_file(&path);
+            Err(Failure::Mapping(error))
+        }
+    }
 }
 
 /// Creates and sizes the share file, never writing its contents. A name that
@@ -748,10 +832,13 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
         {
             Ok(file) => {
                 // Sizing is not writing: a multi-GiB heap must stay sparse.
-                file.set_len(size as u64).map_err(|error| Failure::Length {
-                    path: path.clone(),
-                    error,
-                })?;
+                if let Err(error) = file.set_len(size as u64) {
+                    drop(file);
+                    // No section exists yet, so the file must not outlive the
+                    // failed allocation.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(Failure::Length { path, error });
+                }
                 return Ok((id, file, path));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -844,7 +931,7 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
             generation: backing.generation,
             offset: offset as u64,
             length: length as u64,
-            file_size: section.size as u64,
+            file_size: section.map_size as u64,
         },
         path: backing.path.clone(),
         section,
@@ -1084,15 +1171,197 @@ mod tests {
         at
     }
 
+    /// Sets this thread's share directory for section-creating calls, restoring
+    /// the previous override on drop. `unconfigured` forces the provider off
+    /// even when the harness set the variable.
+    struct ShareDirectory(Option<Option<PathBuf>>);
+
+    impl ShareDirectory {
+        fn configured(path: &Path) -> Self {
+            Self::install(Some(Some(path.to_path_buf())))
+        }
+
+        fn unconfigured() -> Self {
+            Self::install(Some(None))
+        }
+
+        fn install(directory: Option<Option<PathBuf>>) -> Self {
+            let previous = DIRECTORY_OVERRIDE.with(|slot| slot.replace(directory));
+            ShareDirectory(previous)
+        }
+    }
+
+    impl Drop for ShareDirectory {
+        fn drop(&mut self) {
+            DIRECTORY_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Every build, the diagnostics guest included, takes the share path when
+    /// the directory is configured: the section owns a backing and a tracked
+    /// view resolves to it.
+    #[test]
+    fn configured_directory_backs_sections_in_every_build() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let before = live();
+        let pages = allocate(2);
+        assert_eq!(live(), before + 1, "the new section counts as live");
+        let at = reserve(2 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(at, 2, pages.as_ptr()), at);
+
+        {
+            let physical = super::super::physical();
+            let section = &physical
+                .pages
+                .get(&pages[0])
+                .expect("a tracked page")
+                .section;
+            assert!(
+                section.share.is_some(),
+                "the section must have a share backing"
+            );
+            assert_eq!(section.size, 2 * PAGE);
+            assert_eq!(section.map_size, 2 * PAGE);
+        }
+
+        let lease = resolve_guest_range(at as usize, PAGE).expect("a tracked view resolves");
+        assert_eq!(lease.range.offset, 0);
+        assert_eq!(lease.range.length, PAGE as u64);
+        assert_eq!(lease.file_size(), (2 * PAGE) as u64);
+        assert_eq!(lease.path().parent(), Some(directory.path()));
+        drop(lease);
+
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(live(), before, "freeing the pages releases the share backing");
+    }
+
+    /// A non-page-multiple allocation must still take the provider: the file
+    /// is rounded up to whole pages, while `Section::size` keeps the guest's
+    /// real size so the padding tail never resolves.
+    #[test]
+    fn non_page_multiple_sizes_round_up_instead_of_falling_back() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let size = PAGE + 0x321;
+        let section = super::super::new_section(size).expect("a share-backed section");
+        assert!(
+            section.share.is_some(),
+            "a rounded size must not silently downgrade to the pagefile"
+        );
+        assert_eq!(section.size, size, "the guest size is unchanged");
+        assert_eq!(section.map_size, 2 * PAGE, "the backing is whole pages");
+        let path = section.share.as_ref().expect("a backing").path.clone();
+        assert_eq!(
+            std::fs::metadata(&path).expect("the share file").len(),
+            (2 * PAGE) as u64
+        );
+
+        let view = FakeView::install(
+            FAKE,
+            2 * PAGE,
+            super::super::Slice {
+                section: section.clone(),
+                index: 0,
+            },
+        );
+        let lease = resolve_guest_range(FAKE, PAGE).expect("the real page resolves");
+        assert_eq!((lease.range.offset, lease.range.length), (0, PAGE as u64));
+        assert_eq!(lease.file_size(), (2 * PAGE) as u64);
+        assert_eq!(
+            resolve_guest_range(FAKE + PAGE, PAGE).unwrap_err(),
+            ResolveError::OutOfBounds,
+            "the padded page must not be guest-visible"
+        );
+        drop((lease, view));
+    }
+
+    /// With no directory, sections stay pagefile-backed and the resolver says
+    /// so explicitly.
+    #[test]
+    fn an_unconfigured_directory_leaves_sections_on_the_pagefile() {
+        let _share = ShareDirectory::unconfigured();
+        let pages = allocate(1);
+        let at = reserve(PAGE);
+        assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_ptr()), at);
+        {
+            let physical = super::super::physical();
+            let section = &physical
+                .pages
+                .get(&pages[0])
+                .expect("a tracked page")
+                .section;
+            assert!(section.share.is_none(), "no provider, no share backing");
+        }
+        assert_eq!(
+            resolve_guest_range(at as usize, PAGE).unwrap_err(),
+            ResolveError::Pagefile
+        );
+        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// A provider that fails leaves an explicit pagefile section, never a
+    /// fabricated share range.
+    #[test]
+    fn a_failed_provider_is_a_pagefile_error_not_a_fabricated_range() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let not_a_directory = directory.path().join("regular-file");
+        std::fs::write(&not_a_directory, b"x").expect("a regular file");
+        let _share = ShareDirectory::configured(&not_a_directory);
+
+        let pages = allocate(1);
+        let at = reserve(PAGE);
+        assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_ptr()), at);
+        {
+            let physical = super::super::physical();
+            let section = &physical
+                .pages
+                .get(&pages[0])
+                .expect("a tracked page")
+                .section;
+            assert!(section.share.is_none(), "a failed provider has no backing");
+        }
+        assert_eq!(
+            resolve_guest_range(at as usize, PAGE).unwrap_err(),
+            ResolveError::Pagefile
+        );
+        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// A provider-backed section keeps a lease alive through page-free and
+    /// unmap, and retirement still drops it.
+    #[test]
+    fn provider_backed_sections_keep_leases_until_retirement() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let pages = allocate(1);
+        let at = reserve(PAGE);
+        assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_ptr()), at);
+
+        let lease = resolve_guest_range(at as usize, PAGE).expect("the view resolves");
+        let id = lease.range.id;
+        let submission = fresh_submission();
+        let key = lease.retain(submission).expect("the lease retains");
+        drop(lease);
+
+        // No page numbers and no view remain: only the registry's reference
+        // keeps the section and its share file alive.
+        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(is_retained(key), "the retained range keeps the backing");
+        assert!(retained(submission, id, GENERATION, 0, PAGE as u64).is_ok());
+        assert_eq!(retire(submission).expect("retire the submission"), 1);
+        assert!(!is_retained(key), "retirement drops the retained range");
+    }
+
     /// The production wiring: a configured share directory backs physical
     /// pages with a named file, and a tracked guest range resolves to that
     /// file's id, offset and length. No GPU work.
     #[test]
     fn configured_directory_backs_pages_and_resolves_guest_ranges() {
-        if cfg!(feature = "diagnostics") {
-            eprintln!("skipped: diagnostic heaps keep the pagefile path");
-            return;
-        }
         let Ok(directory) = std::env::var(DIRECTORY) else {
             eprintln!("skipped: {DIRECTORY} is not set");
             return;
@@ -1218,10 +1487,6 @@ mod tests {
     /// section.
     #[test]
     fn byte_ranges_cross_adjacent_views_and_refuse_rounding_grants() {
-        if cfg!(feature = "diagnostics") {
-            eprintln!("skipped: diagnostic heaps keep the pagefile path");
-            return;
-        }
         let Ok(directory) = std::env::var(DIRECTORY) else {
             eprintln!("skipped: {DIRECTORY} is not set");
             return;
@@ -1318,10 +1583,12 @@ mod tests {
             ResolveError::OutOfBounds,
             "rounding the last byte up would overflow"
         );
-        // The byte past the last mapped page is not granted by rounding.
-        assert_eq!(
-            resolve_guest_range(at as usize + 4 * PAGE - 1, 2).unwrap_err(),
-            ResolveError::NotMapped
+        // The byte past the last mapped page is not granted by rounding. An
+        // adjacent view of another section may make the refusal
+        // `NotContiguous` rather than `NotMapped`; either way it must refuse.
+        assert!(
+            resolve_guest_range(at as usize + 4 * PAGE - 1, 2).is_err(),
+            "the byte past the last mapped page must not be granted by rounding"
         );
 
         drop((crossing, subrange, tail));
@@ -1392,12 +1659,12 @@ mod tests {
             .expect("a share file");
         let size = pages * PAGE;
         file.set_len(size as u64).expect("the share file's length");
-        let backing = Arc::new(Backing {
+        let backing = Backing::new(
             id,
             generation,
-            path: path.clone(),
-            _file: file.try_clone().expect("a copy"),
-        });
+            path.clone(),
+            file.try_clone().expect("a copy"),
+        );
         let section =
             super::super::file_section(&file, size, Some(backing)).expect("a share section");
         (section, path)
