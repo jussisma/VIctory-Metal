@@ -5,13 +5,16 @@
 # machine-readable ready line, telemetry and process hygiene. This script only:
 #   * builds the Win64 diag victory.exe, the ARM64 victory_metal_host and the
 #     x86_64 victory-irconverter when they are missing or older than the tree,
-#   * exports VICTORY_BACKEND=metal (never a D3DMetal DLL override),
+#   * resolves VICTORY_BACKEND (metal by default, d3d12 for the D3D12 host
+#     reference) and never forces a D3DMetal DLL override of its own,
 #   * bounds the delegated run with GUEST_TIMEOUT and a hard outer guard,
-#   * prints its own summary with backend, endpoint, share dir and fence page.
+#   * prints its own summary with backend, endpoint, share dir and fence page,
+#   * removes the diagnostics directory it created itself unless the caller
+#     passes --keep-session (a caller-supplied --out is never removed).
 #
 # Usage:
 #   victory-metal.sh [--window|--headless] [--timeout SEC] [--frames N]
-#                    [--out DIR] [--keep] [--dry-run] [--exe PATH]
+#                    [--out DIR] [--keep-session] [--dry-run] [--exe PATH]
 #                    [-- guest args...]
 #
 #   --exe PATH    guest executable passed to `victory.exe run` (default: the
@@ -24,8 +27,13 @@
 #                 delegate reap the daemon and Wine after the guest stops.
 #   --frames N    diagnostic frame count (VICTORY_FRAME_MEASURED, default 120)
 #   --out DIR     build.log, launcher.log, host.log, guest.log, telemetry.json
-#                 and summary.txt (default: a fresh mktemp directory)
-#   --keep        keep the isolated session directory (share dir, Wine prefix)
+#                 and summary.txt (default: this run's own mktemp directory,
+#                 removed on exit unless --keep-session). A caller-supplied
+#                 directory is kept and never removed.
+#   --keep-session keep the session and the default --out directory. `--keep`,
+#                 VICTORY_KEEP_LOGS=1 and VICTORY_KEEP_SESSION=1 are the same
+#                 opt-in (historical aliases); removal is the default on every
+#                 exit path.
 #   --dry-run     print the resolved command and exported environment; build
 #                 nothing, start no daemon and touch no GPU
 #   --window      native window presentation
@@ -34,9 +42,22 @@
 #
 # Everything after `--` is forwarded to the guest after `--execute`.
 #
+# Backend (VICTORY_BACKEND):
+#   metal (default)  the native ARM64 path: the delegate starts the daemon.
+#   d3d12            the D3D12 host reference path, which is what
+#                    metal-poc/abi-diff.py diffs the native guest ABI against.
+#   Any other value is a usage error before a binary is built or a temp dir is
+#   created. The resolved value is printed by --dry-run, in the summary and in
+#   the delegate's `LAUNCH_ENV backend=` line.
+#
 # Delegation:
-#   run-title-metal.sh <mode> --frames N --out DIR [--keep] --print-env \
+#   run-title-metal.sh <mode> --frames N --out DIR [--keep-session] --print-env \
 #       -- <victory.exe> run <guest> --execute [guest args...]
+#
+# VICTORY_LAUNCHER_RUNNER overrides only the delegate executable (default:
+# tools/macos/metal-poc/run-title-metal.sh) so the launcher contract can be
+# tested hermetically. The wrapper still owns its temp directory, its signals,
+# its outer guard and the exit code; the override cannot make it skip those.
 #
 # Exit codes:
 #   0    the delegated run PASSed
@@ -47,13 +68,16 @@
 #        11 D3DMetal fallback observed, 12 gate report partial, 13 orphan
 #        survived, 14 host exited, 15 summary lost, 130/143/129 signal.
 #
-# The session secret is never printed or logged. Teardown belongs entirely to
-# run-title-metal.sh; this wrapper only waits for it and propagates its status.
+# The session secret is never printed or logged. Teardown of the guest session
+# belongs entirely to run-title-metal.sh; this wrapper waits for it, propagates
+# its status and removes only the --out directory it created itself.
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SELF_DIR/../.." && pwd)"
-RUNNER="$ROOT/tools/macos/metal-poc/run-title-metal.sh"
+# VICTORY_LAUNCHER_RUNNER replaces only the delegate executable (tests use a
+# stub); the wrapper's own hygiene, guard and exit propagation stay in place.
+RUNNER="${VICTORY_LAUNCHER_RUNNER:-$ROOT/tools/macos/metal-poc/run-title-metal.sh}"
 START_DIR="$(pwd)"
 # Homebrew's rustup is keg-only; put it first like the other macOS harnesses.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
@@ -74,10 +98,12 @@ TIMEOUT=""
 FRAMES=120
 OUT_ARG=""
 OUT=""
+OUT_OWNED=0
 KEEP=0
 DRY_RUN=0
 EXE=""
 GUEST=""
+BACKEND="metal"
 MODE="headless"
 MODE_FLAG="--headless"
 GUARD_SECONDS=""
@@ -92,7 +118,7 @@ FENCE_PAGE_RESOLVED=""
 usage() {
     cat <<'USAGE'
 usage: victory-metal.sh [--window|--headless] [--timeout SEC] [--frames N]
-                        [--out DIR] [--keep] [--dry-run] [--exe PATH]
+                        [--out DIR] [--keep-session] [--dry-run] [--exe PATH]
                         [-- guest args...]
 
   --exe PATH    guest executable passed to `victory.exe run` (default: the
@@ -100,11 +126,15 @@ usage: victory-metal.sh [--window|--headless] [--timeout SEC] [--frames N]
   --timeout SEC bound the run with GUEST_TIMEOUT=SEC and a hard outer guard
   --frames N    diagnostic frame count (default 120)
   --out DIR     build/launcher/host/guest logs, telemetry and summary.txt here
-  --keep        keep the isolated session directory (share dir, Wine prefix)
+  --keep-session keep the session and the default --out directory (--keep,
+                VICTORY_KEEP_LOGS=1 and VICTORY_KEEP_SESSION=1 alias it)
   --dry-run     print the resolved command and environment; do nothing else
   --window      open the native window
   --headless    force headless presentation (default); conflicts with --window
   -h, --help
+
+VICTORY_BACKEND selects the guest backend: metal (default) or d3d12 (the D3D12
+host reference path). Any other value is a usage error.
 USAGE
 }
 
@@ -141,7 +171,7 @@ while [ "$#" -gt 0 ]; do
             OUT_ARG="$2"
             shift 2
             ;;
-        --keep)
+        --keep-session|--keep)
             KEEP=1
             shift
             ;;
@@ -183,6 +213,29 @@ case "$FRAMES" in
     ""|*[!0-9]*|0) fail_usage "--frames must be a positive integer" ;;
 esac
 
+# Resolve the delegate backend before a binary is built or a temp dir exists,
+# so a typo is a usage error that leaves nothing behind. An inherited value
+# selects the D3D12 host reference path; the default stays the native metal
+# path exactly as before.
+case "${VICTORY_BACKEND:-metal}" in
+    metal) BACKEND=metal ;;
+    d3d12) BACKEND=d3d12 ;;
+    *)
+        echo "victory-metal.sh: unsupported VICTORY_BACKEND=${VICTORY_BACKEND:-} (expected metal or d3d12)" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+export VICTORY_BACKEND="$BACKEND"
+
+# The delegate is exec'd directly, so it must be a real executable file. This
+# only selects the process; signal forwarding, the outer guard and this
+# wrapper's own temp-dir hygiene are unaffected.
+if [ ! -f "$RUNNER" ] || [ ! -x "$RUNNER" ]; then
+    echo "victory-metal.sh: VICTORY_LAUNCHER_RUNNER is not an executable file: $RUNNER" >&2
+    exit 3
+fi
+
 if [ "$WINDOW" = 1 ]; then
     MODE=window
     MODE_FLAG=--window
@@ -199,16 +252,92 @@ case "$GUEST" in
     *) GUEST="$START_DIR/$GUEST" ;;
 esac
 
+# --- Teardown --------------------------------------------------------------
+# Installed before this run creates any path, so every exit status (including a
+# usage check that fails after the temp dir exists) removes what it owns. The
+# delegate removes its own session; this wrapper removes only the --out
+# directory it created itself.
+stop_watchdog() {
+    if [ -n "${WATCHDOG:-}" ]; then
+        kill "$WATCHDOG" 2>/dev/null || true
+        wait "$WATCHDOG" 2>/dev/null || true
+        WATCHDOG=""
+    fi
+}
+
+forward_and_exit() {
+    status=$1
+    trap '' INT TERM HUP
+    if [ -n "${CHILD:-}" ]; then
+        kill -TERM "$CHILD" 2>/dev/null || true
+        waited=0
+        while kill -0 "$CHILD" 2>/dev/null && [ "$waited" -lt 100 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+        kill -KILL "$CHILD" 2>/dev/null || true
+        wait "$CHILD" 2>/dev/null || true
+        CHILD=""
+    fi
+    stop_watchdog
+    exit "$status"
+}
+
+# --keep-session and its historical aliases.
+keep_session() {
+    if [ "${VICTORY_KEEP_LOGS:-0}" = 1 ] || [ "${VICTORY_KEEP_SESSION:-0}" = 1 ] || [ "${KEEP:-0}" = 1 ]; then
+        return 0
+    fi
+    return 1
+}
+
+wrapper_cleanup() {
+    status=$?
+    trap '' INT TERM HUP
+    set +e
+    stop_watchdog
+    if [ "${OUT_OWNED:-0}" = 1 ] && [ -n "${OUT:-}" ] && [ -e "$OUT" ]; then
+        case "$OUT" in
+            */victory-metal-out.????????) ;;
+            *)
+                echo "victory-metal.sh: WARN: refusing to remove unexpected diagnostics path $OUT" >&2
+                OUT=""
+                ;;
+        esac
+        if [ -n "$OUT" ]; then
+            if keep_session; then
+                echo "victory-metal.sh: kept session files in $OUT"
+            else
+                rm -rf -- "$OUT" 2>/dev/null || true
+                if [ -e "$OUT" ]; then
+                    echo "victory-metal.sh: WARN: diagnostics directory survived removal: $OUT" >&2
+                else
+                    echo "victory-metal.sh: removed the session directory (use --keep-session to keep it)"
+                fi
+            fi
+        fi
+    fi
+    trap - EXIT INT TERM HUP
+    exit "$status"
+}
+trap wrapper_cleanup EXIT
+trap 'forward_and_exit 130' INT
+trap 'forward_and_exit 143' TERM
+trap 'forward_and_exit 129' HUP
+
 if [ -n "$OUT_ARG" ]; then
     case "$OUT_ARG" in
         /*) OUT="$OUT_ARG" ;;
         *) OUT="$START_DIR/$OUT_ARG" ;;
     esac
+    OUT_OWNED=0
 elif [ "$DRY_RUN" = 1 ]; then
     OUT="${TMPDIR:-/tmp}/victory-metal-out.DRYRUN"
+    OUT_OWNED=0
 else
     OUT="$(mktemp -d "${TMPDIR:-/tmp}/victory-metal-out.XXXXXXXX")" \
         || { echo "victory-metal.sh: cannot create the --out directory" >&2; exit 3; }
+    OUT_OWNED=1
 fi
 
 if [ "$DRY_RUN" != 1 ]; then
@@ -225,7 +354,6 @@ if [ -n "$TIMEOUT" ]; then
     GUARD_SECONDS=$((TIMEOUT + 60))
 fi
 
-export VICTORY_BACKEND=metal
 # Cycle 08 Boot #1: without this, Rosetta does not report AVX/AVX2 in CPUID and
 # victory.exe's own Xbox-Series preflight refuses to execute the title. The
 # reference launcher (tools/macos/victory.sh) sets the same variable. An
@@ -301,14 +429,6 @@ prepare_builds() {
         --bin victory-irconverter || exit 3
 }
 
-stop_watchdog() {
-    if [ -n "${WATCHDOG:-}" ]; then
-        kill "$WATCHDOG" 2>/dev/null || true
-        wait "$WATCHDOG" 2>/dev/null || true
-        WATCHDOG=""
-    fi
-}
-
 # The fallback timer is one Python process (run-title-metal.sh already needs
 # python3): no long-lived `sleep` child can survive a killed watchdog.
 start_watchdog() {
@@ -382,28 +502,6 @@ run_guarded() {
     return "$rc"
 }
 
-forward_and_exit() {
-    status=$1
-    trap '' INT TERM HUP
-    if [ -n "${CHILD:-}" ]; then
-        kill -TERM "$CHILD" 2>/dev/null || true
-        waited=0
-        while kill -0 "$CHILD" 2>/dev/null && [ "$waited" -lt 100 ]; do
-            sleep 0.1
-            waited=$((waited + 1))
-        done
-        kill -KILL "$CHILD" 2>/dev/null || true
-        wait "$CHILD" 2>/dev/null || true
-        CHILD=""
-    fi
-    stop_watchdog
-    exit "$status"
-}
-
-trap 'forward_and_exit 130' INT
-trap 'forward_and_exit 143' TERM
-trap 'forward_and_exit 129' HUP
-
 print_args() {
     for arg in "$@"; do
         case "$arg" in
@@ -429,7 +527,7 @@ dry_run() {
     fi
     print_args "$@"
     echo "ENVIRONMENT"
-    echo "  VICTORY_BACKEND=metal"
+    echo "  VICTORY_BACKEND=$BACKEND"
     echo "  ROSETTA_ADVERTISE_AVX=${ROSETTA_ADVERTISE_AVX:-1}"
     if [ -n "$TIMEOUT" ]; then
         echo "  GUEST_TIMEOUT=$TIMEOUT"
@@ -439,11 +537,18 @@ dry_run() {
     echo "  VICTORY_FRAME_MEASURED=$FRAMES"
     echo "  VICTORY_FRAME_WARMUP=<delegate default 20>"
     echo "  VICTORY_METAL_SECRET=REDACTED"
-    echo "  VICTORY_METAL_ENDPOINT=<resolved by run-title-metal.sh>"
-    echo "  VICTORY_METAL_SHARE_DIR=<resolved by run-title-metal.sh>"
-    echo "  VICTORY_METAL_FENCE_PAGE=<share dir>/gpu-fence.v1.page"
-    echo "  WINEDLLOVERRIDES=<delegate default: mscoree,mshtml=;winedbg.exe=d>"
-    echo "  # no D3DMetal d3d12/d3d12core/dxgi override is set or required"
+    if [ "$BACKEND" = metal ]; then
+        echo "  VICTORY_METAL_ENDPOINT=<resolved by run-title-metal.sh>"
+        echo "  VICTORY_METAL_SHARE_DIR=<resolved by run-title-metal.sh>"
+        echo "  VICTORY_METAL_FENCE_PAGE=<share dir>/gpu-fence.v1.page"
+        echo "  WINEDLLOVERRIDES=<delegate default: mscoree,mshtml=;winedbg.exe=d>"
+        echo "  # no D3DMetal d3d12/d3d12core/dxgi override is set or required"
+    else
+        echo "  VICTORY_METAL_ENDPOINT=<unset: the d3d12 reference has no native daemon>"
+        echo "  VICTORY_METAL_SHARE_DIR=<resolved by run-title-metal.sh>"
+        echo "  VICTORY_METAL_FENCE_PAGE=<share dir>/gpu-fence.v1.page"
+        echo "  WINEDLLOVERRIDES=<delegate default: mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b>"
+    fi
     echo "  CARGO_TARGET_DIR=$TARGET_DIR"
     if [ -n "${WINE:-}" ]; then
         echo "  WINE=$WINE"
@@ -453,7 +558,8 @@ dry_run() {
     echo "  # inherited environment is passed through unchanged"
     echo "SUMMARY"
     echo "  launcher=victory-metal"
-    echo "  backend=metal"
+    echo "  backend=$BACKEND"
+    echo "  runner=$RUNNER"
     echo "  mode=$MODE"
     echo "  endpoint=<resolved at launch>"
     echo "  share_dir=<resolved at launch>"
@@ -494,7 +600,8 @@ print_summary() {
     fi
     echo "victory-metal.sh: summary"
     echo "  launcher=victory-metal"
-    echo "  backend=metal"
+    echo "  backend=$BACKEND"
+    echo "  runner=$RUNNER"
     echo "  status=$status"
     echo "  exit_code=$rc"
     echo "  endpoint=${ENDPOINT:-none}"
@@ -518,7 +625,7 @@ delegate() {
     keep=$2
     shift 2
     if [ "$keep" = 1 ]; then
-        set -- "$RUNNER" "$mode" --frames "$FRAMES" --out "$OUT" --keep --print-env \
+        set -- "$RUNNER" "$mode" --frames "$FRAMES" --out "$OUT" --keep-session --print-env \
             -- "$APP" run "$GUEST" --execute "$@"
     else
         set -- "$RUNNER" "$mode" --frames "$FRAMES" --out "$OUT" --print-env \
@@ -538,8 +645,15 @@ delegate() {
     return "$rc"
 }
 
+# The env aliases (VICTORY_KEEP_LOGS / VICTORY_KEEP_SESSION) must reach the
+# delegate too, so the flag is computed once from every spelling.
+KEEP_FLAG=0
+if keep_session; then
+    KEEP_FLAG=1
+fi
+
 if [ "$DRY_RUN" = 1 ]; then
-    delegate "$MODE_FLAG" "$KEEP" "$@"
+    delegate "$MODE_FLAG" "$KEEP_FLAG" "$@"
     exit 0
 fi
 
@@ -549,5 +663,5 @@ case "$GUEST" in
     *) [ -f "$GUEST" ] || { echo "victory-metal.sh: guest executable not found: $GUEST" >&2; exit 2; } ;;
 esac
 rc=0
-delegate "$MODE_FLAG" "$KEEP" "$@" || rc=$?
+delegate "$MODE_FLAG" "$KEEP_FLAG" "$@" || rc=$?
 exit "$rc"

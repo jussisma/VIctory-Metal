@@ -48,6 +48,16 @@
 #   6. `victory_hygiene_finalize "$status"` -> exit 13 if a tracked PID survived,
 #      otherwise exit with the run's real status.
 #
+# The cleanup function that runs from `trap cleanup EXIT` must not let a second
+# signal or a failing helper abort steps 1-6: ignore INT/TERM/HUP while it runs
+# (`trap '' INT TERM HUP`), turn `set -e` off (`set +e`), and guard every helper
+# call (`|| true`). Otherwise an interrupted cleanup leaks the temp dir.
+#
+# Keep aliases: `--keep`/`--keep-session` set KEEP=1; `VICTORY_KEEP_LOGS=1` and
+# `VICTORY_KEEP_SESSION=1` are environment aliases. Removal is the default and
+# covers every exit status, including usage, setup failure, timeouts and
+# signals.
+#
 # Exit code 13 means "a child started by this run survived cleanup"; scripts that
 # use this helper document it in their header. It is deliberately distinct from
 # the gate's 12 (PARTIAL with named gaps) and from ordinary setup failures.
@@ -105,9 +115,10 @@ victory_hygiene_work() {
     VICTORY_HYGIENE_WORK_REMOVED=0
 }
 
-# 1 when the caller asked to keep logs (KEEP=1 is the historical spelling).
+# 1 when the caller asked to keep logs/session (KEEP=1 is the historical
+# spelling; VICTORY_KEEP_LOGS and VICTORY_KEEP_SESSION are env aliases).
 victory_hygiene_keep_logs() {
-    if [ "${VICTORY_KEEP_LOGS:-0}" = 1 ] || [ "${KEEP:-0}" = 1 ]; then
+    if [ "${VICTORY_KEEP_LOGS:-0}" = 1 ] || [ "${VICTORY_KEEP_SESSION:-0}" = 1 ] || [ "${KEEP:-0}" = 1 ]; then
         return 0
     fi
     return 1
@@ -466,6 +477,10 @@ victory_hygiene_reap_marker() {
 }
 
 # Remove the owned temp dir exactly once. A log-keeping caller only keeps it.
+# The bound path is the ownership proof: it is the literal directory this run
+# created (never a glob or an inferred name). A path that survived removal is
+# reported and left un-marked so a caller can retry instead of pretending the
+# session is gone.
 victory_hygiene_remove_work() {
     if [ "$VICTORY_HYGIENE_WORK_REMOVED" = 1 ]; then
         return 0
@@ -473,13 +488,28 @@ victory_hygiene_remove_work() {
     if [ -z "${VICTORY_HYGIENE_WORK:-}" ]; then
         return 0
     fi
+    case "$VICTORY_HYGIENE_WORK" in
+        /|.|..)
+            echo "process-hygiene: refusing to remove unsafe session path $VICTORY_HYGIENE_WORK" >&2
+            return 1
+            ;;
+    esac
+    if [ ! -e "$VICTORY_HYGIENE_WORK" ]; then
+        VICTORY_HYGIENE_WORK_REMOVED=1
+        return 0
+    fi
     if victory_hygiene_keep_logs; then
         echo "process-hygiene: kept session files in $VICTORY_HYGIENE_WORK"
         VICTORY_HYGIENE_WORK_REMOVED=1
         return 0
     fi
-    rm -rf "$VICTORY_HYGIENE_WORK" 2>/dev/null || true
+    rm -rf -- "$VICTORY_HYGIENE_WORK" 2>/dev/null || true
+    if [ -e "$VICTORY_HYGIENE_WORK" ]; then
+        echo "process-hygiene: session dir survived removal: $VICTORY_HYGIENE_WORK" >&2
+        return 1
+    fi
     VICTORY_HYGIENE_WORK_REMOVED=1
+    return 0
 }
 
 # Post-run assertion: fail with the dedicated code 13 if any PID this run
