@@ -135,6 +135,12 @@ struct List {
     /// ([`take_retained`]).
     #[cfg(windows)]
     metal_retained: std::sync::Mutex<Vec<u64>>,
+    /// The pipeline pointer the title last set on this list on the native
+    /// path. A 0x470 state flush takes a state pointer; comparing it tells a
+    /// re-application of the tracked pipeline from a new state block
+    /// ([`note_state_flush`]).
+    #[cfg(windows)]
+    last_pipeline: std::sync::atomic::AtomicU64,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -1590,6 +1596,8 @@ fn new_list(
         }),
         #[cfg(windows)]
         metal_retained: Default::default(),
+        #[cfg(windows)]
+        last_pipeline: Default::default(),
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
@@ -2881,6 +2889,7 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        note_last_pipeline(this, pipeline);
         set_native_pipeline(this, pipeline);
         return;
     }
@@ -3123,6 +3132,131 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     let _ = (this, min, max);
 }
 
+/// The 0x470 `SetStateX` state-flush census.
+///
+/// The console's command list has a `SetStateX(state)` method that commits a
+/// state block the title already built for its current pipeline. The title
+/// calls it only after a pipeline change and skips it when the block pointer
+/// equals the last one it committed, so by the time it reaches the list every
+/// state it carries was already recorded through `SetPipelineState`, the root
+/// signature and the explicit setters. The call is therefore consumed without
+/// a Wire v3 command, but it is never dropped silently: the census below names
+/// it `state_flush` and reports whether its block matched the tracked pipeline
+/// and which shape its argument had.
+#[cfg(any(windows, test))]
+mod state_flush {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Every 0x470 call the list consumed.
+    pub(super) const CALLS: usize = 0;
+    /// The block pointer equalled the pipeline last set on this list.
+    pub(super) const SAME_PIPELINE: usize = 1;
+    /// The block pointer differed from a non-zero last pipeline.
+    pub(super) const CHANGED_PIPELINE: usize = 2;
+    /// No pipeline had been set on this list yet.
+    pub(super) const NO_PIPELINE: usize = 3;
+    /// The argument was zero.
+    pub(super) const VALUE_ZERO: usize = 4;
+    /// The argument fitted in 16 bits (a flag or an index, not an address).
+    pub(super) const VALUE_SMALL: usize = 5;
+    /// The argument fitted in 32 bits.
+    pub(super) const VALUE_LOW: usize = 6;
+    /// The argument looked like the title's low-memory window (below 2^40).
+    pub(super) const VALUE_GUEST: usize = 7;
+    /// The argument was above 2^40: a title image or allocator address, as
+    /// Boot #19's 0x6fff... block pointer was.
+    pub(super) const VALUE_HIGH: usize = 8;
+    /// The static counter names, in the order of the constants above.
+    pub(super) const NAMES: [&str; 9] = [
+        "state_flush",
+        "state_flush_same_pipeline",
+        "state_flush_changed_pipeline",
+        "state_flush_no_pipeline",
+        "state_flush_value_zero",
+        "state_flush_value_small",
+        "state_flush_value_low",
+        "state_flush_value_guest",
+        "state_flush_value_high",
+    ];
+
+    static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
+
+    /// Which shape the state pointer has. Only the class is kept: the value
+    /// itself may name title memory and is never logged.
+    fn value_class(value: u64) -> usize {
+        match value {
+            0 => VALUE_ZERO,
+            v if v < 0x1_0000 => VALUE_SMALL,
+            v if v < 1 << 32 => VALUE_LOW,
+            v if v < 1 << 40 => VALUE_GUEST,
+            _ => VALUE_HIGH,
+        }
+    }
+
+    /// Counts one consumed state flush. `value` is the title's state-block
+    /// pointer and `last` the pipeline last set on the list; neither is
+    /// logged, only which class the call fell into.
+    pub(super) fn note(value: u64, last: u64) {
+        let count = COUNTS[CALLS].fetch_add(1, Relaxed) + 1;
+        if value != 0 && value == last {
+            COUNTS[SAME_PIPELINE].fetch_add(1, Relaxed);
+        } else if last != 0 {
+            COUNTS[CHANGED_PIPELINE].fetch_add(1, Relaxed);
+        } else {
+            COUNTS[NO_PIPELINE].fetch_add(1, Relaxed);
+        }
+        COUNTS[value_class(value)].fetch_add(1, Relaxed);
+        if count.is_power_of_two() {
+            let [calls, same, changed, none, zero, small, low, guest, high] =
+                std::array::from_fn(|i| COUNTS[i].load(Relaxed));
+            tracing::info!(
+                state_flush = calls,
+                state_flush_same_pipeline = same,
+                state_flush_changed_pipeline = changed,
+                state_flush_no_pipeline = none,
+                state_flush_value_zero = zero,
+                state_flush_value_small = small,
+                state_flush_value_low = low,
+                state_flush_value_guest = guest,
+                state_flush_value_high = high,
+                "draw-list state flush census"
+            );
+        }
+    }
+
+    /// The counters, in [`NAMES`] order.
+    #[cfg(test)]
+    pub(super) fn counts() -> [u64; NAMES.len()] {
+        std::array::from_fn(|i| COUNTS[i].load(Relaxed))
+    }
+}
+
+/// Records the pipeline a title set on this list, for [`state_flush`].
+#[cfg(windows)]
+fn note_last_pipeline(this: This, pipeline: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.last_pipeline
+        .store(pipeline as usize as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consumes one 0x470 `SetStateX` state flush and counts it.
+#[cfg(windows)]
+fn note_state_flush(this: This, value: u64) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let last = list
+        .last_pipeline
+        .load(std::sync::atomic::Ordering::Relaxed);
+    state_flush::note(value, last);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -3318,16 +3452,15 @@ mod state {
         }
     }
 
-    /// 0x470 `(u64)` on newer lists: an unknown state flush. Wire v3 has no
-    /// command for it, so it is refused by name instead of silently dropped.
-    pub(super) extern "system" fn unknown_state_flush(this: This, _value: u64) {
+    /// 0x470 `(u64)` on newer lists: `SetStateX`, the title's state flush.
+    ///
+    /// The title commits a state block it already built for its current
+    /// pipeline; every state in it (pipeline, root signature, the explicit
+    /// setters) was recorded through those calls first. Consuming it adds no
+    /// Wire v3 command; [`super::state_flush`] names and counts it.
+    pub(super) extern "system" fn unknown_state_flush(this: This, value: u64) {
         if metal() {
-            with_metal(this, |producer| {
-                producer.refuse(
-                    "SetStateX (0x470): unknown state with no Wire v3 command",
-                    None,
-                )
-            });
+            super::note_state_flush(this, value);
         }
     }
     /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource,
@@ -4271,6 +4404,112 @@ mod tests {
             state::unknown_state_flush as *const (),
             "0x470 state flush"
         );
+    }
+
+    /// 0x470 is consumed, never refused: its census splits the calls into
+    /// the block pointer repeating the tracked pipeline, changing it, or
+    /// arriving before any pipeline. Boot #19 saw only the changing shape
+    /// (a non-zero last pipeline, always a different block); the other
+    /// classes keep a future title from landing in an unnamed bucket.
+    #[test]
+    fn the_state_flush_is_consumed_and_counted() {
+        let before = state_flush::counts();
+        state_flush::note(0x1234_5670, 0);
+        state_flush::note(0x1234_5670, 0x1234_5670);
+        state_flush::note(0x1234_5670, 0x1234_5670);
+        state_flush::note(0x1234_5678, 0x1234_5670);
+        let after = state_flush::counts();
+        assert_eq!(after[state_flush::CALLS] - before[state_flush::CALLS], 4);
+        assert_eq!(
+            after[state_flush::NO_PIPELINE] - before[state_flush::NO_PIPELINE],
+            1
+        );
+        assert_eq!(
+            after[state_flush::SAME_PIPELINE] - before[state_flush::SAME_PIPELINE],
+            2
+        );
+        assert_eq!(
+            after[state_flush::CHANGED_PIPELINE] - before[state_flush::CHANGED_PIPELINE],
+            1
+        );
+        // All four arguments name title memory below 4 GiB.
+        assert_eq!(
+            after[state_flush::VALUE_LOW] - before[state_flush::VALUE_LOW],
+            4
+        );
+    }
+
+    /// The value histogram keeps pointer-shaped arguments without logging
+    /// them, and still separates the shapes a future title may use.
+    #[test]
+    fn the_state_flush_value_histogram_classes() {
+        let before = state_flush::counts();
+        state_flush::note(0, 0);
+        state_flush::note(0x20, 0);
+        state_flush::note(0x1_0000, 0);
+        state_flush::note(0x1_0000_0000, 0);
+        state_flush::note(1 << 40, 0);
+        let after = state_flush::counts();
+        assert_eq!(
+            after[state_flush::VALUE_ZERO] - before[state_flush::VALUE_ZERO],
+            1
+        );
+        assert_eq!(
+            after[state_flush::VALUE_SMALL] - before[state_flush::VALUE_SMALL],
+            1
+        );
+        assert_eq!(
+            after[state_flush::VALUE_LOW] - before[state_flush::VALUE_LOW],
+            1
+        );
+        assert_eq!(
+            after[state_flush::VALUE_GUEST] - before[state_flush::VALUE_GUEST],
+            1
+        );
+        assert_eq!(
+            after[state_flush::VALUE_HIGH] - before[state_flush::VALUE_HIGH],
+            1
+        );
+    }
+
+    /// 0x470 has a handler; the next newer method slot (0x478, 143) is still
+    /// unknown and keeps refusing by name with E_NOTIMPL.
+    #[test]
+    fn an_unknown_slot_after_the_state_flush_still_refuses() {
+        assert_eq!(
+            NEWER_LIST_FUNCTIONS.0[142],
+            state::unknown_state_flush as *const (),
+            "0x470 state flush"
+        );
+        assert_ne!(
+            NEWER_LIST_FUNCTIONS.0[143],
+            state::unknown_state_flush as *const (),
+            "0x478 must not alias the state flush"
+        );
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // SAFETY: the list is ours and the unknown slot is the refusing stub
+        // (this, second, third, fourth) -> HRESULT.
+        let unknown =
+            slot::<extern "system" fn(This, usize, usize, usize) -> HRESULT>(list, 143 * 8);
+        assert_eq!(
+            unknown(list, 0, 0, 0),
+            crate::object::E_NOTIMPL,
+            "0x478 should refuse"
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     /// A guest buffer footprint lowers to one pitched wire copy: the first
