@@ -248,6 +248,12 @@ pub enum TextureFormat {
     Rgb10a2Unorm,
     /// `MTLPixelFormatR32Float`.
     R32Float,
+    /// `MTLPixelFormatR32Uint` (DXGI_FORMAT_R32_UINT): an integer storage
+    /// (UAV) and colour target.
+    R32Uint,
+    /// `MTLPixelFormatR32Sint` (DXGI_FORMAT_R32_SINT): a signed integer
+    /// storage (UAV) and colour target.
+    R32Sint,
     /// `MTLPixelFormatR16Float`.
     R16Float,
     /// `MTLPixelFormatDepth32Float`.
@@ -276,6 +282,8 @@ impl TextureFormat {
             Self::Rg11g11b10Float => 92,
             Self::Rgb10a2Unorm => 90,
             Self::R32Float => 55,
+            Self::R32Uint => 53,
+            Self::R32Sint => 54,
             Self::R16Float => 25,
             Self::Depth32Float => 252,
             Self::Depth24Stencil8 => 255,
@@ -331,6 +339,8 @@ impl TextureFormat {
             Self::Depth32Float => 14,
             Self::Depth24Stencil8 => 15,
             Self::Depth32FloatStencil8 => 16,
+            Self::R32Uint => 18,
+            Self::R32Sint => 19,
         }
     }
 
@@ -355,6 +365,8 @@ impl TextureFormat {
             14 => Self::Depth32Float,
             15 => Self::Depth24Stencil8,
             16 => Self::Depth32FloatStencil8,
+            18 => Self::R32Uint,
+            19 => Self::R32Sint,
             _ => return None,
         })
     }
@@ -2837,6 +2849,8 @@ fn attachment_pixel_format(format: TextureFormat) -> Result<(usize, bool), Regis
         TextureFormat::Rgba8Unorm
         | TextureFormat::Bgra8Unorm
         | TextureFormat::Rgba16Float
+        | TextureFormat::R32Uint
+        | TextureFormat::R32Sint
         | TextureFormat::Depth32Float => Ok((format.mtl_pixel_format(), false)),
         TextureFormat::Depth32FloatStencil8 => Ok((format.mtl_pixel_format(), true)),
         _ => Err(RegistryError::Unsupported(
@@ -3190,6 +3204,8 @@ mod tests {
             (TextureFormat::Rg11g11b10Float, 92),
             (TextureFormat::Rgb10a2Unorm, 90),
             (TextureFormat::R32Float, 55),
+            (TextureFormat::R32Uint, 53),
+            (TextureFormat::R32Sint, 54),
             (TextureFormat::R16Float, 25),
             (TextureFormat::Depth32Float, 252),
             (TextureFormat::Depth24Stencil8, 255),
@@ -3218,6 +3234,57 @@ mod tests {
         assert!(matches!(
             attachment_pixel_format(target.format),
             Ok((115, false))
+        ));
+    }
+
+    /// The Boot #2b compute-storage target (1280x720 R32_UINT) is both a
+    /// colour attachment (RTV, Metal 53) and a shader-written storage target
+    /// (UAV); R32_SINT is its signed sibling (Metal 54). No GPU is touched.
+    #[test]
+    fn a_1280x720_r32_uint_storage_colour_target_is_accepted() {
+        let mut target = desc();
+        target.width = 1280;
+        target.height = 720;
+        target.format = TextureFormat::R32Uint;
+        target.usage = TextureUsage::color_attachment();
+        assert!(target.validate().is_ok());
+        assert!(matches!(
+            attachment_pixel_format(target.format),
+            Ok((53, false))
+        ));
+
+        let mut storage = target.clone();
+        storage.usage = TextureUsage {
+            shader_read: true,
+            shader_write: true,
+            render_target: true,
+            depth_stencil: false,
+        };
+        assert!(storage.validate().is_ok());
+        assert!(
+            ViewPlan::resolve(
+                &storage,
+                TextureViewKind::Uav,
+                TextureSubresource::single(0, 0),
+            )
+            .is_ok(),
+            "an R32_UINT storage target must bind as a UAV"
+        );
+        assert!(
+            ViewPlan::resolve(
+                &storage,
+                TextureViewKind::Rtv,
+                TextureSubresource::single(0, 0),
+            )
+            .is_ok(),
+            "an R32_UINT storage target is also a colour attachment"
+        );
+
+        target.format = TextureFormat::R32Sint;
+        assert!(target.validate().is_ok());
+        assert!(matches!(
+            attachment_pixel_format(target.format),
+            Ok((54, false))
         ));
     }
 

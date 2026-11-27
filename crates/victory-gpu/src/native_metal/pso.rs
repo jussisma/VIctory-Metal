@@ -515,6 +515,8 @@ pub const fn color_format_code(dxgi: u32) -> Option<u8> {
         28 => 7,  // R8G8B8A8_UNORM
         29 => 8,  // R8G8B8A8_UNORM_SRGB
         41 => 12, // R32_FLOAT
+        42 => 18, // R32_UINT (MTLPixelFormatR32Uint, 53)
+        43 => 19, // R32_SINT (MTLPixelFormatR32Sint, 54)
         54 => 13, // R16_FLOAT
         87 => 9,  // B8G8R8A8_UNORM
         _ => return None,
@@ -1187,6 +1189,24 @@ mod tests {
         let mesh = encode_mesh_state(&[DEFAULT_COLOR_FORMAT], "main");
         assert_eq!(&mesh[..4], b"VPS1");
         assert_eq!(mesh[4], 1, "mesh stage code");
+    }
+
+    /// R32_UINT/R32_SINT colour attachments encode the registry codes the host
+    /// decodes (`TextureFormat::R32Uint`/`R32Sint`), not the Rgba8Unorm
+    /// default an unmapped format would silently take.
+    #[test]
+    fn r32_integer_targets_map_to_the_r32_host_codes() {
+        assert_eq!(color_format_code(42), Some(18));
+        assert_eq!(color_format_code(43), Some(19));
+        assert_eq!(color_format_code(11), None);
+        #[cfg(target_os = "macos")]
+        {
+            use victory_metal::macos::registry::TextureFormat;
+            assert_eq!(TextureFormat::from_code(18), Some(TextureFormat::R32Uint));
+            assert_eq!(TextureFormat::from_code(19), Some(TextureFormat::R32Sint));
+            assert_eq!(TextureFormat::R32Uint.mtl_pixel_format(), 53);
+            assert_eq!(TextureFormat::R32Sint.mtl_pixel_format(), 54);
+        }
     }
 
     fn sample_blend(enable: bool) -> BlendState {

@@ -2616,7 +2616,7 @@ fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
     let generation = read_u32(payload, 8);
     let dimension = texture_dimension_from_code(payload[12])?;
     let format = texture_format_from_code(payload[13])?;
-    let usage = texture_usage_from_code(payload[14])?;
+    let usage = texture_usage_for_format(payload[14], format)?;
     let sample_count = u32::from(payload[15]);
     let width = read_u32(payload, 16);
     let height = read_u32(payload, 20);
@@ -2709,7 +2709,10 @@ fn texture_dimension_from_code(code: u8) -> Option<TextureDimension> {
 /// Maps a kind 8 format code to a registry format.
 ///
 /// The codes are a stable, documented subset of the registry formats; a code
-/// outside this table is an explicit "unsupported format" rejection.
+/// outside this table is an explicit "unsupported format" rejection. This
+/// kind-8 numbering is separate from [`TextureFormat::code`] (the `VPS1`/`VPS2`
+/// pipeline-state numbering), where `R32Uint`/`R32Sint` are codes 18 and 19;
+/// the two spaces never decode each other's bytes.
 fn texture_format_from_code(code: u8) -> Option<TextureFormat> {
     Some(match code {
         0 => TextureFormat::Rgba8Unorm,
@@ -2722,9 +2725,13 @@ fn texture_format_from_code(code: u8) -> Option<TextureFormat> {
         7 => TextureFormat::Depth32Float,
         8 => TextureFormat::Depth32FloatStencil8,
         // RGBA16Float (DXGI_FORMAT_R16G16B16A16_FLOAT), the title's
-        // SDR-presented FP16 back-buffer. Code 10 and above stay unsupported
-        // and are rejected before the executor sees a descriptor.
+        // SDR-presented FP16 back-buffer.
         9 => TextureFormat::Rgba16Float,
+        // R32_UINT and R32_SINT integer storage/colour targets. MTL 53/54.
+        10 => TextureFormat::R32Uint,
+        11 => TextureFormat::R32Sint,
+        // Codes 12 and above stay unsupported and are rejected before the
+        // executor sees a descriptor.
         _ => return None,
     })
 }
@@ -2742,6 +2749,28 @@ fn texture_usage_from_code(code: u8) -> Option<TextureUsage> {
             depth_stencil: false,
         },
         _ => return None,
+    })
+}
+
+/// The usage a kind 8 usage code names, widened for the integer R32 formats.
+///
+/// R32_UINT and R32_SINT are storage (UAV) targets as well as colour
+/// attachments. The guest names a UAV target (resource flag 0x4) with usage 1
+/// (colour attachment), so the host adds the shader-write bit those formats
+/// need for a compute write and keeps the render-target bit for an RTV. A
+/// sampled or depth use is left exactly as sent.
+fn texture_usage_for_format(code: u8, format: TextureFormat) -> Option<TextureUsage> {
+    let usage = texture_usage_from_code(code)?;
+    if !matches!(format, TextureFormat::R32Uint | TextureFormat::R32Sint)
+        || (!usage.render_target && !usage.shader_write)
+    {
+        return Some(usage);
+    }
+    Some(TextureUsage {
+        shader_read: true,
+        shader_write: true,
+        render_target: true,
+        depth_stencil: false,
     })
 }
 
@@ -4887,11 +4916,62 @@ mod tests {
         assert_eq!((request.desc.width, request.desc.height), (2560, 1440));
     }
 
-    /// Codes 10 and above are still refused explicitly: the decoder returns
+    /// Guest kind 8 codes 10 and 11 are the integer storage/colour targets:
+    /// R32_UINT -> `TextureFormat::R32Uint` (`MTLPixelFormatR32Uint`, 53) and
+    /// R32_SINT -> `TextureFormat::R32Sint` (`MTLPixelFormatR32Sint`, 54).
+    /// A 1280x720 registration (the Boot #2b target) decodes to a descriptor
+    /// the registry accepts, with the storage/colour usage widened so a UAV
+    /// write and an RTV are both legal.
+    #[test]
+    fn host_codes_10_and_11_are_r32_storage_colour_targets() {
+        for (host_code, format, mtl) in [
+            (10u8, TextureFormat::R32Uint, 53usize),
+            (11u8, TextureFormat::R32Sint, 54usize),
+        ] {
+            assert_eq!(texture_format_from_code(host_code), Some(format));
+            assert_eq!(format.mtl_pixel_format(), mtl);
+            assert!(!format.is_depth_stencil());
+            assert!(!format.is_block_compressed());
+            assert!(format.is_color_render_target());
+
+            // Usage 1 is what the guest computes for a UAV target (flags 0x4).
+            let mut payload = texture_registration_payload(host_code);
+            payload[14] = 1; // colour attachment
+            payload[16..20].copy_from_slice(&1280u32.to_le_bytes());
+            payload[20..24].copy_from_slice(&720u32.to_le_bytes());
+            let request = decode_texture_request(&payload)
+                .expect("a 1280x720 R32 target is a valid registration");
+            assert_eq!(request.desc.format, format);
+            assert_eq!((request.desc.width, request.desc.height), (1280, 720));
+            assert!(request.desc.usage.shader_read);
+            assert!(request.desc.usage.shader_write);
+            assert!(request.desc.usage.render_target);
+            assert!(request.desc.validate().is_ok(), "the descriptor is accepted");
+        }
+    }
+
+    /// A storage-usage registration for R32_UINT is accepted too and also
+    /// carries the colour-attachment bit, so the same host texture can back a
+    /// UAV and an RTV.
+    #[test]
+    fn an_r32_uint_storage_usage_is_accepted() {
+        let mut payload = texture_registration_payload(10);
+        payload[14] = 3; // storage
+        payload[16..20].copy_from_slice(&1280u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&720u32.to_le_bytes());
+        let request =
+            decode_texture_request(&payload).expect("a 1280x720 R32_UINT storage target decodes");
+        assert_eq!(request.desc.format, TextureFormat::R32Uint);
+        assert!(request.desc.usage.shader_write);
+        assert!(request.desc.usage.render_target);
+        assert!(request.desc.validate().is_ok());
+    }
+
+    /// Codes 12 and above are still refused explicitly: the decoder returns
     /// no format, so no default host format can be substituted.
     #[test]
-    fn host_format_codes_above_9_are_refused() {
-        for code in 10..=u8::MAX {
+    fn host_format_codes_above_11_are_refused() {
+        for code in 12..=u8::MAX {
             assert_eq!(texture_format_from_code(code), None, "code {code}");
             assert!(
                 decode_texture_request(&texture_registration_payload(code)).is_none(),
