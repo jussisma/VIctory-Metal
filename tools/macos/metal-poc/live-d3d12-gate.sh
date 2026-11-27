@@ -161,7 +161,7 @@ write_hlsl() {
     cat >"$HLSL_DIR/vs.hlsl" <<'EOS'
 struct VSOut { float4 pos : SV_Position; };
 [RootSignature("RootFlags(0)")]
-VSOut vs_main(uint vid : SV_VertexID) {
+VSOut main(uint vid : SV_VertexID) {
     float2 c[3] = { float2(-1.0,-1.0), float2(3.0,-1.0), float2(-1.0,3.0) };
     VSOut o; o.pos = float4(c[vid], 0.0, 1.0); return o;
 }
@@ -169,7 +169,7 @@ EOS
     cat >"$HLSL_DIR/ps.hlsl" <<'EOS'
 struct PSOut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };
 [RootSignature("RootFlags(0)")]
-PSOut ps_main() {
+PSOut main() {
     PSOut o;
     o.c0 = float4(1.0, 128.0/255.0, 0.0, 1.0);
     o.c1 = float4(0.0, 128.0/255.0, 1.0, 1.0);
@@ -178,14 +178,33 @@ PSOut ps_main() {
 EOS
     cat >"$HLSL_DIR/psm.hlsl" <<'EOS'
 [RootSignature("RootFlags(0)")]
-float4 psm_main() : SV_Target { return float4(0.0, 1.0, 1.0, 1.0); }
+float4 main() : SV_Target { return float4(0.0, 1.0, 1.0, 1.0); }
 EOS
     cat >"$HLSL_DIR/cs.hlsl" <<'EOS'
+// The culling kernel: it writes the indirect draw record the following
+// ExecuteIndirect reads, so a frame without this write draws nothing. The
+// Wave64 values are read (and feed a never-taken branch) so the translated
+// kernel still carries the console wave intrinsics; the store itself must not
+// depend on them.
+//
+// `UAV(u0)` declares the argument buffer as a *root* UAV, not a descriptor
+// table entry: the IRConverter then reflects a top-level argument-buffer field
+// that the guest's root view at slot 0 fills.
+RWStructuredBuffer<uint> gArgs : register(u0);
+[RootSignature("RootFlags(0), UAV(u0)")]
 [numthreads(64,1,1)]
-void cs_main(uint tid : SV_DispatchThreadID) {
+void main(uint tid : SV_DispatchThreadID) {
     uint lanes = WaveGetLaneCount();
     uint sum = WaveActiveSum(tid + 1u);
-    if (sum == 0xdeadbeefu && lanes == 12345u) { }
+    if (tid == 0u) {
+        gArgs[0] = 3u; // vertex count
+        gArgs[1] = 1u; // instance count
+        gArgs[2] = 0u; // start vertex
+        gArgs[3] = 0u; // start instance
+    }
+    if (sum == 0xdeadbeefu && lanes == 12345u) {
+        gArgs[3] = 0xdeadbeefu;
+    }
 }
 EOS
     # A mesh shader whose used constant table pushes the Mesh+Pixel pair well
@@ -200,7 +219,7 @@ static const uint gTable[{n}] = {{{vals}}};
 [outputtopology("triangle")]
 [numthreads(32,1,1)]
 [RootSignature("RootFlags(0)")]
-void ms_main(out indices uint3 tri[1], out vertices VOut verts[3], uint gid : SV_GroupID) {{
+void main(out indices uint3 tri[1], out vertices VOut verts[3], uint gid : SV_GroupID) {{
     SetMeshOutputCounts(3, 1);
     uint acc = gTable[gid % {n}] ^ gTable[(gid * 7u + 1u) % {n}];
     float2 c[3] = {{ float2(-1.0,-1.0), float2(3.0,-1.0), float2(-1.0,3.0) }};
@@ -235,11 +254,11 @@ pool_stage() {
     [ -f "$CONV" ] || { echo "POOL_UNAVAILABLE libmetalirconverter.dylib missing"; return 0; }
     [ -x "$IRCONV" ] || { echo "POOL_UNAVAILABLE victory-irconverter missing"; return 0; }
     write_hlsl
-    compile_dxil vs.hlsl vs_6_0 vs_main vs || return 0
-    compile_dxil ps.hlsl ps_6_0 ps_main ps || return 0
-    compile_dxil ms.hlsl ms_6_5 ms_main ms || return 0
-    compile_dxil psm.hlsl ps_6_0 psm_main psm || return 0
-    compile_dxil cs.hlsl cs_6_6 cs_main cs || return 0
+    compile_dxil vs.hlsl vs_6_0 main vs || return 0
+    compile_dxil ps.hlsl ps_6_0 main ps || return 0
+    compile_dxil ms.hlsl ms_6_5 main ms || return 0
+    compile_dxil psm.hlsl ps_6_0 main psm || return 0
+    compile_dxil cs.hlsl cs_6_6 main cs || return 0
 
     if ! python3 - "$DXIL_DIR" "$IRCONV" "$CONV" "$METALLIB_DIR" <<'PY'
 import json
@@ -249,13 +268,18 @@ import sys
 import time
 
 dxil_dir, worker, converter, out_dir = sys.argv[1:5]
-jobs = [("vs", 1, "vs_main"), ("ps", 2, "ps_main"), ("ms", 5, "ms_main"),
-        ("psm", 2, "psm_main"), ("cs", 8, "cs_main")]
+jobs = [("vs", 1, "main"), ("ps", 2, "main"), ("ms", 5, "main"),
+        ("psm", 2, "main"), ("cs", 8, "main")]
+# The pool sets this on every child; the gate drives the same worker directly
+# and must ask for the same `VMRES2` frame (metallib + converter reflection).
+env = dict(os.environ)
+env["VICTORY_IRCONVERTER_STDIO_REFLECTION"] = "1"
 proc = subprocess.Popen([worker, "--stdio", "--converter", converter],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE)
+                        stderr=subprocess.PIPE, env=env)
 timings = []
 written = {}
+reflections = {}
 started = time.time()
 for index, (name, stage, entry) in enumerate(jobs):
     path = os.path.join(dxil_dir, name + ".dxil")
@@ -266,21 +290,45 @@ for index, (name, stage, entry) in enumerate(jobs):
     proc.stdin.flush()
     line = proc.stdout.readline()
     parts = line.split()
-    if not parts or parts[0] != b"VMRES":
+    if not parts or parts[0] != b"VMRES2":
         print(f"POOL_ERROR {name} protocol={line[:80]!r}")
         proc.kill()
         sys.exit(3)
     status = int(parts[3])
-    length = int(parts[4])
-    payload = proc.stdout.read(length)
+    metallib_len = int(parts[4])
+    reflection_len = int(parts[5])
+    metallib = proc.stdout.read(metallib_len)
+    reflection = proc.stdout.read(reflection_len)
     elapsed = (time.time() - began) * 1000.0
-    timings.append((name, elapsed, status, len(payload)))
-    if status != 0 or not payload.startswith(b"MTLB"):
-        print(f"POOL_ERROR {name} status={status} message={payload[:160]!r}")
+    timings.append((name, elapsed, status, len(metallib)))
+    if status != 0 or not metallib.startswith(b"MTLB"):
+        print(f"POOL_ERROR {name} status={status} message={metallib[:160]!r}")
+        proc.kill()
+        sys.exit(3)
+    if not reflection:
+        print(f"POOL_ERROR {name} reflection JSON is empty")
+        proc.kill()
+        sys.exit(3)
+    try:
+        parsed = json.loads(reflection)
+    except ValueError as error:
+        print(f"POOL_ERROR {name} reflection JSON does not parse: {error}")
+        proc.kill()
+        sys.exit(3)
+    if "TopLevelArgumentBuffer" not in parsed:
+        print(f"POOL_ERROR {name} reflection has no TopLevelArgumentBuffer")
         proc.kill()
         sys.exit(3)
     written[name] = os.path.join(out_dir, name + ".metallib")
-    open(written[name], "wb").write(payload)
+    open(written[name], "wb").write(metallib)
+    reflection_path = os.path.join(out_dir, name + ".reflection.json")
+    open(reflection_path, "wb").write(reflection)
+    reflections[name] = {
+        "bytes": len(reflection),
+        "path": reflection_path,
+        "params": len(parsed.get("TopLevelArgumentBuffer", [])),
+        "entry": parsed.get("EntryPoint", ""),
+    }
 proc.stdin.close()
 proc.wait()
 total_s = max(time.time() - started, 1e-9)
@@ -296,6 +344,8 @@ summary = {
     "subsequent_avg_ms": round(warm_avg, 3),
     "mesh_pair_bytes": os.path.getsize(written["ms"]) + os.path.getsize(written["psm"]),
     "metallib_bytes": {k: os.path.getsize(v) for k, v in written.items()},
+    "reflection": reflections,
+    "reflection_bytes": {k: v["bytes"] for k, v in reflections.items()},
 }
 print("POOL_SUMMARY " + json.dumps(summary))
 PY
@@ -311,6 +361,104 @@ echo "Compiling and translating the gate's DXIL shaders through the --stdio pool
 pool_stage >"$WORK/pool.log" 2>&1 || true
 cat "$WORK/pool.log"
 POOL_SUMMARY="$(sed -n 's/^POOL_SUMMARY //p' "$WORK/pool.log" | tail -1)"
+
+# --- Build the reflection-derived VAB1 ABIs on the host --------------------
+#
+# `victory_metal::macos` (and therefore `RootSignatureLayout`) only exists on
+# macOS, so the Win64 guest cannot parse converter reflection itself. The
+# x86_64 worker above produced each stage's reflection JSON; this one-shot
+# host helper parses it with `RootSignatureLayout::from_converter_reflection_json`
+# (rejecting an unparseable layout) and encodes the same `VAB1` container
+# `pso::encode_abi` would, which the guest then registers verbatim.
+ABI_DIR="$WORK/abi"
+SHARE_PIPE="$SHARE/pipelines"
+ABI_STATUS="skipped"
+ABI_SUMMARY=""
+mkdir -p "$ABI_DIR" "$WORK/abi-helper/src" "$SHARE_PIPE"
+cat >"$WORK/abi-helper/Cargo.toml" <<EOS
+[package]
+name = "gate-abi"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+victory-metal = { path = "$ROOT/crates/victory-metal" }
+EOS
+cat >"$WORK/abi-helper/src/main.rs" <<'EOS'
+fn main() {
+    let mut groups: Vec<Vec<String>> = vec![Vec::new()];
+    for argument in std::env::args().skip(1) {
+        if argument == "--" {
+            groups.push(Vec::new());
+        } else {
+            groups.last_mut().expect("a group").push(argument);
+        }
+    }
+    for group in groups.iter().filter(|group| !group.is_empty()) {
+        let out = &group[0];
+        let mut stages: Vec<(u8, String)> = Vec::new();
+        let mut index = 1;
+        while index + 1 < group.len() {
+            let stage: u8 = group[index].parse().expect("wire stage code");
+            let path = &group[index + 1];
+            let json = std::fs::read_to_string(path).expect("read reflection JSON");
+            let layout =
+                victory_metal::macos::bindings::RootSignatureLayout::from_converter_reflection_json(
+                    &json,
+                )
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+            eprintln!(
+                "ABI_STAGE path={path} stage={stage} params={} argbuf={} entry={}",
+                layout.parameters().len(),
+                layout.argument_buffer_len(),
+                layout.entry_point()
+            );
+            stages.push((stage, json));
+            index += 2;
+        }
+        // Same container `pso::encode_abi` writes: magic, version, count, then
+        // per entry `stage u8 | json_len u32 LE | converter reflection JSON`.
+        let mut abi = Vec::with_capacity(6 + stages.len() * 8);
+        abi.extend_from_slice(b"VAB1");
+        abi.push(1);
+        abi.push(u8::try_from(stages.len()).expect("stage count fits u8"));
+        for (stage, json) in &stages {
+            abi.push(*stage);
+            abi.extend_from_slice(
+                &u32::try_from(json.len())
+                    .expect("reflection JSON length fits u32")
+                    .to_le_bytes(),
+            );
+            abi.extend_from_slice(json.as_bytes());
+        }
+        std::fs::write(out, &abi).expect("write VAB1");
+        eprintln!("ABI_WRITTEN path={out} bytes={} stages={}", abi.len(), stages.len());
+    }
+}
+EOS
+if [ "$POOL_STATUS" = "translated" ]; then
+    echo "Encoding reflection-derived pipeline ABIs on the host..."
+    if CARGO_TARGET_DIR="$ROOT/target" cargo run --offline --quiet \
+        --manifest-path "$WORK/abi-helper/Cargo.toml" --target aarch64-apple-darwin -- \
+        "$ABI_DIR/graphics.vab1" 0 "$METALLIB_DIR/vs.reflection.json" \
+            1 "$METALLIB_DIR/ps.reflection.json" -- \
+        "$ABI_DIR/mesh.vab1" 2 "$METALLIB_DIR/ms.reflection.json" \
+            1 "$METALLIB_DIR/psm.reflection.json" -- \
+        "$ABI_DIR/compute.vab1" 4 "$METALLIB_DIR/cs.reflection.json" \
+        >"$WORK/abi.log" 2>&1
+    then
+        ABI_STATUS="built"
+        ABI_SUMMARY="$(grep '^ABI_' "$WORK/abi.log" | tr '\n' ' ')"
+    else
+        ABI_STATUS="failed"
+    fi
+    cat "$WORK/abi.log" || true
+fi
+if [ "$POOL_STATUS" = "translated" ] && [ "$ABI_STATUS" = "built" ]; then
+    cp "$METALLIB_DIR"/*.metallib "$METALLIB_DIR"/*.reflection.json "$ABI_DIR"/*.vab1 "$SHARE_PIPE"/
+fi
 
 # Disk-cache cold-vs-warm is owned by the pool itself; reuse the existing
 # measurement rather than inventing a second cache. It is reported separately.
@@ -404,11 +552,17 @@ export VICTORY_LIVE_GATE_OUT="$(winpath "$GUEST_REPORT")"
 export VICTORY_LIVE_GATE_CSV="$(winpath "$FRAMES_CSV")"
 export VICTORY_LIVE_GATE_GRAPHICS_ID="${graphics_id:-0}"
 export VICTORY_LIVE_GATE_COMPUTE_ID="${compute_id:-0}"
-export VICTORY_LIVE_GATE_METALLIB_VS="$(winpath "$METALLIB_DIR/vs.metallib")"
-export VICTORY_LIVE_GATE_METALLIB_PS="$(winpath "$METALLIB_DIR/ps.metallib")"
-export VICTORY_LIVE_GATE_METALLIB_MS="$(winpath "$METALLIB_DIR/ms.metallib")"
-export VICTORY_LIVE_GATE_METALLIB_PSM="$(winpath "$METALLIB_DIR/psm.metallib")"
-export VICTORY_LIVE_GATE_METALLIB_CS="$(winpath "$METALLIB_DIR/cs.metallib")"
+export VICTORY_LIVE_GATE_METALLIB_VS="$(winpath "$SHARE_PIPE/vs.metallib")"
+export VICTORY_LIVE_GATE_METALLIB_PS="$(winpath "$SHARE_PIPE/ps.metallib")"
+export VICTORY_LIVE_GATE_METALLIB_MS="$(winpath "$SHARE_PIPE/ms.metallib")"
+export VICTORY_LIVE_GATE_METALLIB_PSM="$(winpath "$SHARE_PIPE/psm.metallib")"
+export VICTORY_LIVE_GATE_METALLIB_CS="$(winpath "$SHARE_PIPE/cs.metallib")"
+export VICTORY_LIVE_GATE_ABI_GRAPHICS="$(winpath "$SHARE_PIPE/graphics.vab1")"
+export VICTORY_LIVE_GATE_ABI_MESH="$(winpath "$SHARE_PIPE/mesh.vab1")"
+export VICTORY_LIVE_GATE_ABI_COMPUTE="$(winpath "$SHARE_PIPE/compute.vab1")"
+export VICTORY_LIVE_GATE_REFLECTION_GRAPHICS="$(winpath "$SHARE_PIPE/vs.reflection.json")"
+export VICTORY_LIVE_GATE_REFLECTION_MESH="$(winpath "$SHARE_PIPE/ms.reflection.json")"
+export VICTORY_LIVE_GATE_REFLECTION_COMPUTE="$(winpath "$SHARE_PIPE/cs.reflection.json")"
 export VICTORY_FRAME_WARMUP="${VICTORY_FRAME_WARMUP:-20}"
 export VICTORY_FRAME_MEASURED="${VICTORY_FRAME_MEASURED:-120}"
 unset VICTORY_METAL_ENDPOINT_OLD 2>/dev/null || true
@@ -448,13 +602,13 @@ cat "$GUEST_LOG" 2>/dev/null || true
 
 # --- Report measured numbers and assertions --------------------------------
 PY_EXIT=0
-python3 - "$FRAMES_CSV" "$GUEST_REPORT" "$TELEMETRY" "$POOL_STATUS" "$POOL_SUMMARY" "$POOL_CACHE_LINE" "$POOL_CACHE_ERROR" "$VICTORY_FRAME_WARMUP" "$VICTORY_FRAME_MEASURED" <<'PY' || PY_EXIT=$?
+python3 - "$FRAMES_CSV" "$GUEST_REPORT" "$TELEMETRY" "$POOL_STATUS" "$POOL_SUMMARY" "$POOL_CACHE_LINE" "$POOL_CACHE_ERROR" "$VICTORY_FRAME_WARMUP" "$VICTORY_FRAME_MEASURED" "$ABI_STATUS" "$ABI_SUMMARY" <<'PY' || PY_EXIT=$?
 import json
 import math
 import os
 import sys
 
-csv_path, report_path, telemetry_path, pool_status, pool_summary, pool_cache, pool_cache_error, warmup, measured_expected = sys.argv[1:10]
+csv_path, report_path, telemetry_path, pool_status, pool_summary, pool_cache, pool_cache_error, warmup, measured_expected, abi_status, abi_summary = sys.argv[1:12]
 measured_expected = int(measured_expected)
 EXPECTED_PRESENT = 0xd5791f96cdb32383
 
@@ -514,10 +668,20 @@ print(f"LIVE_GATE d3dmetal guest_fallback={report.get('d3dmetal_fallback_count',
 print(f"LIVE_GATE unsupported_opcodes={report.get('unsupported_opcodes','?') or '(none)'}")
 print(f"LIVE_GATE pool status={pool_status} summary={pool_summary or '-'}")
 print(f"LIVE_GATE pool_cache line={pool_cache or '-'} error={pool_cache_error or '-'}")
+print(f"LIVE_GATE abi status={abi_status} {abi_summary or '-'}")
 print(f"LIVE_GATE stages compute={report.get('compute_pipeline','?')} "
       f"graphics={report.get('graphics_pipeline','?')} mesh={report.get('mesh_pipeline','?')}")
+print(f"LIVE_GATE stage_owner graphics={report.get('graphics_pipeline_owner','?')} "
+      f"builtin_compute={report.get('builtin_compute_id','?')} "
+      f"builtin_graphics={report.get('builtin_graphics_id','?')}")
+print(f"LIVE_GATE pipeline_ids used={report.get('pipeline_ids_used','?')} "
+      f"mesh_used={report.get('mesh_pipeline_used','?')} "
+      f"compute_probe={report.get('compute_probe_pipeline_id','?')}")
 print(f"LIVE_GATE probes compute={report.get('compute_probe','?')} "
       f"mesh={report.get('mesh_dispatch','?')} linkage={report.get('compute_indirect_linkage','?')}")
+print(f"LIVE_GATE linkage_frames={report.get('compute_indirect_linkage_frames','?')} "
+      f"unbound_dispatches={report.get('compute_dispatches_without_bindings','?')} "
+      f"args_after_frames={report.get('args_after_frames','?')}")
 
 problems = []
 stage_failure = report.get("first_failing_stage")
@@ -579,8 +743,13 @@ else:
     if not pool_cache:
         problems.append("pool cache measurement unavailable: " + (pool_cache_error or "missing"))
 
+# Reflection-derived ABIs: the launcher must have parsed every stage's
+# converter reflection with `RootSignatureLayout` and produced a VAB1.
+if abi_status != "built":
+    problems.append("reflection ABI stage " + abi_status)
+
 # Required stages from the merged code. A translation refusal is a real gap.
-if not report.get("compute_pipeline", "").startswith("v1_id="):
+if not report.get("compute_pipeline", "").startswith("v2_kind=0"):
     problems.append("compute pipeline: " + report.get("compute_pipeline", "missing"))
 if not report.get("graphics_pipeline", "").startswith("v2_kind=1"):
     problems.append("graphics pipeline: " + report.get("graphics_pipeline", "missing"))
@@ -588,16 +757,63 @@ if not report.get("mesh_pipeline", "").startswith("v2_kind=2"):
     problems.append("mesh pipeline: " + report.get("mesh_pipeline", "missing"))
 if report.get("graphics_pipeline_fallback"):
     problems.append("graphics fell back to the host built-in: " + report["graphics_pipeline_fallback"])
+if report.get("graphics_pipeline_owner", "guest_v2") != "guest_v2":
+    problems.append("graphics pipeline owner=" + report.get("graphics_pipeline_owner", "?"))
 if not report.get("compute_probe", "").startswith("Ok("):
     problems.append("compute probe: " + report.get("compute_probe", "missing"))
 if not report.get("mesh_dispatch", "").startswith("Ok("):
     problems.append("mesh dispatch probe: " + report.get("mesh_dispatch", "missing"))
-# The merged producer has no compute root view/descriptor table, so the
-# compute->ExecuteIndirect linkage cannot be recorded. Report it as the first
-# partial stage rather than claiming the full title chain.
+
+# The recorded streams must name the ids the guest's own registrations
+# returned, not a daemon built-in.
+def stage_id(value):
+    for field in (value or "").split():
+        if field.startswith("id="):
+            try:
+                return int(field[3:])
+            except ValueError:
+                return None
+    return None
+
+
+graphics = stage_id(report.get("graphics_pipeline"))
+mesh = stage_id(report.get("mesh_pipeline"))
+compute = stage_id(report.get("compute_pipeline"))
+used = report.get("pipeline_ids_used", "")
+if f"graphics={graphics}" not in used.split():
+    problems.append(f"frames did not name the guest graphics id={graphics}: {used}")
+if compute is not None and f"compute={compute}" not in used.split():
+    problems.append(f"frames did not name the guest compute id={compute}: {used}")
+if str(report.get("graphics_pipeline_used", "")) != str(graphics):
+    problems.append(
+        f"graphics pipeline used {report.get('graphics_pipeline_used')} != registered {graphics}"
+    )
+if str(report.get("mesh_pipeline_used", "")) != str(mesh):
+    problems.append(
+        f"mesh pipeline used {report.get('mesh_pipeline_used')} != registered {mesh}"
+    )
+
+# The culling dispatch must carry the argument buffer as a binding, a barrier
+# must order it before the indirect draw, and the GPU must have written the
+# expected record.
 linkage = report.get("compute_indirect_linkage", "")
 if not linkage.startswith("true"):
     problems.append("compute_indirect_linkage: " + (linkage or "missing"))
+if str(report.get("compute_indirect_linkage_frames", "0")) != str(report.get("frames_ok", "-1")):
+    problems.append(
+        f"linkage frames {report.get('compute_indirect_linkage_frames')} != "
+        f"frames_ok {report.get('frames_ok')}"
+    )
+if str(report.get("compute_dispatches_without_bindings", "?")) not in ("0",):
+    problems.append(
+        "compute dispatches without bindings="
+        + str(report.get("compute_dispatches_without_bindings", "?"))
+    )
+if report.get("args_after_frames", "") != "3,1,0,0":
+    problems.append(
+        "compute-written argument record=" + report.get("args_after_frames", "missing")
+        + " expected=3,1,0,0"
+    )
 
 if problems:
     first = stage_failure or (problems[0].split("=")[0].strip() if problems else "unknown")

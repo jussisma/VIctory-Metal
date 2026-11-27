@@ -17,10 +17,11 @@
 //!    creation registers the guest allocation with the host (kind 2) through
 //!    the `GuestRangeResolver` seam.
 //! 3. Two colour textures, a depth texture and the present surface are
-//!    registered through the native queue (kinds 8/9), and the DXIL pool's
-//!    metallibs are registered as compute (kind 4 v1) and graphics/mesh
-//!    (kind 4 v2) pipelines.
-//! 4. Every measured frame records a Wave64 compute dispatch, an
+//!    registered through the native queue (kinds 8/9), and the launcher's
+//!    prebuilt metallibs plus reflection-derived `VAB1` ABIs are registered as
+//!    guest-owned compute, graphics and mesh version 2 pipelines (kind 4 v2).
+//! 4. Every measured frame records a Wave64 compute dispatch whose root UAV is
+//!    the indirect argument buffer, a UAV->indirect barrier, an
 //!    `ExecuteIndirect` draw into an MRT+depth pass through the version 3
 //!    producer, and a real `Present` through the queue entry point.
 //! 5. `Signal` + `Fence::GetCompletedValue` observe completion on the 0-IPC
@@ -39,16 +40,18 @@ use std::time::{Duration, Instant};
 
 use victory_gpu::device;
 use victory_gpu::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
-use victory_gpu::native_metal::client::{PIPELINE_KIND_GRAPHICS, PIPELINE_KIND_MESH};
+use victory_gpu::native_metal::client::{
+    PIPELINE_KIND_COMPUTE, PIPELINE_KIND_GRAPHICS, PIPELINE_KIND_MESH,
+};
 use victory_gpu::native_metal::fence_page_guest::GuestFencePage;
 use victory_gpu::native_metal::producer::{
-    DepthTarget, MetalProducer, RenderTarget, ResourceId,
+    BarrierEntry, DepthTarget, MetalProducer, RenderTarget, ResourceId,
 };
 use victory_gpu::native_metal::{pso, queue, telemetry};
 use victory_gpu::object::{Object, S_OK};
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{
-    IndirectArguments, LoadOp, PrimitiveTopology, StoreOp,
+    CommandV3, IndirectArguments, LoadOp, PrimitiveTopology, RootBufferView, StoreOp,
 };
 
 type This = *const Object;
@@ -61,6 +64,8 @@ const PAGE: u64 = 64 * 1024;
 const ALLOC_LEN: u64 = ALLOC_PAGES * PAGE;
 /// Indirect draw record offset: last page, 16-byte record.
 const ARGS_OFFSET: u64 = 3 * PAGE;
+/// Root view length the culling kernel writes and `ExecuteIndirect` reads.
+const ARGS_LEN: u64 = 16;
 /// Sentinel bytes the refused replay would overwrite with its `CopyBuffer`.
 const SENTINEL_OFFSET: u64 = 3 * PAGE + 16;
 const SENTINEL_LEN: u64 = 16;
@@ -270,6 +275,120 @@ fn read_metallib(name: &str) -> Option<Vec<u8>> {
         .filter(|bytes| bytes.starts_with(b"MTLB"))
 }
 
+/// The prebuilt `VAB1` container the launcher built from the converter
+/// reflection with `RootSignatureLayout::from_converter_reflection_json`.
+fn read_abi(name: &str) -> Option<Vec<u8>> {
+    let path = env_path(name)?;
+    std::fs::read(&path)
+        .ok()
+        .filter(|bytes| bytes.starts_with(b"VAB1"))
+}
+
+/// The raw converter reflection JSON the launcher used as the root-layout
+/// witness next to a non-empty ABI (the host validates only its length).
+fn read_witness(name: &str) -> Option<Vec<u8>> {
+    let path = env_path(name)?;
+    std::fs::read(&path).ok().filter(|bytes| !bytes.is_empty())
+}
+
+/// The root view the culling kernel writes: slot 0 is the reflected UAV field.
+fn culling_view() -> RootBufferView {
+    RootBufferView {
+        slot: 0,
+        allocation_id: ALLOC_ID,
+        generation: ALLOC_GEN,
+        offset: ARGS_OFFSET,
+        length: ARGS_LEN,
+    }
+}
+
+/// What one recorded submission proves about the compute -> `ExecuteIndirect`
+/// chain: the culling dispatch carries the argument buffer as a binding, a
+/// barrier separates it from the indirect draw, and that draw names the same
+/// allocation and offset.
+struct Linkage {
+    dispatch_bindings: usize,
+    barrier_entries: usize,
+    indirect: IndirectArguments,
+}
+
+fn recorded_linkage(commands: &[CommandV3]) -> Result<Linkage, String> {
+    let dispatch_at = commands
+        .iter()
+        .position(|command| matches!(command, CommandV3::Dispatch3d(_)))
+        .ok_or_else(|| "no compute dispatch was recorded".to_string())?;
+    let indirect_at = commands
+        .iter()
+        .position(|command| matches!(command, CommandV3::ExecuteIndirectDraw(_)))
+        .ok_or_else(|| "no ExecuteIndirect draw was recorded".to_string())?;
+    let barrier_at = commands
+        .iter()
+        .position(|command| matches!(command, CommandV3::ResourceBarrier(_)))
+        .ok_or_else(|| "no barrier between the culling dispatch and the draw".to_string())?;
+    if !(dispatch_at < barrier_at && barrier_at < indirect_at) {
+        return Err(format!(
+            "wrong command order: dispatch={dispatch_at} barrier={barrier_at} indirect={indirect_at}"
+        ));
+    }
+    let CommandV3::Dispatch3d(dispatch) = &commands[dispatch_at] else {
+        return Err("dispatch slot mismatch".to_string());
+    };
+    let CommandV3::ResourceBarrier(barrier) = &commands[barrier_at] else {
+        return Err("barrier slot mismatch".to_string());
+    };
+    let CommandV3::ExecuteIndirectDraw(draw) = &commands[indirect_at] else {
+        return Err("indirect slot mismatch".to_string());
+    };
+    let covers = dispatch.bindings.iter().any(|binding| {
+        binding.allocation_id == draw.arguments.allocation_id
+            && binding.offset <= draw.arguments.offset
+            && draw.arguments.offset
+                < binding.offset.saturating_add(binding.length)
+    });
+    if !covers {
+        return Err(format!(
+            "the culling dispatch binds {:?}, not the indirect argument buffer {}@{}",
+            dispatch.bindings, draw.arguments.allocation_id, draw.arguments.offset
+        ));
+    }
+    if !barrier
+        .entries
+        .iter()
+        .any(|entry| entry.allocation_id == draw.arguments.allocation_id)
+    {
+        return Err("the barrier does not order the argument buffer".to_string());
+    }
+    Ok(Linkage {
+        dispatch_bindings: dispatch.bindings.len(),
+        barrier_entries: barrier.entries.len(),
+        indirect: draw.arguments,
+    })
+}
+
+/// The pipeline ids a recorded stream names, per family.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsedPipelineIds {
+    graphics: Option<u64>,
+    mesh: Option<u64>,
+    compute: Option<u64>,
+}
+
+fn recorded_pipeline_ids(commands: &[CommandV3]) -> UsedPipelineIds {
+    let mut ids = UsedPipelineIds::default();
+    for command in commands {
+        match command {
+            CommandV3::SetGraphicsPipeline(pipeline) => ids.graphics = Some(pipeline.pipeline_id),
+            CommandV3::SetPipeline(pipeline) if ids.graphics.is_none() => {
+                ids.graphics = Some(pipeline.pipeline_id);
+            }
+            CommandV3::SetMeshPipeline(pipeline) => ids.mesh = Some(pipeline.pipeline_id),
+            CommandV3::SetComputePipeline(pipeline) => ids.compute = Some(pipeline.pipeline_id),
+            _ => {}
+        }
+    }
+    ids
+}
+
 /// Encodes a graphics `PipelineState` (`VPS1`) with a depth attachment.
 ///
 /// Mirrors `victory_metal::macos::registry::PipelineState::encode` so the gate
@@ -300,11 +419,12 @@ fn graphics_state_with_depth(color_formats: &[u8], depth_code: u8, fragment: &st
 fn write_allocation(path: &Path) {
     let mut bytes = vec![0u8; ALLOC_LEN as usize];
     // Indirect draw record: vertex_count, instance_count, start_vertex,
-    // start_instance.
-    let record = [3u32, 1, 0, 0];
+    // start_instance. Left at zero on purpose: only the frame's culling
+    // compute dispatch writes it, so `ExecuteIndirect` can draw geometry only
+    // if the compute root UAV write reached the same buffer.
     let at = ARGS_OFFSET as usize;
-    for (index, word) in record.iter().enumerate() {
-        bytes[at + index * 4..at + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    for index in 0..(ARGS_LEN as usize / 4) {
+        bytes[at + index * 4..at + index * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
     }
     // The replay probe copies 16 bytes over this sentinel if it ever runs.
     let sentinel = 0xA5A5_5A5Au32;
@@ -492,11 +612,23 @@ fn live_d3d12_guest_gate() {
     // installed presenter (kind 9).
 
     // --- Translated pipelines from the pool's metallibs. ---
+    //
+    // The Win64 guest cannot run the x86_64 IRConverter, so the launcher
+    // prebuilds each stage's metallib *and* the converter reflection JSON with
+    // the `--stdio` worker, builds the `VAB1` container from that reflection on
+    // the host (the only target where `victory_metal::macos` exists), and the
+    // guest registers the prebuilt libraries here with `register_translated`.
     let vs = read_metallib("VICTORY_LIVE_GATE_METALLIB_VS");
     let ps = read_metallib("VICTORY_LIVE_GATE_METALLIB_PS");
     let ms = read_metallib("VICTORY_LIVE_GATE_METALLIB_MS");
     let psm = read_metallib("VICTORY_LIVE_GATE_METALLIB_PSM");
     let cs = read_metallib("VICTORY_LIVE_GATE_METALLIB_CS");
+    let graphics_abi = read_abi("VICTORY_LIVE_GATE_ABI_GRAPHICS");
+    let mesh_abi = read_abi("VICTORY_LIVE_GATE_ABI_MESH");
+    let compute_abi = read_abi("VICTORY_LIVE_GATE_ABI_COMPUTE");
+    let graphics_witness = read_witness("VICTORY_LIVE_GATE_REFLECTION_GRAPHICS");
+    let mesh_witness = read_witness("VICTORY_LIVE_GATE_REFLECTION_MESH");
+    let compute_witness = read_witness("VICTORY_LIVE_GATE_REFLECTION_COMPUTE");
     report.note(
         "metallibs",
         format!(
@@ -508,99 +640,45 @@ fn live_d3d12_guest_gate() {
             cs.as_ref().map_or(0, Vec::len)
         ),
     );
+    report.note(
+        "reflection_abis",
+        format!(
+            "graphics={} mesh={} compute={}",
+            graphics_abi.as_ref().map_or(0, Vec::len),
+            mesh_abi.as_ref().map_or(0, Vec::len),
+            compute_abi.as_ref().map_or(0, Vec::len)
+        ),
+    );
     if let (Some(ms), Some(psm)) = (&ms, &psm) {
         report.note("mesh_pixel_pair_bytes", ms.len() + psm.len());
     }
 
     let builtin_graphics = env_u64("VICTORY_LIVE_GATE_GRAPHICS_ID").unwrap_or(0);
     let builtin_compute = env_u64("VICTORY_LIVE_GATE_COMPUTE_ID").unwrap_or(0);
+    report.note("builtin_graphics_id", builtin_graphics);
+    report.note("builtin_compute_id", builtin_compute);
 
-    let compute_id = match &cs {
-        Some(metallib) => match queue::register_pipeline(metallib, "cs_main") {
-            Ok(id) => {
-                report.stage("compute_pipeline", true, format!("v1_id={id}"));
-                Some(id)
-            }
-            Err(error) => {
-                report.stage("compute_pipeline", false, format!("v1_refused: {error}"));
-                None
-            }
-        },
-        None => {
-            report.stage("compute_pipeline", false, "no cs metallib");
-            None
-        }
-    };
-    // The daemon's built-in compute kernel binds a buffer; dispatching it with
-    // no binding would write to nil. The gate therefore uses only the
-    // translated Wave64 pipeline for compute and reports the built-in id.
-    report.note(
-        "builtin_compute_id",
-        builtin_compute,
-    );
 
     let mut graphics_id = None;
     let mut use_root_constants = false;
-    if let (Some(vs), Some(ps)) = (&vs, &ps) {
-        let state = graphics_state_with_depth(
-            &[pso::DEFAULT_COLOR_FORMAT, pso::DEFAULT_COLOR_FORMAT],
-            14,
-            "ps_main",
-        );
-        // The translated pair has no resources, so the ABI is empty (no
-        // auto-binding) and no root-signature bytes are needed.
-        let details = pso::PipelineDetails {
-            state: &state,
-            abi: b"",
-            root_signature: b"",
-        };
-        let result = pso::register_translated(
-            &[
-                (pso::PipelineStage::Vertex, vs.as_slice(), "vs_main"),
-                (pso::PipelineStage::Pixel, ps.as_slice(), "ps_main"),
-            ],
-            &details,
-        );
-        match result {
-            Ok(id) => {
-                report.stage("graphics_pipeline", true, format!("v2_kind={PIPELINE_KIND_GRAPHICS} id={id}"));
-                graphics_id = Some(id);
-            }
-            Err(error) => {
-                report.stage("graphics_pipeline", false, format!("v2_refused: {error}"));
-            }
-        }
-    } else {
-        report.stage("graphics_pipeline", false, "no vs/ps metallib");
-    }
-    if graphics_id.is_none() && builtin_graphics != 0 {
-        // The daemon's built-in MRT+depth pipeline is native Metal and has no
-        // DXIL translation step; it is the honest fallback that keeps the
-        // measured frames on the real API when the translated registration is
-        // refused. The script reports the refusal as a partial stage.
-        graphics_id = Some(builtin_graphics);
-        use_root_constants = true;
-        report.note("graphics_pipeline_fallback", format!("host_builtin_id={builtin_graphics}"));
-    }
-    let Some(graphics_id) = graphics_id else {
-        report.note("ok", 0);
-        report.note("reason", "no graphics pipeline (translated or built-in)");
-        report.write(&out);
-        return;
-    };
 
-    let mesh_id = match (&ms, &psm) {
-        (Some(ms), Some(psm)) => {
-            let state = pso::encode_mesh_state(&[pso::DEFAULT_COLOR_FORMAT], "psm_main");
+    // Registration order fixes the host's wire handles: the mesh family is
+    // registered first (handle 1), compute second (handle 2) and graphics last
+    // (handle 3). None of those handles can be shadowed by the daemon's legacy
+    // built-ins (compute 1, graphics 2) in the family-specific maps the host
+    // resolves against.
+    let mesh_id = match (&ms, &psm, &mesh_abi, &mesh_witness) {
+        (Some(ms), Some(psm), Some(abi), Some(witness)) => {
+            let state = pso::encode_mesh_state(&[pso::DEFAULT_COLOR_FORMAT], "main");
             let details = pso::PipelineDetails {
                 state: &state,
-                abi: b"",
-                root_signature: b"",
+                abi,
+                root_signature: witness,
             };
             match pso::register_translated(
                 &[
-                    (pso::PipelineStage::Mesh, ms.as_slice(), "ms_main"),
-                    (pso::PipelineStage::Pixel, psm.as_slice(), "psm_main"),
+                    (pso::PipelineStage::Mesh, ms.as_slice(), "main"),
+                    (pso::PipelineStage::Pixel, psm.as_slice(), "main"),
                 ],
                 &details,
             ) {
@@ -615,10 +693,115 @@ fn live_d3d12_guest_gate() {
             }
         }
         _ => {
-            report.stage("mesh_pipeline", false, "no mesh/psm metallib");
+            report.stage(
+                "mesh_pipeline",
+                false,
+                "no mesh/psm metallib or no reflection-derived ABI",
+            );
             None
         }
     };
+
+    // A reflection-derived `VAB1` ABI makes this a version 2 compute frame: the
+    // host stores the converter's root UAV layout and `flush_compute_abi` writes
+    // the bound root view's device address into it. Its handle must not be the
+    // daemon's legacy compute id, which `resolve_compute_pipeline` consults
+    // first; registering it before graphics keeps that true.
+    let compute_id = match (&cs, &compute_abi, &compute_witness) {
+        (Some(metallib), Some(abi), Some(witness)) => {
+            let details = pso::PipelineDetails {
+                state: b"",
+                abi,
+                root_signature: witness,
+            };
+            match pso::register_translated(
+                &[(pso::PipelineStage::Compute, metallib.as_slice(), "main")],
+                &details,
+            ) {
+                Ok(id) => {
+                    report.stage(
+                        "compute_pipeline",
+                        true,
+                        format!("v2_kind={PIPELINE_KIND_COMPUTE} id={id}"),
+                    );
+                    Some(id)
+                }
+                Err(error) => {
+                    report.stage("compute_pipeline", false, format!("v2_refused: {error}"));
+                    None
+                }
+            }
+        }
+        _ => {
+            report.stage(
+                "compute_pipeline",
+                false,
+                "no cs metallib or no reflection-derived ABI",
+            );
+            None
+        }
+    };
+
+    if let (Some(vs), Some(ps), Some(abi), Some(witness)) = (
+        &vs,
+        &ps,
+        &graphics_abi,
+        &graphics_witness,
+    ) {
+        let state = graphics_state_with_depth(
+            &[pso::DEFAULT_COLOR_FORMAT, pso::DEFAULT_COLOR_FORMAT],
+            14,
+            "main",
+        );
+        // Both stages' reflections are empty root layouts (the shaders take no
+        // resources), so the ABI carries the converter's own two empty
+        // `TopLevelArgumentBuffer` documents. The host parses them with
+        // `RootSignatureLayout` and binds no argument buffer for this pair.
+        let details = pso::PipelineDetails {
+            state: &state,
+            abi,
+            root_signature: witness,
+        };
+        let result = pso::register_translated(
+            &[
+                (pso::PipelineStage::Vertex, vs.as_slice(), "main"),
+                (pso::PipelineStage::Pixel, ps.as_slice(), "main"),
+            ],
+            &details,
+        );
+        match result {
+            Ok(id) => {
+                report.stage("graphics_pipeline", true, format!("v2_kind={PIPELINE_KIND_GRAPHICS} id={id}"));
+                graphics_id = Some(id);
+            }
+            Err(error) => {
+                report.stage("graphics_pipeline", false, format!("v2_refused: {error}"));
+            }
+        }
+    } else {
+        report.stage(
+            "graphics_pipeline",
+            false,
+            "no vs/ps metallib or no reflection-derived ABI",
+        );
+    }
+    if graphics_id.is_none() && builtin_graphics != 0 {
+        // Only used so the measured frames still exercise the real API; the
+        // report records the fallback and the launcher turns it into PARTIAL.
+        graphics_id = Some(builtin_graphics);
+        use_root_constants = true;
+        report.note("graphics_pipeline_fallback", format!("host_builtin_id={builtin_graphics}"));
+    }
+    let Some(graphics_id) = graphics_id else {
+        report.note("ok", 0);
+        report.note("reason", "no graphics pipeline (translated or built-in)");
+        report.write(&out);
+        return;
+    };
+    report.note(
+        "graphics_pipeline_owner",
+        if use_root_constants { "host_builtin" } else { "guest_v2" },
+    );
 
     // --- Probe the binding paths the producer can express. ---
     if let Some(compute_id) = compute_id {
@@ -629,13 +812,28 @@ fn live_d3d12_guest_gate() {
                 MetalProducer::new(9_001, 1).expect("producer")
             }
         };
+        // Bind slot 0 at the allocation's first 16 bytes: the probe proves the
+        // ABI upload path without touching the indirect record at `ARGS_OFFSET`.
+        let probe_view = RootBufferView {
+            slot: 0,
+            allocation_id: ALLOC_ID,
+            generation: ALLOC_GEN,
+            offset: 0,
+            length: ARGS_LEN,
+        };
         let recorded = probe
             .set_compute_pipeline(compute_id)
             .and_then(|()| probe.set_compute_threadgroup_size([64, 1, 1]))
+            .and_then(|()| probe.set_compute_root_buffer_view(probe_view))
             .and_then(|()| probe.dispatch(1, 1, 1));
         match recorded {
             Ok(()) => match probe.flush() {
                 Ok(submission) => {
+                    let used = recorded_pipeline_ids(&submission.commands);
+                    report.note(
+                        "compute_probe_pipeline_id",
+                        used.compute.map_or_else(|| "none".to_string(), |id| id.to_string()),
+                    );
                     let result = queue::submit_recorded_batch(&[submission], 0);
                     report.stage(
                         "compute_probe",
@@ -645,8 +843,8 @@ fn live_d3d12_guest_gate() {
                                 status: ReplyStatus::Ok,
                                 ..
                             })
-                        ),
-                        format!("{result:?}"),
+                        ) && used.compute == Some(compute_id),
+                        format!("{result:?} used_id={:?}", used.compute),
                     );
                 }
                 Err(error) => report.stage("compute_probe", false, format!("flush: {error}")),
@@ -659,12 +857,26 @@ fn live_d3d12_guest_gate() {
 
     if let Some(mesh_id) = mesh_id {
         let mut probe = MetalProducer::new(9_002, 1).expect("mesh probe producer");
+        // `dispatch_mesh` opens the pass from the bound targets; the mesh state
+        // declares one colour attachment, so the probe binds exactly one.
+        let targets = [RenderTarget::cleared(
+            ResourceId::new(COLOR0_ID, TEXTURE_GEN).expect("color0"),
+            [0.0, 0.0, 0.0, 1.0],
+        )];
         let recorded = probe
-            .set_mesh_pipeline(mesh_id)
+            .set_render_targets(&targets, None)
+            .and_then(|()| probe.set_viewport(0.0, 0.0, TARGET_W as f32, TARGET_H as f32, 0.0, 1.0))
+            .and_then(|()| probe.set_scissor_edges(0, 0, TARGET_W as i32, TARGET_H as i32))
+            .and_then(|()| probe.set_mesh_pipeline(mesh_id))
             .and_then(|()| probe.dispatch_mesh(1, 1, 1));
         match recorded {
             Ok(()) => match probe.flush() {
                 Ok(submission) => {
+                    let used = recorded_pipeline_ids(&submission.commands);
+                    report.note(
+                        "mesh_pipeline_used",
+                        used.mesh.map_or_else(|| "none".to_string(), |id| id.to_string()),
+                    );
                     let result = queue::submit_recorded_batch(&[submission], 0);
                     report.stage(
                         "mesh_dispatch",
@@ -674,8 +886,8 @@ fn live_d3d12_guest_gate() {
                                 status: ReplyStatus::Ok,
                                 ..
                             })
-                        ),
-                        format!("{result:?}"),
+                        ) && used.mesh == Some(mesh_id),
+                        format!("{result:?} used_id={:?}", used.mesh),
                     );
                 }
                 Err(error) => report.stage("mesh_dispatch", false, format!("flush: {error}")),
@@ -685,16 +897,6 @@ fn live_d3d12_guest_gate() {
     } else {
         report.stage("mesh_dispatch", false, "no mesh pipeline");
     }
-
-    // The producer has no compute resource binding (ADR follow-up): a compute
-    // root view / descriptor table is not part of the merged API, so the
-    // compute->indirect linkage is reported as an explicit gap rather than
-    // faked.
-    report.stage(
-        "compute_indirect_linkage",
-        false,
-        "MetalProducer has no compute root view or descriptor table; Dispatch3d.bindings is always empty",
-    );
 
     // --- Measured frames ---
     let total = warmup + measured;
@@ -706,6 +908,9 @@ fn live_d3d12_guest_gate() {
     let mut present_status = 0i32;
     let deadline = Duration::from_secs(30);
     let mut max_in_flight = 0u32;
+    let mut linkage_frames = 0u32;
+    let mut linkage_detail = String::from("no frame recorded");
+    let mut frame_pipeline_ids = String::from("none");
 
     for index in 0..total {
         let started = Instant::now();
@@ -721,15 +926,28 @@ fn live_d3d12_guest_gate() {
             }
         };
 
-        // Compute culling stage: a real Wave64 dispatch through the
-        // translated compute pipeline. The merged producer has no compute
-        // root binding, so the kernel takes no buffer (reported above).
+        // Compute culling stage: the guest's own Wave64 pipeline writes the
+        // indirect argument record through the reflected root UAV slot, and a
+        // UAV->indirect barrier orders that write before the draw reading it.
         let mut stage_error = None;
         if let Some(compute_id) = compute_id {
             if let Err(error) = producer
                 .set_compute_pipeline(compute_id)
                 .and_then(|()| producer.set_compute_threadgroup_size([64, 1, 1]))
+                .and_then(|()| producer.set_compute_root_buffer_view(culling_view()))
                 .and_then(|()| producer.dispatch(1, 1, 1))
+                .and_then(|()| {
+                    producer.resource_barrier(&[BarrierEntry {
+                        allocation_id: ALLOC_ID,
+                        generation: ALLOC_GEN,
+                        offset: ARGS_OFFSET,
+                        length: ARGS_LEN,
+                        // D3D12_RESOURCE_STATE_UNORDERED_ACCESS ->
+                        // D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.
+                        before_state: 0x8,
+                        after_state: 0x200,
+                    }])
+                })
             {
                 stage_error = Some(format!("compute: {error}"));
             }
@@ -818,6 +1036,58 @@ fn live_d3d12_guest_gate() {
             }
         };
         let sequence = submission.sequence;
+        // Every frame must carry the culling dispatch -> barrier -> indirect
+        // draw chain on the same argument buffer, and name the guest's own
+        // pipeline ids, not a daemon built-in.
+        let linkage = match recorded_linkage(&submission.commands) {
+            Ok(linkage) => linkage,
+            Err(reason) => {
+                report.stage(
+                    "compute_indirect_linkage",
+                    false,
+                    format!("frame {index}: {reason}"),
+                );
+                break;
+            }
+        };
+        let used = recorded_pipeline_ids(&submission.commands);
+        if used.graphics != Some(graphics_id) {
+            report.stage(
+                "frame_graphics_pipeline",
+                false,
+                format!(
+                    "frame {index}: recorded {:?}, guest registration {graphics_id}",
+                    used.graphics
+                ),
+            );
+            break;
+        }
+        if compute_id.is_some() && used.compute != compute_id {
+            report.stage(
+                "frame_compute_pipeline",
+                false,
+                format!(
+                    "frame {index}: recorded {:?}, guest registration {compute_id:?}",
+                    used.compute
+                ),
+            );
+            break;
+        }
+        if linkage_frames == 0 {
+            linkage_detail = format!(
+                "true dispatch_bindings={} barrier_entries={} args_allocation={} args_offset={} \
+                 args_read_by=ExecuteIndirectDraw",
+                linkage.dispatch_bindings,
+                linkage.barrier_entries,
+                linkage.indirect.allocation_id,
+                linkage.indirect.offset
+            );
+            frame_pipeline_ids = format!(
+                "graphics={graphics_id} compute={}",
+                compute_id.map_or_else(|| "none".to_string(), |id| id.to_string())
+            );
+        }
+        linkage_frames += 1;
         match queue::submit_recorded_batch(&[submission], 0) {
             Ok(queue::NativeDispatch::Native {
                 status: ReplyStatus::Ok,
@@ -888,6 +1158,43 @@ fn live_d3d12_guest_gate() {
     report.note("max_in_flight_observed", max_in_flight);
     report.note("present_status", present_status);
     report.note("last_list_id", last_list);
+    report.note("compute_indirect_linkage_frames", linkage_frames);
+    report.note(
+        "compute_indirect_linkage",
+        if frames_ok > 0 && linkage_frames == frames_ok {
+            linkage_detail.clone()
+        } else {
+            format!("false frames={linkage_frames}/{frames_ok}")
+        },
+    );
+    report.note("pipeline_ids_used", frame_pipeline_ids);
+    report.note("graphics_pipeline_used", graphics_id);
+    report.note(
+        "compute_pipeline_used",
+        compute_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+    );
+    // What the shared allocation holds after the frames: the culling kernel
+    // writes 3,1,0,0 at `ARGS_OFFSET`, so anything else means the compute root
+    // UAV did not reach the buffer `ExecuteIndirect` reads.
+    let args_after = std::fs::read(&allocation_path)
+        .ok()
+        .and_then(|bytes| {
+            let at = ARGS_OFFSET as usize;
+            bytes.get(at..at + ARGS_LEN as usize).map(|slice| {
+                slice
+                    .chunks_exact(4)
+                    .map(|word| {
+                        format!(
+                            "{}",
+                            u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        })
+        .unwrap_or_else(|| "unreadable".to_string());
+    report.note("args_after_frames", args_after);
     let _ = std::fs::write(&csv, csv_text);
 
     // --- Exactly-once replay probe on the last frame's list identity. ---
@@ -937,6 +1244,10 @@ fn live_d3d12_guest_gate() {
         .map(|(opcode, count)| format!("{opcode}:{count}"))
         .collect();
     report.note("unsupported_opcodes", histogram.join(","));
+    report.note(
+        "compute_dispatches_without_bindings",
+        snapshot.compute_dispatches_without_bindings,
+    );
     report.note(
         "d3dmetal_fallback_count",
         snapshot.d3dmetal_fallback_count,
