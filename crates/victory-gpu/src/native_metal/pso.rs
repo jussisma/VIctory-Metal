@@ -60,6 +60,9 @@ use victory_metal::compiler_pool::{
 };
 #[cfg(target_os = "macos")]
 use victory_metal::macos::bindings::RootSignatureLayout;
+use victory_metal::wire_v3::{
+    BlendAttachment, BlendState, DepthStencilState, RasterizerState, StencilFaceState,
+};
 
 /// The shader stage a wire pipeline registration names.
 ///
@@ -250,11 +253,51 @@ pub const DEFAULT_PAYLOAD_MEMORY_LENGTH: u16 = 1024;
 
 /// Encodes a graphics `PipelineState` (`VPS1`) for the stage set.
 ///
-/// Mirrors `victory_metal::macos::registry::PipelineState::encode(Graphics)`:
-/// magic, stage code `0`, colour formats, no depth, a fragment entry, no
-/// object entry and zero mesh budgets.
+/// Mirrors `victory_metal::macos::registry::PipelineState::encode(Graphics)`
+/// with no render state: magic, stage code `0`, colour formats, no depth, a
+/// fragment entry, no object entry and zero mesh budgets.
 pub fn encode_graphics_state(color_formats: &[u8], fragment_entry: &str) -> Vec<u8> {
-    encode_state(0, color_formats, fragment_entry, None, [0; 3], [0; 3], 0, 0)
+    encode_graphics_state_with_render(
+        color_formats,
+        fragment_entry,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Encodes a graphics `PipelineState` carrying the guest render state.
+///
+/// The optional values are exactly the state Metal bakes at pipeline creation
+/// (blend and alpha-to-coverage) or hashes into the content key (depth/stencil
+/// and rasterizer). Passing them all `None` is the historical `VPS1` encoding,
+/// so the wire stays byte-compatible; any value selects `VPS2`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_graphics_state_with_render(
+    color_formats: &[u8],
+    fragment_entry: &str,
+    depth_format: Option<u8>,
+    blend: Option<&BlendState>,
+    depth_stencil: Option<&DepthStencilState>,
+    rasterizer: Option<&RasterizerState>,
+) -> Vec<u8> {
+    encode_state(
+        0,
+        color_formats,
+        fragment_entry,
+        None,
+        depth_format,
+        [0; 3],
+        [0; 3],
+        0,
+        0,
+        RenderStateRefs {
+            blend,
+            depth_stencil,
+            rasterizer,
+        },
+    )
 }
 
 /// Encodes a mesh `PipelineState` (`VPS1`) without an object stage.
@@ -289,16 +332,65 @@ pub fn encode_mesh_state_for(
     object_threadgroup: [u16; 3],
     payload_memory_length: u16,
 ) -> Vec<u8> {
-    encode_state(
-        1,
+    encode_mesh_state_for_with_render(
         color_formats,
         fragment_entry,
         object_entry,
         mesh_threadgroup,
         object_threadgroup,
         payload_memory_length,
-        0,
+        None,
+        None,
+        None,
+        None,
     )
+}
+
+/// [`encode_mesh_state_for`] plus the guest render state (`VPS2` when any is
+/// present).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mesh_state_for_with_render(
+    color_formats: &[u8],
+    fragment_entry: &str,
+    object_entry: Option<&str>,
+    mesh_threadgroup: [u16; 3],
+    object_threadgroup: [u16; 3],
+    payload_memory_length: u16,
+    depth_format: Option<u8>,
+    blend: Option<&BlendState>,
+    depth_stencil: Option<&DepthStencilState>,
+    rasterizer: Option<&RasterizerState>,
+) -> Vec<u8> {
+    encode_state(
+        1,
+        color_formats,
+        fragment_entry,
+        object_entry,
+        depth_format,
+        mesh_threadgroup,
+        object_threadgroup,
+        payload_memory_length,
+        0,
+        RenderStateRefs {
+            blend,
+            depth_stencil,
+            rasterizer,
+        },
+    )
+}
+
+/// Borrowed render state one `VPS2` encoding carries.
+#[derive(Clone, Copy, Default)]
+struct RenderStateRefs<'a> {
+    blend: Option<&'a BlendState>,
+    depth_stencil: Option<&'a DepthStencilState>,
+    rasterizer: Option<&'a RasterizerState>,
+}
+
+impl RenderStateRefs<'_> {
+    const fn is_empty(self) -> bool {
+        self.blend.is_none() && self.depth_stencil.is_none() && self.rasterizer.is_none()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -307,17 +399,30 @@ fn encode_state(
     color_formats: &[u8],
     fragment_entry: &str,
     object_entry: Option<&str>,
+    depth_format: Option<u8>,
     mesh_threadgroup: [u16; 3],
     object_threadgroup: [u16; 3],
     payload_memory_length: u16,
     max_total_threadgroups_per_mesh_grid: u32,
+    render: RenderStateRefs<'_>,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + fragment_entry.len());
-    out.extend_from_slice(b"VPS1");
+    let has_render_state = !render.is_empty();
+    let mut out = Vec::with_capacity(if has_render_state {
+        192 + fragment_entry.len()
+    } else {
+        64 + fragment_entry.len()
+    });
+    out.extend_from_slice(if has_render_state { b"VPS2" } else { b"VPS1" });
     out.push(stage);
     out.push(u8::try_from(color_formats.len()).expect("colour format count exceeds u8"));
     out.extend_from_slice(color_formats);
-    out.push(0); // no depth attachment
+    match depth_format {
+        Some(format) => {
+            out.push(1);
+            out.push(format);
+        }
+        None => out.push(0),
+    }
     let object = object_entry.unwrap_or("");
     out.push(u8::from(!fragment_entry.is_empty()) | (u8::from(!object.is_empty()) << 1));
     push_u16_string(&mut out, fragment_entry);
@@ -327,7 +432,103 @@ fn encode_state(
     }
     out.extend_from_slice(&payload_memory_length.to_le_bytes());
     out.extend_from_slice(&max_total_threadgroups_per_mesh_grid.to_le_bytes());
+    if has_render_state {
+        push_render_state(&mut out, render);
+    }
     out
+}
+
+/// Appends the `VPS2` render-state section (fixed order: blend, depth/stencil,
+/// rasterizer).
+fn push_render_state(out: &mut Vec<u8>, render: RenderStateRefs<'_>) {
+    let mut flags = 0u8;
+    if render.blend.is_some() {
+        flags |= 1;
+    }
+    if render.depth_stencil.is_some() {
+        flags |= 2;
+    }
+    if render.rasterizer.is_some() {
+        flags |= 4;
+    }
+    out.push(flags);
+    if let Some(blend) = render.blend {
+        out.push(u8::from(blend.independent_blend));
+        out.push(u8::from(blend.alpha_to_coverage));
+        out.push(u8::try_from(blend.attachments.len()).expect("blend attachment count exceeds u8"));
+        for attachment in &blend.attachments {
+            push_blend_attachment(out, attachment);
+        }
+    }
+    if let Some(depth) = render.depth_stencil {
+        out.push(u8::from(depth.depth_enable));
+        out.push(u8::from(depth.depth_write));
+        push_u16(out, depth.depth_func.code());
+        out.push(u8::from(depth.stencil_enable));
+        push_stencil_face(out, &depth.front);
+        push_stencil_face(out, &depth.back);
+    }
+    if let Some(raster) = render.rasterizer {
+        push_u16(out, raster.fill.code());
+        push_u16(out, raster.cull.code());
+        push_u16(out, raster.front_face.code());
+        out.extend_from_slice(&raster.depth_bias.to_le_bytes());
+        out.extend_from_slice(&raster.slope_scaled_depth_bias.to_bits().to_le_bytes());
+        out.extend_from_slice(&raster.depth_bias_clamp.to_bits().to_le_bytes());
+        out.push(u8::from(raster.depth_clip));
+    }
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_blend_attachment(out: &mut Vec<u8>, attachment: &BlendAttachment) {
+    out.push(u8::from(attachment.enable));
+    push_u16(out, attachment.src_color.code());
+    push_u16(out, attachment.dst_color.code());
+    push_u16(out, attachment.color_op.code());
+    push_u16(out, attachment.src_alpha.code());
+    push_u16(out, attachment.dst_alpha.code());
+    push_u16(out, attachment.alpha_op.code());
+    out.push(attachment.write_mask);
+}
+
+fn push_stencil_face(out: &mut Vec<u8>, face: &StencilFaceState) {
+    push_u16(out, face.fail.code());
+    push_u16(out, face.depth_fail.code());
+    push_u16(out, face.pass.code());
+    push_u16(out, face.func.code());
+    out.push(face.read_mask);
+    out.push(face.write_mask);
+}
+
+/// Host `TextureFormat` code for a PC `DXGI_FORMAT` render-target format.
+///
+/// Only formats the host registry can attach are mapped; an unmapped format
+/// leaves the caller's historical `Rgba8Unorm` default, exactly as the
+/// pre-`VPS2` default state did.
+pub const fn color_format_code(dxgi: u32) -> Option<u8> {
+    Some(match dxgi {
+        24 => 11, // R10G10B10A2_UNORM
+        26 => 10, // R11G11B10_FLOAT
+        28 => 7,  // R8G8B8A8_UNORM
+        29 => 8,  // R8G8B8A8_UNORM_SRGB
+        41 => 12, // R32_FLOAT
+        54 => 13, // R16_FLOAT
+        87 => 9,  // B8G8R8A8_UNORM
+        _ => return None,
+    })
+}
+
+/// Host `TextureFormat` code for a PC `DXGI_FORMAT` depth format.
+pub const fn depth_format_code(dxgi: u32) -> Option<u8> {
+    Some(match dxgi {
+        20 => 16, // D32_FLOAT_S8X24_UINT
+        40 => 14, // D32_FLOAT
+        45 => 15, // D24_UNORM_S8_UINT
+        _ => return None,
+    })
 }
 
 fn push_u16_string(out: &mut Vec<u8>, text: &str) {
@@ -940,6 +1141,7 @@ fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_metal::wire_v3::{BlendFactor, BlendOperation};
 
     #[test]
     fn stage_codes_match_the_converter() {
@@ -985,6 +1187,85 @@ mod tests {
         let mesh = encode_mesh_state(&[DEFAULT_COLOR_FORMAT], "main");
         assert_eq!(&mesh[..4], b"VPS1");
         assert_eq!(mesh[4], 1, "mesh stage code");
+    }
+
+    fn sample_blend(enable: bool) -> BlendState {
+        BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: vec![BlendAttachment {
+                enable,
+                src_color: BlendFactor::SrcAlpha,
+                dst_color: BlendFactor::InvSrcAlpha,
+                color_op: BlendOperation::Add,
+                src_alpha: BlendFactor::One,
+                dst_alpha: BlendFactor::Zero,
+                alpha_op: BlendOperation::Add,
+                write_mask: 0x0f,
+            }],
+        }
+    }
+
+    /// The guest serialises the D3D12 render state in a fixed order: identical
+    /// state is identical bytes, a changed blend is different bytes, and the
+    /// host decodes the same values (including the depth format).
+    #[test]
+    fn guest_render_state_is_deterministic_vps2() {
+        let enabled = sample_blend(true);
+        let disabled = sample_blend(false);
+        let encoded = encode_graphics_state_with_render(
+            &[DEFAULT_COLOR_FORMAT],
+            "main",
+            Some(14),
+            Some(&enabled),
+            None,
+            None,
+        );
+        assert_eq!(&encoded[..4], b"VPS2");
+        assert_eq!(
+            encoded,
+            encode_graphics_state_with_render(
+                &[DEFAULT_COLOR_FORMAT],
+                "main",
+                Some(14),
+                Some(&enabled),
+                None,
+                None,
+            ),
+            "the same state encodes to the same bytes"
+        );
+        let other = encode_graphics_state_with_render(
+            &[DEFAULT_COLOR_FORMAT],
+            "main",
+            Some(14),
+            Some(&disabled),
+            None,
+            None,
+        );
+        assert_ne!(encoded, other, "a changed blend changes the encoded state");
+
+        #[cfg(target_os = "macos")]
+        {
+            use victory_metal::macos::registry::{
+                PipelineStage as RegistryStage, PipelineState, TextureFormat,
+            };
+            let decoded = PipelineState::decode_for(&encoded, RegistryStage::Graphics)
+                .expect("the guest VPS2 blob decodes on the host");
+            assert_eq!(decoded.blend, Some(enabled.clone()));
+            assert_eq!(decoded.depth_format, Some(TextureFormat::Depth32Float));
+            assert!(decoded.depth_stencil.is_none() && decoded.rasterizer.is_none());
+            // The guest and the host encoders are byte-identical for the same
+            // state, so the BLAKE3 key covers exactly what the host decodes.
+            let host = PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: Some(TextureFormat::Depth32Float),
+                fragment_entry: Some("main".to_string()),
+                blend: Some(enabled),
+                ..PipelineState::default()
+            }
+            .encode(RegistryStage::Graphics);
+            assert_eq!(host, encoded, "guest and host VPS2 encodings agree");
+        }
     }
 
     /// The fields of a `VPS1` blob the guest encoder can produce.

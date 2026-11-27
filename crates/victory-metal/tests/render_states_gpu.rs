@@ -48,7 +48,8 @@ use victory_metal::macos::bindings::{
 };
 use victory_metal::macos::device::{DirectMetalTransport, PipelineAbi};
 use victory_metal::macos::registry::{
-    PipelineStage, PipelineState, TextureDesc, TextureDimension, TextureFormat, TextureUsage,
+    PipelineKey, PipelineRegistry, PipelineStage, PipelineState, TextureDesc, TextureDimension,
+    TextureFormat, TextureUsage,
 };
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat, RenderTarget};
 use victory_metal::wire::{BufferBinding, ListIdentity, ReplyStatus};
@@ -110,6 +111,40 @@ fragment MrtOut state_fragment(VOut in [[stage_in]]) {
     MrtOut out;
     out.color0 = in.color0;
     out.color1 = in.color1;
+    return out;
+}
+"#;
+
+/// Content-hashed state shader: position and colour are vertex attributes, so
+/// the guest PSO needs no root-constant ABI (the content-hashed path always
+/// carries an ABI and would route `SetRootConstants` through it).
+const CONTENT_HASHED_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+    float4 color [[flat]];
+};
+
+struct MrtOut {
+    float4 a [[color(0)]];
+    float4 b [[color(1)]];
+};
+
+vertex VOut chs_vertex(uint vid [[vertex_id]],
+                       constant float4 *positions [[buffer(0)]],
+                       constant float4 *colors [[buffer(1)]]) {
+    VOut out;
+    out.position = positions[vid];
+    out.color = colors[vid];
+    return out;
+}
+
+fragment MrtOut chs_fragment(VOut in [[stage_in]]) {
+    MrtOut out;
+    out.a = in.color;
+    out.b = in.color;
     return out;
 }
 "#;
@@ -518,6 +553,31 @@ fn vertex_buffer(offset: u64, length: u64) -> CommandV3 {
             stride: 16,
             length,
         }],
+    })
+}
+
+/// Positions at slot 0 and per-vertex colours at slot 1, both from the same
+/// page. The content-hashed path carries an ABI, so the shader takes colours as
+/// vertex attributes instead of root constants.
+fn state_vertex_buffers(position_offset: u64, color_offset: u64, length: u64) -> CommandV3 {
+    CommandV3::SetVertexBuffers(VertexBufferSet {
+        start_slot: 0,
+        buffers: vec![
+            VertexBuffer {
+                allocation_id: ALLOC_VERTICES,
+                generation: 1,
+                offset: position_offset,
+                stride: 16,
+                length,
+            },
+            VertexBuffer {
+                allocation_id: ALLOC_VERTICES,
+                generation: 1,
+                offset: color_offset,
+                stride: 16,
+                length,
+            },
+        ],
     })
 }
 
@@ -946,5 +1006,343 @@ fn render_states_pixels_are_exact() {
         "render-state proof on {}: blend=magenta/yellow, depth=green/cyan/yellow/blue, \
          upload=green/blue, encoders={stats:?}",
         info.name_str()
+    );
+}
+
+/// ADR-029 proof: a *content-hashed guest PSO* whose blob carries alpha
+/// blending draws the exact blended pixels, two different blend states hash to
+/// two pipeline objects while the identical registration is reused, and a
+/// second content-hashed draw keeps the Cycle 06 depth/cull/clear assertions.
+///
+/// This is the guest path (state blob -> `PipelineKey` -> host registry), not
+/// the legacy `GraphicsPipeline` the first proof uses.
+#[test]
+fn content_hashed_blend_pixels_are_exact() {
+    let dir = TempDir::new("content-hashed-state");
+    let Some(library) = compile_metallib(dir.path(), "content_state", CONTENT_HASHED_MSL) else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
+        return;
+    };
+
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let targets = create_targets(&transport);
+    let allocations = register_targets(&transport, &targets);
+
+    // The triangle covers every pixel; the quads are the Cycle 06 depth/cull
+    // scene reused below.
+    let mut positions = Vec::new();
+    let triangle_start = positions.len();
+    positions.extend_from_slice(&[
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ]);
+    let near_start = positions.len();
+    push_quad(&mut positions, [-1.0, -1.0, 0.0, 1.0], 0.5, true);
+    let far_start = positions.len();
+    push_quad(&mut positions, [-1.0, -1.0, 1.0, 1.0], 0.75, true);
+    let culled_start = positions.len();
+    push_quad(&mut positions, [0.0, -1.0, 1.0, 0.0], 0.25, false);
+    let drawn_start = positions.len();
+    push_quad(&mut positions, [-1.0, -1.0, 0.0, 0.0], 0.25, true);
+    let biased_start = positions.len();
+    push_quad(&mut positions, [0.0, 0.0, 1.0, 1.0], 0.75, true);
+
+    let red_half_alpha = [1.0f32, 0.0, 0.0, 0.5];
+    let green = [0.0f32, 1.0, 0.0, 1.0];
+    let blue = [0.0f32, 0.0, 1.0, 1.0];
+    let yellow = [1.0f32, 1.0, 0.0, 1.0];
+    let cyan = [0.0f32, 1.0, 1.0, 1.0];
+    let mut colors = Vec::new();
+    colors.extend_from_slice(&[red_half_alpha; 3]);
+    colors.extend_from_slice(&[green; 6]);
+    colors.extend_from_slice(&[blue; 6]);
+    colors.extend_from_slice(&[yellow; 6]);
+    colors.extend_from_slice(&[yellow; 6]);
+    colors.extend_from_slice(&[cyan; 6]);
+
+    let position_data = position_bytes(&positions);
+    let color_base = position_data.len() as u64;
+    let mut state_page_bytes = position_data;
+    state_page_bytes.extend_from_slice(&position_bytes(&colors));
+    let mut position_page = HostPage::new(16 * 1024);
+    position_page.write(0, &state_page_bytes);
+    // SAFETY: the page is 16 KiB aligned and outlives every submission.
+    let position_handle = unsafe { transport.register_zerocopy(position_page.raw(), 16 * 1024) }
+        .expect("position page must register");
+    let mut state_allocations = allocations.clone();
+    state_allocations.insert((ALLOC_VERTICES, 1), position_handle);
+    let position_offset = |start: usize| (start * 16) as u64;
+    let color_offset = |start: usize| color_base + (start * 16) as u64;
+
+    let alpha = BlendAttachment {
+        enable: true,
+        src_color: BlendFactor::SrcAlpha,
+        dst_color: BlendFactor::InvSrcAlpha,
+        color_op: BlendOperation::Add,
+        src_alpha: BlendFactor::One,
+        dst_alpha: BlendFactor::Zero,
+        alpha_op: BlendOperation::Add,
+        write_mask: 0x0f,
+    };
+    let alpha_blend = BlendState {
+        independent_blend: true,
+        alpha_to_coverage: false,
+        attachments: vec![alpha, alpha],
+    };
+    let color_formats = [TextureFormat::Rgba8Unorm, TextureFormat::Rgba8Unorm];
+
+    // The content key covers the render state: A, A (reuse), B create two
+    // objects and reuse the identical registration once.
+    let blend_state_a = PipelineState {
+        color_formats: color_formats.to_vec(),
+        depth_format: None,
+        fragment_entry: Some("chs_fragment".to_string()),
+        blend: Some(alpha_blend.clone()),
+        ..PipelineState::default()
+    }
+    .encode(PipelineStage::Graphics);
+    let blend_state_b = PipelineState {
+        color_formats: color_formats.to_vec(),
+        depth_format: None,
+        fragment_entry: Some("chs_fragment".to_string()),
+        blend: Some(disabled_blend()),
+        ..PipelineState::default()
+    }
+    .encode(PipelineStage::Graphics);
+    let mut registry = PipelineRegistry::new(&transport).expect("registry");
+    let key_a = PipelineKey::from_parts(
+        &library,
+        "chs_vertex",
+        PipelineStage::Graphics,
+        &blend_state_a,
+    );
+    let first = registry
+        .register_graphics(key_a.clone(), &library, "chs_vertex", &blend_state_a)
+        .expect("the alpha-blended PSO registers");
+    let reused = registry
+        .register_graphics(key_a, &library, "chs_vertex", &blend_state_a)
+        .expect("the identical PSO is reused");
+    assert_eq!(first, reused, "identical state keeps one PSO id");
+    assert_eq!(registry.created_count(), 1);
+    assert_eq!(registry.reuse_count(), 1);
+    let key_b = PipelineKey::from_parts(
+        &library,
+        "chs_vertex",
+        PipelineStage::Graphics,
+        &blend_state_b,
+    );
+    let second = registry
+        .register_graphics(key_b, &library, "chs_vertex", &blend_state_b)
+        .expect("the blend-disabled PSO registers");
+    assert_ne!(first, second, "a different blend state is a different PSO id");
+    assert_eq!(registry.created_count(), 2, "two blend states create two PSOs");
+    assert_eq!(registry.reuse_count(), 1, "only the identical state is reused");
+
+    const BLEND_HANDLE: u64 = 0x7100;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            BLEND_HANDLE,
+            &library,
+            "chs_vertex",
+            &blend_state_a,
+            PipelineAbi::default(),
+        )
+        .expect("the content-hashed blended pipeline must register");
+
+    // ---- first draw: alpha blend over a known blue background -------------
+    let blend_commands = vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![
+                colour_attachment(ALLOC_COLOUR0, LoadOp::Clear, [0.0, 0.0, 1.0, 1.0]),
+                colour_attachment(ALLOC_COLOUR1, LoadOp::Clear, [0.0, 0.0, 1.0, 1.0]),
+            ],
+            depth_stencil: None,
+        }),
+        CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: BLEND_HANDLE,
+        }),
+        CommandV3::SetViewport(full_viewport()),
+        CommandV3::SetScissor(scissor(0, 0, EDGE, EDGE)),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        state_vertex_buffers(
+            position_offset(triangle_start),
+            color_offset(triangle_start),
+            TRIANGLE_BYTES,
+        ),
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+    ];
+    let (reply, _) = transport
+        .submit_v3_with_stats(
+            &SubmissionV3 {
+                sequence: 301,
+                list: Some(list(31)),
+                commands: blend_commands,
+            },
+            &state_allocations,
+        )
+        .expect("the content-hashed blend submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "blend submission status");
+    transport.wait_for_gpu().expect("blend pass completes");
+    let target0 = transport
+        .read_render_target_rgba8(&targets.colour0)
+        .expect("target 0 readback");
+    let target1 = transport
+        .read_render_target_rgba8(&targets.colour1)
+        .expect("target 1 readback");
+    // (1,0,0) * 0.5 + (0,0,1) * 0.5 = (0.5, 0, 0.5); alpha 1 * 0.5 + 0 = 0.5.
+    for (label, pixels) in [("target 0", &target0), ("target 1", &target1)] {
+        for (index, value) in pixels.iter().enumerate() {
+            assert_eq!(
+                *value,
+                [128, 0, 128, 128],
+                "{label} alpha-blended pixel {index} (blue background)"
+            );
+        }
+    }
+
+    // ---- second draw: Cycle 06 depth test, back-face culling and clears ----
+    let depth_pipeline_state = PipelineState {
+        color_formats: color_formats.to_vec(),
+        depth_format: Some(TextureFormat::Depth32Float),
+        fragment_entry: Some("chs_fragment".to_string()),
+        blend: Some(disabled_blend()),
+        depth_stencil: Some(depth_state(CompareFunction::Less)),
+        rasterizer: Some(raster(CullMode::Back, 0)),
+        ..PipelineState::default()
+    }
+    .encode(PipelineStage::Graphics);
+    const DEPTH_HANDLE: u64 = 0x7101;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            DEPTH_HANDLE,
+            &library,
+            "chs_vertex",
+            &depth_pipeline_state,
+            PipelineAbi::default(),
+        )
+        .expect("the content-hashed depth pipeline must register");
+
+    let draw = || CommandV3::Draw(DrawState {
+        vertex_count: 6,
+        instance_count: 1,
+        start_vertex: 0,
+        start_instance: 0,
+    });
+    let half = EDGE / 2;
+    let depth_commands = vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![
+                colour_attachment(ALLOC_COLOUR0, LoadOp::Clear, [0.0, 0.0, 0.0, 1.0]),
+                colour_attachment(ALLOC_COLOUR1, LoadOp::Clear, [0.0, 0.0, 0.0, 1.0]),
+            ],
+            depth_stencil: Some(depth_attachment(LoadOp::DontCare)),
+        }),
+        CommandV3::ClearDepthStencilView(ClearDepthStencilView {
+            depth: Some(1.0),
+            stencil: None,
+            rect: None,
+        }),
+        CommandV3::SetDepthStencilState(depth_state(CompareFunction::Less)),
+        CommandV3::SetRasterizerState(raster(CullMode::Back, 0)),
+        CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: DEPTH_HANDLE,
+        }),
+        CommandV3::SetViewport(full_viewport()),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::SetScissor(scissor(0, 0, half, EDGE)),
+        state_vertex_buffers(
+            position_offset(near_start),
+            color_offset(near_start),
+            QUAD_BYTES,
+        ),
+        draw(),
+        CommandV3::SetScissor(scissor(0, 0, EDGE, EDGE)),
+        state_vertex_buffers(
+            position_offset(far_start),
+            color_offset(far_start),
+            QUAD_BYTES,
+        ),
+        draw(),
+        CommandV3::SetScissor(scissor(half, half, half, half)),
+        state_vertex_buffers(
+            position_offset(culled_start),
+            color_offset(culled_start),
+            QUAD_BYTES,
+        ),
+        draw(),
+        CommandV3::SetScissor(scissor(0, half, half, half)),
+        state_vertex_buffers(
+            position_offset(drawn_start),
+            color_offset(drawn_start),
+            QUAD_BYTES,
+        ),
+        draw(),
+        CommandV3::SetRasterizerState(raster(CullMode::Back, -1)),
+        CommandV3::SetScissor(scissor(half, 0, half, half)),
+        state_vertex_buffers(
+            position_offset(biased_start),
+            color_offset(biased_start),
+            QUAD_BYTES,
+        ),
+        draw(),
+        CommandV3::EndRenderPass,
+    ];
+    let (reply, _) = transport
+        .submit_v3_with_stats(
+            &SubmissionV3 {
+                sequence: 302,
+                list: Some(list(32)),
+                commands: depth_commands,
+            },
+            &state_allocations,
+        )
+        .expect("the content-hashed depth submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "depth submission status");
+    transport.wait_for_gpu().expect("depth pass completes");
+    let target0 = transport
+        .read_render_target_rgba8(&targets.colour0)
+        .expect("target 0 readback");
+    let target1 = transport
+        .read_render_target_rgba8(&targets.colour1)
+        .expect("target 1 readback");
+    for pixels in [&target0, &target1] {
+        assert_pixel(pixels, 8, 8, [0, 255, 0, 255], "near quad (top-left)");
+        assert_pixel(
+            pixels,
+            EDGE - 8,
+            8,
+            [0, 255, 255, 255],
+            "depth-bias quad (top-right)",
+        );
+        assert_pixel(
+            pixels,
+            8,
+            EDGE - 8,
+            [255, 255, 0, 255],
+            "front-face quad (bottom-left)",
+        );
+        assert_pixel(
+            pixels,
+            EDGE - 8,
+            EDGE - 8,
+            [0, 0, 255, 255],
+            "culled back face (bottom-right, clear preserved)",
+        );
+    }
+
+    transport
+        .unregister_buffer(position_handle)
+        .expect("unregister the position page");
+
+    eprintln!(
+        "content-hashed render-state proof: alpha blend [128,0,128,128], PSO ids \
+         {first:?}/{second:?} (created=2 reused=1), depth/cull/clear preserved"
     );
 }

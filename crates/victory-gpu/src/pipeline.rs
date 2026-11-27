@@ -636,7 +636,42 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
             return Err(error);
         }
     };
-    match crate::native_metal::pso::register(&programs) {
+    // The guest render state is part of the content-hashed state blob, so a
+    // pipeline that differs only in blending, depth/stencil or rasterizer is a
+    // different host PSO instead of colliding on one key. A pipeline with no
+    // recorded graphics state (compute, or a legacy description) keeps the
+    // historical default blob.
+    use crate::native_metal::pso::PipelineStage;
+    let pixel_entry = programs
+        .iter()
+        .find(|program| program.stage == PipelineStage::Pixel)
+        .map(|program| program.entry.as_str())
+        .unwrap_or_default();
+    let object_entry = programs
+        .iter()
+        .find(|program| program.stage == PipelineStage::Object)
+        .map(|program| program.entry.as_str());
+    let mesh = programs
+        .iter()
+        .any(|program| program.stage == PipelineStage::Mesh);
+    let state_blob = match p.host.graphics.as_deref() {
+        Some(graphics) => match graphics.pipeline_state(pixel_entry, object_entry, mesh) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                crate::native_metal::telemetry::note_registration_failure();
+                let error = format!("pipeline render state is not representable: {error}");
+                tracing::warn!(pipeline = ?this, %error, "native pipeline registration failed");
+                *cell = Some(Err(error.clone()));
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    let details = crate::native_metal::pso::PipelineDetails {
+        state: state_blob.as_deref().unwrap_or(&[]),
+        ..crate::native_metal::pso::PipelineDetails::default()
+    };
+    match crate::native_metal::pso::register_with_details(&programs, &details) {
         Ok((id, serving)) => {
             if serving.warm {
                 crate::native_metal::telemetry::note_pool_warm();

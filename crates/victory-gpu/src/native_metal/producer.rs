@@ -2637,7 +2637,14 @@ mod tests {
         let first = producer.flush().expect("first flush").sequence;
         producer.present(1, 0).expect("present");
         let second = producer.flush().expect("second flush").sequence;
-        assert_eq!(second, first + 1);
+        // `NEXT_SEQUENCE` is process-global (every producer in the session
+        // draws from it), so another test's flush may run between these two
+        // under `--test-threads=4`. The wire contract is strictly increasing,
+        // not per-producer contiguous.
+        assert!(
+            second > first,
+            "flush sequences must increase: {first} then {second}"
+        );
     }
 
     #[test]
