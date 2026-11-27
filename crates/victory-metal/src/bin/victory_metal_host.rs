@@ -71,8 +71,13 @@
 //! `p99_ms`, sustained `fps`, the unsupported-opcode histogram,
 //! `graphics_status`, `present_status`, `present_checksum`,
 //! `last_error` (the last bounded GPU/protocol refusal reason, or `null`),
-//! `d3dmetal_fallback_count` (always `0` on this path) and the observed D3DMetal
-//! image list. A write failure is reported, never silently ignored.
+//! `d3dmetal_fallback_count` (always `0` on this path), the observed D3DMetal
+//! image list, and `frame_probe`. `frame_probe` is `null` unless
+//! `VICTORY_METAL_FRAME_PROBE` opts into the presented-frame probe
+//! (`=1`); it then reports `non_black_pixels`, `unique_luma_buckets`,
+//! `frame_crc`, `sampled_frames`, `probe_pixels`, `last_sampled_frame`,
+//! `dropped_samples`, `fallback_clear`, `probe_every` and a named `failure`.
+//! A write failure is reported, never silently ignored.
 //!
 //! Session counters are copied from `IpcHost::session_stats()` after
 //! `serve_once` returns, so an abnormal disconnect still reports how many
@@ -933,6 +938,67 @@ fn json_escape(text: &str) -> String {
     out
 }
 
+/// Serialises the opt-in presented-frame probe for telemetry.
+///
+/// `null` means the probe was never requested (the default). When the
+/// environment requests it but no window presented a frame, an explicit
+/// zero-sample object with `failure: "probe_not_sampled"` is reported instead
+/// of pretending the probe ran or hiding the opt-in.
+#[cfg(target_os = "macos")]
+fn frame_probe_json() -> String {
+    let report = victory_metal::macos::present::frame_probe_report();
+    match report {
+        Some(report) => {
+            let failure = report.failure.as_deref().map_or_else(
+                || "null".to_string(),
+                |message| format!("\"{}\"", json_escape(message)),
+            );
+            let last_frame = report
+                .last_sampled_frame
+                .map_or_else(|| "null".to_string(), |frame| frame.to_string());
+            format!(
+                concat!(
+                    "{{",
+                    "\"sampled_frames\": {}, ",
+                    "\"probe_pixels\": {}, ",
+                    "\"last_sampled_frame\": {}, ",
+                    "\"non_black_pixels\": {}, ",
+                    "\"unique_luma_buckets\": {}, ",
+                    "\"frame_crc\": {}, ",
+                    "\"dropped_samples\": {}, ",
+                    "\"fallback_clear\": {}, ",
+                    "\"probe_every\": {}, ",
+                    "\"failure\": {}",
+                    "}}"
+                ),
+                report.sampled_frames,
+                report.probe_pixels,
+                last_frame,
+                report.non_black_pixels,
+                report.unique_luma_buckets,
+                report.frame_crc,
+                report.dropped_samples,
+                report.fallback_clear,
+                report.probe_every,
+                failure,
+            )
+        }
+        None => match victory_metal::macos::present::FrameProbeConfig::from_env() {
+            Some(config) => format!(
+                concat!(
+                    "{{\"sampled_frames\": 0, \"probe_pixels\": 0, ",
+                    "\"last_sampled_frame\": null, \"non_black_pixels\": 0, ",
+                    "\"unique_luma_buckets\": 0, \"frame_crc\": 0, ",
+                    "\"dropped_samples\": 0, \"fallback_clear\": false, ",
+                    "\"probe_every\": {}, \"failure\": \"probe_not_sampled\"}}"
+                ),
+                config.every
+            ),
+            None => "null".to_string(),
+        },
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn write_telemetry(
     path: &Path,
@@ -977,6 +1043,7 @@ fn write_telemetry(
         || "null".to_string(),
         |message| format!("\"{}\"", json_escape(message)),
     );
+    let frame_probe = frame_probe_json();
 
     let json = format!(
         concat!(
@@ -1005,7 +1072,8 @@ fn write_telemetry(
             "  \"last_error\": {last_error},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
-            "  \"d3dmetal_fallback_count\": 0\n",
+            "  \"d3dmetal_fallback_count\": 0,\n",
+            "  \"frame_probe\": {frame_probe}\n",
             "}}\n"
         ),
         pid = process::id(),
@@ -1033,6 +1101,7 @@ fn write_telemetry(
         last_error = last_error,
         images = images,
         loaded = !d3dmetal.is_empty(),
+        frame_probe = frame_probe,
     );
 
     if let Some(parent) = path
@@ -1212,6 +1281,12 @@ fn run(args: Args) -> Result<(), String> {
             "a D3DMetal image was loaded during the session: {}",
             loaded.join(", ")
         ));
+    }
+
+    // One final `frame_probe=...` line in host.log, even when the last sample
+    // happened many frames before teardown. Off (no report) prints nothing.
+    if let Some(report) = victory_metal::macos::present::frame_probe_report() {
+        eprintln!("{}", report.log_line());
     }
 
     if let Some(path) = args.telemetry_json.as_deref() {

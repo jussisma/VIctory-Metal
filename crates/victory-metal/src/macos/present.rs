@@ -35,7 +35,8 @@
 
 use std::ffi::c_void;
 use std::mem;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
@@ -206,6 +207,9 @@ pub struct NativeSwapchain {
     presented: u64,
     width: u32,
     height: u32,
+    /// Opt-in presented-frame probe. `None` (the default) adds no command
+    /// buffer, no blit, no readback and no allocation to the present path.
+    probe: Option<FrameProbe>,
 }
 
 impl NativeSwapchain {
@@ -218,6 +222,9 @@ impl NativeSwapchain {
         // SAFETY: `queue` is a live `MTLCommandQueue`; `retain` returns it +1.
         let retained = unsafe { objc::msg_send_id_0(queue, objc::sel(c"retain")) };
         let queue = ObjcObject::from_retained(retained)?;
+        // The probe is the only extra state; with the environment unset this is
+        // a single environment read and every field below stays `None`.
+        let probe = FrameProbe::from_env(layer.as_raw());
         Some(Self {
             layer,
             queue,
@@ -226,6 +233,7 @@ impl NativeSwapchain {
             presented: 0,
             width,
             height,
+            probe,
         })
     }
 
@@ -355,6 +363,17 @@ impl NativeSwapchain {
             return Err(PresentError::Metal(format!(
                 "drawable present failed (status={status}): {message}"
             )));
+        }
+
+        // The drawable now holds exactly the pixels the window server shows:
+        // either the GPU blit of `source` or the diagnostic clear. Sampling it
+        // after `waitUntilCompleted` is the only point where "presented" and
+        // "readable" coincide. With the probe off, `probe` is `None` and this
+        // block does nothing.
+        if let Some(probe) = self.probe.as_mut() {
+            // `filled == false` means the drawable was cleared to the known
+            // diagnostic colour, so the probe can use that as its clear value.
+            probe.observe(self.queue.as_raw(), target, self.presented, !filled);
         }
 
         self.presented = self.presented.wrapping_add(1);
@@ -500,6 +519,766 @@ fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<
         objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in presented-frame probe
+// ---------------------------------------------------------------------------
+//
+// A successful `presentDrawable:` and a perfectly blank clear look identical
+// from the outside. The probe closes that gap without becoming part of the
+// production path: it is off unless `VICTORY_METAL_FRAME_PROBE` says otherwise,
+// it samples the drawable only on every Nth presented frame, it copies a fixed
+// 8x8 grid of 8x8 blocks into one 64x64 shared staging texture (16 KiB), and it
+// never waits on the GPU for longer than `FRAME_PROBE_WAIT`. Exactly one probe
+// command buffer may be in flight; further opportunities are counted and
+// dropped. The probe never writes pixels to disk: only counters and a CRC reach
+// telemetry and the host log.
+
+/// Environment variable that opts into the presented-frame probe.
+pub const FRAME_PROBE_ENV: &str = "VICTORY_METAL_FRAME_PROBE";
+/// Environment variable that overrides the sampling interval.
+pub const FRAME_PROBE_EVERY_ENV: &str = "VICTORY_METAL_FRAME_PROBE_EVERY";
+/// Default sampling interval: one probe every 30 presented frames.
+pub const FRAME_PROBE_DEFAULT_EVERY: u64 = 30;
+/// A channel counts as content when it differs from the clear value by more
+/// than this many 8-bit steps (out of 255). The comparison is strict: a
+/// difference of exactly 8 is still considered clear.
+pub const FRAME_PROBE_CHANNEL_THRESHOLD: u8 = 8;
+/// The probe copies an 8x8 grid of blocks.
+pub const FRAME_PROBE_GRID: u32 = 8;
+/// Each sampled block is 8x8 pixels, so the staging texture is 64x64 pixels
+/// (16 KiB at BGRA8) regardless of the drawable size.
+pub const FRAME_PROBE_BLOCK: u32 = 8;
+/// One probe measures exactly this many pixels (`8 * 8 * 8 * 8`).
+pub const FRAME_PROBE_PIXELS: u64 = (FRAME_PROBE_GRID as u64)
+    * (FRAME_PROBE_BLOCK as u64)
+    * (FRAME_PROBE_GRID as u64)
+    * (FRAME_PROBE_BLOCK as u64);
+/// How long one `present` may block waiting for the probe blit.
+pub const FRAME_PROBE_WAIT: Duration = Duration::from_millis(10);
+/// After this long an in-flight probe is abandoned and a named failure is
+/// recorded instead of blocking teardown forever.
+pub const FRAME_PROBE_MAX_IN_FLIGHT: Duration = Duration::from_secs(2);
+
+/// Process-wide last probe report, read by the host for telemetry.
+static FRAME_PROBE_REPORT: OnceLock<Mutex<Option<FrameProbeReport>>> = OnceLock::new();
+
+fn publish_frame_probe_report(report: &FrameProbeReport) {
+    let cell = FRAME_PROBE_REPORT.get_or_init(|| Mutex::new(None));
+    if let Ok(mut slot) = cell.lock() {
+        *slot = Some(report.clone());
+    }
+}
+
+/// The most recent presented-frame probe report, or `None` when the probe has
+/// never run in this process (the default).
+pub fn frame_probe_report() -> Option<FrameProbeReport> {
+    FRAME_PROBE_REPORT
+        .get()
+        .and_then(|cell| cell.lock().ok())
+        .and_then(|slot| slot.clone())
+}
+
+/// Probe opt-in and sampling interval parsed from the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameProbeConfig {
+    /// Sample every `every` presented frames; frame 0 is always sampled.
+    pub every: u64,
+}
+
+impl FrameProbeConfig {
+    /// Parses the two environment values.
+    ///
+    /// `None` means the probe is off; an unset or invalid `every` falls back to
+    /// [`FRAME_PROBE_DEFAULT_EVERY`] so a malformed override can never disable
+    /// the explicit opt-in.
+    pub fn from_values(enabled: Option<&str>, every: Option<&str>) -> Option<Self> {
+        if !enabled.is_some_and(probe_flag_enabled) {
+            return None;
+        }
+        let every = every
+            .and_then(parse_probe_every)
+            .unwrap_or(FRAME_PROBE_DEFAULT_EVERY);
+        Some(Self { every })
+    }
+
+    /// Reads the configuration from the process environment.
+    pub fn from_env() -> Option<Self> {
+        let enabled = std::env::var(FRAME_PROBE_ENV).ok();
+        let every = std::env::var(FRAME_PROBE_EVERY_ENV).ok();
+        Self::from_values(enabled.as_deref(), every.as_deref())
+    }
+}
+
+fn probe_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "on" | "true" | "yes"
+    )
+}
+
+/// Parses a positive sampling interval; `0` and non-numbers are rejected.
+pub fn parse_probe_every(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|interval| *interval > 0)
+}
+
+/// Whether presented frame `frame_index` should be probed.
+///
+/// Frame 0 (the first presented frame) and every `every`-th frame afterwards
+/// are sampled. `every == 0` is inert rather than a division by zero.
+pub fn probe_due(frame_index: u64, every: u64) -> bool {
+    every > 0 && frame_index.is_multiple_of(every)
+}
+
+/// Byte order of a sampled 4-channel frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelOrder {
+    /// Blue, green, red, alpha (`MTLPixelFormatBGRA8Unorm`).
+    Bgra,
+    /// Red, green, blue, alpha (`MTLPixelFormatRGBA8Unorm`).
+    Rgba,
+}
+
+/// One probe measurement over a sampled BGRA8/RGBA8 buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameProbeSample {
+    /// Pixels with any channel farther than the threshold from the clear value.
+    pub non_black_pixels: u64,
+    /// Distinct 5-bit luma buckets seen (0..=32).
+    pub unique_luma_buckets: u32,
+    /// CRC-64/ECMA-182 over the sampled pixels in row-major order.
+    pub frame_crc: u64,
+    /// Number of pixels in this measurement.
+    pub probe_pixels: u64,
+}
+
+/// The accumulated probe result reported in telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameProbeReport {
+    /// Sampled frames that were actually read back.
+    pub sampled_frames: u64,
+    /// Pixels measured per sample.
+    pub probe_pixels: u64,
+    /// Frame index of the last successful sample, if any.
+    pub last_sampled_frame: Option<u64>,
+    /// Non-black pixels in the last sample.
+    pub non_black_pixels: u64,
+    /// Distinct 5-bit luma buckets in the last sample.
+    pub unique_luma_buckets: u32,
+    /// CRC-64/ECMA-182 of the last sample.
+    pub frame_crc: u64,
+    /// Sample opportunities dropped because a probe was still in flight.
+    pub dropped_samples: u64,
+    /// True when the last sample came from the diagnostic fallback clear.
+    pub fallback_clear: bool,
+    /// Sampling interval in presented frames.
+    pub probe_every: u64,
+    /// First named failure, if any. A set failure stops further sampling.
+    pub failure: Option<String>,
+}
+
+impl Default for FrameProbeReport {
+    fn default() -> Self {
+        Self {
+            sampled_frames: 0,
+            probe_pixels: 0,
+            last_sampled_frame: None,
+            non_black_pixels: 0,
+            unique_luma_buckets: 0,
+            frame_crc: 0,
+            dropped_samples: 0,
+            fallback_clear: false,
+            probe_every: FRAME_PROBE_DEFAULT_EVERY,
+            failure: None,
+        }
+    }
+}
+
+impl FrameProbeReport {
+    /// One stable `frame_probe=...` line for the host log.
+    pub fn log_line(&self) -> String {
+        let frame = self
+            .last_sampled_frame
+            .map_or_else(|| "none".to_string(), |index| index.to_string());
+        let failure = self.failure.as_deref().unwrap_or("none");
+        format!(
+            "frame_probe=frame={frame} non_black_pixels={} unique_luma_buckets={} \
+             frame_crc={:016x} sampled_frames={} probe_pixels={} dropped_samples={} \
+             fallback_clear={} probe_every={} failure={failure}",
+            self.non_black_pixels,
+            self.unique_luma_buckets,
+            self.frame_crc,
+            self.sampled_frames,
+            self.probe_pixels,
+            self.dropped_samples,
+            u8::from(self.fallback_clear),
+            self.probe_every,
+        )
+    }
+}
+
+/// CRC-64/ECMA-182 (poly `0x42F0E1EBA9EA3693`, init `0`, no reflection, no
+/// final XOR). This is the checksum of the sampled pixels only, in the order
+/// the staging texture is laid out, so it is stable across processes and
+/// sensitive to a single changed channel.
+pub fn frame_crc64(pixels: &[[u8; 4]]) -> u64 {
+    let mut crc = 0u64;
+    for pixel in pixels {
+        crc = crc64_ecma_update(crc, pixel);
+    }
+    crc
+}
+
+fn crc64_ecma_update(mut crc: u64, bytes: &[u8]) -> u64 {
+    const POLYNOMIAL: u64 = 0x42F0_E1EB_A9EA_3693;
+    for &byte in bytes {
+        crc ^= u64::from(byte) << 56;
+        for _ in 0..8 {
+            crc = if crc & (1 << 63) != 0 {
+                (crc << 1) ^ POLYNOMIAL
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// The 5-bit luma bucket of one pixel (`0..=31`), using BT.601 integer weights
+/// so both byte orders agree for grayscale input.
+pub fn luma_bucket(pixel: [u8; 4], order: PixelOrder) -> u32 {
+    let (red, green, blue) = match order {
+        PixelOrder::Bgra => (pixel[2], pixel[1], pixel[0]),
+        PixelOrder::Rgba => (pixel[0], pixel[1], pixel[2]),
+    };
+    let luma = (77 * u32::from(red) + 150 * u32::from(green) + 29 * u32::from(blue)) >> 8;
+    (luma.min(255)) >> 3
+}
+
+/// Measures a sampled buffer against `clear`.
+///
+/// A pixel is non-black when any of its four channels differs from the matching
+/// `clear` channel by more than `threshold`. `clear` is expressed in the same
+/// byte order as `pixels`.
+pub fn analyze_pixels(
+    pixels: &[[u8; 4]],
+    order: PixelOrder,
+    clear: [u8; 4],
+    threshold: u8,
+) -> FrameProbeSample {
+    let mut non_black_pixels = 0u64;
+    let mut buckets = 0u32;
+    for &pixel in pixels {
+        if pixel
+            .iter()
+            .zip(clear.iter())
+            .any(|(&value, &clear)| value.abs_diff(clear) > threshold)
+        {
+            non_black_pixels += 1;
+        }
+        buckets |= 1u32 << luma_bucket(pixel, order);
+    }
+    FrameProbeSample {
+        non_black_pixels,
+        unique_luma_buckets: buckets.count_ones(),
+        frame_crc: frame_crc64(pixels),
+        probe_pixels: pixels.len() as u64,
+    }
+}
+
+/// Convenience wrapper for the BGRA8 case.
+pub fn analyze_bgra8(pixels: &[[u8; 4]], clear: [u8; 4], threshold: u8) -> FrameProbeSample {
+    analyze_pixels(pixels, PixelOrder::Bgra, clear, threshold)
+}
+
+/// Layout of the fixed-size sampling grid for one drawable extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeLayout {
+    block_width: u32,
+    block_height: u32,
+    step_x: u32,
+    step_y: u32,
+    staging_width: u32,
+    staging_height: u32,
+}
+
+impl ProbeLayout {
+    fn new(width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let block_width = FRAME_PROBE_BLOCK.min(width);
+        let block_height = FRAME_PROBE_BLOCK.min(height);
+        Some(Self {
+            block_width,
+            block_height,
+            step_x: (width / FRAME_PROBE_GRID).max(1),
+            step_y: (height / FRAME_PROBE_GRID).max(1),
+            staging_width: block_width * FRAME_PROBE_GRID,
+            staging_height: block_height * FRAME_PROBE_GRID,
+        })
+    }
+
+    fn block_origin(&self, grid_x: u32, grid_y: u32, width: u32, height: u32) -> MTLOrigin {
+        MTLOrigin {
+            x: (grid_x * self.step_x).min(width.saturating_sub(self.block_width)) as usize,
+            y: (grid_y * self.step_y).min(height.saturating_sub(self.block_height)) as usize,
+            z: 0,
+        }
+    }
+
+    fn staging_origin(&self, grid_x: u32, grid_y: u32) -> MTLOrigin {
+        MTLOrigin {
+            x: (grid_x * self.block_width) as usize,
+            y: (grid_y * self.block_height) as usize,
+            z: 0,
+        }
+    }
+}
+
+/// `MTLRegion` (`MTLOrigin origin, MTLSize size`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct MTLRegion {
+    origin: MTLOrigin,
+    size: objc::MTLSize,
+}
+
+/// One shared staging texture reused by every probe.
+struct StagingTexture {
+    texture: ObjcObject,
+    format: usize,
+    layout: ProbeLayout,
+}
+
+/// The GPU side of the probe; created only when the environment opts in.
+struct FrameProbe {
+    every: u64,
+    device: ObjcObject,
+    staging: Option<StagingTexture>,
+    /// Retained probe command buffer; at most one exists.
+    in_flight: Option<ObjcObject>,
+    in_flight_frame: u64,
+    in_flight_started: Instant,
+    in_flight_fallback_clear: bool,
+    report: FrameProbeReport,
+    /// Set on the first failure so the probe gives up instead of retrying.
+    abandoned: bool,
+}
+
+impl FrameProbe {
+    /// Builds the probe from the environment, or returns `None` when it is off.
+    fn from_env(layer: objc::Id) -> Option<Self> {
+        let config = FrameProbeConfig::from_env()?;
+        // SAFETY: `layer` is a live `CAMetalLayer`; `device` returns its
+        // (borrowed) `MTLDevice`, retained here for the probe's lifetime.
+        let device = unsafe { objc::msg_send_id_0(layer, objc::sel(c"device")) };
+        if device.is_null() {
+            return None;
+        }
+        // SAFETY: `retain` returns the live device +1.
+        let retained = unsafe { objc::msg_send_id_0(device, objc::sel(c"retain")) };
+        let device = ObjcObject::from_retained(retained)?;
+        // Readback needs the drawable to be more than a render target. This is
+        // set only for the opt-in probe; the production layer stays
+        // framebuffer-only.
+        // SAFETY: `layer` is a live `CAMetalLayer`, and `setFramebufferOnly:`
+        // takes a BOOL.
+        unsafe {
+            objc::msg_send_void_u8(layer, objc::sel(c"setFramebufferOnly:"), 0);
+        }
+        Some(Self {
+            every: config.every,
+            device,
+            staging: None,
+            in_flight: None,
+            in_flight_frame: 0,
+            in_flight_started: Instant::now(),
+            in_flight_fallback_clear: false,
+            report: FrameProbeReport {
+                probe_every: config.every,
+                ..FrameProbeReport::default()
+            },
+            abandoned: false,
+        })
+    }
+
+    /// Called once per successful present. Never returns an error and never
+    /// blocks for longer than [`FRAME_PROBE_WAIT`].
+    fn observe(
+        &mut self,
+        queue: objc::Id,
+        target: objc::Id,
+        frame_index: u64,
+        fallback_clear: bool,
+    ) {
+        if self.abandoned {
+            return;
+        }
+        self.harvest_if_complete();
+        let due = probe_due(frame_index, self.every);
+        if self.in_flight.is_some() {
+            if self.in_flight_started.elapsed() > FRAME_PROBE_MAX_IN_FLIGHT {
+                self.fail("probe_in_flight_timeout");
+            } else if due {
+                // One probe at a time: drop this sampling opportunity instead
+                // of queuing another command buffer.
+                self.report.dropped_samples = self.report.dropped_samples.saturating_add(1);
+            }
+            return;
+        }
+        if !due {
+            return;
+        }
+        match self.encode(queue, target, frame_index, fallback_clear) {
+            Ok(()) => self.wait_for(FRAME_PROBE_WAIT),
+            Err(reason) => self.fail(&reason),
+        }
+    }
+
+    fn encode(
+        &mut self,
+        queue: objc::Id,
+        target: objc::Id,
+        frame_index: u64,
+        fallback_clear: bool,
+    ) -> Result<(), String> {
+        // SAFETY: `target` is the live drawable texture; the accessors only
+        // read immutable properties.
+        let (format, width, height) = unsafe {
+            (
+                objc::msg_send_usize_0(target, objc::sel(c"pixelFormat")),
+                objc::msg_send_usize_0(target, objc::sel(c"width")),
+                objc::msg_send_usize_0(target, objc::sel(c"height")),
+            )
+        };
+        if !matches!(
+            format,
+            MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM
+        ) {
+            return Err(format!("probe_unsupported_pixel_format_{format}"));
+        }
+        let width = u32::try_from(width).map_err(|_| "probe_extent_overflow".to_string())?;
+        let height = u32::try_from(height).map_err(|_| "probe_extent_overflow".to_string())?;
+        let layout = ProbeLayout::new(width, height).ok_or("probe_zero_extent".to_string())?;
+        self.ensure_staging(format, layout)?;
+        let staging = self.staging.as_ref().ok_or("probe_staging_missing")?;
+
+        // SAFETY: `queue` is the live transport queue; `commandBuffer` returns
+        // an autoreleased buffer that lives in the caller's pool.
+        let command_buffer = unsafe { objc::msg_send_id_0(queue, objc::sel(c"commandBuffer")) };
+        if command_buffer.is_null() {
+            return Err("probe_command_buffer_null".to_string());
+        }
+        // SAFETY: `command_buffer` is live and uncommitted.
+        let encoder =
+            unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder")) };
+        if encoder.is_null() {
+            return Err("probe_blit_encoder_null".to_string());
+        }
+        for grid_y in 0..FRAME_PROBE_GRID {
+            for grid_x in 0..FRAME_PROBE_GRID {
+                // SAFETY: both textures are live 4-channel textures, the source
+                // rectangle lies inside `target`, and the destination rectangle
+                // lies inside the fixed staging atlas.
+                unsafe {
+                    encode_texture_block_copy(
+                        encoder,
+                        target,
+                        layout.block_origin(grid_x, grid_y, width, height),
+                        layout.block_width,
+                        layout.block_height,
+                        staging.texture.as_raw(),
+                        layout.staging_origin(grid_x, grid_y),
+                    );
+                }
+            }
+        }
+        // SAFETY: `encoder` is an active blit encoder and `command_buffer` is
+        // an uncommitted buffer with only that encoder attached.
+        unsafe {
+            objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+        }
+        // SAFETY: retry the just-committed buffer so it can be polled after the
+        // autorelease pool of the present call is drained.
+        let retained = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"retain")) };
+        let retained = ObjcObject::from_retained(retained)
+            .ok_or_else(|| "probe_command_buffer_retain_failed".to_string())?;
+        self.in_flight = Some(retained);
+        self.in_flight_frame = frame_index;
+        self.in_flight_started = Instant::now();
+        self.in_flight_fallback_clear = fallback_clear;
+        Ok(())
+    }
+
+    fn ensure_staging(&mut self, format: usize, layout: ProbeLayout) -> Result<(), String> {
+        if let Some(staging) = self.staging.as_ref()
+            && staging.format == format
+            && staging.layout == layout
+        {
+            return Ok(());
+        }
+        let texture = create_probe_staging_texture(
+            self.device.as_raw(),
+            format,
+            layout.staging_width,
+            layout.staging_height,
+        )?;
+        self.staging = Some(StagingTexture {
+            texture,
+            format,
+            layout,
+        });
+        Ok(())
+    }
+
+    fn poll_status(&self) -> Option<usize> {
+        self.in_flight.as_ref().map(|command_buffer| {
+            // SAFETY: `command_buffer` is a live retained `MTLCommandBuffer`.
+            unsafe { objc::msg_send_usize_0(command_buffer.as_raw(), objc::sel(c"status")) }
+        })
+    }
+
+    /// Polls without blocking; harvests a completed probe, records a GPU error,
+    /// and leaves a still-running probe in place.
+    fn harvest_if_complete(&mut self) {
+        if self.in_flight.is_none() {
+            return;
+        }
+        match self.poll_status() {
+            Some(MTL_COMMAND_BUFFER_STATUS_COMPLETED) => self.harvest(),
+            // `MTLCommandBufferStatusError` is 5.
+            Some(5) => self.fail("probe_command_buffer_error"),
+            _ => {}
+        }
+    }
+
+    /// Waits at most `timeout` for the in-flight probe, then returns.
+    fn wait_for(&mut self, timeout: Duration) {
+        let started = Instant::now();
+        loop {
+            match self.poll_status() {
+                Some(MTL_COMMAND_BUFFER_STATUS_COMPLETED) => {
+                    self.harvest();
+                    return;
+                }
+                Some(5) => {
+                    self.fail("probe_command_buffer_error");
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            }
+            if started.elapsed() >= timeout {
+                // Still in flight: keep the single command buffer and drop the
+                // next opportunity rather than block the render loop.
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(250));
+        }
+    }
+
+    fn harvest(&mut self) {
+        let Some(command_buffer) = self.in_flight.take() else {
+            return;
+        };
+        let Some(staging) = self.staging.as_ref() else {
+            self.fail("probe_staging_missing");
+            return;
+        };
+        let width = staging.layout.staging_width;
+        let height = staging.layout.staging_height;
+        let mut pixels = vec![[0u8; 4]; (width as usize) * (height as usize)];
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc::MTLSize {
+                width: width as usize,
+                height: height as usize,
+                depth: 1,
+            },
+        };
+        let bytes_per_row = (width as usize) * (BYTES_PER_PIXEL as usize);
+        // SAFETY: the command buffer completed, so the shared staging texture
+        // holds final bytes; `pixels` is exactly `width * height` pixels and
+        // `bytes_per_row` matches its row stride.
+        unsafe {
+            get_texture_bytes(
+                staging.texture.as_raw(),
+                pixels.as_mut_ptr().cast(),
+                bytes_per_row,
+                region,
+            );
+        }
+        let order = if staging.format == MTL_PIXEL_FORMAT_BGRA8_UNORM {
+            PixelOrder::Bgra
+        } else {
+            PixelOrder::Rgba
+        };
+        // A blitted frame has a guest-defined clear that this probe cannot
+        // know, so non-black is measured against opaque black. The diagnostic
+        // fallback clear *is* known: use its first pixel so a uniform fallback
+        // frame reports zero non-black pixels.
+        let clear = if self.in_flight_fallback_clear {
+            pixels.first().copied().unwrap_or([0, 0, 0, 255])
+        } else {
+            [0, 0, 0, 255]
+        };
+        let sample = analyze_pixels(&pixels, order, clear, FRAME_PROBE_CHANNEL_THRESHOLD);
+        self.report.sampled_frames = self.report.sampled_frames.saturating_add(1);
+        self.report.probe_pixels = sample.probe_pixels;
+        self.report.last_sampled_frame = Some(self.in_flight_frame);
+        self.report.non_black_pixels = sample.non_black_pixels;
+        self.report.unique_luma_buckets = sample.unique_luma_buckets;
+        self.report.frame_crc = sample.frame_crc;
+        self.report.fallback_clear = self.in_flight_fallback_clear;
+        drop(command_buffer);
+        self.publish();
+    }
+
+    fn fail(&mut self, reason: &str) {
+        self.abandoned = true;
+        self.in_flight = None;
+        self.report.failure = Some(reason.to_string());
+        self.publish();
+    }
+
+    fn publish(&self) {
+        publish_frame_probe_report(&self.report);
+        eprintln!("{}", self.report.log_line());
+    }
+}
+
+/// Creates the one shared BGRA8/RGBA8 staging texture the probe reads back.
+fn create_probe_staging_texture(
+    device: objc::Id,
+    format: usize,
+    width: u32,
+    height: u32,
+) -> Result<ObjcObject, String> {
+    let class = objc::class(c"MTLTextureDescriptor");
+    if class.is_null() {
+        return Err("probe_texture_descriptor_unavailable".to_string());
+    }
+    // SAFETY: `class` is `MTLTextureDescriptor`; the selector is the documented
+    // 2D factory and `format` is a 4-channel unorm format.
+    let descriptor = unsafe {
+        type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, u8) -> objc::Id;
+        let send: Fn = mem::transmute(objc::msg_send_entry());
+        send(
+            class,
+            objc::sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+            format,
+            width as usize,
+            height as usize,
+            0,
+        )
+    };
+    if descriptor.is_null() {
+        return Err("probe_texture_descriptor_null".to_string());
+    }
+    // SAFETY: `descriptor` is a live descriptor; shared storage lets the CPU
+    // read the staging texture after completion.
+    unsafe {
+        msg_send_void_usize(
+            descriptor,
+            objc::sel(c"setStorageMode:"),
+            MTL_STORAGE_MODE_SHARED,
+        );
+    }
+    // SAFETY: `device` is the live layer device and `descriptor` is fully
+    // populated; `newTextureWithDescriptor:` returns a retained texture (+1).
+    let raw =
+        unsafe { objc::msg_send_id_1(device, objc::sel(c"newTextureWithDescriptor:"), descriptor) };
+    ObjcObject::from_retained(raw).ok_or_else(|| "probe_staging_texture_null".to_string())
+}
+
+/// Copies one block from `source` to `destination` on a blit encoder.
+///
+/// # Safety
+///
+/// Both textures must be live, have the same 4-channel pixel format, and the
+/// source/destination rectangles must lie inside their respective textures.
+unsafe fn encode_texture_block_copy(
+    encoder: objc::Id,
+    source: objc::Id,
+    source_origin: MTLOrigin,
+    width: u32,
+    height: u32,
+    destination: objc::Id,
+    destination_origin: MTLOrigin,
+) {
+    type Fn = unsafe extern "C" fn(
+        objc::Id,
+        objc::Sel,
+        objc::Id,
+        usize,
+        usize,
+        MTLOrigin,
+        objc::MTLSize,
+        objc::Id,
+        usize,
+        usize,
+        MTLOrigin,
+    );
+    let size = objc::MTLSize {
+        width: width as usize,
+        height: height as usize,
+        depth: 1,
+    };
+    // SAFETY: the caller guarantees textures, formats and rectangles.
+    let send: Fn = unsafe { mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: argument layout matches the 11-argument selector.
+    unsafe {
+        send(
+            encoder,
+            objc::sel(
+                c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+            ),
+            source,
+            0,
+            0,
+            source_origin,
+            size,
+            destination,
+            0,
+            0,
+            destination_origin,
+        );
+    }
+}
+
+/// Issues `getBytes:bytesPerRow:fromRegion:mipmapLevel:` on a shared texture.
+///
+/// # Safety
+///
+/// `texture` must be a live shared-storage texture whose GPU work completed,
+/// and `destination` must hold at least `bytes_per_row * region.size.height`.
+unsafe fn get_texture_bytes(
+    texture: objc::Id,
+    destination: *mut c_void,
+    bytes_per_row: usize,
+    region: MTLRegion,
+) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, *mut c_void, usize, MTLRegion, usize);
+    // SAFETY: the caller guarantees the texture and buffer bounds.
+    let send: Fn = unsafe { mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: argument layout matches `getBytes:bytesPerRow:fromRegion:mipmapLevel:`.
+    unsafe {
+        send(
+            texture,
+            objc::sel(c"getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+            destination,
+            bytes_per_row,
+            region,
+            0,
+        );
+    }
 }
 
 /// An opaque clear colour used by the present render pass.
@@ -1709,5 +2488,238 @@ mod tests {
                 .expect("zero extent must be rejected");
             assert_eq!(error, PresentError::ZeroExtent { width, height });
         }
+    }
+
+    #[test]
+    fn frame_probe_is_off_by_default_and_the_opt_in_is_explicit() {
+        assert_eq!(FrameProbeConfig::from_values(None, None), None);
+        for off in ["", "0", "off", "false", "no", "  "] {
+            assert_eq!(
+                FrameProbeConfig::from_values(Some(off), None),
+                None,
+                "{off:?} must not enable the probe"
+            );
+        }
+        for on in ["1", "on", "true", "yes", " TRUE "] {
+            assert!(
+                FrameProbeConfig::from_values(Some(on), None).is_some(),
+                "{on:?} must enable the probe"
+            );
+        }
+        assert_eq!(
+            FrameProbeConfig::from_values(Some("1"), None),
+            Some(FrameProbeConfig {
+                every: FRAME_PROBE_DEFAULT_EVERY
+            })
+        );
+        assert_eq!(
+            FrameProbeConfig::from_values(Some("1"), Some("5")),
+            Some(FrameProbeConfig { every: 5 })
+        );
+        // A malformed or zero interval falls back to the documented default.
+        for invalid in ["0", "-3", "bogus", ""] {
+            assert_eq!(
+                FrameProbeConfig::from_values(Some("1"), Some(invalid)),
+                Some(FrameProbeConfig {
+                    every: FRAME_PROBE_DEFAULT_EVERY
+                }),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(parse_probe_every(" 7 "), Some(7));
+        assert_eq!(parse_probe_every("0"), None);
+    }
+
+    #[test]
+    fn probe_schedule_samples_frame_zero_and_every_nth_frame() {
+        let sampled: Vec<u64> = (0..100).filter(|frame| probe_due(*frame, 30)).collect();
+        assert_eq!(sampled, vec![0, 30, 60, 90]);
+        assert_eq!(
+            sampled.last().copied(),
+            Some(90),
+            "the report carries the last sampled frame index"
+        );
+        assert!(probe_due(0, 1));
+        assert!(probe_due(1, 1));
+        assert!(!probe_due(0, 0), "zero interval must be inert");
+        assert!(!probe_due(1, 0));
+    }
+
+    #[test]
+    fn probe_threshold_counts_only_pixels_beyond_the_clear() {
+        let clear = [10, 20, 30, 200];
+        let all_clear = vec![clear; 64];
+        let sample = analyze_bgra8(&all_clear, clear, FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.non_black_pixels, 0, "an all-clear frame has no content");
+        assert_eq!(sample.unique_luma_buckets, 1);
+        assert_eq!(sample.probe_pixels, 64);
+
+        // A difference of exactly the threshold is still clear.
+        let mut at_threshold = all_clear.clone();
+        at_threshold[3][0] = clear[0] + FRAME_PROBE_CHANNEL_THRESHOLD;
+        assert_eq!(
+            analyze_bgra8(&at_threshold, clear, FRAME_PROBE_CHANNEL_THRESHOLD).non_black_pixels,
+            0
+        );
+
+        // One step beyond the threshold on any channel counts exactly one pixel.
+        for channel in 0..4 {
+            let mut one = all_clear.clone();
+            one[7][channel] = clear[channel] + FRAME_PROBE_CHANNEL_THRESHOLD + 1;
+            let sample = analyze_bgra8(&one, clear, FRAME_PROBE_CHANNEL_THRESHOLD);
+            assert_eq!(sample.non_black_pixels, 1, "channel {channel}");
+        }
+    }
+
+    #[test]
+    fn probe_luma_buckets_are_five_bit_and_a_gradient_spans_all_of_them() {
+        // Every 8-bit gray level maps to one 5-bit bucket.
+        let gradient: Vec<[u8; 4]> = (0..=255u16)
+            .map(|value| {
+                let level = u8::try_from(value).expect("0..=255 fits u8");
+                [level, level, level, 255]
+            })
+            .collect();
+        let sample = analyze_bgra8(&gradient, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.unique_luma_buckets, 32);
+        assert_eq!(sample.probe_pixels, 256);
+
+        // Values 0..=7 share bucket 0; 8 starts bucket 1.
+        let same_bucket = vec![[0, 0, 0, 255], [7, 7, 7, 255]];
+        assert_eq!(
+            analyze_bgra8(&same_bucket, [0, 0, 0, 255], 0).unique_luma_buckets,
+            1
+        );
+        let next_bucket = vec![[7, 7, 7, 255], [8, 8, 8, 255]];
+        assert_eq!(
+            analyze_bgra8(&next_bucket, [0, 0, 0, 255], 0).unique_luma_buckets,
+            2
+        );
+    }
+
+    #[test]
+    fn probe_crc_is_stable_sensitive_and_matches_the_ecma182_check_value() {
+        // CRC-64/ECMA-182 standard check value for the ASCII bytes "123456789".
+        assert_eq!(crc64_ecma_update(0, b"123456789"), 0x6C40_DF5F_0B49_7347);
+        assert_eq!(frame_crc64(&[]), 0);
+
+        let frame = vec![[1u8, 2, 3, 4]; 16];
+        let same = frame.clone();
+        assert_eq!(
+            frame_crc64(&frame),
+            frame_crc64(&same),
+            "the CRC must be deterministic for identical pixels"
+        );
+
+        let mut one_bit = frame.clone();
+        one_bit[7][2] ^= 1;
+        assert_ne!(
+            frame_crc64(&frame),
+            frame_crc64(&one_bit),
+            "a single changed channel must change the CRC"
+        );
+    }
+
+    #[test]
+    fn probe_report_line_names_every_telemetry_quantity() {
+        let report = FrameProbeReport {
+            sampled_frames: 4,
+            probe_pixels: FRAME_PROBE_PIXELS,
+            last_sampled_frame: Some(90),
+            non_black_pixels: 12,
+            unique_luma_buckets: 3,
+            frame_crc: 0x0123_4567_89AB_CDEF,
+            dropped_samples: 2,
+            fallback_clear: false,
+            probe_every: 30,
+            failure: None,
+        };
+        let line = report.log_line();
+        assert!(line.starts_with("frame_probe="), "{line}");
+        for expected in [
+            "frame=90",
+            "non_black_pixels=12",
+            "unique_luma_buckets=3",
+            "sampled_frames=4",
+            "probe_pixels=4096",
+            "dropped_samples=2",
+            "fallback_clear=0",
+            "probe_every=30",
+            "failure=none",
+        ] {
+            assert!(line.contains(expected), "{line} must contain {expected}");
+        }
+        assert!(line.contains("frame_crc=0123456789abcdef"));
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device: exercises the GPU staging-blit probe path"]
+    fn frame_probe_gpu_staging_blit_copies_the_presented_texture() {
+        let transport = open_transport();
+        let mut image = create_surface(&transport, 64, 64);
+        let mut path = PresentPath::new(&transport);
+        let mut sink = RecordingSink::new();
+        path.present(&mut image, ClearColor::OPAQUE_RED, &mut sink)
+            .expect("present should reach the sink");
+        path.finish_present().expect("frame should finish");
+
+        let layout = ProbeLayout::new(64, 64).expect("64x64 layout");
+        let staging = create_probe_staging_texture(
+            transport.device_raw(),
+            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            layout.staging_width,
+            layout.staging_height,
+        )
+        .expect("probe staging texture");
+
+        // SAFETY: `queue` is the live transport queue and both textures are
+        // live 64x64 BGRA8 textures.
+        unsafe {
+            let command_buffer =
+                objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer"));
+            assert!(!command_buffer.is_null());
+            let encoder =
+                objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
+            assert!(!encoder.is_null());
+            for grid_y in 0..FRAME_PROBE_GRID {
+                for grid_x in 0..FRAME_PROBE_GRID {
+                    encode_texture_block_copy(
+                        encoder,
+                        image.texture_raw(),
+                        layout.block_origin(grid_x, grid_y, 64, 64),
+                        layout.block_width,
+                        layout.block_height,
+                        staging.as_raw(),
+                        layout.staging_origin(grid_x, grid_y),
+                    );
+                }
+            }
+            objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
+        }
+
+        let mut pixels = vec![[0u8; 4]; 64 * 64];
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc::MTLSize {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+        };
+        // SAFETY: the command buffer completed above; `pixels` holds the whole
+        // 64x64 staging texture at a matching row pitch.
+        unsafe {
+            get_texture_bytes(
+                staging.as_raw(),
+                pixels.as_mut_ptr().cast(),
+                64 * 4,
+                region,
+            );
+        }
+        let expected = expected_bgra(ClearColor::OPAQUE_RED);
+        let mismatch = pixels.iter().position(|pixel| *pixel != expected);
+        assert_eq!(mismatch, None, "staging copy differs at pixel {mismatch:?}");
     }
 }
