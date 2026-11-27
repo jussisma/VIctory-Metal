@@ -900,12 +900,18 @@ fn lane_reads_across_halves_match_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// LDS shared by a group that is one console wave64 (no barriers between
-/// its lanes) cannot be split into two host waves; one of 32 threads or
-/// fewer is one host wave, and a group of several console waves keeps the
-/// console's barriers.
+/// A group that is one console wave64 (no barriers between its lanes) spans
+/// two host waves on a host whose waves are 32 lanes: LDS shared between them
+/// gets the barriers `split_wave_barriers` places, whether the host is split
+/// in halves (`host_wave32`) or only told to run the program in 32-lane waves
+/// (`narrow_waves`, D3DMetal). One of 32 threads or fewer is one host wave,
+/// and a group of several console waves keeps the console's barriers.
+///
+/// This lane reads its own dword, so no barrier is needed; the refusal this
+/// test used to assert was the barrier pass being keyed to `narrow_waves`
+/// alone (a wave32 host without that switch lost the LDS lowering entirely).
 #[test]
-fn lds_of_a_one_wave64_group_is_refused_in_halves() {
+fn lds_of_a_one_wave64_group_gets_its_barriers_in_halves() {
     let lds = [
         PROLOGUE.as_slice(),
         &[
@@ -924,10 +930,16 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
         &[S_ENDPGM],
     ]
     .concat();
-    let why = refusal(&lds, 64, 256);
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
+    let n = native(&lds, true, 64, 256);
+    let d3dmetal = lowered_with(&n, true, true).expect("narrow waves");
+    assert_eq!(d3dmetal.wave_size, Some(32));
+    assert_eq!(d3dmetal.split_barriers, 0, "the lane reads its own dword");
+    let wave32 = lowered_with(&n, true, false).expect("a wave32 host");
+    assert_eq!(wave32.wave_size, d3dmetal.wave_size);
+    assert_eq!(wave32.split_barriers, d3dmetal.split_barriers);
+    assert_eq!(
+        wave32.dxil, d3dmetal.dxil,
+        "both option sets emit the barriers' own DXIL"
     );
     assert_eq!(refusal(&lds, 32, 256), "translated");
     assert_eq!(refusal(&lds, 128, 512), "translated");
@@ -1216,23 +1228,19 @@ fn the_lds_program_is_what_its_comments_say() {
     }
 }
 
-/// With narrow host waves (#148, D3DMetal), a one-wave group whose LDS gets
-/// its barrier runs in halves instead of being refused; without them it is
-/// refused, as before.
+/// A one-wave group whose LDS needs a barrier runs in halves with it, on a
+/// host split in halves (`host_wave32`) and on D3DMetal's narrow waves alike:
+/// the barrier is the same one (#148), and so is the DXIL.
 #[test]
 fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
     let n = native(&lds_across_halves(), true, 64, 256);
     let synced = lowered_with(&n, true, true).expect("synced, in halves");
     assert_eq!(synced.wave_size, Some(32));
     assert_eq!(synced.split_barriers, 1);
-    let why = lowered_with(&n, true, false)
-        .err()
-        .expect("refused")
-        .to_string();
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
-    );
+    let wave32 = lowered_with(&n, true, false).expect("synced on a wave32 host");
+    assert_eq!(wave32.wave_size, Some(32));
+    assert_eq!(wave32.split_barriers, 1);
+    assert_eq!(wave32.dxil, synced.dxil);
 }
 
 /// The synced program on every hardware adapter, in halves: each lane reads
@@ -1322,9 +1330,9 @@ fn the_lds_loop_is_what_its_comments_say() {
     }
 }
 
-/// With narrow host waves (D3DMetal), LDS a one-wave group shares in a loop
-/// on a scalar count gets its barriers inside the loop and runs in halves;
-/// without them it is refused, as before.
+/// LDS a one-wave group shares in a loop on a scalar count gets its barriers
+/// inside the loop and runs in halves, whether the host is split in halves
+/// (`host_wave32`) or only told to run 32-lane waves (D3DMetal).
 #[test]
 fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
     let n = native(&lds_in_a_loop(), true, 64, 256);
@@ -1335,14 +1343,10 @@ fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
         v.validate(&mut synced.dxil.clone())
             .expect("DXIL validation failed");
     }
-    let why = lowered_with(&n, true, false)
-        .err()
-        .expect("refused")
-        .to_string();
-    assert!(
-        why.contains("LDS one console wave64 shares without barriers"),
-        "{why}"
-    );
+    let wave32 = lowered_with(&n, true, false).expect("synced on a wave32 host");
+    assert_eq!(wave32.wave_size, Some(32));
+    assert_eq!(wave32.split_barriers, 2);
+    assert_eq!(wave32.dxil, synced.dxil);
 }
 
 /// The loop on every hardware adapter, in halves: every pass gives the
