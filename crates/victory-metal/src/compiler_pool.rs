@@ -23,9 +23,13 @@
 //!
 //! # Worker protocol (version 1)
 //!
-//! Each worker is a child process driven over stdin/stdout with
-//! length-prefixed frames. No arguments are passed; the protocol version is
-//! implicit in the header tokens.
+//! Each worker is a child process started as `victory-irconverter --stdio`
+//! (see [`pool_stdio_enabled`]) and driven over stdin/stdout with
+//! length-prefixed frames. When `VICTORY_METAL_IRCONVERTER` or `D3DMETAL_RES`
+//! names a converter library, the pool also passes `--converter <path>`; a
+//! worker that rejects `--stdio` exits before answering and is reported as
+//! [`PoolError::WorkerExited`] on the affected job, never silently replaced by
+//! the one-shot path. The protocol version is implicit in the header tokens.
 //!
 //! Request, pool -> worker stdin:
 //!
@@ -76,7 +80,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest worker count the pool will ever start.
 pub const MAX_WORKERS: usize = 8;
@@ -118,6 +122,33 @@ const SIGKILL: i32 = 9;
 const PROTOCOL_MAGIC_JOB: &str = "VMJOB";
 const PROTOCOL_MAGIC_RESULT: &str = "VMRES";
 const MAX_FRAME_HEADER_BYTES: usize = 4096;
+/// Argument that selects the worker's persistent framed protocol.
+const STDIO_ARG: &str = "--stdio";
+/// Argument that names the x86_64 IRConverter library to the worker.
+const CONVERTER_ARG: &str = "--converter";
+
+/// Whether this build starts workers in persistent `--stdio` mode.
+///
+/// It is always true: the pool no longer has a one-shot fallback, so a worker
+/// that does not understand `--stdio` fails explicitly instead of being driven
+/// once per job. Tests use this to assert the transport.
+pub const fn pool_stdio_enabled() -> bool {
+    true
+}
+
+/// Converter library passed to a `--stdio` worker, taken from the same
+/// environment the renderer uses. `None` lets the worker report the missing
+/// converter itself, which surfaces as [`PoolError::WorkerExited`].
+fn converter_from_env() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_METAL_IRCONVERTER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::var_os("D3DMETAL_RES")
+                .map(|root| PathBuf::from(root).join("libmetalirconverter.dylib"))
+                .filter(|path| path.is_file())
+        })
+}
 
 /// Pool sizing, timeout and cache configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +263,37 @@ pub struct PoolStats {
     pub errors: u64,
     /// Callers currently dispatched to or waiting for a worker.
     pub in_flight: usize,
+    /// Jobs actually run inside a worker (cache hits excluded).
+    pub worker_jobs: u64,
+    /// Sum of worker job wall times, including the first job's process start.
+    pub worker_job_micros_total: u64,
+    /// Longest single worker job wall time.
+    pub worker_job_micros_max: u64,
+}
+
+/// Per-worker lifetime counters and wall-time instrumentation.
+///
+/// `first_job_micros` includes process start and the Rosetta/dylib warm-up;
+/// `subsequent_job_micros_total / subsequent_jobs` is the steady-state cost.
+/// A persistent `--stdio` worker should show a first job far slower than the
+/// average of the rest, which is the amortisation the pool exists for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerTiming {
+    /// Jobs answered by this worker slot (across respawns).
+    pub jobs: u64,
+    /// Wall time of the first job after the slot's first spawn.
+    pub first_job_micros: u64,
+    /// Jobs after the first one.
+    pub subsequent_jobs: u64,
+    /// Sum of wall times for the jobs after the first one.
+    pub subsequent_job_micros_total: u64,
+}
+
+impl WorkerTiming {
+    /// Average wall time of jobs after the first, when there is one.
+    pub fn subsequent_avg_micros(&self) -> Option<u64> {
+        (self.subsequent_jobs > 0).then(|| self.subsequent_job_micros_total / self.subsequent_jobs)
+    }
 }
 
 /// Explicit pool failure. Every variant is terminal for the affected job only.
@@ -339,6 +401,9 @@ struct AtomicStats {
     completed: AtomicU64,
     errors: AtomicU64,
     in_flight: AtomicUsize,
+    worker_jobs: AtomicU64,
+    worker_job_micros_total: AtomicU64,
+    worker_job_micros_max: AtomicU64,
 }
 
 /// Bounded, lazily spawned worker pool with a content-hashed disk cache.
@@ -467,7 +532,36 @@ impl CompilerPool {
             completed: load(&self.stats.completed),
             errors: load(&self.stats.errors),
             in_flight: self.stats.in_flight.load(Ordering::Relaxed),
+            worker_jobs: load(&self.stats.worker_jobs),
+            worker_job_micros_total: load(&self.stats.worker_job_micros_total),
+            worker_job_micros_max: load(&self.stats.worker_job_micros_max),
         }
+    }
+
+    /// Jobs answered by each worker slot, in slot order.
+    ///
+    /// A cache hit does not touch a worker, so the counts do not move on a warm
+    /// run. The counts span respawns in the same slot.
+    pub fn worker_job_counts(&self) -> Vec<u64> {
+        self.slots
+            .iter()
+            .map(|slot| slot.jobs_served.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Per-slot job counts and wall-time instrumentation.
+    pub fn worker_timings(&self) -> Vec<WorkerTiming> {
+        self.slots
+            .iter()
+            .map(|slot| WorkerTiming {
+                jobs: slot.jobs_served.load(Ordering::Relaxed),
+                first_job_micros: slot.first_job_micros.load(Ordering::Relaxed),
+                subsequent_jobs: slot.subsequent_jobs.load(Ordering::Relaxed),
+                subsequent_job_micros_total: slot
+                    .subsequent_job_micros_total
+                    .load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// Compiles one job, consulting the disk cache before any worker runs.
@@ -605,11 +699,27 @@ impl Drop for CompilerPool {
 #[derive(Default)]
 struct WorkerSlot {
     in_flight: AtomicUsize,
+    jobs_served: AtomicU64,
+    first_job_micros: AtomicU64,
+    subsequent_jobs: AtomicU64,
+    subsequent_job_micros_total: AtomicU64,
     child: Mutex<Option<Child>>,
     poisoned: Mutex<HashSet<u64>>,
 }
 
 impl WorkerSlot {
+    /// Records one completed worker job. Only the slot's dispatcher thread
+    /// calls this, so the first/rest split needs no compare-and-swap.
+    fn record_job(&self, micros: u64) {
+        if self.jobs_served.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.first_job_micros.store(micros, Ordering::Relaxed);
+        } else {
+            self.subsequent_jobs.fetch_add(1, Ordering::Relaxed);
+            self.subsequent_job_micros_total
+                .fetch_add(micros, Ordering::Relaxed);
+        }
+    }
+
     /// Marks `seq` as timed out and kills the worker so a blocked read
     /// returns and the dispatcher can respawn it.
     fn cancel(&self, seq: u64) {
@@ -778,6 +888,12 @@ impl ChildIo {
 
 fn spawn_child(program: &Path, slot: &WorkerSlot) -> Result<ChildIo, PoolError> {
     let mut command = Command::new(program);
+    if pool_stdio_enabled() {
+        command.arg(STDIO_ARG);
+    }
+    if let Some(converter) = converter_from_env() {
+        command.arg(CONVERTER_ARG).arg(converter);
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -827,6 +943,9 @@ fn worker_loop(
             io = None;
             continue;
         }
+        // The first job of a slot includes process start and Rosetta/dylib
+        // warm-up; later jobs reuse the same `--stdio` child.
+        let started = Instant::now();
         if io.is_none() {
             match spawn_child(&program, &slot) {
                 Ok(child) => {
@@ -842,6 +961,15 @@ fn worker_loop(
             continue;
         };
         let outcome = child.run(&job);
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        slot.record_job(micros);
+        stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
+        stats
+            .worker_job_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+        stats
+            .worker_job_micros_max
+            .fetch_max(micros, Ordering::Relaxed);
         // A late cancellation may have raced with the reply; drop it so the
         // caller's id/sequence can be reused by a later job.
         if let Ok(mut poisoned) = slot.poisoned.lock() {
@@ -1022,6 +1150,29 @@ mod cache_bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_are_driven_in_persistent_stdio_mode() {
+        assert!(pool_stdio_enabled());
+    }
+
+    #[test]
+    fn fresh_pool_reports_zero_worker_jobs_and_no_timings() {
+        // A program is configured so the slots exist; no job is submitted, so
+        // no child is ever spawned.
+        let pool = CompilerPool::new(PoolConfig::default(), Some(PathBuf::from("/bin/false")));
+        assert_eq!(pool.worker_job_counts().len(), pool.workers());
+        assert!(pool.worker_job_counts().iter().all(|&jobs| jobs == 0));
+        assert!(
+            pool.worker_timings()
+                .iter()
+                .all(|timing| *timing == WorkerTiming::default())
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.worker_jobs, 0);
+        assert_eq!(stats.worker_job_micros_total, 0);
+        assert_eq!(stats.worker_job_micros_max, 0);
+    }
 
     #[test]
     fn worker_env_is_clamped_and_invalid_values_default() {
