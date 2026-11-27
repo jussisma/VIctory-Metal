@@ -1,21 +1,25 @@
-//! Path-in/path-out DXIL to serialized metallib converter.
+//! Path-in/path-out and persistent stdio DXIL to serialized metallib converter.
 //!
 //! Build and run this binary as `x86_64-apple-darwin` (Rosetta 2 on Apple
 //! Silicon), because Apple's `libmetalirconverter.dylib` is x86_64-only. The
 //! converter does not create an `MTLDevice`, an `MTLLibrary`, or any GPU work;
-//! it only serializes the metallib bytes to the output path.
+//! it only serializes the metallib bytes.
 //!
 //! Usage:
 //! ```text
 //! victory-irconverter --converter <libmetalirconverter.dylib> \
 //!     --entry <entry-point> [--reflection <path>] <input.dxil> <output.metallib>
+//! victory-irconverter --stdio --converter <libmetalirconverter.dylib> \
+//!     [--reflection-dir <dir>]
 //! ```
 //!
-//! `--converter` and `--entry` are required. The root signature must already be
-//! embedded in the DXIL; `--root-signature` only carries the caller's raw
-//! layout bytes into the reflection payload and cache key, it never overrides
-//! the embedded signature. DXIL input is copied by IRConverter
-//! (`IRObjectCreateFromDXIL` ownership `1`) before the Rust buffer is released.
+//! `--converter` is required in both modes; `--entry` is required for the
+//! path-in/path-out mode and is taken from each job frame in `--stdio` mode.
+//! The root signature must already be embedded in the DXIL; `--root-signature`
+//! only carries the caller's raw layout bytes into the reflection payload and
+//! cache key, it never overrides the embedded signature. DXIL input is copied
+//! by IRConverter (`IRObjectCreateFromDXIL` ownership `1`) before the Rust
+//! buffer is released.
 //!
 //! `--reflection` writes the binary reflection payload consumed by
 //! `victory-metal`: converter stage, metallib hash and size, DXIL/root-layout
@@ -23,11 +27,35 @@
 //! `--converter-version`, `--target`, `--min-os`, `--flag` and `--binding` are
 //! supplied by the renderer so key and reflection agree.
 //!
+//! # Persistent stdio protocol
+//!
+//! `--stdio` keeps one process alive and serves framed jobs on stdin/stdout
+//! using the protocol [`victory_metal::compiler_pool`] already speaks. Each
+//! request is a text header followed by the raw payload:
+//!
+//! ```text
+//! VMJOB <seq> <job-id> <stage> <entry-len> <dxil-len>\n<entry><dxil>
+//! ```
+//!
+//! and each response echoes `seq` and `job-id`:
+//!
+//! ```text
+//! VMRES <seq> <job-id> <status> <payload-len>\n<payload>
+//! ```
+//!
+//! `status == 0` carries the serialized metallib; any other status carries a
+//! UTF-8 diagnostic. A malformed header whose lengths still parse is rejected
+//! with a nonzero status after its payload is drained, so the loop stays alive.
+//! The process exits 0 on a clean stdin EOF. `--reflection-dir` is a daemon
+//! option that writes `<seq>-<job-id>.reflection` for each successful job; the
+//! pool frame carries no per-job reflection path, so the pool itself derives
+//! reflection metadata from the job instead of asking the worker.
+//!
 //! Input limits are fixed by `victory-metal`: at most
 //! `MAX_DXIL_INPUT_BYTES` (16 MiB) of DXIL, at most `MAX_ENTRY_POINT_BYTES`
 //! (256) bytes in the entry name, and at most `MAX_METALLIB_OUTPUT_BYTES`
-//! (64 MiB) of output. There is no stdin/stdout mode and no environment-based
-//! converter fallback: the caller names exactly one converter file.
+//! (64 MiB) of output. There is no environment-based converter fallback: the
+//! caller names exactly one converter file in both modes.
 //!
 //! On non-macOS targets this binary exists only so workspace `--all-targets`
 //! checks keep compiling; it exits with a usage error.
@@ -48,7 +76,7 @@ mod cli {
     use std::env;
     use std::ffi::OsString;
     use std::fs::{self, File};
-    use std::io::Read;
+    use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
     use std::path::{Path, PathBuf};
 
     use victory_metal::macos::cache::{
@@ -60,14 +88,26 @@ mod cli {
         MAX_METALLIB_OUTPUT_BYTES, convert_dxil_to_metallib,
     };
 
+    /// Largest accepted stdio request header, matching the pool's own bound.
+    const MAX_STDIO_HEADER_BYTES: usize = 4096;
+    /// Largest accepted stdio payload (entry plus DXIL) before it is rejected
+    /// as unrecoverable framing.
+    const MAX_STDIO_PAYLOAD_BYTES: usize = MAX_DXIL_INPUT_BYTES + MAX_ENTRY_POINT_BYTES;
+
     const USAGE: &str = "\
 usage: victory-irconverter --converter <libmetalirconverter.dylib> \\
            --entry <entry-point> [options] <input.dxil> <output.metallib>
+       victory-irconverter --stdio --converter <libmetalirconverter.dylib> \\
+           [--reflection-dir <dir>] [options]
 
   --converter, -c <path>  explicitly configured x86_64 libmetalirconverter.dylib
   --entry, -e <name>      DXIL entry point (embedded root signature is used)
+  --stdio                 serve VMJOB/VMRES frames on stdin/stdout instead of
+                          converting one input/output pair
   --reflection <path>     write the reflection payload (metallib hash, stage,
                           root layout, options and binding metadata)
+  --reflection-dir <dir>  with --stdio, write <seq>-<job-id>.reflection for each
+                          successful job (the pool frame has no per-job path)
   --root-signature <path> raw root signature bytes to carry into the reflection
                           and cache key (conversion still uses the embedded one)
   --converter-version <s> converter/protocol version string
@@ -84,14 +124,19 @@ root signature <= 1048576 bytes.
 
     struct Args {
         converter: PathBuf,
+        /// One-shot entry point. Empty in stdio mode, where each job names it.
         entry: String,
+        /// One-shot input path. Empty in stdio mode.
         input: PathBuf,
+        /// One-shot output path. Empty in stdio mode.
         output: PathBuf,
         reflection: Option<PathBuf>,
+        reflection_dir: Option<PathBuf>,
         root_signature: Option<PathBuf>,
         converter_version: String,
         options: TranslationOptions,
         bindings: Vec<BindingMetadata>,
+        stdio: bool,
     }
 
     pub(super) fn run() -> i32 {
@@ -104,6 +149,7 @@ root signature <= 1048576 bytes.
                 eprintln!("victory-irconverter: {message}\n\n{USAGE}");
                 2
             }
+            Ok(Some(args)) if args.stdio => run_stdio(&args),
             Ok(Some(args)) => match convert(&args) {
                 Ok(()) => 0,
                 Err(message) => {
@@ -118,12 +164,14 @@ root signature <= 1048576 bytes.
         let mut converter = None;
         let mut entry = None;
         let mut reflection = None;
+        let mut reflection_dir = None;
         let mut root_signature = None;
         let mut converter_version = DEFAULT_CONVERTER_VERSION.to_string();
         let mut options = TranslationOptions::default();
         let mut bindings = Vec::new();
         let mut positional = Vec::new();
         let mut only_positional = false;
+        let mut stdio = false;
 
         while let Some(arg) = raw.next() {
             if !only_positional && arg == "--" {
@@ -133,6 +181,12 @@ root signature <= 1048576 bytes.
             let text = arg.to_str();
             match text {
                 Some("--help" | "-h") => return Ok(None),
+                Some("--stdio") if !only_positional => {
+                    if stdio {
+                        return Err("--stdio was given more than once".to_string());
+                    }
+                    stdio = true;
+                }
                 Some("--converter" | "-c") if !only_positional => {
                     if converter.is_some() {
                         return Err("--converter was given more than once".to_string());
@@ -157,12 +211,17 @@ root signature <= 1048576 bytes.
                     }
                     reflection = Some(PathBuf::from(next_value(&mut raw, "--reflection")?));
                 }
+                Some("--reflection-dir") if !only_positional => {
+                    if reflection_dir.is_some() {
+                        return Err("--reflection-dir was given more than once".to_string());
+                    }
+                    reflection_dir = Some(PathBuf::from(next_value(&mut raw, "--reflection-dir")?));
+                }
                 Some("--root-signature") if !only_positional => {
                     if root_signature.is_some() {
                         return Err("--root-signature was given more than once".to_string());
                     }
-                    root_signature =
-                        Some(PathBuf::from(next_value(&mut raw, "--root-signature")?));
+                    root_signature = Some(PathBuf::from(next_value(&mut raw, "--root-signature")?));
                 }
                 Some("--converter-version") if !only_positional => {
                     converter_version = string_value(&mut raw, "--converter-version")?;
@@ -187,6 +246,51 @@ root signature <= 1048576 bytes.
             }
         }
 
+        if stdio {
+            if !positional.is_empty() {
+                return Err(format!(
+                    "--stdio serves alternating frames; it does not take input or output paths \
+                     (got {})",
+                    positional.len()
+                ));
+            }
+            if entry.is_some() {
+                return Err(
+                    "--stdio takes the entry point from each job frame; drop --entry".to_string(),
+                );
+            }
+            if reflection.is_some() {
+                return Err(
+                    "--stdio takes no per-job reflection path; use --reflection-dir".to_string(),
+                );
+            }
+            if root_signature.is_some() {
+                return Err(
+                    "--stdio cannot carry a per-job root signature; the DXIL's embedded \
+                     signature is used"
+                        .to_string(),
+                );
+            }
+            let converter =
+                converter.ok_or_else(|| "--converter is required with --stdio".to_string())?;
+            return Ok(Some(Args {
+                converter,
+                entry: String::new(),
+                input: PathBuf::new(),
+                output: PathBuf::new(),
+                reflection: None,
+                reflection_dir,
+                root_signature: None,
+                converter_version,
+                options,
+                bindings,
+                stdio: true,
+            }));
+        }
+
+        if reflection_dir.is_some() {
+            return Err("--reflection-dir is only valid with --stdio".to_string());
+        }
         if positional.len() != 2 {
             return Err(format!(
                 "expected exactly one input and one output path, got {}",
@@ -203,10 +307,12 @@ root signature <= 1048576 bytes.
             input,
             output,
             reflection,
+            reflection_dir: None,
             root_signature,
             converter_version,
             options,
             bindings,
+            stdio: false,
         }))
     }
 
@@ -299,6 +405,223 @@ root signature <= 1048576 bytes.
             output.bytes.len()
         );
         Ok(())
+    }
+
+    /// Serves the pool's persistent `VMJOB`/`VMRES` protocol until stdin EOF.
+    ///
+    /// The frame layout is owned by [`victory_metal::compiler_pool`]; this
+    /// function must not invent another one. Every job goes through the same
+    /// validated [`convert_dxil_to_metallib`] call as the one-shot mode.
+    fn run_stdio(args: &Args) -> i32 {
+        if !args.converter.is_file() {
+            eprintln!(
+                "victory-irconverter: --converter {} is not a regular file",
+                args.converter.display()
+            );
+            return 2;
+        }
+        if let Some(dir) = &args.reflection_dir {
+            if let Err(err) = fs::create_dir_all(dir) {
+                eprintln!(
+                    "victory-irconverter: cannot create reflection directory {}: {err}",
+                    dir.display()
+                );
+                return 2;
+            }
+        }
+
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let stdout = io::stdout();
+        let mut writer = BufWriter::new(stdout.lock());
+        let mut served: u64 = 0;
+
+        loop {
+            let mut line = Vec::new();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => {
+                    eprintln!("victory-irconverter: stdio EOF after {served} jobs");
+                    return 0;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("victory-irconverter: failed to read stdio header: {err}");
+                    return 2;
+                }
+            }
+            if line.len() > MAX_STDIO_HEADER_BYTES {
+                eprintln!(
+                    "victory-irconverter: stdio header is {} bytes; limit is {}",
+                    line.len(),
+                    MAX_STDIO_HEADER_BYTES
+                );
+                return 2;
+            }
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                eprintln!("victory-irconverter: stdio header is not UTF-8");
+                return 2;
+            };
+            let fields: Vec<&str> = text.split_ascii_whitespace().collect();
+            let seq = fields.get(1).and_then(|value| value.parse::<u64>().ok());
+            let id = fields.get(2).and_then(|value| value.parse::<u64>().ok());
+            let entry_len = fields.get(4).and_then(|value| value.parse::<usize>().ok());
+            let dxil_len = fields.get(5).and_then(|value| value.parse::<usize>().ok());
+
+            let (Some(entry_len), Some(dxil_len)) = (entry_len, dxil_len) else {
+                // Without lengths there is no way to find the next frame; answer
+                // with the ids we could parse and end the loop instead of
+                // silently misparsing binary payload as headers.
+                let _ = write_response(
+                    &mut writer,
+                    seq.unwrap_or(0),
+                    id.unwrap_or(0),
+                    2,
+                    b"malformed VMJOB header without byte lengths",
+                );
+                return 2;
+            };
+            let Some(payload_len) = entry_len.checked_add(dxil_len) else {
+                eprintln!("victory-irconverter: stdio frame length overflow");
+                return 2;
+            };
+            if payload_len > MAX_STDIO_PAYLOAD_BYTES {
+                eprintln!(
+                    "victory-irconverter: stdio frame is {payload_len} bytes; limit is \
+                     {MAX_STDIO_PAYLOAD_BYTES}"
+                );
+                return 2;
+            }
+            let mut payload = vec![0u8; payload_len];
+            if let Err(err) = reader.read_exact(&mut payload) {
+                eprintln!("victory-irconverter: truncated stdio frame: {err}");
+                return 2;
+            }
+
+            let header_ok = fields.len() == 6
+                && fields[0] == "VMJOB"
+                && seq.is_some()
+                && id.is_some()
+                && fields[3].parse::<u32>().is_ok();
+            if !header_ok {
+                if write_response(
+                    &mut writer,
+                    seq.unwrap_or(0),
+                    id.unwrap_or(0),
+                    2,
+                    b"malformed VMJOB header",
+                )
+                .is_err()
+                {
+                    return 0;
+                }
+                continue;
+            }
+            let seq = seq.expect("checked above");
+            let id = id.expect("checked above");
+            let stage = fields[3].parse::<u32>().expect("checked above");
+            let (entry_bytes, dxil) = payload.split_at(entry_len);
+            let Ok(entry) = std::str::from_utf8(entry_bytes) else {
+                if write_response(&mut writer, seq, id, 2, b"entry point is not UTF-8").is_err() {
+                    return 0;
+                }
+                continue;
+            };
+
+            match convert_stdio_job(args, seq, id, stage, entry, dxil) {
+                Ok(metallib) => {
+                    served += 1;
+                    if write_response(&mut writer, seq, id, 0, &metallib).is_err() {
+                        return 0;
+                    }
+                }
+                Err((status, message)) => {
+                    if write_response(&mut writer, seq, id, status, message.as_bytes()).is_err() {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs one stdio job through the one-shot conversion core.
+    fn convert_stdio_job(
+        args: &Args,
+        seq: u64,
+        id: u64,
+        stage: u32,
+        entry: &str,
+        dxil: &[u8],
+    ) -> Result<Vec<u8>, (u32, String)> {
+        if entry.is_empty() || entry.len() > MAX_ENTRY_POINT_BYTES {
+            return Err((
+                2,
+                format!(
+                    "entry point is {} bytes; limit is {MAX_ENTRY_POINT_BYTES}",
+                    entry.len()
+                ),
+            ));
+        }
+        if dxil.is_empty() || dxil.len() > MAX_DXIL_INPUT_BYTES {
+            return Err((
+                2,
+                format!(
+                    "DXIL input is {} bytes; limit is {MAX_DXIL_INPUT_BYTES}",
+                    dxil.len()
+                ),
+            ));
+        }
+        let output = convert_dxil_to_metallib(dxil, entry, &args.converter)
+            .map_err(|err| (1, format!("conversion failed: {err}")))?;
+        if output.bytes.is_empty() || output.bytes.len() > MAX_METALLIB_OUTPUT_BYTES {
+            return Err((
+                1,
+                format!("converted metallib has invalid size {}", output.bytes.len()),
+            ));
+        }
+        if stage != 0 && output.stage != stage {
+            return Err((
+                3,
+                format!(
+                    "frame declared stage {stage}, converter reported stage {}",
+                    output.stage
+                ),
+            ));
+        }
+        if let Some(dir) = &args.reflection_dir {
+            let reflection = ReflectionPayload::from_translation(
+                &output.bytes,
+                output.stage,
+                entry,
+                dxil,
+                None,
+                &args.converter_version,
+                &args.options,
+                &args.bindings,
+            );
+            let path = dir.join(format!("{seq}-{id}.reflection"));
+            if let Err(err) = fs::write(&path, reflection.encode()) {
+                return Err((
+                    4,
+                    format!("failed to write reflection {}: {err}", path.display()),
+                ));
+            }
+        }
+        Ok(output.bytes)
+    }
+
+    fn write_response(
+        writer: &mut impl Write,
+        seq: u64,
+        id: u64,
+        status: u32,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        write!(writer, "VMRES {seq} {id} {status} {}\n", payload.len())?;
+        writer.write_all(payload)?;
+        writer.flush()
     }
 
     fn read_root_signature(path: &Path) -> Result<Vec<u8>, String> {
