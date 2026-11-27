@@ -5732,6 +5732,110 @@ mod tests {
     }
 
     #[test]
+    fn wire_v3_keeps_every_mixed_table_entry_in_guest_order() {
+        // Four entries that alternate shape: every entry keeps its own kind
+        // byte and the guest's position, and nothing is merged or dropped.
+        let mixed = DescriptorTableV3 {
+            set: 5,
+            base_register: 3,
+            kind: DescriptorKind::Srv,
+            bindings: vec![
+                entry(0),
+                DescriptorTableEntryV3::Texture(0x2100),
+                entry(64),
+                DescriptorTableEntryV3::Texture(0x2101),
+            ],
+        };
+        let frame = single_frame(CommandV3::SetDescriptorTable(mixed.clone()));
+        let command = &frame[COMMAND_START..];
+        assert_eq!(&command[12..14], &DESCRIPTOR_ENTRY_TAGGED.to_le_bytes());
+
+        let tag0 = DESCRIPTOR_TABLE_HEADER_LEN;
+        let payload0 = tag0 + DESCRIPTOR_ENTRY_TAG_LEN;
+        let tag1 = payload0 + BINDING_LEN;
+        let payload1 = tag1 + DESCRIPTOR_ENTRY_TAG_LEN;
+        let tag2 = payload1 + RESOURCE_HANDLE_LEN;
+        let payload2 = tag2 + DESCRIPTOR_ENTRY_TAG_LEN;
+        let tag3 = payload2 + BINDING_LEN;
+        let payload3 = tag3 + DESCRIPTOR_ENTRY_TAG_LEN;
+        assert_eq!(
+            frame.len(),
+            COMMAND_START + payload3 + RESOURCE_HANDLE_LEN,
+            "two buffer payloads and two handle payloads, one tag byte each"
+        );
+        assert_eq!(command[tag0], DESCRIPTOR_ENTRY_KIND_BUFFER);
+        assert_eq!(command[tag1], DESCRIPTOR_ENTRY_KIND_TEXTURE);
+        assert_eq!(command[tag2], DESCRIPTOR_ENTRY_KIND_BUFFER);
+        assert_eq!(command[tag3], DESCRIPTOR_ENTRY_KIND_TEXTURE);
+        // A buffer payload is allocation(8) generation(4) reserved(4)
+        // offset(8) length(8); the offset field proves the entry positions.
+        assert_eq!(&command[payload0 + 16..payload0 + 24], &0u64.to_le_bytes());
+        assert_eq!(&command[payload2 + 16..payload2 + 24], &64u64.to_le_bytes());
+        assert_eq!(&command[payload1..payload1 + 8], &0x2100u64.to_le_bytes());
+        assert_eq!(&command[payload3..payload3 + 8], &0x2101u64.to_le_bytes());
+
+        assert_eq!(
+            decode_submission_v3(&frame).expect("the mixed table decodes"),
+            submission_with(vec![CommandV3::SetDescriptorTable(mixed)])
+        );
+    }
+
+    #[test]
+    fn wire_v3_keeps_a_mixed_view_table_and_a_sampler_table_in_one_set() {
+        // One descriptor set holds a view table that mixes a buffer range with
+        // a registered texture, plus its sampler table at its own base
+        // register. Each root table keeps its own kind and entry order.
+        let views = DescriptorTableV3 {
+            set: 7,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
+        };
+        let samplers = DescriptorTableV3 {
+            set: 7,
+            base_register: 4,
+            kind: DescriptorKind::Sampler,
+            bindings: vec![DescriptorTableEntryV3::Sampler(0x3100)],
+        };
+        let submission = submission_with(vec![
+            CommandV3::SetDescriptorTable(views.clone()),
+            CommandV3::SetDescriptorTable(samplers.clone()),
+        ]);
+        assert_roundtrip(&submission);
+
+        let frame = encode_submission_v3(&submission).expect("the set encodes");
+        let decoded = decode_submission_v3(&frame).expect("the set decodes");
+        let CommandV3::SetDescriptorTable(first) = &decoded.commands[0] else {
+            panic!("the first command is the mixed view table");
+        };
+        let CommandV3::SetDescriptorTable(second) = &decoded.commands[1] else {
+            panic!("the second command is the sampler table");
+        };
+        assert_eq!(first, &views);
+        assert_eq!(first.kind, DescriptorKind::Srv);
+        assert_eq!(
+            first.bindings,
+            vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
+            "the buffer and the texture stay in guest order"
+        );
+        assert_eq!(second, &samplers);
+        assert_eq!(second.kind, DescriptorKind::Sampler);
+        assert_eq!(second.base_register, 4);
+
+        // The uniform sampler table still uses the legacy single tag and
+        // 8-byte handles, so the common case keeps its old byte layout.
+        let sampler_frame = single_frame(CommandV3::SetDescriptorTable(samplers));
+        assert_eq!(
+            &sampler_frame[COMMAND_START + 12..COMMAND_START + 14],
+            &DESCRIPTOR_ENTRY_RESOURCE.to_le_bytes()
+        );
+        assert_eq!(
+            sampler_frame.len(),
+            COMMAND_START + DESCRIPTOR_TABLE_HEADER_LEN + RESOURCE_HANDLE_LEN
+        );
+    }
+
+    #[test]
     fn wire_v3_names_the_slot_of_an_unknown_per_entry_tag() {
         let table = DescriptorTableV3 {
             set: 0,
