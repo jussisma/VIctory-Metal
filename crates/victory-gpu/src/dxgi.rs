@@ -143,10 +143,11 @@ const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
 const AMD: u32 = 0x1002;
 
-extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
+/// The adapter's identity as the console reports it: static console values,
+/// never read from (nor confirmed by) a host D3D12 device (ADR-030). Adapter
+/// identity queries therefore need no device on either backend, and the
+/// native metal path cannot create one behind a description query.
+fn console_adapter_description() -> AdapterDescription {
     let mut name = [0; 128];
     for (slot, unit) in name.iter_mut().zip("VIctory console GPU".encode_utf16()) {
         *slot = unit;
@@ -154,7 +155,7 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     // shortcut: memory sizes are the title's split (GPU-optimal, standard),
     // not measured; revisit once memory is emulated.
     let (gpu_optimal, standard) = crate::console::current().title_memory();
-    let description = AdapterDescription {
+    AdapterDescription {
         name,
         vendor: AMD,
         device: 0,
@@ -164,7 +165,14 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
         dedicated_system_memory: 0,
         shared_system_memory: standard,
         luid: [1, 0],
-    };
+    }
+}
+
+extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let description = console_adapter_description();
     // SAFETY: checked non-null; the title passes room for the description.
     unsafe { out.write(description) };
     S_OK
@@ -322,6 +330,26 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    /// ADR-030: adapter identity is the static console description, so the
+    /// query needs no host D3D12 device and cannot create one. This test never
+    /// touches a device.
+    #[test]
+    fn adapter_identity_is_static_and_device_free() {
+        let description = console_adapter_description();
+        let len = description
+            .name
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(description.name.len());
+        assert_eq!(
+            String::from_utf16(&description.name[..len]).unwrap(),
+            "VIctory console GPU"
+        );
+        assert_eq!(description.vendor, AMD);
+        assert_eq!(description.device, 0);
+        assert_eq!(description.luid, [1, 0]);
     }
 
     #[test]
