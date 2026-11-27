@@ -797,11 +797,174 @@ impl Drop for Memory {
     }
 }
 
+/// Where memory this backend created came from: the branch that has to
+/// explain a guest range the share table cannot resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreatedRangeOrigin {
+    /// A D3D12 heap this backend allocated (`CreateHeap`). The memory is
+    /// host memory unless a share-backed allocator is installed: the title's
+    /// general allocator (`XMemAlloc`) is not a section and does not resolve
+    /// (see `register_native_buffer`), so a heap range this table names has
+    /// no host-visible backing.
+    Heap,
+    /// A resource at a guest address the title mapped itself
+    /// (`CreatePlacedResourceX` at an address): the backing, if any, is the
+    /// title's mapping, not this backend's.
+    AtAddress,
+}
+
+/// One range of guest memory this backend created, as the range tables keep
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreatedRange {
+    /// First guest byte of the range.
+    pub(crate) base: u64,
+    /// Range length in bytes.
+    pub(crate) len: u64,
+    /// Which table and backing class named it.
+    pub(crate) origin: CreatedRangeOrigin,
+}
+
+/// The resolver branch a refused guest range falls to.
+///
+/// The native backend's resolver has five places a range can be claimed:
+/// the heap table (this module), the title-mapped address table (this
+/// module), the `xmem` share table, the loader images and the sections the
+/// share resolver owns. The last three live in `victory-hle` (the dependency
+/// runs the other way), so a range neither table here covers is reported as
+/// the share table's own refusal, `no shared xmem range`; the loader image
+/// and section tables are that resolver's internal branches. The point of
+/// this enum is that a range inside memory *this* backend created is never
+/// silently indistinguishable from one the share table never knew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeRefusalBranch {
+    /// The heap table: this process created the heap, and the range's
+    /// backing is not host-visible.
+    Heap(CreatedRange),
+    /// The title-mapped address table: the title created the memory.
+    AtAddress(CreatedRange),
+    /// No table here covers the range: the share resolver's tables rejected
+    /// it and the refusal keeps the share resolver's name.
+    ShareTable,
+}
+
+impl RangeRefusalBranch {
+    /// The branch's name, for a log line.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Heap(_) => "heap_table",
+            Self::AtAddress(_) => "title_address_table",
+            Self::ShareTable => "xmem_share_table",
+        }
+    }
+
+    /// The refusal this branch gives a range it cannot back.
+    ///
+    /// `None` keeps the share resolver's own error, which is already named
+    /// (`no shared xmem range` or `the range's section has no host-visible
+    /// backing`). A heap or title-mapped address this backend created gets
+    /// its own name, so the two are never conflated.
+    pub(crate) fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Heap(_) => Some("heap has no host-visible backing"),
+            Self::AtAddress(_) => Some("title-mapped address has no host-visible backing"),
+            Self::ShareTable => None,
+        }
+    }
+
+    /// The range this branch named, when it is one of this backend's tables.
+    pub(crate) fn range(self) -> Option<CreatedRange> {
+        match self {
+            Self::Heap(range) | Self::AtAddress(range) => Some(range),
+            Self::ShareTable => None,
+        }
+    }
+}
+
+/// The most heap and title-address ranges the tables keep; a boot creates a
+/// few hundred. Oldest entries are dropped first, so the tables stay bounded
+/// rather than growing with a long run.
+const MAX_CREATED_RANGES: usize = 4096;
+
+/// Guest ranges this backend created: heaps (`CreateHeap`) and resources at
+/// title-mapped addresses. Guarded by one lock; lookups are a linear scan of
+/// a small table.
+static CREATED_RANGES: std::sync::Mutex<Vec<CreatedRange>> = std::sync::Mutex::new(Vec::new());
+
+/// Records a range this backend created, replacing an entry at the same base.
+fn note_created_range(range: CreatedRange) {
+    let mut ranges = CREATED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = ranges.iter_mut().find(|held| held.base == range.base) {
+        *slot = range;
+        return;
+    }
+    if ranges.len() >= MAX_CREATED_RANGES {
+        // A title address is streaming and may churn; a heap is the long-lived
+        // table a vertex or index refusal needs, so give up the oldest title
+        // address first.
+        let index = ranges
+            .iter()
+            .position(|held| held.origin == CreatedRangeOrigin::AtAddress)
+            .unwrap_or(0);
+        ranges.remove(index);
+    }
+    ranges.push(range);
+}
+
+/// Drops a range when its heap or resource goes, so a reused address is not
+/// reported as the old backing.
+fn forget_created_range(base: u64) {
+    CREATED_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|held| held.base != base);
+}
+
+/// The branch that names a guest range starting at `address`: a heap this
+/// backend created, a title-mapped address it created a resource at, or the
+/// share table (which owns the loader image and section branches). The
+/// branch is chosen by where the range starts, so a buffer's first byte names
+/// the heap that owns it.
+pub(crate) fn guest_range_branch(address: u64, _len: u64) -> RangeRefusalBranch {
+    let ranges = CREATED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(range) = ranges.iter().rev().find(|held| {
+        held.len != 0 && address >= held.base && address < held.base.saturating_add(held.len)
+    }) else {
+        return RangeRefusalBranch::ShareTable;
+    };
+    match range.origin {
+        CreatedRangeOrigin::Heap => RangeRefusalBranch::Heap(*range),
+        CreatedRangeOrigin::AtAddress => RangeRefusalBranch::AtAddress(*range),
+    }
+}
+
+/// Empties the range tables: tests start each case from a known state.
+#[cfg(test)]
+pub(crate) fn clear_created_ranges_for_test() {
+    CREATED_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Records a synthetic range for another module's tests (the queue's resolver
+/// wrapper), which cannot create a real heap without a device.
+#[cfg(test)]
+pub(crate) fn note_created_range_for_test(base: u64, len: u64, origin: CreatedRangeOrigin) {
+    note_created_range(CreatedRange { base, len, origin });
+}
+
 #[repr(C)]
 struct Heap {
     object: Object,
     desc: HeapDesc,
     memory: Memory,
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        forget_created_range(self.memory.address());
+    }
 }
 
 pub(crate) extern "system" fn create_heap(
@@ -814,12 +977,6 @@ pub(crate) extern "system" fn create_heap(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(
-        size = desc.size,
-        kind = desc.properties.kind,
-        flags = format_args!("{:#x}", desc.flags),
-        "heap"
-    );
     if desc.alignment != 0 && !desc.alignment.is_power_of_two() {
         return E_INVALIDARG;
     }
@@ -827,10 +984,34 @@ pub(crate) extern "system" fn create_heap(
         size: desc.size,
         alignment: desc.alignment.max(KIB_64),
     };
+    // Heap memory is the host's, as before: the title's general allocator
+    // (`XMemAlloc`) is not a share-backed section either (the Boot #15b log
+    // shows committed resources allocated through it still refused as
+    // `no shared xmem range`), so switching the source here would move a
+    // heap without making it resolvable. The range is registered instead, so
+    // a refused bind in it is named (`heap has no host-visible backing`)
+    // rather than reading as an `xmem` miss.
     let memory = match Memory::new(info) {
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    let base = memory.address();
+    note_created_range(CreatedRange {
+        base,
+        len: desc.size,
+        origin: CreatedRangeOrigin::Heap,
+    });
+    tracing::debug!(
+        size = desc.size,
+        kind = desc.properties.kind,
+        flags = format_args!("{:#x}", desc.flags),
+        base = format_args!("{base:#x}"),
+        "heap"
+    );
+    // The refusal census and the named heap branch live in the queue module;
+    // wrap the installed resolver once so a bind in this heap is named.
+    #[cfg(any(windows, test, target_os = "macos"))]
+    crate::native_metal::queue::install_created_range_resolver();
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
         desc,
@@ -2501,13 +2682,12 @@ fn register_native_buffer(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
         Ok(range) => range,
         Err(error) => {
             telemetry::note_registration_failure();
-            tracing::warn!(
-                address = format_args!("{address:#x}"),
-                bytes = len,
-                %error,
-                "VICTORY_BACKEND=metal: a buffer's range does not resolve to a share allocation; \
-                 its first bind will be refused"
-            );
+            // Name the branch that rejected the range: the heap table, the
+            // title-mapped address table, or the share table. A heap this
+            // backend created that has no host-visible backing says so by
+            // name instead of reading as an `xmem` miss.
+            let branch = guest_range_branch(address, len);
+            queue::note_refused_guest_range(address, len, branch, &error);
             return S_OK;
         }
     };
@@ -2973,7 +3153,7 @@ fn create_at_address_impl(
         creation_nodes: 1,
         visible_nodes: 1,
     };
-    hand_out_resource(
+    let result = hand_out_resource(
         desc,
         DEFAULT,
         0,
@@ -2982,7 +3162,22 @@ fn create_at_address_impl(
         clear,
         iid,
         out,
-    )
+    );
+    if result == S_OK {
+        // The title mapped this memory itself: it is not one of our heaps.
+        // Remembering the range lets a refused bind say so by name instead of
+        // reading like an `xmem` range this backend never created.
+        if let Some(info) = footprint(&desc).filter(|info| info.size != 0) {
+            note_created_range(CreatedRange {
+                base: address,
+                len: info.size,
+                origin: CreatedRangeOrigin::AtAddress,
+            });
+        }
+        #[cfg(any(windows, test, target_os = "macos"))]
+        crate::native_metal::queue::install_created_range_resolver();
+    }
+    result
 }
 
 /// Device method 0xf0, `CreateReservedResource`.
@@ -3982,6 +4177,99 @@ mod tests {
             create_heap(std::ptr::null(), &bad, &HEAP_IIDS[0], &mut out),
             E_INVALIDARG
         );
+    }
+
+    /// Every heap joins the range table, so a refused bind in it is named.
+    #[test]
+    fn a_heap_joins_the_heap_table_and_a_released_heap_is_forgotten() {
+        clear_created_ranges_for_test();
+        let heap = heap(4 << 20);
+        // SAFETY: a heap we just made.
+        let memory = unsafe { &(*heap.cast::<Heap>()).memory };
+        let base = memory.address();
+        assert!(
+            !memory.from_title_allocator(),
+            "heap memory is host memory: the title allocator is not share-backed either"
+        );
+        match guest_range_branch(base + 0x1000, KIB_64) {
+            branch @ RangeRefusalBranch::Heap(range) => {
+                assert_eq!((range.base, range.len), (base, 4 << 20));
+                assert_eq!(range.origin, CreatedRangeOrigin::Heap);
+                assert_eq!(
+                    branch.refusal(),
+                    Some("heap has no host-visible backing"),
+                    "a heap range's refusal is named"
+                );
+                assert_eq!(branch.name(), "heap_table");
+            }
+            other => panic!("expected the heap table, got {other:?}"),
+        }
+        assert_eq!(
+            guest_range_branch(base + (4 << 20), KIB_64),
+            RangeRefusalBranch::ShareTable,
+            "a byte past the heap is not the heap's"
+        );
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+        assert_eq!(
+            guest_range_branch(base + 0x1000, KIB_64),
+            RangeRefusalBranch::ShareTable,
+            "releasing the heap forgets its range"
+        );
+    }
+
+    /// The Boot #15b shape: a ~1 MiB buffer at a non-zero offset inside a
+    /// heap is the heap table's, not the share table's.
+    #[test]
+    fn a_one_mib_buffer_inside_a_heap_with_a_nonzero_offset_is_the_heap_table() {
+        clear_created_ranges_for_test();
+        let heap = heap(2 << 20);
+        // SAFETY: a heap we just made.
+        let base = unsafe { (*heap.cast::<Heap>()).memory.address() };
+        let address = base + 0x2b0f0;
+        let len = 1_010_960;
+        match guest_range_branch(address, len) {
+            RangeRefusalBranch::Heap(range) => {
+                assert_eq!(range.base, base);
+                assert_eq!(range.len, 2 << 20);
+                assert_eq!(range.origin, CreatedRangeOrigin::Heap);
+            }
+            other => panic!("expected the heap table, got {other:?}"),
+        }
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+        clear_created_ranges_for_test();
+    }
+
+    /// A resource at an address the title mapped itself is named by its own
+    /// table, so it is never confused with an `xmem` range.
+    #[test]
+    fn a_title_mapped_address_is_named_by_its_own_table() {
+        clear_created_ranges_for_test();
+        let desc = buffer(4096);
+        let mut out = std::ptr::null();
+        let hr = create_at_address(
+            std::ptr::null(),
+            0x147a_0000,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(hr, S_OK);
+        match guest_range_branch(0x147a_0100, 16) {
+            branch @ RangeRefusalBranch::AtAddress(range) => {
+                assert_eq!(range.base, 0x147a_0000);
+                assert_eq!(range.len, footprint(&desc).expect("a footprint").size);
+                assert_eq!(
+                    branch.refusal(),
+                    Some("title-mapped address has no host-visible backing")
+                );
+                assert_eq!(branch.name(), "title_address_table");
+            }
+            other => panic!("expected the title address table, got {other:?}"),
+        }
+        assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        clear_created_ranges_for_test();
     }
 
     #[test]
