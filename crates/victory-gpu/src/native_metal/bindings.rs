@@ -1544,10 +1544,10 @@ mod tests {
         );
         assert_eq!(
             enumerate_descriptor_table(TABLE_BASE, |_| {
-                DescriptorSlot::Unresolvable("a placed view is not a buffer descriptor")
+                DescriptorSlot::Unresolvable("a sampler descriptor has no host equivalent")
             }),
             Err(TableRunError::Unsupported(
-                "a placed view is not a buffer descriptor"
+                "a sampler descriptor has no host equivalent"
             ))
         );
     }

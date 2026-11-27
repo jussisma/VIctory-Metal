@@ -2119,7 +2119,7 @@ fn native_texture_registration(
 }
 
 /// Parameters for registering a texture at its first table bind.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) struct TextureTableRegistration {
     /// Guest memory base, the kind 8 handle.
     pub handle: u64,
@@ -2157,15 +2157,27 @@ pub(crate) fn texture_table_registration(
     usage: u8,
 ) -> Option<Result<TextureTableRegistration, &'static str>> {
     let (base, desc) = texture_memory(this)?;
-    let handle = base as u64;
+    Some(registration_from_desc(base as u64, &desc, usage))
+}
+
+/// The kind 8 parameters for a texture of `desc` at guest `handle`.
+///
+/// `handle` is the texture's guest memory base, the identity the host's
+/// texture registry (kind 8) names it by. This is the one decode both a
+/// resource-backed texture's first table bind ([`texture_table_registration`])
+/// and a placed texture view ([`placed_texture_registration`]) go through, so
+/// the two can never disagree about a dimension, format or usage code.
+#[cfg(any(windows, test))]
+fn registration_from_desc(
+    handle: u64,
+    desc: &ResourceDesc,
+    usage: u8,
+) -> Result<TextureTableRegistration, &'static str> {
     if handle == 0 {
-        return Some(Err("a texture descriptor names no guest memory"));
+        return Err("a texture descriptor names no guest memory");
     }
-    let (dimension, format, usage) = match texture_registration_codes(&desc, usage) {
-        Ok(codes) => codes,
-        Err(why) => return Some(Err(why)),
-    };
-    Some(Ok(TextureTableRegistration {
+    let (dimension, format, usage) = texture_registration_codes(desc, usage)?;
+    Ok(TextureTableRegistration {
         handle,
         dimension,
         format,
@@ -2184,7 +2196,35 @@ pub(crate) fn texture_table_registration(
         } else {
             desc.depth_or_array_size.max(1)
         },
-    }))
+    })
+}
+
+/// The registration a placed texture view needs, from the words the title
+/// passed to device 0x230/0x238 (ADR-040).
+///
+/// A placed view names no resource object: its resource description (the same
+/// 56-byte layout a title resource uses) and the view's guest memory address
+/// are all there is. The handle is that address, exactly the guest memory base
+/// a resource-backed texture registers under; a zero address or a description
+/// with no console footprint is an explicit, named error, never a guessed one.
+#[cfg(any(windows, test))]
+pub(crate) fn placed_texture_registration(
+    address: u64,
+    resource: &[u32; 14],
+    usage: u8,
+) -> Result<TextureTableRegistration, &'static str> {
+    if address == 0 {
+        return Err("a placed texture view names no device memory");
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let desc = unsafe { resource.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if desc.dimension == BUFFER {
+        return Err("a placed buffer resource is not a texture");
+    }
+    if footprint(&desc).is_none() {
+        return Err("a placed texture view's resource description has no footprint");
+    }
+    registration_from_desc(address, &desc, usage)
 }
 
 /// Canonical DXGI -> kind 8 wire code, after resolving a typeless format to
