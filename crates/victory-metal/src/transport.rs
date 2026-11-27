@@ -7,6 +7,7 @@
 use thiserror::Error;
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId, VmStatus};
+use crate::fence_page::FencePage;
 
 /// Errors produced by a [`MetalTransport`] implementation.
 #[derive(Debug, Error)]
@@ -93,4 +94,44 @@ pub trait MetalTransport: Send + Sync {
         threads: u32,
         threads_per_group: u32,
     ) -> Result<(), MetalError>;
+}
+
+/// Fire-and-forget guest-side transport with shared-memory completion.
+///
+/// This boundary is deliberately Wine-free and independent of
+/// [`MetalTransport`]: a renderer builds a version 3 frame and hands it over
+/// without waiting for a reply, then observes GPU completion with one atomic
+/// load from a page both processes map `MAP_SHARED`.
+///
+/// The wake mechanism is abstracted behind
+/// [`crate::fence_page::Wake`], so a future Wine-free host can swap a loopback
+/// socket for a Mach port without touching renderer code.
+///
+/// This is a separate trait on purpose: no required method is added to
+/// [`MetalTransport`], so every existing implementor stays source- and
+/// wire-compatible.
+pub trait GuestTransport: Send + Sync {
+    /// Submits one encoded version 3 submission without waiting for a reply.
+    ///
+    /// `frame` is a complete [`crate::wire_v3::SubmissionV3`] encoding; its
+    /// sequence must be nonzero, must increase within the session, and becomes
+    /// the returned fence value. Implementations must not read a reply frame to
+    /// produce that value.
+    ///
+    /// Returns the submitted fence value. GPU completion is observed later
+    /// through [`GuestTransport::completed_fence`].
+    fn submit_async(&self, frame: &[u8]) -> Result<u64, MetalError>;
+
+    /// Reads the shared completed fence.
+    ///
+    /// Implementations must document and preserve this as a single
+    /// `Ordering::Acquire` load: one memory read, zero syscalls, zero IPC
+    /// round-trips.
+    fn completed_fence(&self) -> u64;
+
+    /// Borrows the shared completion page for direct inspection.
+    fn fence_page(&self) -> &FencePage;
+
+    /// Rings the host wake channel. Best-effort; failures are not fatal.
+    fn wake(&self);
 }

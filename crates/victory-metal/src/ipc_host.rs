@@ -28,8 +28,38 @@
 //! | 4 | guest to host | `ticket: u64 LE`, `entry_len: u16 LE`, entry bytes |
 //! | 5 | guest to host | one version 3 request envelope (below) |
 //! | 5 | host to guest | one complete encoded [`crate::wire::Reply`] |
+//! | 6 | guest to host | `byte_len: u64 LE`, must be 4096; shared fence page |
+//! | 7 | guest to host | one version 3 request envelope, no reply frame |
 //! | 128 | host to guest | one byte: 0 = accepted, 1 = rejected |
 //! | 129 | host to guest | one byte status, then `pipeline_id: u64 LE` on success |
+//!
+//! # Shared completion fence page (ADR-012)
+//!
+//! Kind 6 is opt-in and registers the launcher-created fence page file
+//! `<canonical share dir>/gpu-fence.v1.page` with the session. The payload is a
+//! single `byte_len: u64 LE` that must equal 4096; the path itself never
+//! crosses the wire, exactly like allocation registration. The host maps the
+//! file `MAP_SHARED` and answers kind 128. A rejection closes the session.
+//!
+//! Once registered, every version 3 submission (kind 5 and kind 7) publishes
+//! its sequence as `submitted_fence` before execution and, only when the device
+//! reports success, as `completed_fence` afterwards. A failed, refused or
+//! replayed submission never advances `completed_fence`, and publishing uses
+//! `fetch_max`, so a stale replay can never lower it. Registration starts the
+//! page with [`crate::fence_page::FencePage::begin_session`], which clears both
+//! fences and advances the epoch; the page file must therefore be created for
+//! the session and must not be shared with a different host.
+//!
+//! Kind 7 is the fire-and-forget path: the same version 3 envelope as kind 5,
+//! executed with the same validation, ledger and fence publication, but with no
+//! reply frame at all. The guest learns success from `completed_fence` and
+//! failure from the fence not advancing. A malformed kind 7 frame closes the
+//! session because there is no reply in which to report the error.
+//!
+//! Note that the host still completes the GPU work synchronously inside
+//! [`BatchExecutor::submit_v3`] (the device path waits with
+//! `waitUntilCompleted`), so only the *guest* is asynchronous. Making the host
+//! submit non-blocking needs a `device.rs` change and is tracked separately.
 //!
 //! # Version 3 request envelope
 //!
@@ -113,7 +143,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -123,9 +153,10 @@ use thiserror::Error;
 
 use crate::abi::{VmBufferId, VmPipelineId};
 use crate::cmdlist::{ListLedger, RingError};
+use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::device::DirectMetalTransport;
-use crate::transport::MetalError;
+use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
 };
@@ -159,6 +190,14 @@ pub const KIND_PIPELINE: u8 = 4;
 pub const KIND_ACK: u8 = 128;
 /// Frame kind for a pipeline registration reply.
 pub const KIND_PIPELINE_REPLY: u8 = 129;
+/// Frame kind for an opt-in shared fence page registration.
+pub const KIND_FENCE_PAGE: u8 = 6;
+/// Frame kind for a fire-and-forget version 3 submission with no reply frame.
+pub const KIND_SUBMISSION_ASYNC: u8 = 7;
+/// Fixed file name of the shared fence page inside the canonical share dir.
+pub const FENCE_PAGE_FILE_NAME: &str = "gpu-fence.v1.page";
+/// Exact length of a fence page registration payload (`byte_len: u64 LE`).
+pub const FENCE_PAGE_REGISTER_PAYLOAD_LEN: usize = 8;
 /// Exact length of the shared session secret.
 pub const SECRET_LEN: usize = 32;
 /// Exact length of a registration payload.
@@ -552,6 +591,8 @@ pub struct IpcHost<E: BatchExecutor> {
     allocations: BTreeMap<u64, RegisteredAllocation>,
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
+    /// Opt-in shared completion page registered by kind 6.
+    fence_page: Option<FencePageMapping>,
     next_sequence: u32,
     submissions: u64,
     ledger: ListLedger,
@@ -586,6 +627,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             allocations: BTreeMap::new(),
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
+            fence_page: None,
             next_sequence: 1,
             submissions: 0,
             ledger: ListLedger::new(),
@@ -638,6 +680,14 @@ impl<E: BatchExecutor> IpcHost<E> {
                 }
                 KIND_SUBMISSION => self.submit(&mut stream, &payload)?,
                 KIND_SUBMISSION_V3 => self.serve_v3_submission(&mut stream, &payload)?,
+                KIND_FENCE_PAGE => {
+                    if let Err(error) = self.register_fence_page(&payload) {
+                        reject_ack(&mut stream);
+                        return Err(error);
+                    }
+                    write_frame(&mut stream, KIND_ACK, &[0])?;
+                }
+                KIND_SUBMISSION_ASYNC => self.serve_async_submission(&payload)?,
                 KIND_PIPELINE => {
                     let reply = self.register_pipeline(&payload);
                     write_frame(&mut stream, KIND_PIPELINE_REPLY, &reply)?;
@@ -709,6 +759,56 @@ impl<E: BatchExecutor> IpcHost<E> {
         );
         self.last_allocation_id = id;
         Ok(())
+    }
+
+    /// Registers the launcher-created fence page file for this session.
+    ///
+    /// The payload carries only `byte_len: u64 LE`; the path is the fixed
+    /// [`FENCE_PAGE_FILE_NAME`] inside the canonical share directory, so a
+    /// hostile peer cannot select another file. The mapping is revalidated as a
+    /// regular, non-symlink, exactly-one-page file by
+    /// [`FencePageMapping::open`]. The page is cleared and its epoch advanced
+    /// before the acknowledgement, so the guest starts from a session-local
+    /// fence state.
+    fn register_fence_page(&mut self, payload: &[u8]) -> Result<(), HostError> {
+        if payload.len() != FENCE_PAGE_REGISTER_PAYLOAD_LEN {
+            return Err(HostError::Protocol(
+                "fence page registration payload must be exactly 8 bytes",
+            ));
+        }
+        if read_u64(payload, 0) != crate::fence_page::FENCE_PAGE_LEN as u64 {
+            return Err(HostError::Protocol(
+                "fence page registration length must be exactly 4096",
+            ));
+        }
+        if self.fence_page.is_some() {
+            return Err(HostError::Protocol(
+                "fence page is already registered for this session",
+            ));
+        }
+
+        let mapping = FencePageMapping::open(self.share_dir.join(FENCE_PAGE_FILE_NAME))?;
+        mapping.page().begin_session();
+        self.fence_page = Some(mapping);
+        Ok(())
+    }
+
+    /// Publishes a version 3 submission's sequence before device execution.
+    fn publish_submitted(&self, sequence: u32) {
+        if let Some(fence) = &self.fence_page {
+            fence.page().publish_submitted(u64::from(sequence));
+        }
+    }
+
+    /// Publishes a version 3 submission's sequence as completed.
+    ///
+    /// Called only after the executor reported success. The page accumulates
+    /// with `fetch_max`, so a stale or replayed sequence can never lower the
+    /// value a guest already observed.
+    fn publish_completed(&self, sequence: u32) {
+        if let Some(fence) = &self.fence_page {
+            fence.page().publish(u64::from(sequence));
+        }
     }
 
     fn submit(&mut self, stream: &mut TcpStream, payload: &[u8]) -> Result<(), HostError> {
@@ -797,6 +897,34 @@ impl<E: BatchExecutor> IpcHost<E> {
         Ok(())
     }
 
+    /// Handles one kind 7 request: a version 3 envelope with no reply frame.
+    ///
+    /// The frame is decoded, sequenced and executed exactly like kind 5, so the
+    /// ledger and fence semantics are identical. There is no reply to carry a
+    /// decode error, so any framing or sequencing failure closes the session;
+    /// execution outcomes are reported only through the shared fence. A success
+    /// publishes `completed_fence`; a refusal or executor failure leaves it
+    /// behind `submitted_fence`, which the guest observes as pending.
+    fn serve_async_submission(&mut self, payload: &[u8]) -> Result<(), HostError> {
+        let submission = decode_v3_request(payload).map_err(|_| {
+            HostError::Protocol("asynchronous version 3 request has no decodable envelope")
+        })?;
+        if submission.sequence != self.next_sequence {
+            return Err(HostError::Protocol(
+                "submission sequence is not the next expected value",
+            ));
+        }
+
+        // The reply carries only a status; there is no frame to send it in.
+        let _reply = self.execute_or_refuse_v3(&submission);
+        self.next_sequence = submission
+            .sequence
+            .checked_add(1)
+            .ok_or(HostError::Protocol("submission sequence exhausted"))?;
+        self.submissions += 1;
+        Ok(())
+    }
+
     /// Executes one version 3 submission, enforcing exactly-once for list-bound
     /// batches with the same [`ListLedger`] used by version 2.
     ///
@@ -808,7 +936,12 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// [`ReplyStatus::ExecutionFailed`]; an identity whose execution outcome is
     /// uncertain stays in flight, mirroring version 2, so it is never executed
     /// twice.
-    fn execute_or_refuse_v3(&self, submission: &SubmissionV3) -> Reply {
+    ///
+    /// When a fence page is registered, a submission that actually reaches the
+    /// executor publishes its sequence as `submitted_fence`, and only a
+    /// `ReplyStatus::Ok` result publishes it as `completed_fence`. Refused and
+    /// replayed submissions publish nothing.
+    fn execute_or_refuse_v3(&mut self, submission: &SubmissionV3) -> Reply {
         let response = |status| Reply {
             sequence: submission.sequence,
             status,
@@ -821,12 +954,12 @@ impl<E: BatchExecutor> IpcHost<E> {
         let allocations = self.allocation_snapshot();
 
         let Some(identity) = submission.list else {
-            return self.execute_v3(submission, &allocations);
+            return self.execute_v3_with_fence(submission, &allocations);
         };
 
         match self.ledger.begin(identity, submission.sequence) {
             Ok(()) => {
-                let reply = self.execute_v3(submission, &allocations);
+                let reply = self.execute_v3_with_fence(submission, &allocations);
                 if reply.status == ReplyStatus::Ok {
                     self.ledger.complete(identity, submission.sequence);
                 }
@@ -835,6 +968,20 @@ impl<E: BatchExecutor> IpcHost<E> {
             Err(RingError::AlreadyExecuted) => response(ReplyStatus::AlreadyExecuted),
             Err(_) => response(ReplyStatus::ExecutionFailed),
         }
+    }
+
+    /// Runs one executor submission and publishes its fence transitions.
+    fn execute_v3_with_fence(
+        &mut self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+    ) -> Reply {
+        self.publish_submitted(submission.sequence);
+        let reply = self.execute_v3(submission, allocations);
+        if reply.status == ReplyStatus::Ok {
+            self.publish_completed(submission.sequence);
+        }
+        reply
     }
 
     fn allocation_snapshot(&self) -> HashMap<(u64, u32), VmBufferId> {
@@ -1205,7 +1352,7 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, HostError
         return Ok(None);
     };
     let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-    let limit = if header[0] == KIND_SUBMISSION_V3 {
+    let limit = if header[0] == KIND_SUBMISSION_V3 || header[0] == KIND_SUBMISSION_ASYNC {
         MAX_PAYLOAD_LEN_V3
     } else {
         MAX_PAYLOAD_LEN
@@ -1240,7 +1387,7 @@ fn read_header(stream: &mut TcpStream) -> Result<Option<[u8; ENVELOPE_LEN]>, Hos
 }
 
 /// Writes one exact envelope and payload, then flushes.
-fn write_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> Result<(), HostError> {
+fn write_frame(stream: &mut impl Write, kind: u8, payload: &[u8]) -> Result<(), HostError> {
     let len = u32::try_from(payload.len())
         .map_err(|_| HostError::Protocol("frame payload does not fit u32"))?;
     if len > MAX_PAYLOAD_LEN {
@@ -1255,6 +1402,143 @@ fn write_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> Result<(), H
     stream.write_all(payload)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Guest-side fire-and-forget transport for the loopback host session.
+///
+/// This is the concrete [`GuestTransport`] implementation for the native
+/// renderer boundary: it speaks the documented local wire protocol, publishes
+/// the submitted fence locally, and reads GPU completion from the shared page
+/// with a single atomic load. It references no Wine or D3D12 symbol.
+///
+/// The host still performs the GPU work synchronously inside its session
+/// thread; only this caller is non-blocking. See the module note on the
+/// remaining limitation.
+///
+/// One transport owns the session's sequence space: every frame it sends is a
+/// kind 7 submission whose sequence becomes the fence value, and mixing kind 5
+/// frames on the same session is not supported.
+pub struct LoopbackAsyncTransport {
+    stream: TcpStream,
+    page: FencePageMapping,
+    waker: Box<dyn Wake>,
+}
+
+impl LoopbackAsyncTransport {
+    /// Connects, authenticates, and registers `page` as the session fence page.
+    ///
+    /// `page` must be a mapping of `<share dir>/gpu-fence.v1.page`. The
+    /// handshake consumes exactly the authentication and registration
+    /// acknowledgements; after it returns, the host sends no frame this
+    /// transport has to read.
+    pub fn connect(
+        addr: SocketAddr,
+        secret: [u8; SECRET_LEN],
+        page: FencePageMapping,
+        waker: Box<dyn Wake>,
+    ) -> Result<Self, HostError> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+
+        write_frame(&mut stream, KIND_AUTH, &secret)?;
+        match read_frame(&mut stream)? {
+            Some((KIND_ACK, payload)) if payload == [0] => {}
+            Some(_) => return Err(HostError::Unauthenticated),
+            None => return Err(HostError::Protocol("host closed before authenticating")),
+        }
+
+        let mut registration = [0u8; FENCE_PAGE_REGISTER_PAYLOAD_LEN];
+        registration.copy_from_slice(&(crate::fence_page::FENCE_PAGE_LEN as u64).to_le_bytes());
+        write_frame(&mut stream, KIND_FENCE_PAGE, &registration)?;
+        match read_frame(&mut stream)? {
+            Some((KIND_ACK, payload)) if payload == [0] => {}
+            Some(_) => {
+                return Err(HostError::Protocol(
+                    "host rejected the shared fence page registration",
+                ));
+            }
+            None => {
+                return Err(HostError::Protocol(
+                    "host closed before registering the fence page",
+                ));
+            }
+        }
+
+        Ok(Self {
+            stream,
+            page,
+            waker,
+        })
+    }
+
+    /// The TCP stream this transport owns, for diagnostics and tests.
+    ///
+    /// No reply frame corresponds to an asynchronous submission, so reading
+    /// from this stream must not be used to learn about completion.
+    pub fn stream(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+impl GuestTransport for LoopbackAsyncTransport {
+    fn submit_async(&self, frame: &[u8]) -> Result<u64, MetalError> {
+        let submission = decode_submission_v3(frame).map_err(|_| {
+            MetalError::InvalidArg("asynchronous submission is not a valid version 3 frame")
+        })?;
+        let sequence = submission.sequence;
+        if sequence == 0 {
+            return Err(MetalError::InvalidArg(
+                "asynchronous submission sequence must be nonzero",
+            ));
+        }
+        if frame.len() > MAX_SUBMISSION_V3_LEN {
+            return Err(MetalError::InvalidArg(
+                "asynchronous submission exceeds the version 3 frame limit",
+            ));
+        }
+        if u64::from(sequence) <= self.page.page().submitted() {
+            // Reject locally: the host would treat this as a sequencing
+            // violation and close the session.
+            return Err(MetalError::InvalidArg(
+                "asynchronous submission sequence must increase",
+            ));
+        }
+        let declared = u32::try_from(frame.len()).map_err(|_| {
+            MetalError::InvalidArg("asynchronous submission length does not fit u32")
+        })?;
+
+        let mut envelope = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len());
+        envelope.extend_from_slice(&V3_REQUEST_MAGIC);
+        envelope.extend_from_slice(&PROTOCOL_VERSION_V3.to_le_bytes());
+        envelope.extend_from_slice(&sequence.to_le_bytes());
+        envelope.extend_from_slice(&0u16.to_le_bytes());
+        envelope.extend_from_slice(&declared.to_le_bytes());
+        envelope.extend_from_slice(frame);
+
+        let mut writer = &self.stream;
+        write_frame(&mut writer, KIND_SUBMISSION_ASYNC, &envelope).map_err(|error| {
+            MetalError::InternalError(format!("asynchronous submission write failed: {error}"))
+        })?;
+
+        let submitted = self.page.page().publish_submitted(u64::from(sequence));
+        self.waker.wake_best_effort();
+        Ok(submitted)
+    }
+
+    fn completed_fence(&self) -> u64 {
+        // One `Ordering::Acquire` load; no syscall and no IPC round-trip.
+        self.page.page().completed()
+    }
+
+    fn fence_page(&self) -> &FencePage {
+        self.page.page()
+    }
+
+    fn wake(&self) {
+        self.waker.wake_best_effort();
+    }
 }
 
 #[cfg(test)]
@@ -2404,6 +2688,106 @@ mod tests {
             "replay reached the executor"
         );
         assert_eq!(state.v3_executions, 1, "replay executed GPU work");
+    }
+
+    #[test]
+    fn v3_submission_publishes_shared_completion_fence() {
+        use crate::fence_page::FENCE_PAGE_LEN;
+
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let fence_path = dir.0.join(FENCE_PAGE_FILE_NAME);
+        // The launcher owns the page file; the host maps it on registration.
+        let launcher_page = FencePageMapping::create(&fence_path).expect("create fence page");
+        assert_eq!(launcher_page.page().completed(), 0);
+
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+        write_frame(
+            &mut client,
+            KIND_FENCE_PAGE,
+            &(FENCE_PAGE_LEN as u64).to_le_bytes(),
+        )
+        .expect("send fence page registration");
+        expect_ack(&mut client, true);
+
+        // A second, independent mapping of the same file is the guest's view.
+        let guest_page = FencePageMapping::open(&fence_path).expect("open shared fence page");
+        assert_eq!(
+            guest_page.page().epoch(),
+            1,
+            "registration must start a new session epoch"
+        );
+
+        let identity = list_identity(41, 1);
+        let first = v3_submission(1, Some(identity), full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &first),
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+        assert_eq!(guest_page.page().completed(), 1);
+        assert_eq!(guest_page.page().submitted(), 1);
+        assert!(!guest_page.page().now_pending());
+
+        // A replay is refused and must not advance or lower the fence.
+        let replay = v3_submission(2, Some(identity), full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &replay),
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::AlreadyExecuted,
+            }
+        );
+        assert_eq!(
+            guest_page.page().completed(),
+            1,
+            "replay advanced the completion fence"
+        );
+        assert_eq!(guest_page.page().submitted(), 1);
+
+        // A validation refusal never reaches the executor and is not published.
+        let unknown = v3_submission(
+            3,
+            None,
+            BufferBinding {
+                allocation_id: ALLOCATION_ID + 1,
+                generation: BASE_GENERATION,
+                offset: 0,
+                length: BYTES as u64,
+            },
+        );
+        assert_eq!(
+            roundtrip_v3(&mut client, &unknown),
+            Reply {
+                sequence: 3,
+                status: ReplyStatus::UnknownHandle,
+            }
+        );
+        assert_eq!(guest_page.page().completed(), 1);
+        assert_eq!(guest_page.page().submitted(), 1);
+
+        // A later success publishes its own sequence.
+        let later = v3_submission(4, None, full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &later),
+            Reply {
+                sequence: 4,
+                status: ReplyStatus::Ok,
+            }
+        );
+        assert_eq!(guest_page.page().completed(), 4);
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(host.executor.state().v3_executions, 2);
     }
 
     #[test]
