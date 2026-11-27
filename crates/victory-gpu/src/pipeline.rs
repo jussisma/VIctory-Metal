@@ -536,7 +536,8 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// The stages `this` would register with the native host, with their DXIL.
+/// The stages `this` would register with the native host, with DXIL the
+/// converter can actually use.
 ///
 /// Only the stages the native pipeline registration understands are listed
 /// (vertex, pixel, mesh, object/amplification, compute); a title pipeline
@@ -545,31 +546,89 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 /// a stage. The amplification/object stage keeps its description position, so
 /// `[mesh, amplification, pixel]` reaches the registration order check instead
 /// of being reordered.
+///
+/// Each returned [`crate::native_metal::pso::StageProgram`] carries a complete
+/// `DXBC` container: the raw console container when it already holds a real
+/// DXIL module, otherwise the container `Shader::translated` emitted. An Xbox
+/// container's `DXIL` part is a 4-byte placeholder beside the console ISA
+/// chunk, so uploading the raw bytes would make the converter child die with
+/// SIGSEGV (Cycle 13, Boot #20). A stage with neither a real raw module nor a
+/// translation is a named refusal.
+///
+/// A `[mesh, pixel]` pair whose standalone mesh translation is over Metal's
+/// 32 KiB output budget is re-translated together so the outputs the pixel
+/// shader never reads are pruned; both linked translations are then used. A
+/// linked refusal falls back to the standalone translations (the link helper
+/// logs it once and remembers the refusal).
 #[cfg(windows)]
-pub(crate) fn native_stages(this: This) -> Vec<(&'static str, Vec<u8>)> {
+pub(crate) fn native_stages(
+    this: This,
+) -> Result<Vec<crate::native_metal::pso::StageProgram>, crate::native_metal::pso::PipelineError> {
+    use crate::native_metal::pso::{self, PipelineStage};
     if this.is_null() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let p = pipeline(this);
-    p.shaders
+    let shaders: Vec<&Arc<Shader>> = pipeline(this)
+        .shaders
         .iter()
-        .filter(|shader| {
-            matches!(
-                shader.stage,
-                "vertex" | "pixel" | "mesh" | "amplification" | "compute"
-            )
-        })
-        .map(|shader| {
-            let container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
-            let mut bytes = container.clone();
-            if bytes.is_empty()
-                && let (Some(full), Some(dir)) = (shader.spilled.get(), SPILL_DIR.get())
-            {
-                bytes = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
-            }
-            (shader.stage, bytes)
-        })
-        .collect()
+        .filter(|shader| PipelineStage::from_name(shader.stage).is_some())
+        .collect();
+
+    // Over-limit mesh: re-translate the pair before any stage is selected, so
+    // both programs come from the linked translation.
+    let mut linked: [Option<Arc<Shader>>; 2] = [None, None];
+    if let Some(mesh) = shaders.iter().copied().find(|shader| shader.stage == "mesh") {
+        let raw = container_of(mesh);
+        // The containers are only kept for linking when `link_mesh_outputs`
+        // is on (see `Shader::translated`), so linking is gated on the same
+        // switch; otherwise the standalone translation is the only one left.
+        if !pso::carries_real_dxil(&raw)
+            && link_mesh_outputs()
+            && let Some(standalone) = mesh.translated().map(|t| t.host.dxil.as_slice())
+            && let Some(pixel) = shaders.iter().copied().find(|shader| shader.stage == "pixel")
+            && pso::linked_mesh_pair_needed(true, standalone)
+            && let Some((linked_mesh, linked_pixel)) = translate_linked(mesh, Some(pixel))
+        {
+            linked[0] = Some(linked_mesh);
+            linked[1] = linked_pixel;
+        }
+    }
+
+    let mut programs = Vec::with_capacity(shaders.len());
+    for shader in shaders {
+        let stage = PipelineStage::from_name(shader.stage).expect("the stages were filtered by name");
+        let raw = container_of(shader);
+        // A stage whose raw container already carries a real module is passed
+        // through; translating it anyway would only change bytes the Win64
+        // reference path expects to stay identical.
+        let translated = if pso::carries_real_dxil(&raw) {
+            None
+        } else {
+            let linked = match shader.stage {
+                "mesh" => linked[0].as_ref(),
+                "pixel" => linked[1].as_ref(),
+                _ => None,
+            };
+            linked
+                .and_then(|linked| linked.translated().map(|t| t.host.dxil.clone()))
+                .or_else(|| shader.translated().map(|t| t.host.dxil.clone()))
+        };
+        programs.push(pso::select_stage_program(stage, &raw, translated.as_deref())?);
+    }
+    Ok(programs)
+}
+
+/// The container of `shader`: its bytes in memory, or the copy kept on disk
+/// (`VICTORY_SPILL_SHADERS`) once the in-memory bytes were released.
+#[cfg(windows)]
+fn container_of(shader: &Shader) -> Vec<u8> {
+    let mut bytes = shader.container.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if bytes.is_empty()
+        && let (Some(full), Some(dir)) = (shader.spilled.get(), SPILL_DIR.get())
+    {
+        bytes = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+    }
+    bytes
 }
 
 /// Every stage name `this` carries, including the ones the native path cannot
@@ -602,18 +661,17 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
     if let Some(known) = cell.as_ref() {
         return known.clone();
     }
-    let stages = native_stages(this);
     let all = stage_names(this);
-    if stages.len() != all.len() {
-        let missing: Vec<&str> = all
-            .iter()
-            .copied()
-            .filter(|stage| !stages.iter().any(|(known, _)| known == stage))
-            .collect();
+    let unsupported: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|stage| crate::native_metal::pso::PipelineStage::from_name(stage).is_none())
+        .collect();
+    if !unsupported.is_empty() {
         let error = format!(
             "the native host registers vertex, pixel, mesh, object/amplification and compute \
              stages only; this PSO also carries {}",
-            missing.join(", ")
+            unsupported.join(", ")
         );
         // The attempt never reaches the PSO registrant, so its census entry is
         // recorded here: the boot states that the title asked for a pipeline
@@ -627,15 +685,10 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
         *cell = Some(Err(error.clone()));
         return Err(error);
     }
-    let programs: Result<Vec<_>, _> = stages
-        .iter()
-        .map(|(stage, container)| {
-            let stage = crate::native_metal::pso::PipelineStage::from_name(stage)
-                .expect("the stages were filtered by name");
-            crate::native_metal::pso::stage_program(stage, container)
-        })
-        .collect();
-    let programs = match programs {
+    // Each program carries a complete DXBC container: the raw one when it
+    // already holds a real DXIL module, otherwise the locally translated one
+    // (never a console container whose DXIL is a 4-byte placeholder).
+    let programs = match native_stages(this) {
         Ok(programs) => programs,
         Err(error) => {
             crate::native_metal::pso::note_refused(
@@ -644,6 +697,7 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
                 &error.to_string(),
             );
             crate::native_metal::telemetry::note_registration_failure();
+            tracing::warn!(pipeline = ?this, %error, "native pipeline stage selection failed");
             let error = error.to_string();
             *cell = Some(Err(error.clone()));
             return Err(error);
