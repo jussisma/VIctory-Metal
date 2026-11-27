@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -242,15 +242,82 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// Host D3D12 device creations attempted in this process. It only moves when
+/// [`host`] reaches [`create`]; on the native `VICTORY_BACKEND=metal` path it
+/// must stay zero (ADR-030).
+static DEVICE_CREATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Calls the native metal path refused to serve with a host D3D12 device. It
+/// proves the ADR-030 gate was taken at least once rather than the guest
+/// quietly making a D3DMetal device.
+static DEVICE_REQUESTS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`host`] may create the host D3D12 device: never on the native
+/// `VICTORY_BACKEND=metal` path, which owns the GPU (ADR-030). Under Wine the
+/// host device would be a D3DMetal device, exactly the silent initialisation
+/// ADR-030 forbids.
+fn device_allowed(metal: bool) -> bool {
+    !metal
+}
+
+/// How many host D3D12 device creations [`host`] attempted in this process.
+///
+/// Zero on `VICTORY_BACKEND=metal` is the proof the guest never asked for a
+/// host device: [`host`] refuses before [`create`] and before any D3D12 object
+/// or module is touched. Diagnostics report it beside
+/// [`device_requests_refused`].
+pub(crate) fn device_creation_attempts() -> u64 {
+    DEVICE_CREATION_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+/// How many calls the native metal path refused to serve with a host D3D12
+/// device. Nonzero proves the gate is live; the creation count stays zero.
+pub(crate) fn device_requests_refused() -> u64 {
+    DEVICE_REQUESTS_REFUSED.load(Ordering::Relaxed)
+}
+
+/// A guest-diagnostics line for the host device guard (ADR-030): the selected
+/// backend, the number of host D3D12 device creations attempted and the
+/// number of calls the native metal path refused. Reading it never creates a
+/// device, so it is safe at any point, including on the metal path.
+pub(crate) fn device_guard_summary() -> String {
+    format!(
+        "backend={} host_d3d12_creation_attempts={} host_d3d12_requests_refused={}",
+        crate::backend::GpuBackend::from_env().as_str(),
+        device_creation_attempts(),
+        device_requests_refused(),
+    )
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+///
+/// On `VICTORY_BACKEND=metal` this is always `None` (ADR-030): the native path
+/// owns the GPU, and a host D3D12 device created lazily here would silently be
+/// a D3DMetal device under Wine. Every caller already handles `None`, taking
+/// its native branch or refusing by name; the one warning below names the
+/// consequence once per process.
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
+    if !device_allowed(crate::backend::metal_selected()) {
+        DEVICE_REQUESTS_REFUSED.fetch_add(1, Ordering::Relaxed);
+        static SAID: OnceLock<()> = OnceLock::new();
+        SAID.get_or_init(|| {
+            tracing::warn!(
+                guard = %device_guard_summary(),
+                "VICTORY_BACKEND=metal: host D3D12 device disabled; the native path must serve this call"
+            );
+        });
+        return None;
+    }
+    HOST.get_or_init(|| {
+        DEVICE_CREATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        match create() {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+                None
+            }
         }
     })
     .as_ref()
@@ -502,6 +569,37 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// ADR-030: the native metal path never allows the host D3D12 device, and
+    /// the decision is pure, so this test creates no device and reads no
+    /// environment.
+    #[test]
+    fn the_metal_path_never_allows_a_host_device() {
+        assert!(
+            !super::device_allowed(true),
+            "metal must refuse the host device"
+        );
+        assert!(
+            super::device_allowed(false),
+            "d3d12 keeps the host device"
+        );
+    }
+
+    /// The guard summary carries the proof counters (and does not create a
+    /// device): the metal run's diagnostics can show zero creations.
+    #[test]
+    fn the_device_guard_summary_names_the_backend_and_the_counters() {
+        let summary = super::device_guard_summary();
+        assert!(summary.contains("backend="), "{summary}");
+        assert!(
+            summary.contains("host_d3d12_creation_attempts="),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("host_d3d12_requests_refused="),
+            "{summary}"
+        );
+    }
+
     #[test]
     fn mesh_support_requires_both_feature_queries_to_confirm_support() {
         use super::MeshSupport;
