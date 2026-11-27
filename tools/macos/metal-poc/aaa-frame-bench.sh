@@ -3,30 +3,33 @@
 #
 # Pipeline under test (the synthetic AAA-shaped frame):
 #
-#   compute culling -> indirect draw -> MRT/depth graphics -> post-FX compute
-#   -> present
+#   compute dispatch -> MRT/depth graphics (direct 3-vertex draw)
+#   -> post-FX compute -> present
 #
 # What this script actually does, in order:
 #
 #   1. builds `victory-metal-host` (ARM64) and a small Win64 guest harness;
 #   2. starts the daemon on an ephemeral loopback port with a private secret,
-#      a shared fence page and `--frame-gate` (synthetic MSL compute + RGBA8
+#      a shared fence page and `--aaa-frame` (synthetic MSL compute + MRT/depth
 #      graphics pipelines built from shaders already in the repository);
 #   3. starts the guest under Wine with `VICTORY_BACKEND=metal`,
 #      `VICTORY_METAL_PORT` and `VICTORY_METAL_SECRET` (no
 #      `VICTORY_METAL_ENDPOINT`, so the guest exercises the ADR-016
 #      auto-connect endpoint), then waits for `FRAME_BENCH_DONE`;
-#   4. reports measured frame-time p50/p95/p99 over 120 frames after 20 warmup
+#   4. registers two RGBA8 colour targets and one D32F depth target over IPC
+#      kind 8, aliases colour-0 as surface 1 over kind 9, then submits the
+#      MRT+depth pass and the post-FX/present pair per measured frame;
+#   5. reports measured frame-time p50/p95/p99 over 120 frames after 20 warmup
 #      frames, sustained FPS, the 0-IPC shared-fence read cost, the pixel
-#      checksum, the AlreadyExecuted replay guard, the AAA stage probes and the
+#      checksum, the AlreadyExecuted replay guard, the texture/surface/
+#      graphics/present reply codes, the present readback checksum and the
 #      D3DMetal module count.
 #
-# The measured frames are the real authenticated loopback + ARM64 Metal compute
-# path. The AAA graphics stage cannot cross the current session because
-# `ipc_host` has no texture registration; the guest probes it explicitly and the
-# script reports that as PARTIAL with the observed reply status. It never
-# fabricates or extrapolates a number: if the 120-frame loop stops early the CSV
-# holds the frames that actually ran and the script exits non-zero.
+# The measured frames are the real authenticated loopback + ARM64 Metal path.
+# Every stage status is reported raw: a refused registration or pass prints one
+# PARTIAL line with the first failing step and its real reply code. The script
+# never fabricates or extrapolates a number: if the 120-frame loop stops early
+# the CSV holds the frames that actually ran and the script exits non-zero.
 #
 # Usage: tools/macos/metal-poc/aaa-frame-bench.sh
 #   WINE=/path/to/wine          override the Wine binary
@@ -85,6 +88,7 @@ GUEST_RC=0
 HOST_RC=0
 
 cleanup() {
+    status=$?
     if [ -n "$GUEST_PID" ] && kill -0 "$GUEST_PID" 2>/dev/null; then
         kill "$GUEST_PID" 2>/dev/null || true
         wait "$GUEST_PID" 2>/dev/null || true
@@ -112,6 +116,11 @@ cleanup() {
         echo "kept harness files in $WORK"
     else
         rm -rf "$WORK"
+    fi
+    # A successful run is only a pass when nothing from this session leaked.
+    if [ "$status" -eq 0 ] && [ -n "$leaked" ]; then
+        trap - EXIT INT TERM
+        exit 4
     fi
 }
 trap cleanup EXIT INT TERM
@@ -161,7 +170,15 @@ cat >"$WORK/aaa_guest.c" <<'CEOF'
 #define ALLOC_BYTES (64u * 1024u)
 #define THREADS 16384u
 #define TPG 64u
+#define POSTFX_THREADS 64u
 #define MAX_FRAMES 512u
+#define TARGET_W 1280u
+#define TARGET_H 720u
+#define COLOR0_ID 4096ULL
+#define COLOR1_ID 4097ULL
+#define DEPTH_ID 4098ULL
+#define SURFACE_ID 1ULL
+#define COLOR_GEN 1u
 
 enum {
     KIND_AUTH = 1,
@@ -169,6 +186,8 @@ enum {
     KIND_SUBMISSION = 5,
     KIND_FENCE_PAGE = 6,
     KIND_SUBMISSION_ASYNC = 7,
+    KIND_TEXTURE_REG = 8,
+    KIND_SURFACE_REG = 9,
     KIND_ACK = 128
 };
 
@@ -197,8 +216,15 @@ static int g_ok = 0;
 static double g_fence_read_ns;
 static unsigned g_replay_status = 0xffff;
 static int g_replay_unchanged = 0;
-static unsigned g_aaa_begin_status = 0xffff;
-static unsigned g_aaa_present_status = 0xffff;
+static unsigned g_texture_status[3] = {0xffff, 0xffff, 0xffff};
+static unsigned g_surface_status = 0xffff;
+static unsigned g_graphics_status = 0xffff;
+static unsigned g_present_status = 0xffff;
+static double g_enc_culling_us;
+static double g_enc_graphics_us;
+static double g_enc_postfx_us;
+static double g_enc_present_us;
+static uint64_t g_expected_present_checksum;
 static unsigned g_guest_modules;
 static int g_d3dmetal_modules = 1;
 static uint64_t g_checksum;
@@ -232,6 +258,8 @@ static void put(Buf *buffer, const void *bytes, size_t len) {
 static void put_u16(Buf *buffer, uint16_t value) { put(buffer, &value, 2); }
 static void put_u32(Buf *buffer, uint32_t value) { put(buffer, &value, 4); }
 static void put_u64(Buf *buffer, uint64_t value) { put(buffer, &value, 8); }
+static void put_f32(Buf *buffer, float value) { put(buffer, &value, 4); }
+static void put_f64(Buf *buffer, double value) { put(buffer, &value, 8); }
 static void reset(Buf *buffer) { buffer->len = 0; }
 static void release(Buf *buffer) {
     free(buffer->data);
@@ -335,6 +363,91 @@ static int recv_frame(SOCKET client, uint8_t *kind, unsigned char **payload, siz
     return 1;
 }
 
+/* Registers one host texture through kind 8 and returns the raw ack status. */
+static int register_texture(SOCKET client, uint64_t id, uint32_t generation, uint8_t dimension,
+                            uint8_t format, uint8_t usage, uint8_t sample_count, uint32_t width,
+                            uint32_t height, uint32_t depth, uint16_t mip_levels,
+                            uint16_t array_layers, unsigned *status) {
+    unsigned char payload[32];
+    uint8_t kind = 0;
+    unsigned char *reply = NULL;
+    size_t len = 0;
+    memcpy(payload, &id, 8);
+    memcpy(payload + 8, &generation, 4);
+    payload[12] = dimension;
+    payload[13] = format;
+    payload[14] = usage;
+    payload[15] = sample_count;
+    memcpy(payload + 16, &width, 4);
+    memcpy(payload + 20, &height, 4);
+    memcpy(payload + 24, &depth, 4);
+    memcpy(payload + 28, &mip_levels, 2);
+    memcpy(payload + 30, &array_layers, 2);
+    send_frame(client, KIND_TEXTURE_REG, payload, sizeof(payload));
+    if (!recv_frame(client, &kind, &reply, &len)) {
+        return 0;
+    }
+    if (kind != KIND_ACK || len != 1) {
+        g_reason = "unexpected texture registration reply";
+        free(reply);
+        return 0;
+    }
+    *status = reply[0];
+    free(reply);
+    return 1;
+}
+
+/* Registers one present surface through kind 9 and returns the raw ack status. */
+static int register_surface(SOCKET client, uint64_t surface_id, uint64_t texture_id,
+                            unsigned *status) {
+    unsigned char payload[16];
+    uint8_t kind = 0;
+    unsigned char *reply = NULL;
+    size_t len = 0;
+    memcpy(payload, &surface_id, 8);
+    memcpy(payload + 8, &texture_id, 8);
+    send_frame(client, KIND_SURFACE_REG, payload, sizeof(payload));
+    if (!recv_frame(client, &kind, &reply, &len)) {
+        return 0;
+    }
+    if (kind != KIND_ACK || len != 1) {
+        g_reason = "unexpected surface registration reply";
+        free(reply);
+        return 0;
+    }
+    *status = reply[0];
+    free(reply);
+    return 1;
+}
+
+static uint64_t fence_value(void *page);
+
+static int wait_fence(void *page, uint32_t sequence) {
+    uint64_t deadline = GetTickCount64() + 30000;
+    while (fence_value(page) < sequence) {
+        if (GetTickCount64() > deadline) {
+            g_reason = "timed out waiting for the shared completion fence";
+            return 0;
+        }
+        SwitchToThread();
+    }
+    return 1;
+}
+
+/* FNV-1a 64 of the expected uniform colour-0 target (RGBA8, row-major). */
+static uint64_t expected_present_checksum(void) {
+    const unsigned char pixel[4] = {255, 128, 0, 255};
+    size_t pixels = (size_t)TARGET_W * (size_t)TARGET_H;
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t index = 0; index < pixels; index++) {
+        for (int channel = 0; channel < 4; channel++) {
+            hash ^= pixel[channel];
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
 static void build_dispatch(Buf *commands, uint64_t pipeline) {
     put_u16(commands, 1);
     put_u16(commands, 0);
@@ -350,33 +463,118 @@ static void build_dispatch(Buf *commands, uint64_t pipeline) {
     put_u64(commands, ALLOC_BYTES);
 }
 
-/* BeginRenderPass naming the registered buffer as a colour attachment. The
-   session has no texture registry, so this is the first AAA stage the current
-   wire cannot carry; the host answers with an explicit refusal status. */
-static void build_aaa_graphics(Buf *commands) {
+/* Colour attachment: handle, generation, mip/slice, load/store, clear colour. */
+static void build_color_attachment(Buf *commands, uint64_t id, uint32_t generation,
+                                   uint16_t load, uint16_t store, double red, double green,
+                                   double blue, double alpha) {
+    put_u64(commands, id);
+    put_u32(commands, generation);
+    put_u16(commands, 0);
+    put_u16(commands, 0);
+    put_u16(commands, load);
+    put_u16(commands, store);
+    put_u32(commands, 0);
+    put_f64(commands, red);
+    put_f64(commands, green);
+    put_f64(commands, blue);
+    put_f64(commands, alpha);
+}
+
+/* MRT+depth graphics pass naming the two registered colour targets and the
+   registered depth target. The host's built-in graphics pipeline was compiled
+   for exactly this attachment set. */
+static void build_graphics(Buf *commands, uint64_t pipeline) {
+    /* BeginRenderPass: 2 colours + 1 depth, all Clear/Store. */
     put_u16(commands, 16);
     put_u16(commands, 0);
+    put_u16(commands, 2);
+    put_u16(commands, 1);
+    put_u32(commands, 0);
+    build_color_attachment(commands, COLOR0_ID, COLOR_GEN, 1, 0, 0.0, 0.0, 0.0, 1.0);
+    build_color_attachment(commands, COLOR1_ID, COLOR_GEN, 1, 0, 0.0, 0.0, 0.0, 1.0);
+    /* Depth attachment: D32F, clear to 1.0, store; stencil DontCare. */
+    put_u64(commands, DEPTH_ID);
+    put_u32(commands, COLOR_GEN);
+    put_u16(commands, 0);
+    put_u16(commands, 0);
     put_u16(commands, 1);
     put_u16(commands, 0);
-    put_u32(commands, 0);
-    put_u64(commands, ALLOC_ID);
-    put_u32(commands, ALLOC_GEN);
-    put_u16(commands, 0);
-    put_u16(commands, 0);
+    put_f32(commands, 1.0f);
+    put_u16(commands, 2);
     put_u16(commands, 1);
+    put_u32(commands, 0);
+    put_u32(commands, 0);
+    /* SetGraphicsPipeline(host graphics id). */
+    put_u16(commands, 20);
+    put_u16(commands, 0);
+    put_u64(commands, pipeline);
+    /* SetViewport(0, 0, TARGET_W, TARGET_H, 0, 1). */
+    put_u16(commands, 18);
+    put_u16(commands, 0);
+    put_f64(commands, 0.0);
+    put_f64(commands, 0.0);
+    put_f64(commands, (double)TARGET_W);
+    put_f64(commands, (double)TARGET_H);
+    put_f64(commands, 0.0);
+    put_f64(commands, 1.0);
+    /* SetScissor(full target). */
+    put_u16(commands, 19);
     put_u16(commands, 0);
     put_u32(commands, 0);
-    for (int index = 0; index < 4; index++) {
-        put_u64(commands, 0);
+    put_u32(commands, 0);
+    put_u32(commands, TARGET_W);
+    put_u32(commands, TARGET_H);
+    /* SetPrimitiveTopology(TriangleList). */
+    put_u16(commands, 23);
+    put_u16(commands, 0);
+    put_u16(commands, 3);
+    put_u16(commands, 0);
+    /* SetRootConstants(slot 0, 32 bytes): the two exact RGBA tints. */
+    put_u16(commands, 8);
+    put_u16(commands, 0);
+    put_u16(commands, 0);
+    put_u16(commands, 32);
+    {
+        float tints[8] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f,
+                          0.0f, 128.0f / 255.0f, 1.0f, 1.0f};
+        put(commands, tints, sizeof(tints));
     }
+    /* Draw(3 vertices, 1 instance). */
+    put_u16(commands, 4);
+    put_u16(commands, 0);
+    put_u32(commands, 3);
+    put_u32(commands, 1);
+    put_u32(commands, 0);
+    put_u32(commands, 0);
+    /* EndRenderPass. */
     put_u16(commands, 17);
     put_u16(commands, 0);
+}
+
+/* Post-FX compute dispatch: the built-in mul-add kernel over the first
+   POSTFX_THREADS words of the guest allocation. */
+static void build_postfx(Buf *commands, uint64_t pipeline) {
+    put_u16(commands, 22);
+    put_u16(commands, 0);
+    put_u64(commands, pipeline);
+    put_u16(commands, 1);
+    put_u16(commands, 0);
+    put_u64(commands, pipeline);
+    put_u32(commands, POSTFX_THREADS);
+    put_u32(commands, TPG);
+    put_u16(commands, 1);
+    put_u16(commands, 0);
+    put_u64(commands, ALLOC_ID);
+    put_u32(commands, ALLOC_GEN);
+    put_u32(commands, 0);
+    put_u64(commands, 0);
+    put_u64(commands, ALLOC_BYTES);
 }
 
 static void build_present(Buf *commands) {
     put_u16(commands, 31);
     put_u16(commands, 0);
-    put_u64(commands, 1);
+    put_u64(commands, SURFACE_ID);
     put_u32(commands, 0);
     put_u32(commands, 0);
 }
@@ -516,8 +714,18 @@ static void write_report(void) {
     fprintf(report, "expected_first=%u\n", g_expected_first);
     fprintf(report, "replay_status=%u\n", g_replay_status);
     fprintf(report, "replay_unchanged=%d\n", g_replay_unchanged);
-    fprintf(report, "aaa_begin_render_pass_status=%u\n", g_aaa_begin_status);
-    fprintf(report, "aaa_present_status=%u\n", g_aaa_present_status);
+    fprintf(report, "texture0_status=%u\n", g_texture_status[0]);
+    fprintf(report, "texture1_status=%u\n", g_texture_status[1]);
+    fprintf(report, "depth_status=%u\n", g_texture_status[2]);
+    fprintf(report, "surface_status=%u\n", g_surface_status);
+    fprintf(report, "graphics_status=%u\n", g_graphics_status);
+    fprintf(report, "present_status=%u\n", g_present_status);
+    fprintf(report, "expected_present_checksum=%016llx\n",
+            (unsigned long long)g_expected_present_checksum);
+    fprintf(report, "encode_culling_us=%.3f\n", g_enc_culling_us);
+    fprintf(report, "encode_graphics_us=%.3f\n", g_enc_graphics_us);
+    fprintf(report, "encode_postfx_us=%.3f\n", g_enc_postfx_us);
+    fprintf(report, "encode_present_us=%.3f\n", g_enc_present_us);
     fprintf(report, "fence_read_ns=%.2f\n", g_fence_read_ns);
     fprintf(report, "guest_modules=%u\n", g_guest_modules);
     fprintf(report, "d3dmetal_modules=%d\n", g_d3dmetal_modules);
@@ -570,6 +778,14 @@ int main(void) {
     uint64_t pipeline = _strtoui64(compute_text, NULL, 10);
     if (pipeline == 0) {
         g_reason = "VICTORY_FRAME_COMPUTE_ID is not set";
+        return finish();
+    }
+
+    char graphics_text[64];
+    env_copy("VICTORY_FRAME_GRAPHICS_ID", graphics_text, sizeof(graphics_text), NULL);
+    uint64_t graphics_pipeline = _strtoui64(graphics_text, NULL, 10);
+    if (graphics_pipeline == 0) {
+        g_reason = "VICTORY_FRAME_GRAPHICS_ID is not set";
         return finish();
     }
 
@@ -744,6 +960,46 @@ int main(void) {
         }
     }
 
+    /* Register the two RGBA8 colour targets and the D32F depth target, then
+       alias colour-0 as the present surface. Every status is reported raw so a
+       refusal is attributed to the exact registration. */
+    {
+        static const struct {
+            uint64_t id;
+            uint8_t format;
+            uint8_t usage;
+        } targets[3] = {
+            {COLOR0_ID, 0, 1},
+            {COLOR1_ID, 0, 1},
+            {DEPTH_ID, 7, 2},
+        };
+        for (unsigned index = 0; index < 3; index++) {
+            unsigned status = 0xffff;
+            if (!register_texture(client, targets[index].id, COLOR_GEN, 1, targets[index].format,
+                                  targets[index].usage, 1, TARGET_W, TARGET_H, 1, 1, 1, &status)) {
+                closesocket(client);
+                return finish();
+            }
+            g_texture_status[index] = status;
+            if (status != 0) {
+                g_reason = "the host refused a texture registration";
+                closesocket(client);
+                return finish();
+            }
+        }
+        unsigned status = 0xffff;
+        if (!register_surface(client, SURFACE_ID, COLOR0_ID, &status)) {
+            closesocket(client);
+            return finish();
+        }
+        g_surface_status = status;
+        if (status != 0) {
+            g_reason = "the host refused the present-surface registration";
+            closesocket(client);
+            return finish();
+        }
+    }
+
     g_csv = fopen(g_csv_path, "w");
     if (g_csv == NULL) {
         g_reason = "cannot create the frame-time CSV";
@@ -755,28 +1011,86 @@ int main(void) {
     Buf commands = {0};
     Buf frame = {0};
     for (unsigned index = 0; index < total; index++) {
+        double started = now_ms();
+        double stage_start;
         uint32_t sequence = ++g_sequence;
+
+        /* Stage 1: compute culling (kind 7, fire-and-forget). */
         reset(&commands);
+        stage_start = now_ms();
         build_dispatch(&commands, pipeline);
         encode_submission(&frame, sequence, 0, 0, &commands, 1);
-        double started = now_ms();
+        g_enc_culling_us += (now_ms() - stage_start) * 1000.0;
         send_envelope(client, KIND_SUBMISSION_ASYNC, sequence, &frame);
-        uint64_t deadline = GetTickCount64() + 30000;
-        while (fence_value(page) < sequence) {
-            if (GetTickCount64() > deadline) {
-                g_reason = "timed out waiting for the shared completion fence";
+        if (!wait_fence(page, sequence)) {
+            release(&commands);
+            release(&frame);
+            closesocket(client);
+            return finish();
+        }
+        g_executions++;
+
+        /* Stage 2: MRT+depth graphics pass (kind 5, explicit reply). */
+        sequence = ++g_sequence;
+        reset(&commands);
+        stage_start = now_ms();
+        build_graphics(&commands, graphics_pipeline);
+        encode_submission(&frame, sequence, 0, 0, &commands, 8);
+        g_enc_graphics_us += (now_ms() - stage_start) * 1000.0;
+        send_envelope(client, KIND_SUBMISSION, sequence, &frame);
+        {
+            uint16_t status = 0xffff;
+            if (!read_reply(client, &status)) {
                 release(&commands);
                 release(&frame);
                 closesocket(client);
                 return finish();
             }
-            SwitchToThread();
+            g_graphics_status = status;
+            if (status != STATUS_OK) {
+                g_reason = "the AAA graphics pass was refused";
+                break;
+            }
+            if (fence_value(page) < sequence) {
+                g_reason = "the AAA graphics pass did not advance the shared fence";
+                break;
+            }
         }
-        double elapsed = now_ms() - started;
-        g_frames_ok++;
+
+        /* Stage 3: post-FX compute dispatch plus present (kind 5). */
+        sequence = ++g_sequence;
+        reset(&commands);
+        stage_start = now_ms();
+        build_postfx(&commands, pipeline);
+        g_enc_postfx_us += (now_ms() - stage_start) * 1000.0;
+        stage_start = now_ms();
+        build_present(&commands);
+        g_enc_present_us += (now_ms() - stage_start) * 1000.0;
+        encode_submission(&frame, sequence, 0, 0, &commands, 3);
+        send_envelope(client, KIND_SUBMISSION, sequence, &frame);
+        {
+            uint16_t status = 0xffff;
+            if (!read_reply(client, &status)) {
+                release(&commands);
+                release(&frame);
+                closesocket(client);
+                return finish();
+            }
+            g_present_status = status;
+            if (status != STATUS_OK) {
+                g_reason = "the post-FX/present submission was refused";
+                break;
+            }
+            if (fence_value(page) < sequence) {
+                g_reason = "the post-FX/present submission did not advance the shared fence";
+                break;
+            }
+        }
         g_executions++;
+
+        g_frames_ok++;
         if (index >= warmup) {
-            fprintf(g_csv, "%.6f\n", elapsed);
+            fprintf(g_csv, "%.6f\n", now_ms() - started);
             fflush(g_csv);
             g_measured++;
         }
@@ -826,35 +1140,6 @@ int main(void) {
         g_replay_unchanged = after == g_checksum;
     }
 
-    {
-        uint32_t sequence = ++g_sequence;
-        reset(&commands);
-        build_aaa_graphics(&commands);
-        encode_submission(&frame, sequence, 0, 0, &commands, 2);
-        send_envelope(client, KIND_SUBMISSION, sequence, &frame);
-        uint16_t status = 0xffff;
-        if (!read_reply(client, &status)) {
-            release(&commands);
-            release(&frame);
-            closesocket(client);
-            return finish();
-        }
-        g_aaa_begin_status = status;
-
-        sequence = ++g_sequence;
-        reset(&commands);
-        build_present(&commands);
-        encode_submission(&frame, sequence, 0, 0, &commands, 1);
-        send_envelope(client, KIND_SUBMISSION, sequence, &frame);
-        if (!read_reply(client, &status)) {
-            release(&commands);
-            release(&frame);
-            closesocket(client);
-            return finish();
-        }
-        g_aaa_present_status = status;
-    }
-
     release(&commands);
     release(&frame);
 
@@ -868,11 +1153,27 @@ int main(void) {
     for (unsigned index = 0; index < g_executions; index++) {
         g_expected_first = g_expected_first * 3u + 7u;
     }
+    g_expected_present_checksum = expected_present_checksum();
 
     g_d3dmetal_modules = d3dmetal_loaded(&g_guest_modules);
 
     g_ok = 1;
-    if (g_replay_status != STATUS_ALREADY_EXECUTED || !g_replay_unchanged) {
+    if (g_texture_status[0] != 0 || g_texture_status[1] != 0 || g_texture_status[2] != 0) {
+        g_ok = 0;
+        g_reason = "a texture registration was refused";
+    } else if (g_surface_status != 0) {
+        g_ok = 0;
+        g_reason = "the present-surface registration was refused";
+    } else if (g_graphics_status != STATUS_OK) {
+        g_ok = 0;
+        g_reason = "the AAA graphics pass was refused";
+    } else if (g_present_status != STATUS_OK) {
+        g_ok = 0;
+        g_reason = "the post-FX/present submission was refused";
+    } else if (g_frames_ok != total) {
+        g_ok = 0;
+        g_reason = "the benchmark did not complete every frame";
+    } else if (g_replay_status != STATUS_ALREADY_EXECUTED || !g_replay_unchanged) {
         g_ok = 0;
         g_reason = "the AlreadyExecuted replay guard did not hold";
     } else if (g_d3dmetal_modules) {
@@ -902,7 +1203,7 @@ echo "Starting the ARM64 victory-metal-host daemon..."
     --secret-file "$SECRET" \
     --port 0 \
     --once \
-    --frame-gate \
+    --aaa-frame \
     --share-dir "$SHARE" \
     --telemetry-json "$TELEMETRY" \
     >"$HOST_OUT" 2>"$HOST_ERR" &
@@ -1068,10 +1369,18 @@ print(
     )
 )
 print(
-    "FRAME_BENCH aaa begin_render_pass_status={} present_status={} "
+    "FRAME_BENCH aaa texture0_status={} texture1_status={} depth_status={} "
+    "surface_status={} graphics_status={} present_status={} "
+    "present_checksum={} expected_present_checksum={} "
     "shader_path=msl-precompiled cold_vs_warm=n/a".format(
-        report.get("aaa_begin_render_pass_status", "?"),
-        report.get("aaa_present_status", "?"),
+        report.get("texture0_status", "?"),
+        report.get("texture1_status", "?"),
+        report.get("depth_status", "?"),
+        report.get("surface_status", "?"),
+        report.get("graphics_status", "?"),
+        report.get("present_status", "?"),
+        telemetry.get("present_checksum", "?"),
+        report.get("expected_present_checksum", "?"),
     )
 )
 print(
@@ -1110,29 +1419,66 @@ if count != measured_expected:
     problems.append(f"measured {count} of {measured_expected} frames")
 if telemetry.get("d3dmetal_fallback_count") != 0:
     problems.append("d3dmetal_fallback_count != 0")
+if telemetry.get("graphics_status") not in (0, "0"):
+    problems.append("host graphics_status=" + str(telemetry.get("graphics_status")))
+if telemetry.get("present_status") not in (0, "0"):
+    problems.append("host present_status=" + str(telemetry.get("present_status")))
+
+# Every AAA stage status is reported raw, so a refusal is attributed to the
+# exact registration or pass that produced it. A non-zero step is a real,
+# labelled gap, never a fabricated pass.
+stages = [
+    ("texture0", report.get("texture0_status", "?")),
+    ("texture1", report.get("texture1_status", "?")),
+    ("depth", report.get("depth_status", "?")),
+    ("surface", report.get("surface_status", "?")),
+    ("graphics", report.get("graphics_status", "?")),
+    ("present", report.get("present_status", "?")),
+]
+first_failure = next(((name, value) for name, value in stages if value != "0"), None)
+if first_failure is not None:
+    print(
+        "PARTIAL aaa-frame-bench first_failing_step={} reply_status={} "
+        "texture0_status={} texture1_status={} depth_status={} surface_status={} "
+        "graphics_status={} present_status={} "
+        "reason=\"the AAA stage was refused by the current session\"".format(
+            first_failure[0],
+            first_failure[1],
+            report.get("texture0_status", "?"),
+            report.get("texture1_status", "?"),
+            report.get("depth_status", "?"),
+            report.get("surface_status", "?"),
+            report.get("graphics_status", "?"),
+            report.get("present_status", "?"),
+        )
+    )
+    sys.exit(1)
+
+expected_checksum = report.get("expected_present_checksum", "?")
+host_checksum = telemetry.get("present_checksum", "?")
+checksum_ok = False
+if expected_checksum not in ("", "?") and host_checksum not in ("", "?", -1, "-1"):
+    try:
+        checksum_ok = int(host_checksum) == int(expected_checksum, 16)
+    except (TypeError, ValueError):
+        checksum_ok = False
+if not checksum_ok:
+    problems.append(
+        "present checksum mismatch host={} expected={}".format(
+            host_checksum, expected_checksum
+        )
+    )
 
 if problems:
     print("PARTIAL aaa-frame-bench reason=\"" + "; ".join(problems) + "\"")
     sys.exit(1)
 
-# The measured compute path is complete; the AAA graphics/present stages are
-# probed explicitly. A non-zero status there is a real, labelled gap, not a
-# fabricated pass.
-begin_status = report.get("aaa_begin_render_pass_status", "?")
-present_status = report.get("aaa_present_status", "?")
-if begin_status != "0" or present_status != "0":
-    print(
-        "PARTIAL aaa-frame-bench first_failing_step=begin_render_pass "
-        f"reply_status={begin_status} present_reply_status={present_status} "
-        "reason=\"the AAA graphics pass is refused by the current session\""
+print(
+    "PASS aaa-frame-bench measured={}/{} p50_ms={:.3f} fps={:.2f} "
+    "checksum={} d3dmetal_calls=0".format(
+        count, measured_expected, p50, fps, host_checksum
     )
-    print(
-        "NOTE aaa-frame-bench indirect_draw=not_reached post_fx=not_reached "
-        "cause=\"ipc_host registers buffer allocations only; texture/surface registration is a separate task\""
-    )
-    sys.exit(1)
-
-print("PASS aaa-frame-bench measured=120/120 p50_ms={:.3f} fps={:.2f} d3dmetal_calls=0".format(p50, fps))
+)
 PY
 
 echo "aaa-frame-bench: exit $PY_EXIT"

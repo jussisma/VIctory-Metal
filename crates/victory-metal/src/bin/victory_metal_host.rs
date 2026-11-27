@@ -15,8 +15,11 @@
 //! flushed before it accepts:
 //!
 //! ```text
-//! victory-metal-host: ready port=<n> pid=<pid>
+//! victory-metal-host: ready port=<n> pid=<pid> compute_pipeline=<id> graphics_pipeline=<id>
 //! ```
+//!
+//! The pipeline ids are `0` unless the built-in pipelines were registered
+//! (`--frame-gate` or `--aaa-frame`).
 //!
 //! A failure prints exactly one `victory-metal-host: error <reason>` line and
 //! exits non-zero. Usage errors exit `2`; runtime failures exit `1`.
@@ -25,7 +28,7 @@
 //!
 //! ```text
 //! victory-metal-host --secret-hex <64 hex> [--port <0|n>] [--once]
-//!                    [--frame-gate] [--telemetry-json <path>]
+//!                    [--frame-gate] [--aaa-frame] [--telemetry-json <path>]
 //!                    [--share-dir <path>] [--help]
 //! ```
 //!
@@ -40,20 +43,30 @@
 //! daemon creates a private `0700` directory under the system temporary
 //! directory and removes it on exit.
 //!
-//! # `--frame-gate`
+//! # `--frame-gate` and `--aaa-frame`
 //!
-//! Compiles the synthetic compute kernel and the RGBA8 graphics pair the
-//! benchmark names before the banner is printed, and writes their native ids to
+//! Both modes compile the synthetic compute kernel and the MRT+depth graphics
+//! pair before the banner is printed, register them on the native transport and
+//! publish their ids in the banner. They are also written to
 //! `<share>/victory-metal-host.compute.id` and
-//! `<share>/victory-metal-host.graphics.id` (`id=<n>\n`). The shaders are the
-//! same synthetic MSL sources used by `metal-worker --frame-gate`; they are
-//! validation scaffolding, not the production shader design.
+//! `<share>/victory-metal-host.graphics.id` (`id=<n>\n`) for launchers that
+//! poll files. The shaders are validation scaffolding, not the production
+//! shader design.
+//!
+//! `--aaa-frame` additionally lets the daemon report the AAA frame outcome in
+//! telemetry: the reply status of the last submission containing a render pass
+//! (`graphics_status`), of the last submission containing a `Present`
+//! (`present_status`), and the FNV-1a 64 checksum of the registered present
+//! texture read back as RGBA8 (`present_checksum`). The texture and surface are
+//! registered by the authenticated guest through IPC kinds 8 and 9; the daemon
+//! never guesses a texture handle.
 //!
 //! # Telemetry
 //!
 //! With `--telemetry-json <path>` the daemon writes one JSON object on
 //! shutdown: submission and frame counts, frame-time `p50_ms`/`p95_ms`/
 //! `p99_ms`, sustained `fps`, the unsupported-opcode histogram,
+//! `graphics_status`, `present_status`, `present_checksum`,
 //! `d3dmetal_fallback_count` (always `0` on this path) and the observed D3DMetal
 //! image list. A write failure is reported, never silently ignored.
 
@@ -75,8 +88,10 @@ usage: victory-metal-host (--secret-hex <hex> | --secret-file <path>) [options]
                              (otherwise VICTORY_METAL_SHARE_DIR, otherwise a
                              private temporary directory)
   --once                     serve exactly one session, then exit
-  --frame-gate               compile and publish the synthetic compute and
-                             graphics pipeline ids before the banner
+  --frame-gate               compile and publish the built-in compute and
+                             MRT+depth graphics pipeline ids before the banner
+  --aaa-frame                like --frame-gate, and report graphics/present
+                             status plus the present texture checksum
   --telemetry-json <path>    write session telemetry JSON on shutdown
   -h, --help
 
@@ -95,7 +110,12 @@ kernel void vm_ipc_bootstrap_mul_add(device uint *data [[buffer(0)]],
 }
 "#;
 
-/// Synthetic graphics pair shared with `metal-worker --frame-gate`.
+/// Synthetic MRT+depth graphics pair used by the AAA frame gate.
+///
+/// Two RGBA8 colour attachments and one D32F depth attachment. The vertex
+/// stage reads two RGBA tints from the root-constants slot bound by
+/// `SetRootConstants(slot 0)` and forwards them as varyings, because the
+/// non-ABI graphics path binds root constants to the vertex stage only.
 const FRAME_GFX_VERTEX: &str = "vm_frame_vertex";
 const FRAME_GFX_FRAGMENT: &str = "vm_frame_fragment";
 const FRAME_GFX_MSL: &str = r#"
@@ -104,22 +124,42 @@ using namespace metal;
 
 struct VOut {
     float4 position [[position]];
-    float4 color;
+    float4 color0;
+    float4 color1;
+};
+
+struct MrtOut {
+    float4 a [[color(0)]];
+    float4 b [[color(1)]];
 };
 
 vertex VOut vm_frame_vertex(uint vid [[vertex_id]],
-                            constant float2 *positions [[buffer(0)]],
-                            constant float4 &color [[buffer(1)]]) {
+                            constant float4 *colors [[buffer(0)]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VOut out;
-    out.position = float4(positions[vid], 0.0, 1.0);
-    out.color = color;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    out.color0 = colors[0];
+    out.color1 = colors[1];
     return out;
 }
 
-fragment float4 vm_frame_fragment(VOut in [[stage_in]]) {
-    return in.color;
+fragment MrtOut vm_frame_fragment(VOut in [[stage_in]]) {
+    MrtOut out;
+    out.a = in.color0;
+    out.b = in.color1;
+    return out;
 }
 "#;
+
+/// Exact colour formats of the built-in AAA graphics pipeline.
+///
+/// Only the macOS daemon compiles Metal pipelines; the Windows target links the
+/// binary but cannot construct these formats.
+#[cfg(target_os = "macos")]
+const FRAME_COLOR_FORMATS: [PixelFormat; 2] = [PixelFormat::Rgba8Unorm, PixelFormat::Rgba8Unorm];
+/// Exact depth format of the built-in AAA graphics pipeline.
+#[cfg(target_os = "macos")]
+const FRAME_DEPTH_FORMAT: PixelFormat = PixelFormat::Depth32Float;
 
 /// File names the `--frame-gate` pipeline ids are published under.
 const COMPUTE_PIPELINE_FILE: &str = "victory-metal-host.compute.id";
@@ -166,6 +206,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut share_dir = None;
     let mut once = false;
     let mut frame_gate = false;
+    let mut aaa_frame = false;
     let mut telemetry_json = None;
 
     let mut args = env::args().skip(1);
@@ -199,6 +240,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--once" => once = true,
             "--frame-gate" => frame_gate = true,
+            "--aaa-frame" => {
+                aaa_frame = true;
+                frame_gate = true;
+            }
             "--telemetry-json" => {
                 telemetry_json = Some(PathBuf::from(next_value(&mut args, "--telemetry-json")?));
             }
@@ -219,6 +264,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         share_dir,
         once,
         frame_gate,
+        aaa_frame,
         telemetry_json,
     }))
 }
@@ -271,11 +317,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
 use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
 #[cfg(target_os = "macos")]
-use victory_metal::macos::render::PixelFormat;
+use victory_metal::macos::render::{GraphicsPipeline, PixelFormat};
 #[cfg(target_os = "macos")]
-use victory_metal::wire::ReplyStatus;
+use victory_metal::wire::{Reply, ReplyStatus};
 #[cfg(target_os = "macos")]
-use victory_metal::wire_v3::SubmissionV3;
+use victory_metal::wire_v3::{CommandV3, SubmissionV3};
 #[cfg(target_os = "macos")]
 use victory_metal::{DirectMetalTransport, MetalError, MetalTransport, VmBufferId, VmPipelineId};
 
@@ -286,6 +332,7 @@ struct Args {
     share_dir: Option<PathBuf>,
     once: bool,
     frame_gate: bool,
+    aaa_frame: bool,
     telemetry_json: Option<PathBuf>,
 }
 
@@ -367,7 +414,6 @@ fn d3dmetal_images() -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Default)]
 struct Stats {
     sessions: u64,
     submissions: u64,
@@ -378,21 +424,52 @@ struct Stats {
     allocations: usize,
     bytes_mapped: u64,
     pipelines: Vec<(String, u64)>,
+    /// Reply status of the last submission that contained a render pass; -1
+    /// until one is observed.
+    graphics_status: i32,
+    /// Reply status of the last submission that contained a `Present`; -1
+    /// until one is observed.
+    present_status: i32,
+    /// Texture handle of the last registered present surface.
+    present_texture_id: Option<u64>,
+    /// FNV-1a 64 of the present texture read back as RGBA8.
+    present_checksum: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            sessions: 0,
+            submissions: 0,
+            frames: 0,
+            refused: 0,
+            frame_ms: Vec::new(),
+            unsupported: BTreeMap::new(),
+            allocations: 0,
+            bytes_mapped: 0,
+            pipelines: Vec::new(),
+            graphics_status: -1,
+            present_status: -1,
+            present_texture_id: None,
+            present_checksum: None,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 struct DaemonExecutor {
-    transport: DirectMetalTransport,
+    transport: Arc<DirectMetalTransport>,
     stats: Arc<Mutex<Stats>>,
 }
 
 #[cfg(target_os = "macos")]
 impl DaemonExecutor {
-    fn new(transport: DirectMetalTransport, stats: Arc<Mutex<Stats>>) -> Self {
+    fn new(transport: Arc<DirectMetalTransport>, stats: Arc<Mutex<Stats>>) -> Self {
         Self { transport, stats }
     }
 
-    fn record(&self, started: Instant, result: &Result<victory_metal::wire::Reply, MetalError>) {
+    fn record(&self, started: Instant, result: &Result<Reply, MetalError>) {
         let mut stats = self
             .stats
             .lock()
@@ -414,29 +491,92 @@ impl DaemonExecutor {
             Err(_) => stats.refused += 1,
         }
     }
+
+    /// Records the AAA stage outcome of one v3 submission.
+    ///
+    /// `graphics_status` follows the reply of a submission containing a render
+    /// pass and `present_status` of one containing a `Present`. The worst
+    /// observed status is retained so a later success cannot hide an earlier
+    /// failure.
+    fn record_v3(
+        &self,
+        started: Instant,
+        submission: &SubmissionV3,
+        result: &Result<Reply, MetalError>,
+    ) {
+        let code = reply_status_code(result);
+        let has_pass = submission
+            .commands
+            .iter()
+            .any(|command| matches!(command, CommandV3::BeginRenderPass(_)));
+        let has_present = submission
+            .commands
+            .iter()
+            .any(|command| matches!(command, CommandV3::Present(_)));
+        self.record(started, result);
+        if has_pass || has_present {
+            let mut stats = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if has_pass {
+                stats.graphics_status = stats.graphics_status.max(code);
+            }
+            if has_present {
+                stats.present_status = stats.present_status.max(code);
+            }
+        }
+    }
+}
+
+/// Maps an executor reply to the wire status code the guest sees.
+#[cfg(target_os = "macos")]
+fn reply_status_code(result: &Result<Reply, MetalError>) -> i32 {
+    match result {
+        Ok(reply) => match reply.status {
+            ReplyStatus::Ok => 0,
+            ReplyStatus::UnknownHandle => 1,
+            ReplyStatus::ExecutionFailed => 2,
+            ReplyStatus::AlreadyExecuted => 3,
+        },
+        Err(_) => 2,
+    }
+}
+
+/// FNV-1a 64 over RGBA8 pixels, byte order row-major.
+#[cfg(target_os = "macos")]
+fn checksum_rgba8(pixels: &[[u8; 4]]) -> u64 {
+    let mut hash = 1_469_598_103_934_665_603u64;
+    for pixel in pixels {
+        for &byte in pixel {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+    }
+    hash
 }
 
 #[cfg(target_os = "macos")]
 impl BatchExecutor for DaemonExecutor {
     fn page_size(&self) -> Result<u64, MetalError> {
-        <DirectMetalTransport as BatchExecutor>::page_size(&self.transport)
+        <DirectMetalTransport as BatchExecutor>::page_size(self.transport.as_ref())
     }
 
     fn register_window(&self, ptr: *mut u8, len: usize) -> Result<VmBufferId, MetalError> {
-        BatchExecutor::register_window(&self.transport, ptr, len)
+        BatchExecutor::register_window(self.transport.as_ref(), ptr, len)
     }
 
     fn unregister_window(&self, id: VmBufferId) -> Result<(), MetalError> {
-        BatchExecutor::unregister_window(&self.transport, id)
+        BatchExecutor::unregister_window(self.transport.as_ref(), id)
     }
 
     fn submit_batch(
         &self,
         submission: &victory_metal::wire::Submission,
         allocations: &HashMap<(u64, u32), VmBufferId>,
-    ) -> Result<victory_metal::wire::Reply, MetalError> {
+    ) -> Result<Reply, MetalError> {
         let started = Instant::now();
-        let result = BatchExecutor::submit_batch(&self.transport, submission, allocations);
+        let result = BatchExecutor::submit_batch(self.transport.as_ref(), submission, allocations);
         self.record(started, &result);
         result
     }
@@ -445,15 +585,34 @@ impl BatchExecutor for DaemonExecutor {
         &self,
         submission: &SubmissionV3,
         allocations: &HashMap<(u64, u32), VmBufferId>,
-    ) -> Result<victory_metal::wire::Reply, MetalError> {
+    ) -> Result<Reply, MetalError> {
         let started = Instant::now();
-        let result = DirectMetalTransport::submit_v3(&self.transport, submission, allocations);
-        self.record(started, &result);
+        let result =
+            DirectMetalTransport::submit_v3(self.transport.as_ref(), submission, allocations);
+        self.record_v3(started, submission, &result);
         result
     }
 
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
-        BatchExecutor::load_pipeline(&self.transport, metallib, entry)
+        BatchExecutor::load_pipeline(self.transport.as_ref(), metallib, entry)
+    }
+
+    fn register_texture(
+        &self,
+        id: u64,
+        desc: victory_metal::macos::registry::TextureDesc,
+    ) -> Result<(), MetalError> {
+        self.transport.register_registry_texture(id, desc)
+    }
+
+    fn register_surface(&self, surface_id: u64, texture_id: u64) -> Result<(), MetalError> {
+        BatchExecutor::register_surface(self.transport.as_ref(), surface_id, texture_id)?;
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        stats.present_texture_id = Some(texture_id);
+        Ok(())
     }
 }
 
@@ -478,21 +637,32 @@ fn build_executor(
     share: &Path,
     frame_gate: bool,
     stats: &Arc<Mutex<Stats>>,
-) -> Result<DaemonExecutor, String> {
-    let transport = DirectMetalTransport::new()
-        .map_err(|error| format!("cannot open the Metal device: {error}"))?;
+) -> Result<(DaemonExecutor, Arc<DirectMetalTransport>), String> {
+    let transport = Arc::new(
+        DirectMetalTransport::new()
+            .map_err(|error| format!("cannot open the Metal device: {error}"))?,
+    );
     if frame_gate {
-        let compute = MetalTransport::compile_msl(&transport, BOOTSTRAP_MSL, BOOTSTRAP_ENTRY)
-            .map_err(|error| format!("cannot compile the frame-gate compute pipeline: {error}"))?;
+        let compute =
+            MetalTransport::compile_msl(transport.as_ref(), BOOTSTRAP_MSL, BOOTSTRAP_ENTRY)
+                .map_err(|error| {
+                    format!("cannot compile the frame-gate compute pipeline: {error}")
+                })?;
         write_pipeline_id(share, COMPUTE_PIPELINE_FILE, compute.0)?;
+        let graphics_state = GraphicsPipeline::compile_mrt(
+            transport.as_ref(),
+            FRAME_GFX_MSL,
+            FRAME_GFX_VERTEX,
+            FRAME_GFX_FRAGMENT,
+            &FRAME_COLOR_FORMATS,
+            Some(FRAME_DEPTH_FORMAT),
+        )
+        .map_err(|error| format!("cannot compile the frame-gate graphics pipeline: {error}"))?;
         let graphics = transport
-            .register_graphics_pipeline(
-                FRAME_GFX_MSL,
-                FRAME_GFX_VERTEX,
-                FRAME_GFX_FRAGMENT,
-                PixelFormat::Rgba8Unorm,
-            )
-            .map_err(|error| format!("cannot compile the frame-gate graphics pipeline: {error}"))?;
+            .register_graphics_pipeline_state(graphics_state)
+            .map_err(|error| {
+                format!("cannot register the frame-gate graphics pipeline: {error}")
+            })?;
         write_pipeline_id(share, GRAPHICS_PIPELINE_FILE, graphics.0)?;
         let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
         stats.pipelines = vec![
@@ -500,7 +670,37 @@ fn build_executor(
             ("graphics".to_string(), graphics.0),
         ];
     }
-    Ok(DaemonExecutor::new(transport, Arc::clone(stats)))
+    let executor = DaemonExecutor::new(Arc::clone(&transport), Arc::clone(stats));
+    Ok((executor, transport))
+}
+
+#[cfg(target_os = "macos")]
+fn pipeline_id(stats: &Stats, name: &str) -> u64 {
+    stats
+        .pipelines
+        .iter()
+        .find(|(label, _)| label == name)
+        .map_or(0, |(_, id)| *id)
+}
+
+/// Reads the last registered present texture back as RGBA8 and records its
+/// FNV-1a 64 checksum. A readback failure leaves the checksum unset, so the
+/// launcher reports an honest gap instead of a fabricated value.
+#[cfg(target_os = "macos")]
+fn read_back_present(transport: &DirectMetalTransport, stats: &Arc<Mutex<Stats>>) {
+    let texture_id = {
+        let stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+        stats.present_texture_id
+    };
+    let Some(texture_id) = texture_id else {
+        return;
+    };
+    let checksum = transport
+        .read_registered_texture_rgba8(texture_id)
+        .map(|pixels| checksum_rgba8(&pixels))
+        .ok();
+    let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+    stats.present_checksum = checksum;
 }
 
 #[cfg(target_os = "macos")]
@@ -584,6 +784,9 @@ fn write_telemetry(
             "  \"bytes_mapped\": {bytes_mapped},\n",
             "  \"unsupported_opcodes\": {{{unsupported}}},\n",
             "  \"pipelines\": {{{pipelines}}},\n",
+            "  \"graphics_status\": {graphics_status},\n",
+            "  \"present_status\": {present_status},\n",
+            "  \"present_checksum\": {present_checksum},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0\n",
@@ -603,6 +806,11 @@ fn write_telemetry(
         bytes_mapped = stats.bytes_mapped,
         unsupported = unsupported,
         pipelines = pipelines,
+        graphics_status = stats.graphics_status,
+        present_status = stats.present_status,
+        present_checksum = stats
+            .present_checksum
+            .map_or_else(|| "-1".to_string(), |value| value.to_string()),
         images = images,
         loaded = !d3dmetal.is_empty(),
     );
@@ -651,8 +859,15 @@ fn run(args: Args) -> Result<(), String> {
     }
     let port = local.port();
 
+    let (compute_pipeline, graphics_pipeline) = {
+        let stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+        (
+            pipeline_id(&stats, "compute"),
+            pipeline_id(&stats, "graphics"),
+        )
+    };
     println!(
-        "victory-metal-host: ready port={port} pid={}",
+        "victory-metal-host: ready port={port} pid={} compute_pipeline={compute_pipeline} graphics_pipeline={graphics_pipeline}",
         process::id()
     );
     io::stdout()
@@ -674,10 +889,10 @@ fn run(args: Args) -> Result<(), String> {
             break;
         }
 
-        let executor = match prepared.take() {
-            Some(executor) => executor,
+        let (executor, transport) = match prepared.take() {
+            Some(pair) => pair,
             None => match build_executor(&share.path, args.frame_gate, &stats) {
-                Ok(executor) => executor,
+                Ok(pair) => pair,
                 Err(error) => {
                     outcome = Err(error);
                     break;
@@ -693,21 +908,26 @@ fn run(args: Args) -> Result<(), String> {
             }
         };
 
-        match host.serve_once(stream) {
-            Ok(summary) => {
-                let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
-                stats.sessions += 1;
-                stats.allocations = summary.allocations;
-                stats.bytes_mapped = summary.bytes_mapped;
-            }
+        let session = host.serve_once(stream);
+        if let Ok(summary) = &session {
+            let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+            stats.sessions += 1;
+            stats.allocations = summary.allocations;
+            stats.bytes_mapped = summary.bytes_mapped;
+        }
+        if args.aaa_frame {
+            read_back_present(transport.as_ref(), &stats);
+        }
+        host.release_all();
+        drop(host);
+
+        match session {
+            Ok(_) => {}
             Err(error) => {
-                host.release_all();
                 outcome = Err(format!("session failed: {error}"));
                 break;
             }
         }
-        host.release_all();
-        drop(host);
 
         if args.once {
             break;
@@ -750,6 +970,10 @@ impl Clone for Stats {
             allocations: self.allocations,
             bytes_mapped: self.bytes_mapped,
             pipelines: self.pipelines.clone(),
+            graphics_status: self.graphics_status,
+            present_status: self.present_status,
+            present_texture_id: self.present_texture_id,
+            present_checksum: self.present_checksum,
         }
     }
 }
