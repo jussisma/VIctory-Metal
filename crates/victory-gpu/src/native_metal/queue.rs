@@ -22,7 +22,11 @@
 //! empty or dropped stream never leaves a hole in the host's ledger.
 //! [`NativeQueue::submit`] sends every queued frame exactly once, in order,
 //! and returns the host's reply status; a replayed list's
-//! [`ReplyStatus::AlreadyExecuted`] is surfaced, never re-sent.
+//! [`ReplyStatus::AlreadyExecuted`] is surfaced, never re-sent. A host refusal
+//! (`ExecutionFailed`/`UnknownHandle`) is a spent sequence too: the host
+//! answered it and moved on, so the frame is consumed and the refusal is
+//! returned as an ordinary reply — a refused pipeline never re-sends its
+//! sequence and never desynchronises the next real submission.
 //!
 //! [`V3Sink`] is the transport seam. [`NativeSink`] starts
 //! [`DisconnectedSink`] and becomes [`Live`](NativeSink::Live) on the first
@@ -226,7 +230,8 @@ impl V3Sink for NativeSink {
 /// Submissions keep the order a closed list produced them in; nothing is
 /// merged, reordered or dropped on success. A transport failure leaves the
 /// unsent frames at the front of the queue (the failure is reported, not
-/// hidden), while a host reply status is always consumed exactly once.
+/// hidden), while a host reply (a status, including a refusal) is always
+/// consumed exactly once and never re-sent.
 #[derive(Debug)]
 pub struct NativeQueue<S: V3Sink> {
     sink: S,
@@ -287,8 +292,9 @@ impl<S: V3Sink> NativeQueue<S> {
     /// is never handed to the host and consumes nothing), and every other one
     /// gets the next sequence exactly once, through
     /// [`producer::ensure_sequence`]. A submission that already carries a
-    /// sequence (a frame built by a caller, or a retried one) keeps it, so a
-    /// retry never renumbers. Nothing is coalesced: one [`SubmissionV3`]
+    /// sequence keeps it (a frame a caller built, or one the queue kept after
+    /// a transport failure), so a resend after a transport error never
+    /// renumbers. Nothing is coalesced: one [`SubmissionV3`]
     /// becomes one outbound frame, encoded with the canonical v3 codec. An
     /// empty batch is refused with [`NativeQueueError::Empty`]. Nothing is
     /// queued if any frame fails to encode, so a refused batch never leaves a
@@ -333,17 +339,32 @@ impl<S: V3Sink> NativeQueue<S> {
 
     /// Sends every queued frame in order, exactly once.
     ///
-    /// Returns one host status per frame, in send order. A transport error
+    /// Returns one host status per frame, in send order. A **transport error**
     /// stops the pump and leaves the failed frame (and everything behind it)
-    /// queued; a host status, including [`ReplyStatus::AlreadyExecuted`], is
-    /// consumed and surfaced, never retried.
+    /// queued, because the host never saw it: the next flush carries the same
+    /// sequences again, once. A **host refusal**
+    /// ([`NativeQueueError::Refused`]: `ExecutionFailed` or `UnknownHandle`)
+    /// is not a transport failure: the host answered the frame and advanced
+    /// its ledger past that sequence, so the frame is consumed here and is
+    /// never re-sent. The remaining frames are still in sequence and keep
+    /// going out; the first refusal is returned to the caller after the pump
+    /// drains, so a refused frame can never leave the host expecting a
+    /// sequence the guest will not send.
     pub fn flush(&mut self) -> Result<Vec<ReplyStatus>, NativeQueueError> {
         let mut statuses = Vec::with_capacity(self.outbound.len());
+        let mut refusal = None;
         while let Some(frame) = self.outbound.pop_front() {
             match self.sink.send(&frame.bytes) {
                 Ok(status) => {
                     self.sent += 1;
                     statuses.push(status);
+                }
+                Err(error @ NativeQueueError::Refused(_)) => {
+                    // The host consumed the sequence and wrote a reply. The
+                    // frame is spent: keeping it would re-send an already
+                    // consumed sequence and poison the session.
+                    self.sent += 1;
+                    refusal.get_or_insert(error);
                 }
                 Err(error) => {
                     self.outbound.push_front(frame);
@@ -351,15 +372,24 @@ impl<S: V3Sink> NativeQueue<S> {
                 }
             }
         }
-        Ok(statuses)
+        match refusal {
+            // The statuses of the frames behind a refusal are still consumed;
+            // the refusal is what the caller must see.
+            Some(error) => Err(error),
+            None => Ok(statuses),
+        }
     }
 
     /// Queues one closed list's submissions and sends them in recorded order.
     ///
     /// Returns the batch's host reply: the first status that is not
-    /// [`ReplyStatus::Ok`], or `Ok` when every frame succeeded. A replayed
-    /// list's `AlreadyExecuted` is therefore surfaced; the frame is not sent
-    /// a second time.
+    /// [`ReplyStatus::Ok`] when the host answered with a status, or the host's
+    /// [`NativeQueueError::Refused`] when it answered `ExecutionFailed` /
+    /// `UnknownHandle`. A replayed list's `AlreadyExecuted` is therefore
+    /// surfaced; the frame is not sent a second time. A refused frame is
+    /// consumed the same way: its refusal is returned to the caller and its
+    /// sequence is spent, so the next frame takes the next sequence with no
+    /// hole.
     pub fn submit(
         &mut self,
         submissions: &[SubmissionV3],
@@ -2510,6 +2540,31 @@ mod tests {
         }
     }
 
+    /// A sink that answers like a live host: it records every sequence it was
+    /// handed and refuses a frame bound to an odd list id with the same
+    /// `UnknownHandle` a refused pipeline registration produces. The refusal is
+    /// a reply, not a transport fault, so it exercises the spent-sequence rule.
+    #[derive(Debug, Default)]
+    struct HostStatusSink {
+        sequences: Vec<u32>,
+        frames: Vec<Vec<u8>>,
+    }
+
+    impl V3Sink for HostStatusSink {
+        fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+            let decoded = decode_submission_v3(bytes).expect("canonical v3");
+            self.sequences.push(decoded.sequence);
+            self.frames.push(bytes.to_vec());
+            if decoded.list.is_some_and(|list| list.list_id % 2 == 1) {
+                return Err(NativeQueueError::Refused(format!(
+                    "the host answered UnknownHandle for sequence {}",
+                    decoded.sequence
+                )));
+            }
+            Ok(ReplyStatus::Ok)
+        }
+    }
+
     /// A configured endpoint connects on the first submission, carries the
     /// batch over one authenticated socket, and records one native frame with
     /// no D3DMetal fallback.
@@ -2893,6 +2948,47 @@ mod tests {
         );
         let _ = carried.recv_timeout(TEST_TIMEOUT).expect("one frame");
         assert_eq!(native_queue().pending(), 0, "nothing is retried");
+        native_queue_reset();
+    }
+
+    /// End-to-end over a loopback host: a submission the host refuses with
+    /// `ExecutionFailed` is answered, consumed and surfaced, and the next
+    /// submission keeps the same session alive at the next sequence. This is
+    /// Boot #21's shape without a GPU: no resend, no protocol violation.
+    #[test]
+    fn a_live_host_refusal_does_not_desynchronise_the_next_submission() {
+        let _serial = serialized();
+        native_queue_reset();
+        reset_sequences(1);
+        let (host, carried) = TestHost::spawn(vec![ReplyStatus::ExecutionFailed, ReplyStatus::Ok]);
+        let config = host.config();
+        assert_eq!(ensure_live(|| Some(Ok(config))), Ok(true));
+
+        let error = submit_recorded_batch(&[submission(0, 41, 1)], 1)
+            .expect_err("the host refused the first submission");
+        assert!(
+            counts_as_refused_submission(&error),
+            "the refusal reaches the caller: {error}"
+        );
+
+        assert_eq!(
+            submit_recorded_batch(&[submission(0, 42, 1)], 1),
+            Ok(NativeDispatch::Native {
+                status: ReplyStatus::Ok,
+                submissions: 1,
+            }),
+            "the session keeps running after an ordinary refusal"
+        );
+
+        let first = carried.recv_timeout(TEST_TIMEOUT).expect("first frame");
+        let second = carried.recv_timeout(TEST_TIMEOUT).expect("second frame");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2, "the refused sequence is not re-sent");
+        assert!(
+            native_queue_is_live(),
+            "the refusal did not end the session"
+        );
+        assert_eq!(native_queue().pending(), 0, "nothing is left to resend");
         native_queue_reset();
     }
 
@@ -3331,31 +3427,138 @@ mod tests {
         );
     }
 
-    /// A host refusal stays queued (not silently dropped) and is never retried
-    /// inside `flush`; the caller sees the same one refused submission, and no
-    /// frame is marked presented.
+    /// A host refusal is a reply, not a transport failure: the host consumed
+    /// the sequence and wrote an answer, so the frame is spent and is never
+    /// re-sent. This is Boot #21: a refused pipeline answered `UnknownHandle`
+    /// for sequence 3, the frame stayed queued, and the next present re-sent
+    /// sequence 3 into a host that already expected 4, which ended the session.
     #[test]
-    fn a_host_refused_send_is_counted_once_and_not_presented() {
-        struct RefusingSink;
+    fn a_host_refused_send_is_consumed_and_never_resent() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(HostStatusSink::default());
 
-        impl V3Sink for RefusingSink {
-            fn send(&mut self, _bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
-                Err(NativeQueueError::Refused(
-                    "the host answered ExecutionFailed for sequence 1".to_string(),
-                ))
-            }
+        let error = queue
+            .submit(&[submission(0, 1, 1)])
+            .expect_err("a host refusal is returned to the caller");
+        assert!(
+            counts_as_refused_submission(&error),
+            "the ledger still reports the refusal: {error}"
+        );
+        assert_eq!(
+            error,
+            NativeQueueError::Refused("the host answered UnknownHandle for sequence 1".to_string()),
+            "the host's reply reaches the caller unchanged"
+        );
+        assert!(
+            refusal_warning(&error).starts_with("native queue refused: "),
+            "the live log still names the host reason"
+        );
+        assert_eq!(queue.sent(), 1, "the host answered the refused frame");
+        assert_eq!(queue.pending(), 0, "a refused frame is never retried");
+        assert_eq!(queue.highest_sequence(), 1);
+
+        // The render channel keeps running: the next real submission takes the
+        // next sequence, with no hole and no resend of the refused one.
+        assert_eq!(queue.submit(&[submission(0, 2, 1)]), Ok(ReplyStatus::Ok));
+        assert_eq!(
+            queue.sink().sequences,
+            vec![1, 2],
+            "the refused sequence is consumed exactly once"
+        );
+    }
+
+    /// A hundred refused submissions interleaved with a hundred real ones keep
+    /// the ledger dense: every frame is sent exactly once, in order, and the
+    /// sequences are 1..=200 with no reuse and no hole.
+    #[test]
+    fn a_hundred_refusals_interleaved_with_real_submissions_keep_the_ledger_dense() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(HostStatusSink::default());
+
+        for index in 0..100u64 {
+            let refused = queue.submit(&[submission(0, index * 2 + 1, 1)]);
+            assert!(
+                matches!(refused, Err(NativeQueueError::Refused(_))),
+                "submission {index} must be refused: {refused:?}"
+            );
+            assert_eq!(
+                queue.submit(&[submission(0, index * 2 + 2, 1)]),
+                Ok(ReplyStatus::Ok),
+                "the real submission after refusal {index} must be carried"
+            );
         }
 
-        let mut queue = NativeQueue::new(RefusingSink);
-        let batch = [submission(1, 1, 1)];
-
-        let error = queue.submit(&batch).expect_err("a host refusal is an error");
-        assert!(counts_as_refused_submission(&error));
-        assert_eq!(queue.sent(), 0, "a refused frame was not sent");
+        assert_eq!(queue.sent(), 200);
+        assert_eq!(queue.pending(), 0);
+        assert!(queue.is_empty());
+        assert_eq!(queue.highest_sequence(), 200);
         assert_eq!(
-            queue.pending(),
+            queue.sink().sequences,
+            (1..=200).collect::<Vec<u32>>(),
+            "each frame is sent once, in order, with no reused or skipped sequence"
+        );
+        let mut distinct = queue.sink().sequences.clone();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 200, "no sequence is sent twice");
+    }
+
+    /// A retry after a refusal is a new submission with a new sequence: it
+    /// reuses nothing and skips nothing.
+    #[test]
+    fn a_retry_after_a_refusal_takes_the_next_sequence() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(HostStatusSink::default());
+        let refused_batch = [submission(0, 21, 1)];
+
+        assert!(matches!(
+            queue.submit(&refused_batch),
+            Err(NativeQueueError::Refused(_))
+        ));
+        // The same batch is offered again: it is a new frame with a new
+        // sequence, never a resend of the consumed one.
+        assert!(matches!(
+            queue.submit(&refused_batch),
+            Err(NativeQueueError::Refused(_))
+        ));
+        assert_eq!(queue.sink().sequences, vec![1, 2]);
+        assert_eq!(queue.highest_sequence(), 2);
+        // Nothing was skipped either: the next accepted frame is 3.
+        assert_eq!(queue.submit(&[submission(0, 22, 1)]), Ok(ReplyStatus::Ok));
+        assert_eq!(queue.sink().sequences, vec![1, 2, 3]);
+    }
+
+    /// A submission whose commands were all refused client-side carries no
+    /// frame: it is dropped before the wire and consumes no sequence, so the
+    /// next real submission is still sequence 1.
+    #[test]
+    fn an_all_refused_submission_consumes_no_sequence() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(RecordingSink::default());
+
+        for list_id in 0..100u64 {
+            let mut dropped = submission(0, 31 + list_id, 1);
+            // Every command was refused by the producer before enqueue.
+            dropped.commands.clear();
+            assert_eq!(
+                queue.submit(std::slice::from_ref(&dropped)),
+                Ok(ReplyStatus::Ok)
+            );
+        }
+        assert_eq!(queue.sink().frames.len(), 0, "nothing reached the host");
+        assert_eq!(queue.highest_sequence(), 0, "no sequence was spent");
+        assert_eq!(queue.sent(), 0);
+
+        assert_eq!(queue.submit(&[submission(0, 77, 1)]), Ok(ReplyStatus::Ok));
+        assert_eq!(
+            decode_submission_v3(&queue.sink().frames[0])
+                .expect("canonical v3")
+                .sequence,
             1,
-            "the refused frame stays at the head of the outbound queue"
+            "the first real frame is sequence 1"
         );
     }
 
