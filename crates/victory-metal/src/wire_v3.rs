@@ -377,6 +377,16 @@
 //! | 12 | 4 | sync interval (0 = immediate, 1 = vsync) |
 //! | 16 | 4 | reserved, must be zero |
 //!
+//! # Reply extension
+//!
+//! A kind 5 request is answered with one Wire reply frame (see
+//! [`crate::wire::decode_reply_with_reason`]). An error reply may additionally
+//! carry a bounded UTF-8 reason trailer guarded by the `VMR3` magic, so the
+//! guest prints the exact host/Metal diagnostic instead of a bare
+//! `ExecutionFailed`. A success reply has the frozen four-byte payload and is
+//! byte-identical to the legacy frame; a legacy error reply still decodes with
+//! no reason.
+//!
 //! # Validation
 //!
 //! Encoding and decoding enforce the same rules, so the writer cannot produce a

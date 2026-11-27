@@ -47,6 +47,21 @@ pub const WINDOW_FRAMES: usize = 4096;
 /// Histogram key for a refused call that has no wire opcode.
 pub const NO_OPCODE: u16 = u16::MAX;
 
+/// Maximum bytes of a host error reason kept in telemetry and logged.
+///
+/// Matches [`victory_metal::wire::MAX_REPLY_REASON_BYTES`] so the guest never
+/// retains more text than the Wire v3 reply can carry.
+pub const MAX_HOST_ERROR_BYTES: usize = 256;
+
+/// One bounded host error carried by a Wire v3 error reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostError {
+    /// Sequence of the refused submission.
+    pub sequence: u32,
+    /// Bounded, single-line host diagnostic.
+    pub reason: String,
+}
+
 /// One recorded frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSample {
@@ -171,6 +186,10 @@ pub struct FrameTelemetry {
     pool_warm: AtomicU64,
     /// Buffer or pipeline registrations that failed explicitly.
     registration_failures: AtomicU64,
+    /// Wire v3 error replies that carried a host reason trailer.
+    host_errors: AtomicU64,
+    /// The most recent bounded host error, retained for the telemetry snapshot.
+    last_host_error: Mutex<Option<HostError>>,
     /// Compute dispatches recorded with no root view or descriptor table.
     ///
     /// The producer cannot see a pipeline's declared root layout, so it reports
@@ -397,6 +416,38 @@ impl FrameTelemetry {
         self.registration_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one Wire v3 error reply that carried a host reason.
+    ///
+    /// The reason is sanitised to one line and bounded to
+    /// [`MAX_HOST_ERROR_BYTES`], so neither the counter nor the retained last
+    /// reason grows without limit. Returns the bounded record for the one log
+    /// line the caller prints.
+    pub fn note_host_error(&self, sequence: u32, reason: &str) -> HostError {
+        let record = HostError {
+            sequence,
+            reason: sanitize_host_error(reason),
+        };
+        self.host_errors.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_host_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(record.clone());
+        record
+    }
+
+    /// Wire v3 error replies that carried a host reason.
+    pub fn host_error_count(&self) -> u64 {
+        self.host_errors.load(Ordering::Relaxed)
+    }
+
+    /// The most recent bounded host error, if any.
+    pub fn last_host_error(&self) -> Option<HostError> {
+        self.last_host_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// One compute dispatch recorded with no root view or descriptor table.
     pub fn note_compute_dispatch_without_bindings(&self) {
         self.compute_dispatches_without_bindings
@@ -479,6 +530,8 @@ impl FrameTelemetry {
             pool_warm: self.pool_warm.load(Ordering::Relaxed),
             registration_failures: self.registration_failures.load(Ordering::Relaxed),
             compute_dispatches_without_bindings: self.compute_dispatches_without_bindings(),
+            host_errors: self.host_error_count(),
+            last_host_error: self.last_host_error(),
         }
     }
 
@@ -569,6 +622,10 @@ pub struct TelemetrySnapshot {
     pub registration_failures: u64,
     /// Compute dispatches recorded with no root view or descriptor table.
     pub compute_dispatches_without_bindings: u64,
+    /// Wire v3 error replies that carried a host reason.
+    pub host_errors: u64,
+    /// The most recent bounded host error, if any.
+    pub last_host_error: Option<HostError>,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -604,16 +661,26 @@ impl std::fmt::Display for TelemetrySnapshot {
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))?;
         if self.named_refusals.is_empty() {
-            return write!(f, ", named_refusals=[]");
-        }
-        write!(f, ", named_refusals=[")?;
-        for (index, (operation, count)) in self.named_refusals.iter().enumerate() {
-            if index > 0 {
-                write!(f, "; ")?;
+            write!(f, ", named_refusals=[]")?;
+        } else {
+            write!(f, ", named_refusals=[")?;
+            for (index, (operation, count)) in self.named_refusals.iter().enumerate() {
+                if index > 0 {
+                    write!(f, "; ")?;
+                }
+                write!(f, "{operation}={count}")?;
             }
-            write!(f, "{operation}={count}")?;
+            write!(f, "]")?;
         }
-        write!(f, "]")
+        write!(f, ", host_errors={}", self.host_errors)?;
+        if let Some(error) = &self.last_host_error {
+            write!(
+                f,
+                ", last_host_error=sequence {}: {}",
+                error.sequence, error.reason
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -637,6 +704,43 @@ fn opcode_list(opcodes: &BTreeMap<u16, u64>, name: &str) -> String {
     }
     text.push(']');
     text
+}
+
+/// Sanitises a host diagnostic into one bounded UTF-8 line.
+///
+/// Control characters become single spaces, whitespace is trimmed and the text
+/// is truncated on a character boundary at [`MAX_HOST_ERROR_BYTES`]. Empty text
+/// becomes a stable placeholder so the log line never ends in `reason=`.
+pub fn sanitize_host_error(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len().min(MAX_HOST_ERROR_BYTES));
+    for character in text.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if cleaned.len() + character.len_utf8() > MAX_HOST_ERROR_BYTES {
+            break;
+        }
+        if character == ' ' && (cleaned.is_empty() || cleaned.ends_with(' ')) {
+            continue;
+        }
+        cleaned.push(character);
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "unknown host error".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// The stable single guest log line for one Wire v3 host error.
+///
+/// The format is fixed so an operator can grep a boot log for
+/// `METAL_HOST_ERROR sequence=` and read the exact host/Metal text.
+pub fn host_error_line(sequence: u32, reason: &str) -> String {
+    format!("METAL_HOST_ERROR sequence={sequence} reason={reason}")
 }
 
 /// The process-wide telemetry the entry points record into.
@@ -716,6 +820,21 @@ pub fn note_pool_warm() {
 /// One buffer or pipeline registration that failed explicitly.
 pub fn note_registration_failure() {
     global().note_registration_failure();
+}
+
+/// Records one Wire v3 host error reason in the process-wide telemetry.
+pub fn note_host_error(sequence: u32, reason: &str) -> HostError {
+    global().note_host_error(sequence, reason)
+}
+
+/// The process-wide count of Wire v3 error replies that carried a reason.
+pub fn host_error_count() -> u64 {
+    global().host_error_count()
+}
+
+/// The process-wide most recent bounded host error.
+pub fn last_host_error() -> Option<HostError> {
+    global().last_host_error()
 }
 
 /// One compute dispatch recorded with no root view or descriptor table.
@@ -1088,6 +1207,58 @@ mod tests {
 
         telemetry.snapshot_and_reset();
         assert_eq!(telemetry.named_refusal_histogram(), BTreeMap::new());
+    }
+
+    /// A host error is bounded, flattened to one line, counted and retained as
+    /// the last reason; the snapshot names both without unbounded growth.
+    #[test]
+    fn host_errors_are_bounded_counted_and_named_once() {
+        let telemetry = telemetry();
+        assert_eq!(telemetry.host_error_count(), 0);
+        assert_eq!(telemetry.last_host_error(), None);
+
+        let short = "Metal execution failed: target texture 640x360 was refused";
+        let record = telemetry.note_host_error(7, short);
+        assert_eq!(record.sequence, 7);
+        assert_eq!(record.reason, short);
+        assert_eq!(telemetry.host_error_count(), 1);
+        assert_eq!(
+            telemetry.last_host_error(),
+            Some(HostError {
+                sequence: 7,
+                reason: short.to_string()
+            })
+        );
+        assert_eq!(
+            host_error_line(record.sequence, &record.reason),
+            format!("METAL_HOST_ERROR sequence=7 reason={short}")
+        );
+
+        let long = "x".repeat(MAX_HOST_ERROR_BYTES * 2);
+        let record = telemetry.note_host_error(8, &long);
+        assert_eq!(record.reason.len(), MAX_HOST_ERROR_BYTES);
+        assert!(record.reason.is_char_boundary(record.reason.len()));
+
+        let unicode = "é".repeat(MAX_HOST_ERROR_BYTES);
+        let record = telemetry.note_host_error(9, &unicode);
+        assert!(record.reason.len() <= MAX_HOST_ERROR_BYTES);
+        assert!(record.reason.is_char_boundary(record.reason.len()));
+
+        let multiline = telemetry.note_host_error(10, "line one\n\tline two");
+        assert_eq!(multiline.reason, "line one line two");
+
+        assert_eq!(telemetry.host_error_count(), 4);
+        assert_eq!(
+            telemetry.last_host_error().map(|error| error.sequence),
+            Some(10)
+        );
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.host_errors, 4);
+        assert_eq!(snapshot.last_host_error, Some(multiline));
+        let line = snapshot.to_string();
+        assert!(line.contains("host_errors=4"), "{line}");
+        assert!(line.contains("last_host_error=sequence 10"), "{line}");
+        assert!(!line.contains('\n'), "the log line must stay one line: {line}");
     }
 
     #[test]
