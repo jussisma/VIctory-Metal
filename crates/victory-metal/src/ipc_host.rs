@@ -227,7 +227,7 @@ use crate::cmdlist::{ListLedger, RingError};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::bindings::RootSignatureLayout;
-use crate::macos::device::{DirectMetalTransport, PipelineAbi, SamplerDesc};
+use crate::macos::device::{DirectMetalTransport, PipelineAbi, SamplerDesc, bounded_gpu_reason};
 use crate::macos::objc::{self, ObjcObject};
 use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
@@ -987,6 +987,26 @@ pub struct SessionSummary {
     pub bytes_mapped: u64,
 }
 
+/// Live counters of one session, readable after `serve_once` returns in either
+/// direction.
+///
+/// [`SessionSummary`] is only returned on a clean disconnect. A session that
+/// fails on a transport or protocol error still answered frames, and this
+/// snapshot lets the daemon publish them instead of reporting zeros.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStats {
+    /// Submission frames answered with a wire reply.
+    pub submissions: u64,
+    /// Answered frames whose status was not `Ok`.
+    pub refused_submissions: u64,
+    /// Allocations registered during the session.
+    pub allocations: usize,
+    /// Sum of logical allocation lengths in bytes.
+    pub bytes_mapped: u64,
+    /// Bounded reason for the last refusal or GPU failure.
+    pub last_error: Option<String>,
+}
+
 /// Synchronous one-peer host session.
 ///
 /// The caller accepts one loopback stream and passes it to
@@ -1032,6 +1052,11 @@ pub struct IpcHost<E: BatchExecutor> {
     fence_page_attached: bool,
     next_sequence: u32,
     submissions: u64,
+    /// Answered frames whose status was not `Ok`.
+    refused_submissions: u64,
+    /// Bounded reason for the last refusal or GPU failure; sticky across a
+    /// later success so telemetry keeps the first diagnosable fault.
+    last_error: Option<String>,
     ledger: ListLedger,
 }
 
@@ -1073,6 +1098,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             fence_page_attached: false,
             next_sequence: 1,
             submissions: 0,
+            refused_submissions: 0,
+            last_error: None,
             ledger: ListLedger::new(),
         })
     }
@@ -1091,6 +1118,40 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// A successful registration clears it.
     pub fn last_pipeline_rejection(&self) -> Option<&str> {
         self.last_pipeline_rejection.as_deref()
+    }
+
+    /// Session counters and the last bounded refusal reason.
+    ///
+    /// Safe to call after [`Self::serve_once`] returned an error: the counters
+    /// are updated as each frame is answered, not only on a clean summary.
+    pub fn session_stats(&self) -> SessionStats {
+        SessionStats {
+            submissions: self.submissions,
+            refused_submissions: self.refused_submissions,
+            allocations: self.allocations.len(),
+            bytes_mapped: self
+                .allocations
+                .values()
+                .map(|allocation| allocation.byte_len)
+                .sum(),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    /// The last bounded refusal or GPU failure reason, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Records one answered frame whose status was not `Ok`.
+    ///
+    /// The wire reason is never raw guest memory: callers pass either Metal's
+    /// own diagnostic or a host-built protocol description, and it is bounded
+    /// and flattened here before it can reach telemetry.
+    fn note_refusal(&mut self, status: ReplyStatus, reason: impl AsRef<str>) {
+        debug_assert_ne!(status, ReplyStatus::Ok, "a refusal cannot be Ok");
+        self.refused_submissions = self.refused_submissions.saturating_add(1);
+        self.last_error = Some(bounded_gpu_reason(reason.as_ref()));
     }
 
     /// Serves exactly one authenticated peer until clean disconnect or a
@@ -1404,6 +1465,10 @@ impl<E: BatchExecutor> IpcHost<E> {
         let submission = match decode_v3_request(payload) {
             Ok(submission) => submission,
             Err(V3RequestError::Rejected(sequence)) => {
+                self.note_refusal(
+                    ReplyStatus::ExecutionFailed,
+                    "version 3 request envelope was rejected before execution",
+                );
                 write_v3_reply(
                     stream,
                     Reply {
@@ -1415,6 +1480,10 @@ impl<E: BatchExecutor> IpcHost<E> {
                 return Ok(());
             }
             Err(V3RequestError::Unsequenced) => {
+                self.note_refusal(
+                    ReplyStatus::ExecutionFailed,
+                    "version 3 request has no recoverable envelope sequence",
+                );
                 write_v3_reply(
                     stream,
                     Reply {
@@ -1430,6 +1499,13 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
 
         if submission.sequence != self.next_sequence {
+            self.note_refusal(
+                ReplyStatus::ExecutionFailed,
+                format!(
+                    "submission sequence mismatch: expected {}, got {}",
+                    self.next_sequence, submission.sequence
+                ),
+            );
             write_v3_reply(
                 stream,
                 Reply {
@@ -1464,9 +1540,20 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// behind `submitted_fence`, which the guest observes as pending.
     fn serve_async_submission(&mut self, payload: &[u8]) -> Result<(), HostError> {
         let submission = decode_v3_request(payload).map_err(|_| {
+            self.note_refusal(
+                ReplyStatus::ExecutionFailed,
+                "asynchronous version 3 request has no decodable envelope",
+            );
             HostError::Protocol("asynchronous version 3 request has no decodable envelope")
         })?;
         if submission.sequence != self.next_sequence {
+            self.note_refusal(
+                ReplyStatus::ExecutionFailed,
+                format!(
+                    "submission sequence mismatch: expected {}, got {}",
+                    self.next_sequence, submission.sequence
+                ),
+            );
             return Err(HostError::Protocol(
                 "submission sequence is not the next expected value",
             ));
@@ -1506,6 +1593,10 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
 
         if !self.v3_references_valid(submission) {
+            self.note_refusal(
+                ReplyStatus::UnknownHandle,
+                "version 3 submission references an unregistered allocation, texture or sampler",
+            );
             return response(ReplyStatus::UnknownHandle);
         }
 
@@ -1523,8 +1614,23 @@ impl<E: BatchExecutor> IpcHost<E> {
                 }
                 reply
             }
-            Err(RingError::AlreadyExecuted) => response(ReplyStatus::AlreadyExecuted),
-            Err(_) => response(ReplyStatus::ExecutionFailed),
+            Err(RingError::AlreadyExecuted) => {
+                self.note_refusal(
+                    ReplyStatus::AlreadyExecuted,
+                    format!(
+                        "list {} generation {} was already executed",
+                        identity.list_id, identity.list_generation
+                    ),
+                );
+                response(ReplyStatus::AlreadyExecuted)
+            }
+            Err(_) => {
+                self.note_refusal(
+                    ReplyStatus::ExecutionFailed,
+                    "the list ledger refused a claim (capacity)",
+                );
+                response(ReplyStatus::ExecutionFailed)
+            }
         }
     }
 
@@ -1564,16 +1670,32 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     fn execute_v3(
-        &self,
+        &mut self,
         submission: &SubmissionV3,
         allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Reply {
         match self.executor.submit_v3(submission, allocations) {
-            Ok(reply) => reply,
-            Err(_) => Reply {
-                sequence: submission.sequence,
-                status: ReplyStatus::ExecutionFailed,
-            },
+            Ok(reply) => {
+                if reply.status != ReplyStatus::Ok {
+                    self.note_refusal(
+                        reply.status,
+                        format!("the executor answered {:?}", reply.status),
+                    );
+                }
+                reply
+            }
+            Err(error) => {
+                // The Metal diagnostic (for example `not supported: ...`, a
+                // command-buffer fault, or a pipeline error) is bounded and
+                // kept for telemetry; the guest status stays ExecutionFailed.
+                let reason = format!("Metal execution failed: {error}");
+                tracing::error!(sequence = submission.sequence, reason = %reason, "Metal submission failed");
+                self.note_refusal(ReplyStatus::ExecutionFailed, reason);
+                Reply {
+                    sequence: submission.sequence,
+                    status: ReplyStatus::ExecutionFailed,
+                }
+            }
         }
     }
 
@@ -1716,13 +1838,17 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// A replay of an executed list is refused with
     /// [`ReplyStatus::AlreadyExecuted`] and performs no GPU work. A submission
     /// without a list identity keeps the legacy execute-every-time behaviour.
-    fn execute_or_refuse(&self, submission: &Submission, list: Option<ListIdentity>) -> Reply {
+    fn execute_or_refuse(&mut self, submission: &Submission, list: Option<ListIdentity>) -> Reply {
         let response = |status| Reply {
             sequence: submission.sequence,
             status,
         };
 
         if !self.submission_bindings_valid(submission) {
+            self.note_refusal(
+                ReplyStatus::UnknownHandle,
+                "submission references an unregistered allocation or range",
+            );
             return response(ReplyStatus::UnknownHandle);
         }
 
@@ -1738,10 +1864,25 @@ impl<E: BatchExecutor> IpcHost<E> {
                 }
                 reply
             }
-            Err(RingError::AlreadyExecuted) => response(ReplyStatus::AlreadyExecuted),
+            Err(RingError::AlreadyExecuted) => {
+                self.note_refusal(
+                    ReplyStatus::AlreadyExecuted,
+                    format!(
+                        "list {} generation {} was already executed",
+                        identity.list_id, identity.list_generation
+                    ),
+                );
+                response(ReplyStatus::AlreadyExecuted)
+            }
             // The ledger refused a claim for another reason (for example its
             // in-flight cap). No work ran and no claim is held.
-            Err(_) => response(ReplyStatus::ExecutionFailed),
+            Err(_) => {
+                self.note_refusal(
+                    ReplyStatus::ExecutionFailed,
+                    "the list ledger refused a claim (capacity)",
+                );
+                response(ReplyStatus::ExecutionFailed)
+            }
         }
     }
 
@@ -1752,7 +1893,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             .all(|command| self.bindings_within_logical_lengths(command))
     }
 
-    fn execute_submission(&self, submission: &Submission) -> Reply {
+    fn execute_submission(&mut self, submission: &Submission) -> Reply {
         let allocations: HashMap<(u64, u32), VmBufferId> = self
             .allocations
             .iter()
@@ -1760,11 +1901,26 @@ impl<E: BatchExecutor> IpcHost<E> {
             .collect();
 
         match self.executor.submit_batch(submission, &allocations) {
-            Ok(reply) => reply,
-            Err(_) => Reply {
-                sequence: submission.sequence,
-                status: ReplyStatus::ExecutionFailed,
-            },
+            Ok(reply) => {
+                if reply.status != ReplyStatus::Ok {
+                    self.note_refusal(
+                        reply.status,
+                        format!("the executor answered {:?}", reply.status),
+                    );
+                }
+                reply
+            }
+            Err(error) => {
+                let reason = format!("Metal execution failed: {error}");
+                // The wire carries a status only; this tracing error and
+                // telemetry `last_error` carry the bounded Metal text.
+                tracing::error!(sequence = submission.sequence, reason = %reason, "Metal batch failed");
+                self.note_refusal(ReplyStatus::ExecutionFailed, reason);
+                Reply {
+                    sequence: submission.sequence,
+                    status: ReplyStatus::ExecutionFailed,
+                }
+            }
         }
     }
 
@@ -2822,6 +2978,10 @@ mod tests {
         v3_submissions: Vec<SubmissionV3>,
         v3_executions: u64,
         v3_not_supported: bool,
+        /// When set, the next `submit_v3` fails with a synthetic Metal error
+        /// and clears the flag, so a later submission in the same session can
+        /// succeed and prove the loop stayed open.
+        v3_fail_once: bool,
         /// Content-hashed per-stage graphics registrations: `(handle, stages,
         /// state, abi)` where each stage is `(wire code, metallib, entry)`.
         graphics_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
@@ -2983,6 +3143,13 @@ mod tests {
             let mut state = self.state();
             if state.v3_not_supported {
                 return Err(MetalError::NotSupported("synthetic v3 refusal"));
+            }
+            if state.v3_fail_once {
+                state.v3_fail_once = false;
+                return Err(MetalError::InternalError(
+                    "draw #12 (MTLCommandBuffer.status=4): synthetic out-of-bounds write"
+                        .to_string(),
+                ));
             }
             state.v3_submissions.push(submission.clone());
             state.v3_executions += 1;
@@ -4731,5 +4898,95 @@ mod tests {
                 "code {code}"
             );
         }
+    }
+
+    /// A GPU `ExecutionFailed` is a per-submission refusal, not a protocol
+    /// error: the reason is recorded, the refusal counter advances, and the
+    /// same session accepts the next submission.
+    #[test]
+    fn v3_execution_failure_is_recorded_and_the_session_continues() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let executor = StubExecutor::new(4096);
+        executor.state().v3_fail_once = true;
+        let server = start(host(&dir, executor));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        let first = v3_submission(1, None, full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &first),
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::ExecutionFailed,
+            },
+            "a GPU fault is still an ExecutionFailed reply"
+        );
+
+        // The session loop must still be open: submission 2 is accepted.
+        let second = v3_submission(2, None, full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &second),
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::Ok,
+            },
+            "a GPU refusal must not end the session"
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("the session ends cleanly, not fatally");
+        let stats = host.session_stats();
+        assert_eq!(stats.submissions, 2);
+        assert_eq!(stats.refused_submissions, 1);
+        let last_error = stats.last_error.expect("the GPU reason is recorded");
+        assert!(
+            last_error.contains("synthetic out-of-bounds write"),
+            "unexpected reason: {last_error}"
+        );
+        assert!(last_error.len() <= crate::macos::device::MAX_GPU_REASON_BYTES);
+    }
+
+    /// A sequence mismatch is a protocol error: the guest gets a status, the
+    /// refusal is recorded, and the session closes non-zero.
+    #[test]
+    fn v3_sequence_mismatch_ends_the_session_as_a_protocol_error() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        // The host expects sequence 1.
+        let out_of_order = v3_submission(2, None, full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &out_of_order),
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::ExecutionFailed,
+            }
+        );
+        assert_eq!(read_frame(&mut client).expect("read close"), None);
+
+        let (result, host) = server.handle.join().expect("server thread");
+        assert!(
+            matches!(result, Err(HostError::Protocol(_))),
+            "a protocol error must end the session"
+        );
+        let stats = host.session_stats();
+        assert_eq!(stats.submissions, 1);
+        assert_eq!(stats.refused_submissions, 1);
+        let last_error = stats.last_error.expect("the protocol reason is recorded");
+        assert!(
+            last_error.contains("sequence mismatch"),
+            "unexpected reason: {last_error}"
+        );
     }
 }

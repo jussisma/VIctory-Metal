@@ -421,6 +421,39 @@ fn micros(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// The host-supplied refusal detail, when the transport carried one.
+///
+/// The live Wire v3 client puts the host's own text into
+/// [`NativeQueueError::Refused`]. The reply frame itself is a fixed status-only
+/// payload, so this is where a host reason enters the guest; a transport error
+/// has its own text but no host reason.
+pub(crate) fn refusal_detail(error: &NativeQueueError) -> Option<&str> {
+    match error {
+        NativeQueueError::Refused(reason) if !reason.is_empty() => Some(reason.as_str()),
+        _ => None,
+    }
+}
+
+/// The single line the guest logs when a native submission is refused.
+///
+/// This is deliberately built from [`refusal_detail`] so a host reason is never
+/// dropped on the floor between the client and the `native queue refused:`
+/// warning.
+pub(crate) fn refusal_warning(error: &NativeQueueError) -> String {
+    match refusal_detail(error) {
+        Some(reason) => format!("native queue refused: {reason}"),
+        None => error.to_string(),
+    }
+}
+
+/// Whether a failed send is a host/GPU refusal, which the refusal counter
+/// records. Every failed submission is counted; this predicate is the explicit
+/// classification the warning uses to distinguish a host reason from a
+/// transport failure.
+pub(crate) fn counts_as_refused_submission(error: &NativeQueueError) -> bool {
+    matches!(error, NativeQueueError::Refused(_))
+}
+
 /// What one `ExecuteCommandLists` batch did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeDispatch {
@@ -1094,8 +1127,11 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
                 );
             }
             Err(error) => {
+                let warning = refusal_warning(&error);
+                let host_refused = counts_as_refused_submission(&error);
                 tracing::warn!(
-                    %error,
+                    reason = %warning,
+                    host_refused,
                     "VICTORY_BACKEND=metal: the native queue refused a submission"
                 );
             }
@@ -2296,5 +2332,62 @@ mod tests {
 
         assert_eq!(queue.flush(), Ok(Vec::new()), "nothing is sent twice");
         assert_eq!(queue.sink().frames.len(), 2);
+    }
+
+    /// A host-supplied refusal reason reaches the exact `native queue refused:`
+    /// warning and is classified as a refused submission. The live client puts
+    /// the host text in `Refused`; this test exercises that seam without a
+    /// socket.
+    #[test]
+    fn a_host_refusal_reason_is_forwarded_to_the_warning() {
+        let host_reason = "draw #12 (MTLCommandBuffer.status=4): out-of-bounds write";
+        let error = NativeQueueError::Refused(format!(
+            "the host answered ExecutionFailed for sequence 586: {host_reason}"
+        ));
+
+        let warning = refusal_warning(&error);
+        assert!(
+            warning.starts_with("native queue refused: "),
+            "{warning}"
+        );
+        assert!(warning.contains(host_reason), "{warning}");
+        assert!(counts_as_refused_submission(&error));
+
+        // A transport fault is not a host reason: it keeps its own text.
+        let transport = NativeQueueError::Transport("connection reset".to_string());
+        assert!(refusal_detail(&transport).is_none());
+        assert!(!counts_as_refused_submission(&transport));
+        assert_eq!(
+            refusal_warning(&transport),
+            "native queue transport: connection reset"
+        );
+    }
+
+    /// A host refusal stays queued (not silently dropped) and is never retried
+    /// inside `flush`; the caller sees the same one refused submission, and no
+    /// frame is marked presented.
+    #[test]
+    fn a_host_refused_send_is_counted_once_and_not_presented() {
+        struct RefusingSink;
+
+        impl V3Sink for RefusingSink {
+            fn send(&mut self, _bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+                Err(NativeQueueError::Refused(
+                    "the host answered ExecutionFailed for sequence 1".to_string(),
+                ))
+            }
+        }
+
+        let mut queue = NativeQueue::new(RefusingSink);
+        let batch = [submission(1, 1, 1)];
+
+        let error = queue.submit(&batch).expect_err("a host refusal is an error");
+        assert!(counts_as_refused_submission(&error));
+        assert_eq!(queue.sent(), 0, "a refused frame was not sent");
+        assert_eq!(
+            queue.pending(),
+            1,
+            "the refused frame stays at the head of the outbound queue"
+        );
     }
 }

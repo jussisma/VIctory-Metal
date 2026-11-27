@@ -66,6 +66,145 @@ const MTL_RESOURCE_USAGE_WRITE: usize = 2;
 /// layouts should place every typed declaration on its natural alignment.
 pub(crate) const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
+/// Maximum bytes of a GPU-failure reason carried host-side.
+///
+/// The wire reply has no room for a diagnostic (see
+/// [`describe_command_buffer_failure`]), so the reason is stored in telemetry
+/// and logged with the same text. It is sanitised to one bounded line so a
+/// Metal `localizedDescription` cannot flood the log or the JSON record.
+pub(crate) const MAX_GPU_REASON_BYTES: usize = 160;
+
+/// One non-completed command buffer, named by the encoder that built it.
+///
+/// `sequence` is the wire sequence for a synchronous submission or the fence
+/// value for an asynchronous one. `status` is the wire status the guest still
+/// receives: a GPU fault never changes the protocol status, it only explains
+/// the `ExecutionFailed` refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandBufferFailure {
+    /// Wire sequence (synchronous) or completion fence (asynchronous).
+    pub sequence: u64,
+    /// The wire status the guest receives: always `ExecutionFailed`, unchanged
+    /// by this diagnostic work.
+    pub status: ReplyStatus,
+    /// Command family that built the failed buffer.
+    pub kind: &'static str,
+    /// First command index of that family in the submission.
+    pub index: usize,
+    /// `MTLCommandBuffer.status`.
+    pub mtl_status: usize,
+    /// Bounded, single-line reason, including Metal's own text.
+    pub reason: String,
+}
+
+/// Cleans a Metal diagnostic into one bounded log/telemetry line.
+///
+/// Control characters (including newlines from a Metal error) become spaces,
+/// repeated whitespace collapses, and the result is truncated on a UTF-8
+/// boundary to at most [`MAX_GPU_REASON_BYTES`]. Raw guest memory is never
+/// passed here: callers only hand over Metal's own `localizedDescription`.
+pub(crate) fn sanitize_gpu_reason(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len().min(MAX_GPU_REASON_BYTES));
+    for character in text.chars() {
+        if character.is_control() {
+            if !cleaned.is_empty() && !cleaned.ends_with(' ') {
+                cleaned.push(' ');
+            }
+            continue;
+        }
+        if character == ' ' {
+            if !cleaned.is_empty() && !cleaned.ends_with(' ') {
+                cleaned.push(' ');
+            }
+            continue;
+        }
+        cleaned.push(character);
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "unknown Metal error".to_string();
+    }
+    truncate_reason(cleaned, MAX_GPU_REASON_BYTES)
+}
+
+/// Truncates `text` to at most `max` bytes on a UTF-8 boundary, with an ASCII
+/// marker when anything was dropped.
+fn truncate_reason(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let marker = "...";
+    let budget = max.saturating_sub(marker.len());
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_string();
+    out.push_str(marker);
+    out
+}
+
+/// Names a non-completed command buffer without changing its wire status.
+///
+/// The wire reply is a fixed four-byte payload (`u16` status plus a reserved
+/// zero word) and its decoder rejects any other length, so there is no
+/// backwards-compatible place for the reason on the wire. This task therefore
+/// uses the documented fallback: the reason is bounded and sanitised here,
+/// logged by the caller, and recorded in host telemetry (`last_error`), while
+/// the guest keeps receiving [`ReplyStatus::ExecutionFailed`] unchanged.
+pub(crate) fn describe_command_buffer_failure(
+    sequence: u64,
+    mtl_status: usize,
+    kind: &'static str,
+    index: usize,
+    detail: &str,
+) -> CommandBufferFailure {
+    let prefix = format!("{kind} #{index} (MTLCommandBuffer.status={mtl_status}): ");
+    let budget = MAX_GPU_REASON_BYTES.saturating_sub(prefix.len());
+    let detail = truncate_reason(&sanitize_gpu_reason(detail), budget);
+    CommandBufferFailure {
+        sequence,
+        status: ReplyStatus::ExecutionFailed,
+        kind,
+        index,
+        mtl_status,
+        reason: format!("{prefix}{detail}"),
+    }
+}
+
+/// [`sanitize_gpu_reason`] for callers that only need the bounded text.
+pub(crate) fn bounded_gpu_reason(text: &str) -> String {
+    sanitize_gpu_reason(text)
+}
+
+/// Adds the command family/index to an error that already carries Metal's own
+/// text (and status) and bounds the combined line.
+pub(crate) fn annotate_gpu_error(
+    sequence: u32,
+    kind: &'static str,
+    index: usize,
+    error: &MetalError,
+) -> MetalError {
+    let detail = error.to_string();
+    let prefix = format!("{kind} #{index}: ");
+    let budget = MAX_GPU_REASON_BYTES.saturating_sub(prefix.len());
+    let reason = format!(
+        "{prefix}{}",
+        truncate_reason(&sanitize_gpu_reason(&detail), budget)
+    );
+    tracing::error!(sequence, reason = %reason, "Metal command buffer failed");
+    MetalError::InternalError(reason)
+}
+
+/// The command family and first command index of one v3 encoder segment.
+fn segment_failure_site(segment: &crate::macos::render::Segment) -> (&'static str, usize) {
+    match &segment.kind {
+        SegmentKind::Compute(range) => ("dispatch", range.start),
+        SegmentKind::Render { range, .. } => ("render pass", range.start),
+        SegmentKind::Blit(range) => ("copy", range.start),
+    }
+}
+
 /// Edge of the lazily created host render target, in pixels.
 ///
 /// The executor renders every graphics submission into this single internal
@@ -270,6 +409,8 @@ enum PreparedGraphicsOp {
 /// hazard tracking a single pass would provide.
 struct PreparedGraphicsSegment {
     pipeline_id: u64,
+    /// Wire index of the first command that opened this segment.
+    first_command_index: usize,
     ops: Vec<PreparedGraphicsOp>,
 }
 
@@ -319,10 +460,12 @@ fn open_graphics_segment(
     segments: &mut Vec<PreparedGraphicsSegment>,
     segment_open: &mut bool,
     pipeline_id: u64,
+    first_command_index: usize,
 ) {
     if !*segment_open {
         segments.push(PreparedGraphicsSegment {
             pipeline_id,
+            first_command_index,
             ops: Vec::new(),
         });
         *segment_open = true;
@@ -543,7 +686,15 @@ unsafe extern "C" fn completion_block_invoke(block: *mut CompletionBlock, comman
     let (state, fence) = unsafe { (&*(*block).state, (*block).fence) };
     // SAFETY: `command_buffer` is a live `MTLCommandBuffer` at completion time.
     let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
-    publish_completion(state, fence, status == MTL_COMMAND_BUFFER_STATUS_COMPLETED);
+    let detail = if status == MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+        None
+    } else {
+        // SAFETY: `[command_buffer error]` returns null or an autoreleased
+        // `NSError *`; `nserror_message` accepts both.
+        let error_raw = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
+        Some(unsafe { objc::nserror_message(error_raw) })
+    };
+    publish_completion(state, fence, status, detail);
 }
 
 /// Records one observed completion and publishes the contiguous watermark.
@@ -552,14 +703,46 @@ unsafe extern "C" fn completion_block_invoke(block: *mut CompletionBlock, comman
 /// dropped rather than resumed with possibly inconsistent state. The
 /// diagnostics-only `stall_publication` flag suppresses the record so a lost
 /// completion can be reproduced; it is never set by the host.
-fn publish_completion(state: &Mutex<AsyncSubmitState>, fence: u64, succeeded: bool) {
-    let Ok(mut state) = state.lock() else {
-        return;
+fn publish_completion(
+    state: &Mutex<AsyncSubmitState>,
+    fence: u64,
+    status: usize,
+    detail: Option<String>,
+) {
+    let failure = {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if state.stall_publication {
+            return;
+        }
+        let failure = if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            let (kind, index) = state
+                .contexts
+                .get(&fence)
+                .copied()
+                .unwrap_or(("command buffer", 0));
+            let detail = detail.unwrap_or_else(|| "unknown Metal error".to_string());
+            let failure = describe_command_buffer_failure(fence, status, kind, index, &detail);
+            state.last_failure = Some(failure.reason.clone());
+            Some(failure)
+        } else {
+            None
+        };
+        state.note_completion(fence, status == MTL_COMMAND_BUFFER_STATUS_COMPLETED);
+        failure
     };
-    if state.stall_publication {
-        return;
+    // Log outside the state lock: a tracing subscriber must never be able to
+    // re-enter the completion bookkeeping.
+    if let Some(failure) = failure {
+        tracing::error!(
+            fence,
+            wire_status = ?failure.status,
+            mtl_status = status,
+            reason = %failure.reason,
+            "asynchronous Metal command buffer did not complete"
+        );
     }
-    state.note_completion(fence, succeeded);
 }
 
 /// Contiguous completion watermark over committed fence values.
@@ -686,6 +869,13 @@ struct AsyncSubmitState {
     watermark: CompletionWatermark,
     /// Retained committed command buffers, keyed by fence, until they complete.
     held: HashMap<u64, ObjcObject>,
+    /// Command family and first command index of every committed buffer.
+    ///
+    /// Metal reports a fault for the whole command buffer, so this is the only
+    /// attribution an asynchronous completion handler can name.
+    contexts: HashMap<u64, (&'static str, usize)>,
+    /// Last nonzero-status command-buffer failure, sanitised and bounded.
+    last_failure: Option<String>,
     retire: RetireQueue,
     /// Staged Metal objects pinned by token until their fence completes.
     staged: HashMap<u64, Vec<ObjcObject>>,
@@ -710,6 +900,8 @@ impl AsyncSubmitState {
             next_fence: 0,
             watermark: CompletionWatermark::new(),
             held: HashMap::new(),
+            contexts: HashMap::new(),
+            last_failure: None,
             retire: RetireQueue::with_capacity(retire_capacity),
             staged: HashMap::new(),
             pins: HashMap::new(),
@@ -737,9 +929,15 @@ impl AsyncSubmitState {
     }
 
     /// Tracks one freshly committed command buffer.
-    fn note_commit(&mut self, fence: u64, command_buffer: ObjcObject) {
+    fn note_commit(
+        &mut self,
+        fence: u64,
+        command_buffer: ObjcObject,
+        site: (&'static str, usize),
+    ) {
         self.watermark.push(fence);
         self.held.insert(fence, command_buffer);
+        self.contexts.insert(fence, site);
         self.counters.submitted += 1;
         self.counters.in_flight_peak = self
             .counters
@@ -837,6 +1035,7 @@ impl AsyncSubmitState {
         if let Some(advanced) = self.watermark.advance() {
             self.publish_completed(advanced);
             self.held.retain(|&fence, _| fence > advanced);
+            self.contexts.retain(|&fence, _| fence > advanced);
         }
         self.drain();
     }
@@ -1144,6 +1343,19 @@ impl DirectMetalTransport {
         }
     }
 
+    /// The last asynchronous command-buffer failure, sanitised and bounded.
+    ///
+    /// The reply for an asynchronous submission is returned before the GPU
+    /// finishes, so a runtime fault cannot change it. The completion handler
+    /// records the same text here for `telemetry.json` (`last_error`) and logs
+    /// it as a tracing error; `None` means no failure has been observed.
+    pub fn last_gpu_failure(&self) -> Option<String> {
+        self.async_submit
+            .lock()
+            .ok()
+            .and_then(|state| state.last_failure.clone())
+    }
+
     /// Drains every retire entry whose fence value has completed and returns
     /// the caller ids released since the previous call.
     ///
@@ -1440,7 +1652,12 @@ impl DirectMetalTransport {
     /// uncommitted buffer first would expose it to a concurrent `wait_on_buffer`.
     /// The fence is reserved first, so the pin is behind a value no published
     /// completion can cover yet.
-    fn commit_async(&self, encoded: EncodedSubmission, sequence: u32) -> Result<(), MetalError> {
+    fn commit_async(
+        &self,
+        encoded: EncodedSubmission,
+        sequence: u32,
+        site: (&'static str, usize),
+    ) -> Result<(), MetalError> {
         self.await_slot()?;
         let state_ptr = Arc::as_ptr(&self.async_submit);
         let EncodedSubmission {
@@ -1466,7 +1683,7 @@ impl DirectMetalTransport {
         }
         {
             let mut state = self.lock_async()?;
-            state.note_commit(fence, command_buffer);
+            state.note_commit(fence, command_buffer, site);
         }
         let block = CompletionBlock {
             // SAFETY: `_NSConcreteStackBlock` is the libclosure class object; its
@@ -1765,7 +1982,7 @@ impl DirectMetalTransport {
 
         // Validation pass: resolve every handle/range and build immutable
         // segment data. No Metal command buffer is created here.
-        for command in &submission.commands {
+        for (command_index, command) in submission.commands.iter().enumerate() {
             match command {
                 Command::SetPipeline(set_pipeline) => {
                     if !state
@@ -1786,7 +2003,7 @@ impl DirectMetalTransport {
                         ));
                     };
                     let slot = usize::from(constants.slot);
-                    open_graphics_segment(&mut segments, &mut segment_open, pipeline);
+                    open_graphics_segment(&mut segments, &mut segment_open, pipeline, command_index);
                     segments
                         .last_mut()
                         .expect("segment was just opened")
@@ -1806,7 +2023,7 @@ impl DirectMetalTransport {
                     else {
                         return Ok(reply(ReplyStatus::UnknownHandle));
                     };
-                    open_graphics_segment(&mut segments, &mut segment_open, pipeline);
+                    open_graphics_segment(&mut segments, &mut segment_open, pipeline, command_index);
                     let segment = segments.last_mut().expect("segment was just opened");
                     for (offset_index, (buffer, offset, _slot)) in resolved.iter().enumerate() {
                         let index = usize::from(table.base_register)
@@ -1872,7 +2089,7 @@ impl DirectMetalTransport {
                         .enumerate()
                         .map(|(index, (buffer, offset, _slot))| (*buffer, *offset, index))
                         .collect();
-                    open_graphics_segment(&mut segments, &mut segment_open, draw.pipeline_id);
+                    open_graphics_segment(&mut segments, &mut segment_open, draw.pipeline_id, command_index);
                     segments
                         .last_mut()
                         .expect("segment was just opened")
@@ -1908,7 +2125,7 @@ impl DirectMetalTransport {
                         .enumerate()
                         .map(|(index, (buffer, offset, _slot))| (*buffer, *offset, index))
                         .collect();
-                    open_graphics_segment(&mut segments, &mut segment_open, draw.pipeline_id);
+                    open_graphics_segment(&mut segments, &mut segment_open, draw.pipeline_id, command_index);
                     segments
                         .last_mut()
                         .expect("segment was just opened")
@@ -2008,7 +2225,14 @@ impl DirectMetalTransport {
                     }
                 }
             }
-            encoder.finish()?;
+            encoder.finish().map_err(|error| {
+                annotate_gpu_error(
+                    submission.sequence,
+                    "render pass",
+                    segment.first_command_index,
+                    &error,
+                )
+            })?;
             first_segment = false;
         }
 
@@ -2048,7 +2272,9 @@ impl DirectMetalTransport {
     /// * The state lock is held through synchronous completion, so a registered
     ///   buffer cannot be unregistered while the GPU reads or writes it.
     /// * The returned reply echoes the submission sequence. A GPU fault after
-    ///   commit returns [`ReplyStatus::ExecutionFailed`].
+    ///   commit returns `Err` with a bounded Metal reason; the IPC host maps
+    ///   that to [`ReplyStatus::ExecutionFailed`], so the guest status is
+    ///   unchanged while telemetry and tracing name the failure.
     /// * A submission is classified as *compute* (only `Dispatch1d`/
     ///   `Dispatch3d`), *graphics* (any of `SetPipeline`, `RootConstants`,
     ///   `DescriptorTable`, `DrawIndexed`, `Draw`, `ResourceBarrier`) or
@@ -2403,7 +2629,28 @@ impl DirectMetalTransport {
         // SAFETY: `cb` has completed via `waitUntilCompleted`.
         let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
         if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
-            return Ok(reply(ReplyStatus::ExecutionFailed));
+            // SAFETY: `[cb error]` returns null or an autoreleased `NSError *`.
+            let error_raw = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
+            // SAFETY: `error_raw` is null or a valid `NSError *`.
+            let detail = unsafe { objc::nserror_message(error_raw) };
+            // The batch is one command buffer; the first command is the only
+            // attribution Metal's whole-buffer failure allows. The status the
+            // guest receives is unchanged (`ExecutionFailed`).
+            let failure = describe_command_buffer_failure(
+                u64::from(submission.sequence),
+                status,
+                "dispatch",
+                0,
+                &detail,
+            );
+            tracing::error!(
+                sequence = failure.sequence,
+                wire_status = ?failure.status,
+                mtl_status = failure.mtl_status,
+                reason = %failure.reason,
+                "Metal compute command buffer did not complete"
+            );
+            return Err(MetalError::InternalError(failure.reason));
         }
 
         Ok(reply(ReplyStatus::Ok))
@@ -2624,9 +2871,14 @@ impl DirectMetalTransport {
             let err_raw = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
             // SAFETY: `err_raw` is either null or a valid `NSError *`.
             let msg = unsafe { objc::nserror_message(err_raw) };
-            return Err(MetalError::InternalError(format!(
-                "Metal MSC argument-buffer dispatch failed (status={status}): {msg}"
-            )));
+            let failure = describe_command_buffer_failure(0, status, "dispatch", 0, &msg);
+            tracing::error!(
+                wire_status = ?failure.status,
+                mtl_status = failure.mtl_status,
+                reason = %failure.reason,
+                "Metal MSC argument-buffer dispatch did not complete"
+            );
+            return Err(MetalError::InternalError(failure.reason));
         }
 
         Ok(())
@@ -6443,7 +6695,13 @@ impl DirectMetalTransport {
             .commands
             .iter()
             .any(|command| matches!(command, CommandV3::Present(_)));
-        self.commit_async(encoded, submission.sequence)?;
+        // Metal faults the whole command buffer; the first encoder segment is
+        // the only attribution an asynchronous completion handler can name.
+        let site = plan
+            .first()
+            .map(segment_failure_site)
+            .unwrap_or(("command buffer", 0));
+        self.commit_async(encoded, submission.sequence, site)?;
         if let Some((list_id, generation)) = list_key {
             state.mark_list_executed(list_id, generation);
         }
@@ -9435,5 +9693,69 @@ mod async_pipeline_tests {
         assert_eq!(clamp_frames_in_flight(Some("64")), 3);
         assert_eq!(clamp_frames_in_flight(Some("nonsense")), 3);
         assert_eq!(clamp_frames_in_flight(Some(" 1 ")), 1);
+    }
+
+    /// A simulated failed command buffer keeps the wire status and carries the
+    /// Metal diagnostic text, named by command family and index. No GPU or
+    /// `MTLCommandBuffer` is created: the decision is this pure function.
+    #[test]
+    fn command_buffer_failure_keeps_status_and_carries_metal_text() {
+        let failure = describe_command_buffer_failure(
+            586,
+            4,
+            "draw",
+            12,
+            "Invalid resource (out of bounds write)\nsecond line",
+        );
+        assert_eq!(
+            failure.status,
+            ReplyStatus::ExecutionFailed,
+            "the guest status must not change"
+        );
+        assert_eq!(failure.sequence, 586);
+        assert_eq!(failure.kind, "draw");
+        assert_eq!(failure.index, 12);
+        assert!(
+            failure.reason.contains("draw #12"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("Invalid resource"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("out of bounds write"),
+            "{}",
+            failure.reason
+        );
+        assert!(
+            !failure.reason.contains('\n'),
+            "the reason must stay one line: {}",
+            failure.reason
+        );
+        assert!(failure.reason.len() <= MAX_GPU_REASON_BYTES);
+    }
+
+    /// The bounded reason never splits a UTF-8 character and never exceeds the
+    /// documented ceiling, even for a long Metal error.
+    #[test]
+    fn gpu_reason_is_sanitised_and_bounded() {
+        let long_ascii = "x".repeat(500);
+        let reason = bounded_gpu_reason(&long_ascii);
+        assert!(reason.len() <= MAX_GPU_REASON_BYTES);
+        assert!(reason.ends_with("..."));
+
+        let long_unicode = "é".repeat(500);
+        let reason = bounded_gpu_reason(&long_unicode);
+        assert!(reason.len() <= MAX_GPU_REASON_BYTES);
+        assert!(reason.is_char_boundary(reason.len()));
+
+        assert_eq!(bounded_gpu_reason(""), "unknown Metal error");
+        assert_eq!(
+            bounded_gpu_reason("line one\n\tline two"),
+            "line one line two"
+        );
     }
 }
