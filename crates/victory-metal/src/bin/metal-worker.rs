@@ -43,12 +43,13 @@ use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use victory_metal::fence_page::FencePageMapping;
-use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
+use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost, PipelineStageLibrary};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::PixelFormat;
 #[cfg(target_os = "macos")]
 use victory_metal::wire::{BufferBinding, Command, Reply, ReplyStatus, Submission};
 #[cfg(target_os = "macos")]
+use victory_metal::macos::device::PipelineAbi;
 use victory_metal::wire_v3::{CommandV3, SubmissionV3};
 #[cfg(target_os = "macos")]
 use victory_metal::{DirectMetalTransport, MetalError, MetalTransport, VmBufferId, VmPipelineId};
@@ -364,6 +365,60 @@ impl BatchExecutor for FrameGateExecutor {
     }
     fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
         BatchExecutor::attach_fence_page(&self.transport, page)
+    }
+
+    fn register_graphics_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        vertex_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_graphics_pipeline(
+            &self.transport, handle, metallib, vertex_entry, state, abi,
+        )
+    }
+
+    fn register_mesh_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        mesh_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_mesh_pipeline(&self.transport, handle, metallib, mesh_entry, state, abi)
+    }
+
+    fn register_graphics_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_graphics_pipeline_stages(&self.transport, handle, stages, state, abi)
+    }
+
+    fn register_mesh_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_mesh_pipeline_stages(&self.transport, handle, stages, state, abi)
+    }
+
+    fn register_compute_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_compute_pipeline_stages(&self.transport, handle, stages, state, abi)
     }
 
     fn detach_fence_page(&self) {
