@@ -254,6 +254,15 @@ pub enum TableRunError {
     Empty,
     /// The first slot names a descriptor this backend cannot express.
     Unsupported(&'static str),
+    /// The typed enumerator met a slot it cannot express. The whole table is
+    /// refused instead of binding a prefix, and the reason names the slot.
+    UnsupportedAt {
+        /// Index of the offending slot in register order (the first slot is
+        /// 0).
+        index: usize,
+        /// The shape the slot names.
+        why: &'static str,
+    },
     /// A run of more than [`MAX_DESCRIPTOR_BINDINGS_V3`] same-kind descriptors
     /// was seen. It is refused instead of silently truncated.
     OverCap {
@@ -277,6 +286,10 @@ impl std::fmt::Display for TableRunError {
             Self::HandleZero => write!(f, "the descriptor-table handle is zero"),
             Self::Empty => write!(f, "the descriptor table's first slot holds no live descriptor"),
             Self::Unsupported(why) => write!(f, "the descriptor table entry is not expressible: {why}"),
+            Self::UnsupportedAt { index, why } => write!(
+                f,
+                "the descriptor table entry at slot {index} is not expressible: {why}"
+            ),
             Self::OverCap { count } => write!(
                 f,
                 "the descriptor table run needs {count} entries, more than the {} a v3 table carries",
@@ -296,9 +309,13 @@ impl std::error::Error for TableRunError {}
 /// Where a homogeneous descriptor-table run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableRunBoundary {
-    /// The next slot held no live descriptor: the normal table end.
+    /// The next slot held no live descriptor: the normal table end. A null
+    /// descriptor also reads as empty, so a trailing null ends the table the
+    /// same way an unwritten slot does.
     Empty,
-    /// The next slot held a descriptor this backend cannot express.
+    /// The next slot held a descriptor this backend cannot express. Only the
+    /// buffer-only [`enumerate_descriptor_table`] still stops here; the typed
+    /// enumerator refuses the whole table with the slot index instead.
     Unresolvable(&'static str),
     /// The next slot held another `kind`: the boundary of the next root
     /// parameter's table. A table still carries one kind across all its
@@ -464,11 +481,13 @@ impl TypedDescriptorTableRun {
 /// entry's shape (buffer range, registered texture handle or sampler handle).
 ///
 /// Sampler tables advance at the 16-byte sampler increment and view tables at
-/// the 32-byte view increment. A first slot that is empty, unresolvable or
-/// whose entry shape the kind cannot express is an error. A later slot of the
-/// same kind is included even when its entry shape differs, so
-/// [`descriptor_table_typed`] can carry a mixed buffer/texture table (the wire
-/// tags every entry) instead of binding a prefix.
+/// the 32-byte view increment. A slot that is empty ends the run: a null
+/// descriptor names no resource, so it reads as empty exactly like an unwritten
+/// slot (`crate::descriptor::view`). A slot the backend cannot express refuses
+/// the whole table as [`TableRunError::UnsupportedAt`] with its index, never a
+/// silent prefix. A later slot of the same kind is included even when its entry
+/// shape differs, so [`descriptor_table_typed`] can carry a mixed
+/// buffer/texture table (the wire tags every entry).
 pub fn enumerate_descriptor_table_typed<F>(
     base_handle: u64,
     mut read: F,
@@ -486,7 +505,9 @@ where
             (DescriptorKind::Sampler, DescriptorEntry::Sampler(handle))
         }
         DescriptorSlot::Empty => return Err(TableRunError::Empty),
-        DescriptorSlot::Unresolvable(why) => return Err(TableRunError::Unsupported(why)),
+        DescriptorSlot::Unresolvable(why) => {
+            return Err(TableRunError::UnsupportedAt { index: 0, why });
+        }
     };
     if !first.is_compatible_with(kind) {
         return Err(TableRunError::Unsupported(
@@ -503,7 +524,14 @@ where
         };
         match read(next_handle) {
             DescriptorSlot::Empty => break TableRunBoundary::Empty,
-            DescriptorSlot::Unresolvable(why) => break TableRunBoundary::Unresolvable(why),
+            // A slot this backend cannot express refuses the table as a
+            // whole. Binding the entries before it would be a silent prefix.
+            DescriptorSlot::Unresolvable(why) => {
+                return Err(TableRunError::UnsupportedAt {
+                    index: entries.len(),
+                    why,
+                });
+            }
             DescriptorSlot::Live(next_kind, binding) => {
                 if next_kind != kind {
                     break TableRunBoundary::KindChange { kind: next_kind };
@@ -1543,6 +1571,120 @@ mod tests {
                 "a sampler descriptor has no host equivalent"
             ))
         );
+    }
+
+    /// A null descriptor (`Create*View` with a null resource) reads as
+    /// [`DescriptorSlot::Empty`] from `crate::descriptor::view`, exactly like
+    /// an unwritten slot, so the run ends there. The live prefix binds and the
+    /// dispatch records it.
+    #[test]
+    fn a_null_slot_ends_the_run_and_the_prefix_binds_and_dispatches() {
+        let resolver = FakeResolver::new();
+        let page = resolver.page_address(0);
+        let run = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
+            match ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize {
+                0 => DescriptorSlot::Live(
+                    DescriptorKind::Uav,
+                    GuestBinding {
+                        address: page,
+                        len: 0x40,
+                    },
+                ),
+                1 => DescriptorSlot::Live(
+                    DescriptorKind::Uav,
+                    GuestBinding {
+                        address: page + 0x80,
+                        len: 0x40,
+                    },
+                ),
+                // The NULL descriptor (and everything the guest left empty).
+                _ => DescriptorSlot::Empty,
+            }
+        })
+        .expect("a table that ends at a null slot");
+        assert_eq!(run.kind, DescriptorKind::Uav);
+        assert_eq!(run.len(), 2, "no live descriptor is dropped");
+        assert_eq!(run.boundary, TableRunBoundary::Empty);
+
+        let resolved = descriptor_table_typed(&resolver, TABLE_BASE, 1, 0, run.kind, &run.entries)
+            .expect("the live prefix resolves");
+        let (table, tokens) = resolved.into_parts();
+        assert_eq!(table.bindings.len(), 2);
+
+        let mut producer =
+            crate::native_metal::producer::MetalProducer::new(9, 1).expect("producer");
+        producer
+            .set_compute_pipeline(0xb00)
+            .expect("compute pipeline");
+        producer
+            .set_compute_threadgroup_size([64, 1, 1])
+            .expect("threadgroup size");
+        producer
+            .set_compute_descriptor_table(table)
+            .expect("the table binds");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+        let submission = producer.flush().expect("flush");
+        let recorded = submission
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                victory_metal::wire_v3::CommandV3::SetDescriptorTable(table) => Some(table.clone()),
+                _ => None,
+            })
+            .expect("the table command");
+        assert_eq!(
+            recorded.bindings.len(),
+            2,
+            "the bound table is the enumerated live prefix"
+        );
+        assert!(
+            submission
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    victory_metal::wire_v3::CommandV3::Dispatch3d(_)
+                )),
+            "the dispatch follows the bound table"
+        );
+        retire_all(&resolver, &tokens);
+    }
+
+    /// A slot the backend cannot express refuses the typed table as a whole
+    /// and names its index, instead of binding the entries before it.
+    #[test]
+    fn an_unrepresentable_typed_slot_refuses_the_table_with_its_index() {
+        const SHAPE: &str = "a descriptor names neither a buffer nor a texture";
+        let error = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
+            match ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize {
+                0 => DescriptorSlot::Live(DescriptorKind::Srv, binding_for(0)),
+                1 => DescriptorSlot::Live(DescriptorKind::Srv, binding_for(1)),
+                2 => DescriptorSlot::Unresolvable(SHAPE),
+                _ => DescriptorSlot::Empty,
+            }
+        })
+        .expect_err("a malformed later slot refuses the table");
+        assert_eq!(
+            error,
+            TableRunError::UnsupportedAt { index: 2, why: SHAPE }
+        );
+        let message = error.to_string();
+        assert!(message.contains("slot 2"), "{message}");
+        assert!(message.contains(SHAPE), "{message}");
+
+        // A malformed first slot names index 0 too.
+        let first = enumerate_descriptor_table_typed(TABLE_BASE, |_| {
+            DescriptorSlot::Unresolvable("a console sampler descriptor has no D3D12-to-Metal mapping")
+        })
+        .expect_err("a malformed first slot refuses the table");
+        assert_eq!(
+            first,
+            TableRunError::UnsupportedAt {
+                index: 0,
+                why: "a console sampler descriptor has no D3D12-to-Metal mapping",
+            }
+        );
+        assert!(first.to_string().contains("slot 0"), "{first}");
     }
 
     #[test]
