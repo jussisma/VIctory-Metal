@@ -1522,13 +1522,66 @@ fn container_entry_point(container: &[u8]) -> Option<String> {
     None
 }
 
+/// The `Program` kind the container's `DXIL` part declares, if its program
+/// header can be read.
+///
+/// A real container's `DXIL` part is a [`victory_shader::DxilProgram`] header
+/// followed by the bitcode, but producers differ in what sits between the
+/// header and the bitcode (a 20-byte digest in newer containers, none in older
+/// ones, Xbox `XDAT` tables in console containers). Only the header is needed
+/// to learn the stage: kind/SM, size in dwords, and the inner `DXIL` magic.
+/// Bitcode well-formedness is deliberately not checked here — the converter is
+/// the authority and answers a named error now that each job is isolated.
+fn dxil_program_kind(container: &[u8]) -> Option<u16> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let data = parsed.part(victory_shader::FourCC::DXIL)?.data;
+    if data.len() < 24 || data.get(8..12) != Some(b"DXIL") {
+        return None;
+    }
+    let size = usize::try_from(u32::from_le_bytes(data.get(4..8)?.try_into().ok()?))
+        .ok()?
+        .checked_mul(4)?;
+    if size < 24 || size > data.len() {
+        return None;
+    }
+    let version = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    Some((version >> 16) as u16)
+}
+
+/// The `Program` kind name of a raw kind code, for refusal reasons.
+fn shader_kind_name(raw: u16) -> String {
+    use victory_shader::ShaderKind;
+    let kind = match raw {
+        0 => ShaderKind::Pixel,
+        1 => ShaderKind::Vertex,
+        2 => ShaderKind::Geometry,
+        3 => ShaderKind::Hull,
+        4 => ShaderKind::Domain,
+        5 => ShaderKind::Compute,
+        6 => ShaderKind::Library,
+        7 => ShaderKind::RayGeneration,
+        8 => ShaderKind::Intersection,
+        9 => ShaderKind::AnyHit,
+        10 => ShaderKind::ClosestHit,
+        11 => ShaderKind::Miss,
+        12 => ShaderKind::Callable,
+        13 => ShaderKind::Mesh,
+        14 => ShaderKind::Amplification,
+        15 => ShaderKind::Node,
+        other => ShaderKind::Unknown(other),
+    };
+    format!("{kind:?}")
+}
+
 /// Validates `container` as the complete shader container of `stage`.
 ///
 /// IRConverter's `IRObjectCreateFromDXIL` takes the whole `DXBC` container: a
 /// bare `DXIL` part (program header plus bitcode) crashes the converter child
 /// instead of answering. The container's own `Program` part and `PSV0` stage
-/// byte must both name `stage`; a disagreement is a named refusal here, never
-/// a worker exit or a wrong library.
+/// byte must both name `stage` when they can be read; a disagreement is a named
+/// refusal here, never a worker exit or a wrong library. The bitcode itself is
+/// left to the converter, which now reports a named error instead of crashing
+/// because every job runs in its own child.
 fn checked_stage_container(
     stage: PipelineStage,
     container: &[u8],
@@ -1551,32 +1604,50 @@ fn checked_stage_container(
             stage.label()
         )));
     }
+    // The part table is what must hold: magic, bounds and a `DXIL` part. A
+    // truncated table, an out-of-bounds part or a non-container is refused
+    // here; the bitcode that follows is the converter's to judge.
     let parsed = victory_shader::Container::parse(container)
         .map_err(|error| PipelineError::Container(format!("{}: {error}", stage.label())))?;
-    let part = parsed
+    parsed
         .part(victory_shader::FourCC::DXIL)
         .ok_or(PipelineError::NoDxil(stage.label()))?;
-    let program = victory_shader::DxilProgram::parse(part.data).map_err(|error| {
-        PipelineError::Container(format!(
-            "the {} stage's DXIL part is malformed: {error}",
-            stage.label()
-        ))
-    })?;
-    if program.kind != stage.dxil_kind() {
+
+    let declared = dxil_program_kind(container);
+    let psv = psv0_stage(container);
+    let expected = raw_shader_kind(stage.dxil_kind());
+    if let Some(declared) = declared
+        && declared != expected
+    {
         return Err(PipelineError::Container(format!(
-            "the {} stage's container declares a {:?} program, not a {:?} one",
+            "the {} stage's container declares a {} program, not a {} one",
             stage.label(),
-            program.kind,
-            stage.dxil_kind()
+            shader_kind_name(declared),
+            shader_kind_name(expected)
         )));
     }
-    let declared = raw_shader_kind(program.kind);
-    if let Some(psv) = psv0_stage(container)
-        && psv != declared
+    if let (Some(declared), Some(psv)) = (declared, psv)
+        && declared != psv
     {
         return Err(PipelineError::Container(format!(
             "the {} stage's container Program part (kind {declared}) disagrees with its PSV0 \
              stage byte ({psv})",
+            stage.label()
+        )));
+    }
+    if let Some(psv) = psv
+        && psv != expected
+    {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's container PSV0 stage byte ({psv}) names another stage than the \
+             requested one (kind {expected})",
+            stage.label()
+        )));
+    }
+    if declared.is_none() && psv.is_none() {
+        return Err(PipelineError::Container(format!(
+            "the {} stage's DXIL part is malformed: no readable DXIL program header and no \
+             PSV0 stage to derive the stage from",
             stage.label()
         )));
     }
@@ -3681,6 +3752,45 @@ mod tests {
         part
     }
 
+    /// Rebuilds `container` with a 20-byte digest between the `DXIL` part's
+    /// program header and its bitcode.
+    ///
+    /// `advance_offset` moves the header's bitcode offset past the digest (the
+    /// layout the converter translates); leaving it false models a producer
+    /// that keeps the older offset, whose bitcode pointer lands on the digest.
+    fn container_with_dxil_digest(
+        container: &[u8],
+        digest: [u8; 20],
+        advance_offset: bool,
+    ) -> Vec<u8> {
+        let parsed = victory_shader::Container::parse(container).expect("the fixture parses");
+        let mut parts: Vec<(victory_shader::FourCC, Vec<u8>)> = parsed
+            .parts
+            .iter()
+            .map(|part| (part.fourcc, part.data.to_vec()))
+            .collect();
+        for (fourcc, body) in &mut parts {
+            if *fourcc != victory_shader::FourCC::DXIL {
+                continue;
+            }
+            assert!(body.len() >= 24, "the fixture DXIL part has a program header");
+            let offset = u32::from_le_bytes(body[16..20].try_into().expect("4 bytes")) as usize;
+            let start = 8 + offset;
+            assert!(start <= body.len(), "the fixture bitcode offset is in bounds");
+            body.splice(start..start, digest);
+            if advance_offset {
+                body[16..20].copy_from_slice(&((offset + digest.len()) as u32).to_le_bytes());
+            }
+            let size_dwords = body.len().div_ceil(4);
+            body[4..8].copy_from_slice(&(size_dwords as u32).to_le_bytes());
+        }
+        let refs: Vec<_> = parts
+            .iter()
+            .map(|(fourcc, data)| (*fourcc, data.as_slice()))
+            .collect();
+        dxbc_container(&refs)
+    }
+
     /// Each of the converter's five stages maps to the container `Program`
     /// kind it declares; the container kind is never confused with the
     /// converter stage code (converter 5 is mesh, container kind 5 is compute).
@@ -3710,6 +3820,89 @@ mod tests {
             }
             other => panic!("a compute container must not pass as mesh, saw {other:?}"),
         }
+    }
+
+    /// A 20-byte digest between the `DXIL` program header and the bitcode is
+    /// not a container refusal: the header and `PSV0` still name the stage and
+    /// the entry, and the bitcode is the converter's to judge. This is the
+    /// layout Boot #18b refused with `bitcode lacks LLVM magic`.
+    #[test]
+    fn a_digest_before_the_bitcode_is_not_a_container_refusal() {
+        for stage in [
+            PipelineStage::Vertex,
+            PipelineStage::Pixel,
+            PipelineStage::Compute,
+        ] {
+            let with_digest = container_with_dxil_digest(&fixture(stage), [0x5a; 20], true);
+            let program = stage_program(stage, &with_digest)
+                .unwrap_or_else(|error| panic!("{stage:?} with digest: {error}"));
+            assert_eq!(program.entry, "main", "{stage:?}: PSV0 still names the entry");
+            assert_eq!(
+                program.dxil, with_digest,
+                "{stage:?}: the converter still gets the whole container"
+            );
+            validate_stage_program(&program).unwrap_or_else(|error| panic!("{stage:?}: {error}"));
+        }
+
+        // A producer that leaves the header's bitcode offset pointing at the
+        // digest used to stop at `bitcode lacks LLVM magic`. The container is
+        // structurally sound, so it now reaches the converter, which is the
+        // authority on the bitcode and answers a named error in its own child.
+        let not_advanced =
+            container_with_dxil_digest(&fixture(PipelineStage::Compute), [0xa5; 20], false);
+        let program = stage_program(PipelineStage::Compute, &not_advanced)
+            .expect("the program header and PSV0 still name the stage");
+        validate_stage_program(&program)
+            .expect("container validation must not parse the bitcode");
+        assert!(!program.dxil.is_empty(), "the container is forwarded intact");
+
+        // The literal "`DXIL` fourcc + part size + 20-byte digest + LLVM
+        // bitcode" layout carries no program header at all. The stage comes
+        // from `PSV0`, the entry from its table, and the converter judges the
+        // bytes; nothing here rejects it for the digest.
+        let standard = fixture(PipelineStage::Compute);
+        let parsed = victory_shader::Container::parse(&standard).expect("the fixture parses");
+        let dxil = parsed
+            .part(victory_shader::FourCC::DXIL)
+            .expect("the fixture has a DXIL part");
+        let offset = u32::from_le_bytes(dxil.data[16..20].try_into().expect("4 bytes")) as usize;
+        let size = u32::from_le_bytes(dxil.data[20..24].try_into().expect("4 bytes")) as usize;
+        let mut digest_and_bitcode = vec![0x7e; 20];
+        digest_and_bitcode.extend_from_slice(&dxil.data[8 + offset..8 + offset + size]);
+        let parts: Vec<_> = parsed
+            .parts
+            .iter()
+            .map(|part| {
+                let data: &[u8] = if part.fourcc == victory_shader::FourCC::DXIL {
+                    &digest_and_bitcode
+                } else {
+                    part.data
+                };
+                (part.fourcc, data)
+            })
+            .collect();
+        let headerless = dxbc_container(&parts);
+        let program = stage_program(PipelineStage::Compute, &headerless)
+            .expect("PSV0 names the compute stage when the DXIL part has no header");
+        assert_eq!(program.entry, "main", "the entry still comes from PSV0");
+        validate_stage_program(&program)
+            .expect("a headerless DXIL part with a PSV0 stage is the converter's to judge");
+    }
+
+    /// A truncated part table is a named container refusal, never a forwarded
+    /// byte string: the converter only ever sees a table whose parts fit.
+    #[test]
+    fn a_truncated_part_table_is_a_named_refusal() {
+        let mut broken = fixture(PipelineStage::Compute);
+        broken[0x1c..0x20].copy_from_slice(&200u32.to_le_bytes());
+        broken.truncate(0x40);
+        let truncated_len = broken.len() as u32;
+        broken[0x18..0x1c].copy_from_slice(&truncated_len.to_le_bytes());
+        let error = stage_program(PipelineStage::Compute, &broken)
+            .expect_err("a truncated part table must be refused");
+        assert!(matches!(error, PipelineError::Container(_)), "{error:?}");
+        assert!(!error.to_string().is_empty(), "the reason is named");
+        assert_eq!(RefusalClass::of(&error), RefusalClass::Container);
     }
 
     /// Every container refusal is a named, bounded `Container`/`NoDxil`
@@ -3866,6 +4059,81 @@ mod tests {
         // The work really ran in workers of the pool, not in the cache.
         let stats = pool_stats();
         assert_eq!(stats.worker_jobs, 3, "three cold stages ran in workers");
+        assert_eq!(stats.errors, 0, "no worker failed");
+
+        // SAFETY: the test holds `ENV_LOCK`.
+        unsafe {
+            std::env::remove_var("VICTORY_IRCONVERTER_WORKER");
+            std::env::remove_var("VICTORY_METAL_IRCONVERTER");
+            std::env::remove_var("VICTORY_METAL_SHADER_CACHE");
+        }
+        reset_pool();
+    }
+
+    /// Both accepted `DXIL` layouts translate through the real `--stdio` pool:
+    /// a standard container and one with a 20-byte digest before the bitcode.
+    /// The second is the layout Boot #18b refused before any job was dispatched.
+    #[test]
+    fn digest_and_standard_containers_translate_through_the_pool() {
+        let Some(worker) = converter_worker_for_test() else {
+            eprintln!(
+                "skipped: no x86_64 victory-irconverter (build it with `cargo build -p \
+                 victory-metal --bin victory-irconverter --target x86_64-apple-darwin`)"
+            );
+            return;
+        };
+        let Some(converter) = converter_library_for_test() else {
+            eprintln!("skipped: no libmetalirconverter.dylib (VICTORY_METAL_IRCONVERTER)");
+            return;
+        };
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let cache = TempShare::new();
+        // SAFETY: the test holds `ENV_LOCK`; every other test that reads these
+        // variables takes the same lock.
+        unsafe {
+            std::env::set_var("VICTORY_IRCONVERTER_WORKER", &worker);
+            std::env::set_var("VICTORY_METAL_IRCONVERTER", &converter);
+            std::env::set_var("VICTORY_METAL_SHADER_CACHE", &cache.0);
+        }
+        reset_pool();
+
+        let mut jobs = 0;
+        for (stage, shader_type) in [
+            (PipelineStage::Vertex, "Vertex"),
+            (PipelineStage::Compute, "Compute"),
+        ] {
+            for (layout, container) in [
+                ("standard", fixture(stage)),
+                (
+                    "digest",
+                    container_with_dxil_digest(&fixture(stage), [0x33; 20], true),
+                ),
+            ] {
+                let program = stage_program(stage, &container)
+                    .unwrap_or_else(|error| panic!("{stage:?}/{layout}: {error}"));
+                let (compiled, serving) = translate_with_reflection(&program)
+                    .unwrap_or_else(|error| panic!("{stage:?}/{layout} through the pool: {error}"));
+                assert!(
+                    compiled.metallib.len() > 4 && compiled.metallib.starts_with(b"MTLB"),
+                    "{stage:?}/{layout}: the converter answered a serialized metallib"
+                );
+                assert!(!serving.warm, "{stage:?}/{layout}: a cold cache never serves warm");
+                let reflection =
+                    std::str::from_utf8(&compiled.reflection).expect("reflection is UTF-8 JSON");
+                assert!(
+                    reflection.contains(&format!("\"ShaderType\":\"{shader_type}\"")),
+                    "{stage:?}/{layout}: reflection reports {shader_type}: {reflection}"
+                );
+                assert!(
+                    reflection.contains("\"EntryPoint\":\"main\""),
+                    "{stage:?}/{layout}: reflection names the entry: {reflection}"
+                );
+                jobs += 1;
+            }
+        }
+
+        let stats = pool_stats();
+        assert_eq!(stats.worker_jobs, jobs, "each cold layout ran in a worker");
         assert_eq!(stats.errors, 0, "no worker failed");
 
         // SAFETY: the test holds `ENV_LOCK`.
