@@ -21,7 +21,7 @@
 //! instead of panicking. `VICTORY_METAL_SHADER_CACHE` selects the disk cache
 //! directory, matching [`crate::macos::irconverter`].
 //!
-//! # Worker protocol (version 1)
+//! # Worker protocol
 //!
 //! Each worker is a child process started as `victory-irconverter --stdio`
 //! (see [`pool_stdio_enabled`]) and driven over stdin/stdout with
@@ -38,22 +38,38 @@
 //! <entry: entry-len raw bytes><dxil: dxil-len raw bytes>
 //! ```
 //!
-//! Response, worker -> pool stdout:
+//! Response, worker -> pool stdout. Version 2 carries the converter reflection
+//! JSON next to the metallib; version 1 (the metallib only) is still accepted
+//! by [`CompilerPool::compile`] so an older worker keeps working:
 //!
 //! ```text
-//! "VMRES" SP <seq> SP <job-id> SP <status> SP <payload-len> LF
+//! "VMRES"  SP <seq> SP <job-id> SP <status> SP <payload-len> LF
 //! <payload: payload-len raw bytes>
+//!
+//! "VMRES2" SP <seq> SP <job-id> SP <status> SP <metallib-len> SP <reflection-len> LF
+//! <metallib: metallib-len raw bytes><reflection: reflection-len raw bytes>
 //! ```
 //!
 //! `<seq>` and `<job-id>` are decimal `u64`, `<stage>` is a decimal `u32`,
-//! and `<entry-len>`, `<dxil-len>` and `<payload-len>` are decimal byte
-//! counts. `<seq>` is the pool's internal monotonic sequence number and is
-//! what the pool uses for routing and cancellation; `<job-id>` is the caller's
-//! id. `status == 0` means `payload` is the serialized metallib; any other
-//! status means the payload is a UTF-8 diagnostic. The worker must echo both
-//! numbers: the pool rejects a mismatched sequence or caller id as
+//! and the length fields are decimal byte counts. `<seq>` is the pool's
+//! internal monotonic sequence number and is what the pool uses for routing
+//! and cancellation; `<job-id>` is the caller's id. `status == 0` means the
+//! payload is the serialized metallib (and, for `VMRES2`, its reflection JSON);
+//! any other status means the payload is a UTF-8 diagnostic. The worker must
+//! echo both numbers: the pool rejects a mismatched sequence or caller id as
 //! [`PoolError::SequenceMismatch`] or [`PoolError::IdMismatch`] instead of
 //! accepting another caller's bytes.
+//!
+//! The pool asks for the version 2 answer by setting
+//! `VICTORY_IRCONVERTER_STDIO_REFLECTION=1` on each child. A worker that
+//! predates it ignores the variable and answers `VMRES`; the request frame is
+//! unchanged, so such a worker keeps serving [`CompilerPool::compile`].
+//!
+//! [`CompilerPool::compile_with_reflection`] needs the reflection, so a
+//! version 1 answer is an explicit [`PoolError::Protocol`] for that call
+//! rather than a silently empty ABI. It is never upgraded by guessing: the
+//! pool reaps that answer path and the next job gets a fresh worker, which may
+//! be a newer binary.
 //!
 //! Requests and responses are strictly alternating on one pipe pair, so the
 //! pool never needs a worker-side scheduler. A worker that exits, closes its
@@ -103,11 +119,26 @@ pub const MAX_JOB_ENTRY_BYTES: usize = 256;
 /// Largest accepted worker payload, matching the serialized metallib limit.
 pub const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest accepted reflection JSON from a worker.
+///
+/// Matches the cache module's 4 MiB reflection bound; the literal keeps the
+/// pool compiling for the Win64 guest, where the `macos` module is not built.
+/// A larger document is refused instead of being truncated into an unusable
+/// ABI.
+pub const MAX_REFLECTION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Version of the reflection channel a `--stdio` worker produces.
+///
+/// Mixed into [`POOL_CONVERTER_VERSION`] so a metallib cached before the pool
+/// asked for reflection is a different key and can never be served to
+/// [`CompilerPool::compile_with_reflection`] as if it carried a layout.
+pub const POOL_REFLECTION_PRODUCER_VERSION: &str = "reflection-json-1";
+
 /// Version mixed into the pool's cache key.
 pub const POOL_CONVERTER_VERSION: &str = concat!(
     "victory-metal/",
     env!("CARGO_PKG_VERSION"),
-    "/shader-pool-1"
+    "/shader-pool-2/reflection-json-1"
 );
 
 #[cfg(unix)]
@@ -121,11 +152,20 @@ const SIGKILL: i32 = 9;
 
 const PROTOCOL_MAGIC_JOB: &str = "VMJOB";
 const PROTOCOL_MAGIC_RESULT: &str = "VMRES";
+const PROTOCOL_MAGIC_RESULT_V2: &str = "VMRES2";
 const MAX_FRAME_HEADER_BYTES: usize = 4096;
 /// Argument that selects the worker's persistent framed protocol.
 const STDIO_ARG: &str = "--stdio";
 /// Argument that names the x86_64 IRConverter library to the worker.
 const CONVERTER_ARG: &str = "--converter";
+/// Environment switch that makes a worker answer `VMRES2` (metallib plus
+/// reflection) instead of the original metallib-only `VMRES`.
+///
+/// It is an environment variable rather than a request header or CLI flag so
+/// an unchanged worker binary keeps working (it ignores the variable and
+/// answers `VMRES`, which [`CompilerPool::compile`] still accepts), while the
+/// request frame itself stays byte-for-byte identical.
+const REFLECTION_FRAMES_ENV: &str = "VICTORY_IRCONVERTER_STDIO_REFLECTION";
 
 /// Whether this build starts workers in persistent `--stdio` mode.
 ///
@@ -242,6 +282,20 @@ pub struct CompileJob<'a> {
     pub entry: &'a str,
     /// Raw DXIL bytes.
     pub dxil: &'a [u8],
+}
+
+/// One translated job with the converter's reflection JSON.
+///
+/// The metallib is what the host opens; the reflection is the
+/// `IRShaderReflectionCopyJSONString` document the guest turns into the
+/// per-stage `PipelineAbi` (`TopLevelArgumentBuffer`, `UsedResources`, stage
+/// and entry point). It is never fabricated from the metallib.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledShader {
+    /// Serialized metallib bytes.
+    pub metallib: Vec<u8>,
+    /// Converter reflection JSON; non-empty for a successful translation.
+    pub reflection: Vec<u8>,
 }
 
 /// Pool statistics snapshot.
@@ -382,13 +436,20 @@ pub enum PoolError {
     Closed,
 }
 
+/// One answer from a worker: the metallib and, for protocol version 2, the
+/// reflection JSON.
+struct WorkerReply {
+    metallib: Vec<u8>,
+    reflection: Option<Vec<u8>>,
+}
+
 struct JobFrame {
     seq: u64,
     id: u64,
     stage: u32,
     entry: String,
     dxil: Vec<u8>,
-    reply: SyncSender<Result<Vec<u8>, PoolError>>,
+    reply: SyncSender<Result<WorkerReply, PoolError>>,
 }
 
 #[derive(Default)]
@@ -570,6 +631,10 @@ impl CompilerPool {
     /// payload for exactly `job.id`. Concurrency is bounded by
     /// [`PoolConfig::queue_depth`]; callers beyond the bound block until a
     /// queued job completes.
+    ///
+    /// This is the metallib-only API. It still accepts a protocol version 1
+    /// worker (`VMRES`), so a caller that needs no reflection keeps working
+    /// against an older binary.
     pub fn compile(&self, job: &CompileJob<'_>) -> Result<Vec<u8>, PoolError> {
         self.validate(job)?;
         self.stats.jobs.fetch_add(1, Ordering::Relaxed);
@@ -587,8 +652,95 @@ impl CompilerPool {
             self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        if self.program.is_none() || self.senders.is_empty() {
+        let reply = match self.dispatch(job) {
+            Ok(reply) => reply,
+            Err(err) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            cache.put(key, job, &reply.metallib, &self.config.converter_version);
+        }
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(reply.metallib)
+    }
+
+    /// Compiles one job and returns the converter reflection JSON with it.
+    ///
+    /// The reflection is required, not optional: a warm cache entry that has
+    /// no reflection sidecar is a miss (the worker re-runs and fills it), and a
+    /// worker that answers the metallib-only `VMRES` frame is an explicit
+    /// [`PoolError::Protocol`] instead of a pipeline registered with an empty
+    /// ABI. The cache key mixes [`POOL_REFLECTION_PRODUCER_VERSION`], so a
+    /// metallib cached before the pool asked for reflection is a different
+    /// entry and cannot be served here.
+    pub fn compile_with_reflection(
+        &self,
+        job: &CompileJob<'_>,
+    ) -> Result<CompiledShader, PoolError> {
+        self.validate(job)?;
+        self.stats.jobs.fetch_add(1, Ordering::Relaxed);
+
+        let cache_key = self
+            .cache
+            .as_ref()
+            .map(|_| cache_bridge::Slot::key(job, &self.config.converter_version));
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            if let Some((metallib, reflection)) = cache.get_with_reflection(key) {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats.completed.fetch_add(1, Ordering::Relaxed);
+                return Ok(CompiledShader {
+                    metallib,
+                    reflection,
+                });
+            }
+            // A metallib without a reflection sidecar is stale for this call;
+            // count a miss so the warm ratio never claims a served ABI.
+            self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let reply = match self.dispatch(job) {
+            Ok(reply) => reply,
+            Err(err) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(err);
+            }
+        };
+        let Some(reflection) = reply.reflection else {
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::Protocol {
+                job_id: job.id,
+                detail: format!(
+                    "worker answered a metallib-only VMRES frame; reflection is required for a \
+                     pipeline ABI (worker protocol {POOL_REFLECTION_PRODUCER_VERSION} expected)"
+                ),
+            });
+        };
+        if reflection.is_empty() {
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::Protocol {
+                job_id: job.id,
+                detail: "worker answered an empty reflection".to_string(),
+            });
+        }
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            cache.put(key, job, &reply.metallib, &self.config.converter_version);
+            cache.put_reflection(key, &reflection);
+        }
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(CompiledShader {
+            metallib: reply.metallib,
+            reflection,
+        })
+    }
+
+    /// Sends one validated job to a worker and waits for its reply.
+    ///
+    /// Cache policy and stats live in the public entry points; this function
+    /// only owns dispatch, the queue gate, cancellation and timeout.
+    fn dispatch(&self, job: &CompileJob<'_>) -> Result<WorkerReply, PoolError> {
+        if self.program.is_none() || self.senders.is_empty() {
             return Err(PoolError::NoWorkerProgram);
         }
         let Some(_gate) = self.gate.acquire() else {
@@ -614,7 +766,6 @@ impl CompilerPool {
         if sent.is_err() {
             slot.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
             return Err(PoolError::Closed);
         }
 
@@ -623,29 +774,15 @@ impl CompilerPool {
         self.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
 
         match waited {
-            Ok(Ok(metallib)) => {
-                if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
-                    cache.put(key, job, &metallib, &self.config.converter_version);
-                }
-                self.stats.completed.fetch_add(1, Ordering::Relaxed);
-                Ok(metallib)
-            }
-            Ok(Err(err)) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                Err(err)
-            }
+            Ok(reply) => reply,
             Err(RecvTimeoutError::Timeout) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 slot.cancel(seq);
                 Err(PoolError::Timeout {
                     job_id: job.id,
                     timeout_ms: self.config.job_timeout.as_millis() as u64,
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                Err(PoolError::Closed)
-            }
+            Err(RecvTimeoutError::Disconnected) => Err(PoolError::Closed),
         }
     }
 
@@ -770,7 +907,7 @@ struct ChildIo {
 }
 
 impl ChildIo {
-    fn run(&mut self, job: &JobFrame) -> Result<Vec<u8>, PoolError> {
+    fn run(&mut self, job: &JobFrame) -> Result<WorkerReply, PoolError> {
         let header = format!(
             "{PROTOCOL_MAGIC_JOB} {} {} {} {} {}\n",
             job.seq,
@@ -812,15 +949,29 @@ impl ChildIo {
             detail: "response header is not UTF-8".to_string(),
         })?;
         let mut fields = text.split_ascii_whitespace();
-        let magic = fields.next();
+        let with_reflection = match fields.next() {
+            Some(PROTOCOL_MAGIC_RESULT) => false,
+            Some(PROTOCOL_MAGIC_RESULT_V2) => true,
+            _ => {
+                return Err(PoolError::Protocol {
+                    job_id: job.id,
+                    detail: format!(
+                        "expected `{PROTOCOL_MAGIC_RESULT} <seq> <id> <status> <len>` or \
+                         `{PROTOCOL_MAGIC_RESULT_V2} <seq> <id> <status> <metallib-len> \
+                         <reflection-len>`"
+                    ),
+                });
+            }
+        };
         let seq = fields.next();
         let id = fields.next();
         let status = fields.next();
-        let len = fields.next();
-        if magic != Some(PROTOCOL_MAGIC_RESULT) || fields.next().is_some() {
+        let metallib_len = fields.next();
+        let reflection_len = if with_reflection { fields.next() } else { None };
+        if fields.next().is_some() {
             return Err(PoolError::Protocol {
                 job_id: job.id,
-                detail: format!("expected `{PROTOCOL_MAGIC_RESULT} <seq> <id> <status> <len>`"),
+                detail: "response header has trailing fields".to_string(),
             });
         }
         let got_seq: u64 =
@@ -854,28 +1005,69 @@ impl ChildIo {
                     job_id: job.id,
                     detail: "response status is not a decimal u32".to_string(),
                 })?;
-        let len: usize =
-            len.and_then(|value| value.parse().ok())
+        let metallib_len: usize =
+            metallib_len
+                .and_then(|value| value.parse().ok())
                 .ok_or_else(|| PoolError::Protocol {
                     job_id: job.id,
-                    detail: "response length is not a decimal usize".to_string(),
+                    detail: "response metallib length is not a decimal usize".to_string(),
                 })?;
-        if len > MAX_RESULT_BYTES {
+        if metallib_len > MAX_RESULT_BYTES {
             return Err(PoolError::Protocol {
                 job_id: job.id,
-                detail: format!("response payload of {len} bytes exceeds 64 MiB"),
+                detail: format!("response payload of {metallib_len} bytes exceeds 64 MiB"),
+            });
+        }
+        let reflection_len: usize = if with_reflection {
+            reflection_len
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| PoolError::Protocol {
+                    job_id: job.id,
+                    detail: "response reflection length is not a decimal usize".to_string(),
+                })?
+        } else {
+            0
+        };
+        if reflection_len > MAX_REFLECTION_OUTPUT_BYTES {
+            return Err(PoolError::Protocol {
+                job_id: job.id,
+                detail: format!(
+                    "response reflection of {reflection_len} bytes exceeds \
+                     {MAX_REFLECTION_OUTPUT_BYTES}"
+                ),
+            });
+        }
+        if status != 0 && reflection_len != 0 {
+            return Err(PoolError::Protocol {
+                job_id: job.id,
+                detail: "failed response carries a reflection payload".to_string(),
             });
         }
 
-        let mut payload = vec![0u8; len];
+        let mut payload = vec![0u8; metallib_len];
         self.stdout
             .read_exact(&mut payload)
             .map_err(|source| PoolError::WorkerRead {
                 job_id: job.id,
                 source,
             })?;
+        let mut reflection = if reflection_len == 0 {
+            None
+        } else {
+            let mut bytes = vec![0u8; reflection_len];
+            self.stdout
+                .read_exact(&mut bytes)
+                .map_err(|source| PoolError::WorkerRead {
+                    job_id: job.id,
+                    source,
+                })?;
+            Some(bytes)
+        };
         if status == 0 {
-            Ok(payload)
+            Ok(WorkerReply {
+                metallib: payload,
+                reflection: reflection.take(),
+            })
         } else {
             Err(PoolError::WorkerFailed {
                 job_id: job.id,
@@ -894,6 +1086,9 @@ fn spawn_child(program: &Path, slot: &WorkerSlot) -> Result<ChildIo, PoolError> 
     if let Some(converter) = converter_from_env() {
         command.arg(CONVERTER_ARG).arg(converter);
     }
+    // Ask for the reflection frame; a worker that predates it ignores the
+    // variable and answers `VMRES`, which `compile` still accepts.
+    command.env(REFLECTION_FRAMES_ENV, "1");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -976,8 +1171,8 @@ fn worker_loop(
             poisoned.remove(&job.seq);
         }
         match outcome {
-            Ok(metallib) => {
-                let _ = job.reply.send(Ok(metallib));
+            Ok(reply) => {
+                let _ = job.reply.send(Ok(reply));
             }
             Err(err) => {
                 // Any IO or protocol failure leaves the pipeline unusable:
@@ -1032,12 +1227,18 @@ impl Drop for GateGuard<'_> {
 
 #[cfg(target_os = "macos")]
 mod cache_bridge {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::CompileJob;
     use crate::macos::cache::{
         Cached, DiskCache, ReflectionPayload, TranslationKey, TranslationOptions,
     };
+
+    /// Suffix of the reflection JSON stored next to the `.vce` entry.
+    const REFLECTION_SIDECAR_SUFFIX: &str = ".reflection.json";
+
+    static REFLECTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     /// Content-hashed disk cache handle.
     pub(super) struct Slot(DiskCache);
@@ -1079,6 +1280,76 @@ mod cache_bridge {
 
         pub(super) fn get(&self, key: &Key) -> Option<Vec<u8>> {
             self.0.get(&key.0).map(|cached| cached.metallib)
+        }
+
+        /// Reads a warm entry that has both the metallib and its reflection.
+        ///
+        /// The converter reflection JSON is stored next to the `.vce` entry as
+        /// `<digest>.reflection.json` (the cache entry format itself is owned
+        /// by [`crate::macos::cache`], whose eval only carries the binary
+        /// [`ReflectionPayload`]). A metallib whose sidecar is missing or
+        /// unreadable is *not* a hit: the caller must re-run the worker rather
+        /// than register a pipeline with no layout.
+        pub(super) fn get_with_reflection(&self, key: &Key) -> Option<(Vec<u8>, Vec<u8>)> {
+            let cached = self.0.get(&key.0)?;
+            let reflection = self.get_reflection(key)?;
+            Some((cached.metallib, reflection))
+        }
+
+        fn reflection_path(&self, key: &Key) -> PathBuf {
+            self.0.dir().join(format!(
+                "{}{}",
+                key.0.digest_hex(),
+                REFLECTION_SIDECAR_SUFFIX
+            ))
+        }
+
+        fn get_reflection(&self, key: &Key) -> Option<Vec<u8>> {
+            let path = self.reflection_path(key);
+            let metadata = std::fs::metadata(&path).ok()?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return None;
+            }
+            if metadata.len() > super::MAX_REFLECTION_OUTPUT_BYTES as u64 {
+                return None;
+            }
+            let bytes = std::fs::read(&path).ok()?;
+            if bytes.is_empty() || bytes.len() > super::MAX_REFLECTION_OUTPUT_BYTES {
+                return None;
+            }
+            Some(bytes)
+        }
+
+        /// Stores the reflection JSON through a same-directory temporary file
+        /// and an atomic rename, so a concurrent reader never sees half a
+        /// document.
+        pub(super) fn put_reflection(&self, key: &Key, reflection: &[u8]) {
+            if reflection.is_empty() || reflection.len() > super::MAX_REFLECTION_OUTPUT_BYTES {
+                tracing::warn!(
+                    entry = key.0.digest_hex(),
+                    bytes = reflection.len(),
+                    "shader pool did not store an out-of-bounds reflection"
+                );
+                return;
+            }
+            let path = self.reflection_path(key);
+            let sequence = REFLECTION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = self.0.dir().join(format!(
+                ".{}.{}.{}.reflection.tmp",
+                key.0.digest_hex(),
+                std::process::id(),
+                sequence
+            ));
+            let written = std::fs::write(&temporary, reflection)
+                .and_then(|()| std::fs::rename(&temporary, &path));
+            if let Err(err) = written {
+                let _ = std::fs::remove_file(&temporary);
+                tracing::warn!(
+                    error = %err,
+                    entry = key.0.digest_hex(),
+                    "shader pool could not store the converter reflection"
+                );
+            }
         }
 
         pub(super) fn put(&self, key: &Key, job: &CompileJob<'_>, metallib: &[u8], version: &str) {
@@ -1135,6 +1406,12 @@ mod cache_bridge {
         pub(super) fn get(&self, _key: &Key) -> Option<Vec<u8>> {
             None
         }
+
+        pub(super) fn get_with_reflection(&self, _key: &Key) -> Option<(Vec<u8>, Vec<u8>)> {
+            None
+        }
+
+        pub(super) fn put_reflection(&self, _key: &Key, _reflection: &[u8]) {}
 
         pub(super) fn put(
             &self,

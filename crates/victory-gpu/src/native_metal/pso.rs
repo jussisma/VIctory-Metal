@@ -12,12 +12,16 @@
 //!
 //! # Pipeline families
 //!
-//! A compute PSO keeps the original version 1 frame: one `ticket + entry` and
-//! the host's `load_metallib` compute path.
+//! A compute PSO with no converter reflection keeps the original version 1
+//! frame: one `ticket + entry` and the host's `load_metallib` compute path. A
+//! compute PSO that has a `VAB1` ABI (the normal case now that the `--stdio`
+//! worker returns reflection) sends the version 2 frame instead, so the host
+//! stores a `PipelineAbi` and the executor uploads the argument buffer that
+//! makes the kernel's root UAV reach the converted MSL.
 //!
 //! A graphics or mesh PSO sends the version 2 frame: one `(stage, ticket,
 //! entry)` per stage, the encoded `PipelineState` (`VPS1`), the encoded
-//! per-stage ABI (`VAB1`) and the raw root-signature bytes. The host reads one
+//! per-stage ABI (`VAB1`) and the root-layout witness bytes. The host reads one
 //! library per stage and creates the pipeline through
 //! `register_content_hashed_graphics_pipeline` / `..._mesh_pipeline`, so the
 //! version 2 path is the same registry the live v3 executor resolves.
@@ -51,7 +55,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use victory_metal::compiler_pool::{CompileJob, CompilerPool, PoolError, PoolStats};
+use victory_metal::compiler_pool::{
+    CompileJob, CompiledShader, CompilerPool, PoolError, PoolStats,
+};
+#[cfg(target_os = "macos")]
+use victory_metal::macos::bindings::RootSignatureLayout;
 
 /// The shader stage a wire pipeline registration names.
 ///
@@ -141,6 +149,9 @@ pub enum PipelineError {
         /// What the pipeline is missing.
         missing: &'static str,
     },
+    /// The converter reflection is missing, malformed or cannot be turned into
+    /// a `VAB1` ABI. A PSO is never registered with a silently empty layout.
+    Reflection(String),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -168,6 +179,7 @@ impl std::fmt::Display for PipelineError {
                     PipelineStage::Compute => "compute",
                 }
             ),
+            Self::Reflection(why) => write!(f, "converter reflection: {why}"),
         }
     }
 }
@@ -197,6 +209,8 @@ pub const WIRE_STAGE_VERTEX: u8 = 0;
 pub const WIRE_STAGE_PIXEL: u8 = 1;
 /// Wire stage code for a mesh shader.
 pub const WIRE_STAGE_MESH: u8 = 2;
+/// Wire stage code for a compute shader.
+pub const WIRE_STAGE_COMPUTE: u8 = crate::native_metal::client::PIPELINE_STAGE_COMPUTE;
 
 /// Encodes a graphics `PipelineState` (`VPS1`) for the stage set.
 ///
@@ -466,20 +480,23 @@ pub fn pool_worker_jobs() -> Vec<u64> {
     pool().worker_job_counts()
 }
 
-/// Translates one stage's DXIL to a metallib, reporting whether the cache or a
-/// worker served it.
-pub fn translate(program: &StageProgram) -> Result<(Vec<u8>, PoolServing), PipelineError> {
-    let before = pool().stats();
-    let job = CompileJob {
-        id: job_id(program),
-        stage: program.stage.converter_stage(),
-        entry: &program.entry,
-        dxil: &program.dxil,
-    };
-    let metallib = pool().compile(&job).map_err(|error| match error {
+/// Maps a pool failure onto the PSO path's explicit error vocabulary.
+fn translate_error(error: PoolError) -> PipelineError {
+    match error {
         PoolError::NoWorkerProgram => PipelineError::ConverterUnavailable(error.to_string()),
         other => PipelineError::Translation(other.to_string()),
-    })?;
+    }
+}
+
+/// Translates one stage's DXIL to a metallib, reporting whether the cache or a
+/// worker served it.
+///
+/// This is the metallib-only API; a pipeline that needs root bindings uses
+/// [`translate_with_reflection`].
+pub fn translate(program: &StageProgram) -> Result<(Vec<u8>, PoolServing), PipelineError> {
+    let before = pool().stats();
+    let job = compile_job(program);
+    let metallib = pool().compile(&job).map_err(translate_error)?;
     let after = pool().stats();
     Ok((
         metallib,
@@ -487,6 +504,40 @@ pub fn translate(program: &StageProgram) -> Result<(Vec<u8>, PoolServing), Pipel
             warm: after.cache_hits > before.cache_hits,
         },
     ))
+}
+
+/// Translates one stage and returns the converter reflection JSON with the
+/// metallib.
+///
+/// The reflection is what [`encode_abi`] turns into the per-stage `VAB1`
+/// container the host parses with
+/// [`victory_metal::macos::bindings::RootSignatureLayout`]. A worker that
+/// cannot provide it is an explicit [`PipelineError::Translation`], never a
+/// pipeline registered with an empty ABI.
+pub fn translate_with_reflection(
+    program: &StageProgram,
+) -> Result<(CompiledShader, PoolServing), PipelineError> {
+    let before = pool().stats();
+    let job = compile_job(program);
+    let compiled = pool()
+        .compile_with_reflection(&job)
+        .map_err(translate_error)?;
+    let after = pool().stats();
+    Ok((
+        compiled,
+        PoolServing {
+            warm: after.cache_hits > before.cache_hits,
+        },
+    ))
+}
+
+fn compile_job(program: &StageProgram) -> CompileJob<'_> {
+    CompileJob {
+        id: job_id(program),
+        stage: program.stage.converter_stage(),
+        entry: &program.entry,
+        dxil: &program.dxil,
+    }
 }
 
 /// The pool job id: the DXIL length and stage, stable for one program and
@@ -511,103 +562,203 @@ pub fn register(programs: &[StageProgram]) -> Result<(u64, PoolServing), Pipelin
 }
 
 /// [`register`] with explicit state/ABI/root-signature bytes.
+///
+/// Each stage is translated with reflection. When the caller supplies no ABI,
+/// the reflections are parsed with
+/// [`RootSignatureLayout::from_converter_reflection_json`] and encoded into the
+/// `VAB1` container, so a compute kernel's UAV/CBV/SRV root entries and a
+/// graphics/mesh pipeline's root entries reach the host automatically. A
+/// reflection that does not parse fails the whole registration; it is never
+/// dropped into an empty ABI.
 #[cfg(any(windows, test))]
 pub fn register_with_details(
     programs: &[StageProgram],
     details: &PipelineDetails<'_>,
 ) -> Result<(u64, PoolServing), PipelineError> {
     let mut warm = true;
-    let mut translated: Vec<(PipelineStage, Vec<u8>, &str)> = Vec::with_capacity(programs.len());
+    let mut translated: Vec<(PipelineStage, CompiledShader, &str)> =
+        Vec::with_capacity(programs.len());
     for program in programs {
-        let (metallib, serving) = translate(program)?;
+        let (compiled, serving) = translate_with_reflection(program)?;
         warm &= serving.warm;
-        translated.push((program.stage, metallib, &program.entry));
+        translated.push((program.stage, compiled, &program.entry));
     }
+
+    let reflections: Vec<(u8, &str)> = translated
+        .iter()
+        .map(|(stage, compiled, _)| {
+            std::str::from_utf8(&compiled.reflection)
+                .map(|json| (stage.wire_code(), json))
+                .map_err(|_| {
+                    PipelineError::Reflection(format!(
+                        "{stage:?}: converter reflection is not UTF-8"
+                    ))
+                })
+        })
+        .collect::<Result<_, PipelineError>>()?;
+    // Parse every reflection before anything is written: an unusable layout is
+    // an explicit failure, not a pipeline with auto-binding silently disabled.
+    //
+    // The Win64 guest build has no `macos` module (and cannot reach a
+    // converter), so it cannot parse here; the host's `VAB1` decoder is then
+    // the validator and refuses the registration explicitly.
+    #[cfg(target_os = "macos")]
+    for (stage, json) in &reflections {
+        RootSignatureLayout::from_converter_reflection_json(json)
+            .map_err(|error| PipelineError::Reflection(format!("stage {stage}: {error}")))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    for (stage, json) in &reflections {
+        if json.trim().is_empty() {
+            return Err(PipelineError::Reflection(format!(
+                "stage {stage}: empty reflection JSON"
+            )));
+        }
+    }
+
+    let derived_abi;
+    let derived_layout_witness;
+    let (abi, root_signature) = if details.abi.is_empty()
+        && details.root_signature.is_empty()
+        && !reflections.is_empty()
+    {
+        derived_abi = encode_abi(&reflections);
+        derived_layout_witness = reflection_layout_witness(&reflections)?;
+        (derived_abi.as_slice(), derived_layout_witness.as_slice())
+    } else {
+        (details.abi, details.root_signature)
+    };
+
     let stages: Vec<(PipelineStage, &[u8], &str)> = translated
         .iter()
-        .map(|(stage, metallib, entry)| (*stage, metallib.as_slice(), *entry))
+        .map(|(stage, compiled, entry)| (*stage, compiled.metallib.as_slice(), *entry))
         .collect();
-    let id = register_translated(&stages, details)?;
+    let translated_details = PipelineDetails {
+        state: details.state,
+        abi,
+        root_signature,
+    };
+    let id = register_translated(&stages, &translated_details)?;
     Ok((id, PoolServing { warm }))
+}
+
+/// The non-empty bytes the version 2 frame carries next to a `VAB1` ABI.
+///
+/// The host requires a non-empty `root_signature` field whenever the ABI is
+/// non-empty, but it only validates the field's length: the registry binds
+/// from the parsed reflection, never from these bytes. The converter consumed
+/// the root signature embedded in the DXIL, and the reflection JSON is its
+/// flattened description, so that document is the honest witness when the
+/// caller supplied no raw root-signature blob of its own.
+fn reflection_layout_witness(reflections: &[(u8, &str)]) -> Result<Vec<u8>, PipelineError> {
+    let (stage, json) = reflections.first().ok_or_else(|| {
+        PipelineError::Reflection("no stage reflection to witness a root layout".to_string())
+    })?;
+    if json.is_empty() {
+        return Err(PipelineError::Reflection(format!(
+            "stage {stage}: empty reflection JSON"
+        )));
+    }
+    if json.len() > crate::native_metal::client::MAX_ROOT_SIGNATURE_BYTES {
+        return Err(PipelineError::Reflection(format!(
+            "stage {stage}: reflection JSON is {} bytes, over the host's {}-byte root-signature \
+             field",
+            json.len(),
+            crate::native_metal::client::MAX_ROOT_SIGNATURE_BYTES
+        )));
+    }
+    Ok(json.as_bytes().to_vec())
 }
 
 /// Registers already-translated stages (one metallib per stage).
 ///
-/// This is the seam tests and callers with a prebuilt library use: a compute
-/// stage keeps the v1 frame; graphics/mesh stages send the version 2 frame.
-/// The stage set is validated before anything is written, so an incomplete
-/// pipeline is an explicit [`PipelineError::HostCannotRegister`] naming the
-/// failing stage.
+/// This is the seam tests and callers with a prebuilt library use. A compute
+/// stage with no ABI keeps the v1 `ticket + entry` frame; a compute stage with
+/// a `VAB1` ABI, and every graphics/mesh stage, sends the version 2 frame that
+/// carries the state, ABI and root-layout witness. The stage set and the
+/// ABI/root pair are validated before anything is written, so an incomplete
+/// pipeline or a layout that cannot bind is an explicit error naming the
+/// failing part.
 #[cfg(any(windows, test))]
 pub fn register_translated(
     stages: &[(PipelineStage, &[u8], &str)],
     details: &PipelineDetails<'_>,
 ) -> Result<u64, PipelineError> {
     let stage_names: Vec<PipelineStage> = stages.iter().map(|(stage, _, _)| *stage).collect();
-    match pipeline_kind(&stage_names)? {
-        PipelineKind::Compute => {
-            let (_, metallib, entry) = stages[0];
-            crate::native_metal::queue::register_pipeline(metallib, entry).map_err(|error| {
-                match error {
-                    crate::native_metal::queue::NativeQueueError::Refused(why) => {
-                        PipelineError::Refused(why)
-                    }
-                    other => PipelineError::Transport(other.to_string()),
-                }
-            })
-        }
-        kind => {
-            for (stage, metallib, _) in stages {
-                if metallib.is_empty() {
-                    return Err(PipelineError::Refused(format!(
-                        "the {stage:?} stage has no metallib"
-                    )));
-                }
-            }
-            let wire: Vec<crate::native_metal::queue::PipelineStageLibrary<'_>> = stages
-                .iter()
-                .map(|(stage, metallib, entry)| crate::native_metal::queue::PipelineStageLibrary {
-                    stage: stage.wire_code(),
-                    metallib,
-                    entry,
-                })
-                .collect();
-            let pixel_entry = stages
-                .iter()
-                .find(|(stage, _, _)| *stage == PipelineStage::Pixel)
-                .map(|(_, _, entry)| *entry)
-                .unwrap_or_default();
-            let kind_code = match kind {
-                PipelineKind::Graphics => crate::native_metal::client::PIPELINE_KIND_GRAPHICS,
-                PipelineKind::Mesh => crate::native_metal::client::PIPELINE_KIND_MESH,
-                PipelineKind::Compute => unreachable!("compute returned above"),
-            };
-            let state_storage;
-            let state = if !details.state.is_empty() {
-                details.state
-            } else {
-                state_storage = if kind == PipelineKind::Mesh {
-                    encode_mesh_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
-                } else {
-                    encode_graphics_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
-                };
-                &state_storage
-            };
-            crate::native_metal::queue::register_pipeline_v2(
-                kind_code,
-                &wire,
-                state,
-                details.abi,
-                details.root_signature,
-            )
-            .map_err(|error| match error {
+    let kind = pipeline_kind(&stage_names)?;
+    if !details.abi.is_empty() && details.root_signature.is_empty() {
+        return Err(PipelineError::Reflection(
+            "a non-empty VAB1 ABI needs the root-layout witness bytes the version 2 frame \
+             carries"
+                .to_string(),
+        ));
+    }
+    if kind == PipelineKind::Compute && details.abi.is_empty() {
+        // No reflection was available: keep the original v1 frame. The host
+        // binds nothing for this pipeline, which is exactly the old behaviour.
+        let (_, metallib, entry) = stages[0];
+        return crate::native_metal::queue::register_pipeline(metallib, entry).map_err(|error| {
+            match error {
                 crate::native_metal::queue::NativeQueueError::Refused(why) => {
                     PipelineError::Refused(why)
                 }
                 other => PipelineError::Transport(other.to_string()),
-            })
+            }
+        });
+    }
+    for (stage, metallib, _) in stages {
+        if metallib.is_empty() {
+            return Err(PipelineError::Refused(format!(
+                "the {stage:?} stage has no metallib"
+            )));
         }
     }
+    let wire: Vec<crate::native_metal::queue::PipelineStageLibrary<'_>> = stages
+        .iter()
+        .map(|(stage, metallib, entry)| crate::native_metal::queue::PipelineStageLibrary {
+            stage: stage.wire_code(),
+            metallib,
+            entry,
+        })
+        .collect();
+    let pixel_entry = stages
+        .iter()
+        .find(|(stage, _, _)| *stage == PipelineStage::Pixel)
+        .map(|(_, _, entry)| *entry)
+        .unwrap_or_default();
+    let kind_code = match kind {
+        PipelineKind::Graphics => crate::native_metal::client::PIPELINE_KIND_GRAPHICS,
+        PipelineKind::Mesh => crate::native_metal::client::PIPELINE_KIND_MESH,
+        PipelineKind::Compute => crate::native_metal::client::PIPELINE_KIND_COMPUTE,
+    };
+    let state_storage: Vec<u8>;
+    let state: &[u8] = if !details.state.is_empty() {
+        details.state
+    } else if kind == PipelineKind::Compute {
+        // A compute `PipelineState` carries no colour/depth shape; the host
+        // accepts an empty state for a compute pipeline.
+        &[]
+    } else {
+        state_storage = if kind == PipelineKind::Mesh {
+            encode_mesh_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+        } else {
+            encode_graphics_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+        };
+        &state_storage
+    };
+    crate::native_metal::queue::register_pipeline_v2(
+        kind_code,
+        &wire,
+        state,
+        details.abi,
+        details.root_signature,
+    )
+    .map_err(|error| match error {
+        crate::native_metal::queue::NativeQueueError::Refused(why) => {
+            PipelineError::Refused(why)
+        }
+        other => PipelineError::Transport(other.to_string()),
+    })
 }
 
 /// The native pipeline family a stage set describes.
@@ -714,6 +865,55 @@ mod tests {
         assert_eq!(abi[4], 1);
         assert_eq!(abi[5], 1);
         assert_eq!(abi[6], WIRE_STAGE_VERTEX);
+    }
+
+    const COMPUTE_REFLECTION_WITH_UAV: &str = r#"{"EntryPoint":"main","ShaderType":"Compute","TopLevelArgumentBuffer":[{"EltOffset":0,"Name":"","Size":8,"Slot":0,"Space":0,"Type":"UAV"}]}"#;
+
+    /// The compute ABI entry the guest sends is the converter's own
+    /// `TopLevelArgumentBuffer` field: offset 0, size 8, slot 0, kind UAV.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_compute_reflection_parses_into_the_uav_the_executor_binds() {
+        let layout =
+            RootSignatureLayout::from_converter_reflection_json(COMPUTE_REFLECTION_WITH_UAV)
+                .expect("the converter reflection parses");
+        assert_eq!(layout.parameters().len(), 1);
+        let parameter = &layout.parameters()[0];
+        assert_eq!(parameter.argument_offset(), 0);
+        assert_eq!(parameter.size(), 8);
+        assert_eq!(parameter.register(), 0);
+        let abi = encode_abi(&[(
+            crate::native_metal::client::PIPELINE_STAGE_COMPUTE,
+            COMPUTE_REFLECTION_WITH_UAV,
+        )]);
+        assert_eq!(&abi[..4], b"VAB1");
+        assert_eq!(abi[5], 1);
+        assert!(
+            abi.windows(COMPUTE_REFLECTION_WITH_UAV.len())
+                .any(|window| window == COMPUTE_REFLECTION_WITH_UAV.as_bytes()),
+            "the container carries the reflection verbatim"
+        );
+    }
+
+    /// A compute ABI with no root-layout witness would be refused by the host;
+    /// the guest rejects it before writing a metallib or sending a frame.
+    #[test]
+    fn a_compute_abi_without_a_root_witness_is_refused() {
+        let abi = encode_abi(&[(
+            crate::native_metal::client::PIPELINE_STAGE_COMPUTE,
+            COMPUTE_REFLECTION_WITH_UAV,
+        )]);
+        let details = PipelineDetails {
+            state: b"",
+            abi: &abi,
+            root_signature: b"",
+        };
+        match register_translated(&[(PipelineStage::Compute, b"MTLB compute", "main")], &details) {
+            Err(PipelineError::Reflection(why)) => {
+                assert!(why.contains("root-layout witness"), "{why}");
+            }
+            other => panic!("an unwitnessed ABI must be refused, saw {other:?}"),
+        }
     }
 
     #[test]

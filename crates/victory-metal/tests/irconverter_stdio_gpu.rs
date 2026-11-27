@@ -539,6 +539,10 @@ struct Response {
     id: u64,
     status: u32,
     payload: Vec<u8>,
+    /// Converter reflection JSON from a `VMRES2` answer (empty for `VMRES`).
+    reflection: Vec<u8>,
+    /// Whether the worker answered `VMRES2` rather than the original `VMRES`.
+    reflection_frame: bool,
 }
 
 /// A direct `victory-irconverter --stdio` child with a kill watchdog.
@@ -551,7 +555,18 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// The pool's view of a worker: the reflection frame is requested.
     fn start(extra: &[&OsStr]) -> Self {
+        Self::start_frames(extra, true)
+    }
+
+    /// A direct driver that predates the reflection frame: no env switch, so
+    /// it keeps receiving the original `VMRES`.
+    fn start_legacy(extra: &[&OsStr]) -> Self {
+        Self::start_frames(extra, false)
+    }
+
+    fn start_frames(extra: &[&OsStr], reflection_frames: bool) -> Self {
         let mut command = Command::new(worker_path());
         command
             .arg("--stdio")
@@ -560,6 +575,9 @@ impl Daemon {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if reflection_frames {
+            command.env("VICTORY_IRCONVERTER_STDIO_REFLECTION", "1");
+        }
         for arg in extra {
             command.arg(arg);
         }
@@ -617,23 +635,46 @@ impl Daemon {
         assert_ne!(read, 0, "daemon exited before answering");
         let text = std::str::from_utf8(&line).expect("UTF-8 response header");
         let fields: Vec<&str> = text.split_ascii_whitespace().collect();
-        assert_eq!(
-            fields.len(),
-            5,
-            "response header is `VMRES <seq> <id> <status> <len>`: {text:?}"
-        );
-        assert_eq!(fields[0], "VMRES");
+        let (payload_len, reflection_len, reflection_frame) = match fields.first().copied() {
+            Some("VMRES") => {
+                assert_eq!(
+                    fields.len(),
+                    5,
+                    "response header is `VMRES <seq> <id> <status> <len>`: {text:?}"
+                );
+                (fields[4].parse().expect("payload length"), 0usize, false)
+            }
+            Some("VMRES2") => {
+                assert_eq!(
+                    fields.len(),
+                    6,
+                    "response header is `VMRES2 <seq> <id> <status> <metallib-len> \
+                     <reflection-len>`: {text:?}"
+                );
+                (
+                    fields[4].parse().expect("metallib length"),
+                    fields[5].parse().expect("reflection length"),
+                    true,
+                )
+            }
+            other => panic!("unexpected response magic {other:?} in {text:?}"),
+        };
         let seq = fields[1].parse().expect("seq");
         let id = fields[2].parse().expect("id");
         let status = fields[3].parse().expect("status");
-        let len: usize = fields[4].parse().expect("payload length");
-        let mut payload = vec![0u8; len];
+        let mut payload = vec![0u8; payload_len];
         self.stdout.read_exact(&mut payload).expect("read payload");
+        let mut reflection = vec![0u8; reflection_len];
+        self.stdout
+            .read_exact(&mut reflection)
+            .expect("read reflection");
         Response {
             seq,
             id,
             status,
             payload,
+            reflection,
+            reflection_frame,
         }
     }
 
@@ -689,6 +730,10 @@ fn stdio_protocol_streams_four_stages_and_survives_bad_headers() {
     );
     assert_ne!(bad.status, 0, "malformed header must be rejected");
     assert!(!bad.payload.is_empty(), "error carries a diagnostic");
+    assert!(
+        bad.reflection.is_empty(),
+        "a failed frame carries no reflection"
+    );
 
     // One long-lived worker, four stages back to back, distinct sequences.
     let mut payloads = Vec::new();
@@ -700,6 +745,20 @@ fn stdio_protocol_streams_four_stages_and_survives_bad_headers() {
         assert_eq!((response.seq, response.id), (seq, id), "{label}: id echo");
         assert_eq!(response.status, 0, "{label}: {:?}", response.payload);
         assert_looks_like_metallib(&response.payload, label);
+        assert!(
+            response.reflection_frame,
+            "{label}: the pool's env switch must select VMRES2"
+        );
+        assert!(
+            !response.reflection.is_empty(),
+            "{label}: VMRES2 must carry the converter reflection"
+        );
+        let json = std::str::from_utf8(&response.reflection)
+            .unwrap_or_else(|err| panic!("{label}: reflection is not UTF-8: {err}"));
+        assert!(
+            json.contains("\"TopLevelArgumentBuffer\""),
+            "{label}: reflection has no root layout: {json}"
+        );
         payloads.push(response.payload);
     }
     for (left, right) in payloads.iter().zip(payloads.iter().skip(1)) {
@@ -708,6 +767,33 @@ fn stdio_protocol_streams_four_stages_and_survives_bad_headers() {
 
     let status = daemon.finish();
     assert!(status.success(), "clean stdin EOF must exit 0: {status}");
+}
+
+/// A caller that predates the reflection channel keeps the original `VMRES`
+/// frame: the request frame is unchanged and only the pool's environment
+/// switch selects `VMRES2`. This is the shape the live gate's own DXIL stage
+/// driver reads.
+#[test]
+fn a_legacy_caller_still_gets_the_v1_frame() {
+    let mut daemon = Daemon::start_legacy(&[]);
+    let (stage, label, dxil) = fixtures()
+        .into_iter()
+        .find(|(stage, _, _)| *stage == CS_STAGE)
+        .expect("the compute fixture");
+    daemon.send(7, 8, stage, "main", &dxil);
+    let response = daemon.recv();
+    assert_eq!((response.seq, response.id), (7, 8));
+    assert_eq!(response.status, 0, "{label}: {:?}", response.payload);
+    assert_looks_like_metallib(&response.payload, label);
+    assert!(
+        !response.reflection_frame,
+        "an unswitched caller must receive VMRES"
+    );
+    assert!(
+        response.reflection.is_empty(),
+        "VMRES carries no reflection payload"
+    );
+    assert!(daemon.finish().success(), "clean EOF");
 }
 
 /// All four stages are actually translated (status 0 MTLB), and the reflection
@@ -724,6 +810,23 @@ fn stdio_reflection_reports_each_converted_stage() {
         let response = daemon.recv();
         assert_eq!(response.status, 0, "{label}: {:?}", response.payload);
         assert_looks_like_metallib(&response.payload, label);
+        let json = std::str::from_utf8(&response.reflection)
+            .unwrap_or_else(|err| panic!("{label}: reflection is not UTF-8: {err}"));
+        let expected = match stage {
+            VS_STAGE => "Vertex",
+            PS_STAGE => "Fragment",
+            MS_STAGE => "Mesh",
+            CS_STAGE => "Compute",
+            other => panic!("unexpected stage {other}"),
+        };
+        assert!(
+            json.contains(&format!("\"ShaderType\":\"{expected}\"")),
+            "{label}: reflection does not report {expected}: {json}"
+        );
+        assert!(
+            json.contains("\"EntryPoint\":\"main\""),
+            "{label}: reflection does not name the entry: {json}"
+        );
 
         let path = dir.path().join(format!("{seq}-{id}.reflection"));
         let bytes = std::fs::read(&path)
@@ -745,6 +848,192 @@ fn stdio_reflection_reports_each_converted_stage() {
 
     let status = daemon.finish();
     assert!(status.success(), "{status}");
+}
+
+/// The pool's reflection API: a cold job returns a non-empty, parseable
+/// converter reflection; a warm cache hit returns the identical metallib *and*
+/// reflection without waking a worker; a fresh pool over the same cache does
+/// the same.
+#[test]
+fn pool_returns_reflection_and_a_warm_hit_repeats_it() {
+    let _env = EnvGuard::set("VICTORY_METAL_IRCONVERTER", &converter_path());
+    let dir = TempDir::new("reflection-pool");
+    let cache = dir.path().join("cache");
+    let config = PoolConfig {
+        workers: 1,
+        queue_depth: 4,
+        job_timeout: Duration::from_secs(60),
+        cache_dir: Some(cache),
+        converter_version: "victory-metal-test/stdio-reflection/1".to_string(),
+    };
+    let dxil = unhex(CS_DXIL_HEX);
+    let job = CompileJob {
+        id: 1,
+        stage: CS_STAGE,
+        entry: "main",
+        dxil: &dxil,
+    };
+
+    let pool = CompilerPool::new(config.clone(), Some(worker_path()));
+    let started = Instant::now();
+    let cold = pool
+        .compile_with_reflection(&job)
+        .expect("a cold job must return reflection");
+    let cold_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    assert_looks_like_metallib(&cold.metallib, "cold reflection job");
+    assert!(
+        !cold.reflection.is_empty(),
+        "a successful translation must carry reflection"
+    );
+    let json = std::str::from_utf8(&cold.reflection).expect("reflection is UTF-8 JSON");
+    assert!(
+        json.contains("\"ShaderType\":\"Compute\""),
+        "reflection does not report the compute stage: {json}"
+    );
+    let layout = victory_metal::macos::bindings::RootSignatureLayout::from_converter_reflection_json(
+        json,
+    )
+    .expect("the reflection parses into a root-signature layout");
+    assert_eq!(layout.entry_point(), "main");
+    assert_eq!(layout.stage(), victory_metal::macos::bindings::ReflectedStage::Compute);
+    // The compute fixture's root UAV is the argument-buffer entry the host
+    // binds: one UAV field at offset 0. This is the entry the guest sends in
+    // `VAB1`, not a fabricated offset.
+    assert_eq!(layout.parameters().len(), 1);
+    let parameter = &layout.parameters()[0];
+    assert_eq!(
+        parameter.kind(),
+        victory_metal::macos::bindings::RootParameterKind::UnorderedAccessView
+    );
+    assert_eq!(parameter.argument_offset(), 0);
+    assert_eq!(parameter.register(), 0);
+
+    let started = Instant::now();
+    let warm = pool
+        .compile_with_reflection(&job)
+        .expect("a warm hit must return the same reflection");
+    let warm_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    println!(
+        "reflection throughput: cold {:.3} ms (metallib {} bytes, reflection {} bytes), warm \
+         {:.3} ms; cache speedup {:.1}x",
+        cold_micros as f64 / 1000.0,
+        cold.metallib.len(),
+        cold.reflection.len(),
+        warm_micros as f64 / 1000.0,
+        cold_micros as f64 / warm_micros.max(1) as f64,
+    );
+    assert_eq!(warm.metallib, cold.metallib, "warm metallib");
+    assert_eq!(warm.reflection, cold.reflection, "warm reflection");
+    let stats = pool.stats();
+    assert_eq!(stats.cache_hits, 1, "the second call is a warm hit");
+    assert_eq!(stats.worker_jobs, 1, "a warm hit must not wake a worker");
+
+    // Distinct jobs on the already-warm worker give the steady-state cost of
+    // carrying reflection through the frame (no process start, no cache hit).
+    // The trailing bytes change the content key, not the kernel.
+    let mut steady = Vec::new();
+    for extra in 0..8u8 {
+        let mut dxil = dxil.clone();
+        dxil.push(extra);
+        let job = CompileJob {
+            id: u64::from(extra) + 2,
+            stage: CS_STAGE,
+            entry: "main",
+            dxil: &dxil,
+        };
+        let started = Instant::now();
+        let compiled = pool
+            .compile_with_reflection(&job)
+            .expect("a warm-worker job returns reflection");
+        steady.push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        assert!(!compiled.reflection.is_empty());
+        assert_looks_like_metallib(&compiled.metallib, "steady reflection job");
+    }
+    let steady_total: u64 = steady.iter().sum();
+    println!(
+        "reflection steady state on a warm worker: {} jobs, {:.3} ms/job average, {:.3} ms max \
+         (reflection {} bytes)",
+        8,
+        steady_total as f64 / 8.0 / 1000.0,
+        steady.iter().copied().max().unwrap_or(0) as f64 / 1000.0,
+        cold.reflection.len()
+    );
+
+    // A fresh pool over the same cache serves both halves from disk.
+    let fresh = CompilerPool::new(config, Some(worker_path()));
+    let fresh_warm = fresh
+        .compile_with_reflection(&job)
+        .expect("a fresh pool reads the cached reflection");
+    assert_eq!(fresh_warm.metallib, cold.metallib);
+    assert_eq!(fresh_warm.reflection, cold.reflection);
+    let fresh_stats = fresh.stats();
+    assert_eq!(fresh_stats.cache_hits, 1);
+    assert_eq!(
+        fresh_stats.worker_starts, 0,
+        "a fresh warm pool never starts a worker"
+    );
+}
+
+/// A worker that answers the original `VMRES` frame keeps serving
+/// [`CompilerPool::compile`], but [`CompilerPool::compile_with_reflection`]
+/// rejects it explicitly: the pool never invents a layout for a pipeline.
+#[test]
+fn a_v1_worker_is_accepted_for_metallib_only_and_rejected_for_reflection() {
+    let dir = TempDir::new("old-frame");
+    let script = dir.path().join("v1-fixture.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+set -u
+[ "${1:-}" = "--stdio" ] || exit 21
+while IFS=' ' read -r magic seq id stage entry_len dxil_len; do
+    [ "$magic" = "VMJOB" ] || exit 23
+    dd bs=1 count="$((entry_len + dxil_len))" of=/dev/null 2>/dev/null
+    printf 'VMRES %s %s 0 14\n' "$seq" "$id"
+    printf 'MTLB old frame'
+done
+"#,
+    )
+    .expect("write fixture");
+    let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).expect("chmod");
+
+    let pool = CompilerPool::new(
+        PoolConfig {
+            workers: 1,
+            queue_depth: 2,
+            job_timeout: Duration::from_secs(5),
+            cache_dir: None,
+            converter_version: "victory-metal-test/stdio-old-frame/1".to_string(),
+        },
+        Some(script),
+    );
+    let job = CompileJob {
+        id: 1,
+        stage: CS_STAGE,
+        entry: "main",
+        dxil: b"dxil",
+    };
+    assert_eq!(
+        pool.compile(&job).expect("a v1 frame serves the metallib API"),
+        b"MTLB old frame"
+    );
+    let error = pool
+        .compile_with_reflection(&job)
+        .expect_err("a v1 frame has no reflection");
+    match error {
+        PoolError::Protocol { detail, .. } => {
+            assert!(detail.contains("VMRES"), "unexpected detail: {detail}");
+            assert!(detail.contains("reflection"), "unexpected detail: {detail}");
+        }
+        other => panic!("expected Protocol, saw {other:?}"),
+    }
+    // The pool stays usable: the failure reaps and respawns the worker.
+    assert_eq!(
+        pool.compile(&job).expect("the pool is still usable"),
+        b"MTLB old frame"
+    );
 }
 
 /// Four stages on four concurrent pool workers: one long-lived `--stdio`
