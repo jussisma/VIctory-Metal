@@ -8,6 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
+use crate::native_metal::abi_trace;
 use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(any(windows, test, target_os = "macos"))]
 use crate::native_metal::telemetry::{self, call_names};
@@ -473,8 +474,17 @@ fn increment(kind: u32) -> Option<u32> {
 }
 
 /// Device method.
-pub(crate) extern "system" fn increment_size(_: This, kind: u32) -> u32 {
-    increment(kind).unwrap_or(0)
+pub(crate) extern "system" fn increment_size(this: This, kind: u32) -> u32 {
+    let size = increment(kind).unwrap_or(0);
+    // The vtable passes the device; the engine's own layout helpers pass null,
+    // so only the guest's query is traced (one line per query).
+    if !this.is_null() {
+        abi_trace::record(
+            abi_trace::calls::GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE,
+            &[u64::from(kind), u64::from(size)],
+        );
+    }
+    size
 }
 
 /// What our render target views hold: the resource and the view
@@ -1050,7 +1060,8 @@ pub(crate) extern "system" fn create_heap(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let result = create_heap_impl(this, desc_ptr, iid, out);
+    let mut facts = HeapFacts::default();
+    let result = create_heap_impl(this, desc_ptr, iid, out, &mut facts);
     #[cfg(any(windows, test, target_os = "macos"))]
     {
         // SAFETY: read only to name the failing arguments; null is tolerated.
@@ -1076,7 +1087,41 @@ pub(crate) extern "system" fn create_heap(
             );
         }
     }
+    // One line per guest query. The engine's own helpers pass a null device,
+    // so a heap made for the runtime is not reported as a title query.
+    if !this.is_null() {
+        // SAFETY: read only for the numeric description; null is tolerated.
+        let (kind, count, flags) = unsafe { desc_ptr.as_ref() }
+            .map(|desc| {
+                (
+                    u64::from(desc.kind),
+                    u64::from(desc.count),
+                    u64::from(desc.flags),
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        abi_trace::record(
+            abi_trace::calls::CREATE_DESCRIPTOR_HEAP,
+            &[
+                kind,
+                count,
+                flags,
+                u64::from(facts.start as u32),
+                facts.start >> 32,
+                facts.source,
+            ],
+        );
+    }
     result
+}
+
+/// What one heap creation handed back, for the ABI trace: the first
+/// descriptor and the backing class (`0` host, `1` title allocator, `2`
+/// placement).
+#[derive(Default)]
+struct HeapFacts {
+    start: u64,
+    source: u64,
 }
 
 fn create_heap_impl(
@@ -1084,13 +1129,19 @@ fn create_heap_impl(
     desc_ptr: *const HeapDesc,
     iid: *const Iid,
     out: *mut This,
+    facts: &mut HeapFacts,
 ) -> HRESULT {
     // SAFETY: the title passes a description (null is tolerated).
     let Some(&desc) = (unsafe { desc_ptr.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let Some(size) = increment(desc.kind).map(|i| u64::from(i) * u64::from(desc.count.max(1)))
-    else {
+    // D3D12's contract is at least one descriptor per heap: the host reference
+    // returns E_INVALIDARG for zero, so the console path does too instead of
+    // quietly allocating a one-slot heap.
+    if desc.count == 0 {
+        return E_INVALIDARG;
+    }
+    let Some(size) = increment(desc.kind).map(|i| u64::from(i) * u64::from(desc.count)) else {
         return E_INVALIDARG;
     };
     // SAFETY: read only as a hint: a title that passes the plain
@@ -1101,6 +1152,15 @@ fn create_heap_impl(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
+    // The class the heap's memory comes from. On a failure this is the class
+    // the path would have used, so the trace still names the branch.
+    facts.source = if placed {
+        2
+    } else if crate::resource::allocator_installed() {
+        1
+    } else {
+        0
+    };
     let (start, memory) = if placed {
         if placement.address.checked_add(size).is_none() {
             return E_INVALIDARG;
@@ -1112,6 +1172,18 @@ fn create_heap_impl(
             Err(hr) => return hr,
         }
     };
+    facts.start = start;
+    // The real backing: an installed allocator may refuse, in which case the
+    // heap is on host memory after all.
+    if memory.is_some() {
+        facts.source = if placed {
+            2
+        } else if memory.as_ref().is_some_and(Memory::from_title_allocator) {
+            1
+        } else {
+            0
+        };
+    }
     // One bounded line per heap: what it is and where its memory came from
     // (a placement's memory is the title's own; never its bytes).
     let source = if placed || memory.as_ref().is_some_and(Memory::from_title_allocator) {
@@ -1184,18 +1256,34 @@ fn start_checked(this: This, name: &'static str) -> u64 {
     let _ = name;
     // A heap whose memory exists always has a real start: a lost address is
     // repaired from the memory itself (and recorded above).
-    match heap.memory.as_ref().map(Memory::address) {
+    let start = match heap.memory.as_ref().map(Memory::address) {
         Some(address) if start == 0 => address,
         _ => start,
-    }
+    };
+    // One line per guest query: the handle's two 32-bit halves and the kind.
+    abi_trace::record(
+        name,
+        &[
+            u64::from(start as u32),
+            start >> 32,
+            u64::from(heap.desc.kind),
+        ],
+    );
+    start
 }
 
 extern "system" fn cpu_start(this: This) -> u64 {
-    start_checked(this, call_names::GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START)
+    start_checked(
+        this,
+        abi_trace::calls::GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START,
+    )
 }
 
 extern "system" fn gpu_start(this: This) -> u64 {
-    start_checked(this, call_names::GET_GPU_DESCRIPTOR_HANDLE_FOR_HEAP_START)
+    start_checked(
+        this,
+        abi_trace::calls::GET_GPU_DESCRIPTOR_HANDLE_FOR_HEAP_START,
+    )
 }
 
 /// IUnknown 3, object 4, device child 1, heap 3.
@@ -1344,6 +1432,124 @@ pub(crate) mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// The host reference refuses a heap of zero descriptors with
+    /// `E_INVALIDARG`; the console path used to make a one-slot heap instead.
+    #[test]
+    fn a_zero_count_heap_is_refused_like_the_host_reference() {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 0,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), E_INVALIDARG);
+        assert!(h.is_null(), "no heap is handed out");
+    }
+
+    /// One bounded row per guest query, in the documented order:
+    /// `[kind, count, flags, start_lo, start_hi, source]` for the heap and
+    /// `[start_lo, start_hi, kind]` for each handle query. The guest passes
+    /// the device; the engine's own helpers pass null and are not traced.
+    #[test]
+    fn the_heap_queries_record_one_row_each() {
+        let _serial = abi_trace::test_serial();
+        let device = crate::device::device();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        abi_trace::begin_test_trace();
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create_heap(device, &Extended(desc, none).0, &HEAP_IIDS[0], &mut h),
+            S_OK
+        );
+        let start = heap(h).start;
+        assert_eq!(increment_size(device, 0), 32);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), start);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), start);
+        let lines = abi_trace::end_test_trace();
+        let (lo, hi) = (u64::from(start as u32), start >> 32);
+        for expected in [
+            format!("abi_trace call=CreateDescriptorHeap values=[0, 4, 1, {lo}, {hi}, 0]"),
+            format!(
+                "abi_trace call=GetCPUDescriptorHandleForHeapStart values=[{lo}, {hi}, 0]"
+            ),
+            format!(
+                "abi_trace call=GetGPUDescriptorHandleForHeapStart values=[{lo}, {hi}, 0]"
+            ),
+            "abi_trace call=GetDescriptorHandleIncrementSize values=[0, 32]".to_string(),
+        ] {
+            assert!(
+                lines.iter().any(|line| line == &expected),
+                "missing {expected:?} in {lines:?}"
+            );
+        }
+        for name in [
+            "CreateDescriptorHeap",
+            "GetCPUDescriptorHandleForHeapStart",
+            "GetGPUDescriptorHandleForHeapStart",
+            "GetDescriptorHandleIncrementSize",
+        ] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!("call={name} ")))
+                    .count(),
+                1,
+                "one row for {name}: {lines:?}"
+            );
+        }
+        release(h);
+    }
+
+    /// A heap placed in title memory says so (`source` = 2), which is the
+    /// class the title's allocator check needs to see.
+    #[test]
+    fn a_placed_heap_records_the_placement_source() {
+        let _serial = abi_trace::test_serial();
+        let mut memory = vec![0u8; 4 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address,
+            size: 4 * 32,
+        };
+        abi_trace::begin_test_trace();
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create_heap(
+                crate::device::device(),
+                &Extended(desc, placement).0,
+                &HEAP_IIDS[0],
+                &mut h
+            ),
+            S_OK
+        );
+        let lines = abi_trace::end_test_trace();
+        let (lo, hi) = (u64::from(address as u32), address >> 32);
+        let expected =
+            format!("abi_trace call=CreateDescriptorHeap values=[0, 4, 1, {lo}, {hi}, 2]");
+        assert!(lines.iter().any(|line| line == &expected), "{lines:?}");
+        release(h);
     }
 
     #[test]

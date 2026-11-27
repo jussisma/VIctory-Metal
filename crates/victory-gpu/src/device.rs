@@ -12,6 +12,7 @@ use crate::object::{
     self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
     guid, guid_text,
 };
+use crate::native_metal::abi_trace;
 use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
@@ -334,6 +335,73 @@ const OPTIONS: [u32; 16] = [
 ];
 
 extern "system" fn check_feature_support(
+    this: This,
+    feature: u32,
+    data: *mut c_void,
+    size: u32,
+) -> HRESULT {
+    let hr = check_feature_support_impl(this, feature, data, size);
+    // One line per guest query. `hr` is the 32-bit HRESULT bit pattern; the
+    // returned words are recorded only on success, because a failed query
+    // promises nothing about the caller's buffer.
+    if !this.is_null() {
+        let (words, count) = if hr >= 0 {
+            feature_words(feature, size, data.cast_const())
+        } else {
+            ([0; FEATURE_WORDS], 0)
+        };
+        let mut values = [0u64; 3 + FEATURE_WORDS];
+        values[0] = u64::from(feature);
+        values[1] = u64::from(size);
+        values[2] = u64::from(hr as u32);
+        values[3..3 + count].copy_from_slice(&words[..count]);
+        abi_trace::record(
+            abi_trace::calls::CHECK_FEATURE_SUPPORT,
+            &values[..3 + count],
+        );
+    }
+    hr
+}
+
+/// Output words one feature answer can contribute to the trace (the value
+/// order is `[feature, size, hr, first returned words]`, at most eight).
+const FEATURE_WORDS: usize = 5;
+
+/// The numeric words a feature answer returned, bounded.
+///
+/// The raw words are read only up to the size the title declared. The
+/// feature-levels structure carries a pointer at word two, which must not
+/// enter the trace, so that query contributes its count and highest level.
+fn feature_words(
+    feature: u32,
+    size: u32,
+    data: *const c_void,
+) -> ([u64; FEATURE_WORDS], usize) {
+    const FEATURE_LEVELS: u32 = 2;
+    if data.is_null() {
+        return ([0; FEATURE_WORDS], 0);
+    }
+    if feature == FEATURE_LEVELS {
+        if (size as usize) < size_of::<FeatureLevels>() {
+            return ([0; FEATURE_WORDS], 0);
+        }
+        // SAFETY: the title declared room for a whole feature-levels query.
+        let query = unsafe { &*data.cast::<FeatureLevels>() };
+        let mut words = [0u64; FEATURE_WORDS];
+        words[0] = u64::from(query.count);
+        words[1] = u64::from(query.highest);
+        return (words, 2);
+    }
+    let count = ((size as usize) / 4).min(FEATURE_WORDS);
+    let mut words = [0u64; FEATURE_WORDS];
+    for (index, word) in words.iter_mut().take(count).enumerate() {
+        // SAFETY: within the buffer size the title declared.
+        *word = u64::from(unsafe { data.cast::<u32>().add(index).read_unaligned() });
+    }
+    (words, count)
+}
+
+fn check_feature_support_impl(
     _: This,
     feature: u32,
     data: *mut c_void,
@@ -401,6 +469,10 @@ extern "system" fn check_feature_support(
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<u32>() };
             // The highest asked for, up to 6.6 (the AMD upscaler asks).
+            // shortcut: a request below 6.0 is echoed back here; whether the
+            // host reference refuses it (E_INVALIDARG) is exactly what the
+            // trace's `hr` and returned word now measure, so no unverified
+            // floor is invented before that comparison exists.
             *q = (*q).min(0x66);
             S_OK
         }
@@ -487,6 +559,7 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
+    f[30] = resource::create_reserved as *const (); // 0xf0 (traced refusal)
     f[36] = fence::create as *const (); // 0x120
     f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
@@ -665,6 +738,60 @@ mod tests {
         assert_eq!(
             check(device, 8, waves.as_mut_ptr().cast(), 16),
             E_INVALIDARG
+        );
+    }
+
+    /// One row per guest query: `[feature, size, hr, ..returned words]`.
+    /// The feature-levels answer records its count and highest level, never
+    /// the title pointer in that structure.
+    #[test]
+    fn feature_queries_record_their_returned_words() {
+        let _serial = abi_trace::test_serial();
+        let device = device();
+        abi_trace::begin_test_trace();
+        let mut model = 0x66u32;
+        assert_eq!(
+            check_feature_support(device, 7, (&raw mut model).cast(), 4),
+            S_OK
+        );
+        let requested = [0xc000u32, 0xc100, 0xd000];
+        let mut levels = FeatureLevels {
+            count: requested.len() as u32,
+            requested: requested.as_ptr(),
+            highest: 0,
+        };
+        assert_eq!(
+            check_feature_support(device, 2, (&raw mut levels).cast(), 0x18),
+            S_OK
+        );
+        let lines = abi_trace::end_test_trace();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "abi_trace call=CheckFeatureSupport values=[7, 4, 0, 102]"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line == &format!(
+                    "abi_trace call=CheckFeatureSupport values=[2, 24, 0, 3, {}]",
+                    0xc100u32
+                )
+            }),
+            "{lines:?}"
+        );
+        let pointer = requested.as_ptr() as usize as u64;
+        assert!(
+            !lines.iter().any(|line| line.contains(&pointer.to_string())),
+            "no title pointer in the trace: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("call=CheckFeatureSupport "))
+                .count(),
+            2,
+            "one row per query: {lines:?}"
         );
     }
 
