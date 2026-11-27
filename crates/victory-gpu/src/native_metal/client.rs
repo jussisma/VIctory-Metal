@@ -31,8 +31,13 @@
 //! `1` = `UnknownHandle`, `2` = `ExecutionFailed`, `3` = `AlreadyExecuted`.
 //! A replayed list therefore surfaces as `AlreadyExecuted`, not as an error;
 //! `UnknownHandle`/`ExecutionFailed` are explicit refusals and are never
-//! retried. (An older note described a one-byte status and a length-first
-//! envelope; neither matches `ipc_host.rs`, so this module follows the code.)
+//! retried. An error reply may append an optional `VMR3` reason trailer
+//! (bounded to 256 UTF-8 bytes) carrying the host's own diagnostic; it is
+//! decoded into the refusal, counted in telemetry, and logged once as
+//! `METAL_HOST_ERROR sequence=<n> reason=<text>`. A reply without the trailer
+//! keeps the pre-ADR-035 text exactly. (An older note described a one-byte
+//! status and a length-first envelope; neither matches `ipc_host.rs`, so this
+//! module follows the code.)
 //!
 //! # Registration frames
 //!
@@ -90,7 +95,7 @@ use std::time::Duration;
 
 use std::collections::BTreeSet;
 
-use victory_metal::wire::{decode_reply, Reply, ReplyStatus, MAGIC};
+use victory_metal::wire::{decode_reply_with_reason, ReplyStatus, MAGIC};
 use victory_metal::wire_v3::PROTOCOL_VERSION_V3;
 
 use crate::native_metal::fence_page_guest::GuestFencePage;
@@ -1581,7 +1586,7 @@ impl WireV3Client {
                 actual: kind,
             });
         }
-        let reply: Reply = match decode_reply(&payload) {
+        let reply = match decode_reply_with_reason(&payload) {
             Ok(reply) => reply,
             Err(error) => {
                 return broken(TransportError::Protocol(format!(
@@ -1597,10 +1602,31 @@ impl WireV3Client {
         }
         match reply.status {
             ReplyStatus::Ok | ReplyStatus::AlreadyExecuted => Outcome::Status(reply.status),
-            other => Outcome::Refused(format!(
-                "the host answered {other:?} for sequence {}",
-                reply.sequence
-            )),
+            other => {
+                let mut message = format!(
+                    "the host answered {other:?} for sequence {}",
+                    reply.sequence
+                );
+                if let Some(reason) = reply.reason {
+                    // The reason is the host's own diagnostic. It is bounded and
+                    // sanitised once here, recorded in telemetry, and logged as
+                    // the one stable line a boot log can be grepped for.
+                    let record = crate::native_metal::telemetry::note_host_error(
+                        reply.sequence,
+                        &reason,
+                    );
+                    tracing::error!(
+                        "{}",
+                        crate::native_metal::telemetry::host_error_line(
+                            record.sequence,
+                            &record.reason
+                        )
+                    );
+                    message.push_str(": ");
+                    message.push_str(&record.reason);
+                }
+                Outcome::Refused(message)
+            }
         }
     }
 }
@@ -1845,6 +1871,20 @@ mod tests {
             Self::write_frame(stream, KIND_SUBMISSION_V3, &reply);
         }
 
+        fn write_reply_with_reason(
+            stream: &mut TcpStream,
+            sequence: u32,
+            status: ReplyStatus,
+            reason: &str,
+        ) {
+            let reply = victory_metal::wire::encode_reply_with_reason(
+                &Reply { sequence, status },
+                Some(reason),
+            )
+            .expect("reply encodes");
+            Self::write_frame(stream, KIND_SUBMISSION_V3, &reply);
+        }
+
         fn endpoint(&self) -> String {
             format!("127.0.0.1:{}", self.port)
         }
@@ -1988,6 +2028,129 @@ mod tests {
             receiver.recv_timeout(TEST_TIMEOUT).expect("frame count"),
             1,
             "the replayed frame was sent exactly once"
+        );
+    }
+
+    /// A Wire v3 error reply that carries a host reason is surfaced verbatim in
+    /// the refusal error, recorded once in telemetry and formatted as the stable
+    /// `METAL_HOST_ERROR` line.
+    #[test]
+    fn a_host_error_reason_reaches_the_guest_refusal_and_telemetry() {
+        let reason = "Metal execution failed: target texture 640x360 was refused";
+        let before = crate::native_metal::telemetry::host_error_count();
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let (kind, _payload) = TestHost::read_frame(&mut stream);
+            assert_eq!(kind, KIND_SUBMISSION_V3);
+            TestHost::write_reply_with_reason(
+                &mut stream,
+                SEQUENCE,
+                ReplyStatus::ExecutionFailed,
+                reason,
+            );
+            let mut byte = [0u8; 1];
+            assert!(matches!(stream.read(&mut byte), Ok(0) | Err(_)));
+        });
+
+        let mut client =
+            WireV3Client::connect_with_timeout(&host.endpoint(), &SECRET, TEST_TIMEOUT)
+                .expect("authenticated connect");
+        let error = client
+            .send(&encoded(SEQUENCE, 100))
+            .expect_err("an ExecutionFailed reply is a refusal");
+        let NativeQueueError::Refused(message) = &error else {
+            panic!("expected a host refusal, got {error:?}");
+        };
+        assert!(message.contains(reason), "{message}");
+        assert_eq!(
+            crate::native_metal::telemetry::host_error_count(),
+            before + 1,
+            "the reason is counted once"
+        );
+        let record = crate::native_metal::telemetry::last_host_error().expect("last host error");
+        assert_eq!(record.sequence, SEQUENCE);
+        assert_eq!(record.reason, reason);
+        assert_eq!(
+            crate::native_metal::telemetry::host_error_line(record.sequence, &record.reason),
+            format!("METAL_HOST_ERROR sequence={SEQUENCE} reason={reason}")
+        );
+        assert!(client.is_connected(), "a refusal keeps the one stream open");
+    }
+
+    /// A legacy reply with no trailer keeps the exact pre-ADR-035 refusal text
+    /// and does not move the host-error telemetry.
+    #[test]
+    fn an_absent_reason_trailer_keeps_the_legacy_refusal_text() {
+        let before = crate::native_metal::telemetry::host_error_count();
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let (kind, _payload) = TestHost::read_frame(&mut stream);
+            assert_eq!(kind, KIND_SUBMISSION_V3);
+            TestHost::write_reply(&mut stream, SEQUENCE, ReplyStatus::ExecutionFailed);
+            let mut byte = [0u8; 1];
+            assert!(matches!(stream.read(&mut byte), Ok(0) | Err(_)));
+        });
+
+        let mut client =
+            WireV3Client::connect_with_timeout(&host.endpoint(), &SECRET, TEST_TIMEOUT)
+                .expect("authenticated connect");
+        let error = client
+            .send(&encoded(SEQUENCE, 100))
+            .expect_err("an ExecutionFailed reply is a refusal");
+        assert_eq!(
+            error,
+            NativeQueueError::Refused(format!(
+                "the host answered ExecutionFailed for sequence {SEQUENCE}"
+            ))
+        );
+        assert_eq!(
+            crate::native_metal::telemetry::host_error_count(),
+            before,
+            "an absent trailer must not be counted"
+        );
+    }
+
+    /// The guest decoder accepts present and absent trailers and refuses an
+    /// overlong one instead of guessing at it.
+    #[test]
+    fn a_v3_reply_reason_trailer_decodes_present_absent_and_oversized() {
+        use victory_metal::wire::{
+            decode_reply_with_reason, encode_reply, encode_reply_with_reason,
+            MAX_REPLY_REASON_BYTES, REPLY_REASON_MAGIC,
+        };
+
+        let reply = Reply {
+            sequence: SEQUENCE,
+            status: ReplyStatus::ExecutionFailed,
+        };
+
+        let present = encode_reply_with_reason(&reply, Some("exact host text"))
+            .expect("encode present trailer");
+        let detail = decode_reply_with_reason(&present).expect("decode present trailer");
+        assert_eq!(detail.reason.as_deref(), Some("exact host text"));
+
+        let absent = encode_reply(&reply).expect("encode legacy reply");
+        let detail = decode_reply_with_reason(&absent).expect("decode legacy reply");
+        assert_eq!(detail.reason, None);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_le_bytes()); // ExecutionFailed
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&REPLY_REASON_MAGIC);
+        payload.extend_from_slice(&((MAX_REPLY_REASON_BYTES as u16) + 1).to_le_bytes());
+        payload.extend(std::iter::repeat(b'x').take(MAX_REPLY_REASON_BYTES + 1));
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&MAGIC);
+        oversized.extend_from_slice(&2u16.to_le_bytes()); // protocol version
+        oversized.extend_from_slice(&2u16.to_le_bytes()); // reply kind
+        oversized.extend_from_slice(&SEQUENCE.to_le_bytes());
+        oversized.extend_from_slice(&0u16.to_le_bytes());
+        oversized.extend_from_slice(&0u16.to_le_bytes());
+        oversized.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        oversized.extend_from_slice(&payload);
+        assert!(
+            decode_reply_with_reason(&oversized).is_err(),
+            "an overlong trailer must be refused"
         );
     }
 

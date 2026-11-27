@@ -1464,54 +1464,48 @@ impl<E: BatchExecutor> IpcHost<E> {
     ) -> Result<(), HostError> {
         let submission = match decode_v3_request(payload) {
             Ok(submission) => submission,
-            Err(V3RequestError::Rejected(sequence)) => {
-                self.note_refusal(
-                    ReplyStatus::ExecutionFailed,
-                    "version 3 request envelope was rejected before execution",
-                );
+            Err(V3RequestError::Rejected { sequence, reason }) => {
+                self.note_refusal(ReplyStatus::ExecutionFailed, &reason);
                 write_v3_reply(
                     stream,
                     Reply {
                         sequence,
                         status: ReplyStatus::ExecutionFailed,
                     },
+                    Some(&reason),
                 )?;
                 self.submissions += 1;
                 return Ok(());
             }
             Err(V3RequestError::Unsequenced) => {
-                self.note_refusal(
-                    ReplyStatus::ExecutionFailed,
-                    "version 3 request has no recoverable envelope sequence",
-                );
+                let reason = "version 3 request has no recoverable envelope sequence";
+                self.note_refusal(ReplyStatus::ExecutionFailed, reason);
                 write_v3_reply(
                     stream,
                     Reply {
                         sequence: self.next_sequence,
                         status: ReplyStatus::ExecutionFailed,
                     },
+                    Some(reason),
                 )?;
                 self.submissions += 1;
-                return Err(HostError::Protocol(
-                    "version 3 request has no recoverable envelope sequence",
-                ));
+                return Err(HostError::Protocol(reason));
             }
         };
 
         if submission.sequence != self.next_sequence {
-            self.note_refusal(
-                ReplyStatus::ExecutionFailed,
-                format!(
-                    "submission sequence mismatch: expected {}, got {}",
-                    self.next_sequence, submission.sequence
-                ),
+            let reason = format!(
+                "submission sequence mismatch: expected {}, got {}",
+                self.next_sequence, submission.sequence
             );
+            self.note_refusal(ReplyStatus::ExecutionFailed, &reason);
             write_v3_reply(
                 stream,
                 Reply {
                     sequence: submission.sequence,
                     status: ReplyStatus::ExecutionFailed,
                 },
+                Some(&reason),
             )?;
             self.submissions += 1;
             return Err(HostError::Protocol(
@@ -1520,7 +1514,15 @@ impl<E: BatchExecutor> IpcHost<E> {
         }
 
         let reply = self.execute_or_refuse_v3(&submission);
-        write_v3_reply(stream, reply)?;
+        let reason = (reply.status != ReplyStatus::Ok).then(|| {
+            self.last_error.clone().unwrap_or_else(|| {
+                format!(
+                    "the host refused the submission with {:?} but recorded no detail",
+                    reply.status
+                )
+            })
+        });
+        write_v3_reply(stream, reply, reason.as_deref())?;
         self.next_sequence = submission
             .sequence
             .checked_add(1)
@@ -2177,12 +2179,17 @@ fn binding_within_allocation(
 }
 
 /// Reason a version 3 request envelope could not be decoded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum V3RequestError {
     /// The envelope carried no usable sequence, so no reply can be correlated.
     Unsequenced,
     /// The envelope sequence is known, but the request was refused.
-    Rejected(u32),
+    Rejected {
+        /// Sequence the reply must echo.
+        sequence: u32,
+        /// Bounded host reason carried by the error reply.
+        reason: String,
+    },
 }
 
 /// Decodes one version 3 request envelope.
@@ -2208,31 +2215,65 @@ fn decode_v3_request(payload: &[u8]) -> Result<SubmissionV3, V3RequestError> {
         return Err(V3RequestError::Unsequenced);
     }
     if version != PROTOCOL_VERSION_V3 {
-        return Err(V3RequestError::Rejected(sequence));
+        return Err(V3RequestError::Rejected {
+            sequence,
+            reason: format!(
+                "version 3 request envelope has version {version}, expected {PROTOCOL_VERSION_V3}"
+            ),
+        });
     }
     if read_u16(payload, 10) != 0 {
-        return Err(V3RequestError::Rejected(sequence));
+        return Err(V3RequestError::Rejected {
+            sequence,
+            reason: "version 3 request reserved word is nonzero".to_string(),
+        });
     }
 
-    let declared =
-        usize::try_from(read_u32(payload, 12)).map_err(|_| V3RequestError::Rejected(sequence))?;
+    let declared = usize::try_from(read_u32(payload, 12)).map_err(|_| V3RequestError::Rejected {
+        sequence,
+        reason: "version 3 request length does not fit the host address space".to_string(),
+    })?;
     if declared > MAX_SUBMISSION_V3_LEN {
-        return Err(V3RequestError::Rejected(sequence));
+        return Err(V3RequestError::Rejected {
+            sequence,
+            reason: format!(
+                "version 3 request declares {declared} bytes, over the {MAX_SUBMISSION_V3_LEN}-byte limit"
+            ),
+        });
     }
     let frame = &payload[V3_REQUEST_HEADER_LEN..];
     if frame.len() != declared {
-        return Err(V3RequestError::Rejected(sequence));
+        return Err(V3RequestError::Rejected {
+            sequence,
+            reason: format!(
+                "version 3 request declares {declared} bytes but carries {}",
+                frame.len()
+            ),
+        });
     }
 
-    let submission = decode_submission_v3(frame).map_err(|_| V3RequestError::Rejected(sequence))?;
+    let submission = decode_submission_v3(frame).map_err(|error| V3RequestError::Rejected {
+        sequence,
+        reason: format!("version 3 submission frame was refused: {error}"),
+    })?;
     if submission.sequence != sequence {
-        return Err(V3RequestError::Rejected(sequence));
+        return Err(V3RequestError::Rejected {
+            sequence,
+            reason: format!(
+                "version 3 request sequence {sequence} does not match submission sequence {}",
+                submission.sequence
+            ),
+        });
     }
     Ok(submission)
 }
 
-fn write_v3_reply(stream: &mut TcpStream, reply: Reply) -> Result<(), HostError> {
-    let encoded = wire::encode_reply(&reply)?;
+fn write_v3_reply(
+    stream: &mut TcpStream,
+    reply: Reply,
+    reason: Option<&str>,
+) -> Result<(), HostError> {
+    let encoded = wire::encode_reply_with_reason(&reply, reason)?;
     write_frame(stream, KIND_SUBMISSION_V3, &encoded)
 }
 
@@ -3011,6 +3052,10 @@ mod tests {
         /// and clears the flag, so a later submission in the same session can
         /// succeed and prove the loop stayed open.
         v3_fail_once: bool,
+        /// Synthetic v3 executor failures, consumed one per `submit_v3`, used
+        /// to exercise the reason trailer with short, maximal and overlong
+        /// host diagnostics.
+        v3_failure_reasons: Vec<String>,
         /// Content-hashed per-stage graphics registrations: `(handle, stages,
         /// state, abi)` where each stage is `(wire code, metallib, entry)`.
         graphics_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
@@ -3172,6 +3217,11 @@ mod tests {
             let mut state = self.state();
             if state.v3_not_supported {
                 return Err(MetalError::NotSupported("synthetic v3 refusal"));
+            }
+            if !state.v3_failure_reasons.is_empty() {
+                return Err(MetalError::InternalError(
+                    state.v3_failure_reasons.remove(0),
+                ));
             }
             if state.v3_fail_once {
                 state.v3_fail_once = false;
@@ -3466,13 +3516,18 @@ mod tests {
 
     fn v3_envelope(submission: &SubmissionV3) -> Vec<u8> {
         let frame = crate::wire_v3::encode_submission_v3(submission).expect("encode v3 submission");
+        v3_envelope_from_frame(submission.sequence, &frame)
+    }
+
+    /// Wraps one already-encoded v3 frame in the `V3RQ` request envelope.
+    fn v3_envelope_from_frame(sequence: u32, frame: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len());
         payload.extend_from_slice(&V3_REQUEST_MAGIC);
         payload.extend_from_slice(&PROTOCOL_VERSION_V3.to_le_bytes());
-        payload.extend_from_slice(&submission.sequence.to_le_bytes());
+        payload.extend_from_slice(&sequence.to_le_bytes());
         payload.extend_from_slice(&0u16.to_le_bytes());
         payload.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&frame);
+        payload.extend_from_slice(frame);
         payload
     }
 
@@ -3497,13 +3552,45 @@ mod tests {
         client: &mut TcpStream,
         submission: &SubmissionV3,
     ) -> Reply {
+        roundtrip_v3_detail(client, submission).without_reason()
+    }
+
+    /// Sends one v3 submission and decodes the reply together with its optional
+    /// reason trailer.
+    fn roundtrip_v3_detail(
+        client: &mut TcpStream,
+        submission: &SubmissionV3,
+    ) -> wire::ReplyWithReason {
         write_frame(client, KIND_SUBMISSION_V3, &v3_envelope(submission))
             .expect("send v3 submission");
         let (kind, payload) = read_frame(client)
             .expect("read v3 reply")
             .expect("v3 reply frame");
         assert_eq!(kind, KIND_SUBMISSION_V3);
-        wire::decode_reply(&payload).expect("decode v3 reply")
+        wire::decode_reply_with_reason(&payload).expect("decode v3 reply")
+    }
+
+    /// Asserts one v3 envelope was refused for `sequence` with a non-empty
+    /// reason containing `needle`.
+    fn assert_rejected_with_reason(
+        result: &Result<SubmissionV3, V3RequestError>,
+        sequence: u32,
+        needle: &str,
+    ) {
+        match result {
+            Err(V3RequestError::Rejected {
+                sequence: actual,
+                reason,
+            }) => {
+                assert_eq!(*actual, sequence);
+                assert!(
+                    reason.contains(needle),
+                    "reason `{reason}` does not name `{needle}`"
+                );
+                assert!(!reason.is_empty(), "the refusal must carry a reason");
+            }
+            other => panic!("expected a rejected envelope, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4545,50 +4632,32 @@ mod tests {
         // Unknown envelope version.
         let mut wrong_version = payload.clone();
         wrong_version[4..6].copy_from_slice(&(PROTOCOL_VERSION_V3 + 1).to_le_bytes());
-        assert_eq!(
-            decode_v3_request(&wrong_version),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(&wrong_version), 1, "version");
 
         // Nonzero reserved word.
         let mut reserved = payload.clone();
         reserved[10..12].copy_from_slice(&1u16.to_le_bytes());
-        assert_eq!(
-            decode_v3_request(&reserved),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(&reserved), 1, "reserved");
 
         // Truncated body, declared length unchanged.
         let truncated = &payload[..payload.len() - 1];
-        assert_eq!(
-            decode_v3_request(truncated),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(truncated), 1, "carries");
 
         // Trailing byte after the declared submission.
         let mut trailing = payload.clone();
         trailing.push(0);
-        assert_eq!(
-            decode_v3_request(&trailing),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(&trailing), 1, "carries");
 
         // Oversized declared submission length.
         let mut oversized = payload.clone();
         oversized[12..16].copy_from_slice(&((MAX_SUBMISSION_V3_LEN as u32) + 1).to_le_bytes());
-        assert_eq!(
-            decode_v3_request(&oversized),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(&oversized), 1, "limit");
 
         // Unknown inner codec version.
         let mut inner_version = payload.clone();
         inner_version[V3_REQUEST_HEADER_LEN + 4..V3_REQUEST_HEADER_LEN + 6]
             .copy_from_slice(&(PROTOCOL_VERSION_V3 + 1).to_le_bytes());
-        assert_eq!(
-            decode_v3_request(&inner_version),
-            Err(V3RequestError::Rejected(1))
-        );
+        assert_rejected_with_reason(&decode_v3_request(&inner_version), 1, "unsupported");
 
         // Short envelope: no recoverable sequence.
         assert_eq!(
@@ -4877,6 +4946,207 @@ mod tests {
         let state = host.executor.state();
         assert!(state.v3_submissions.is_empty());
         assert_eq!(state.v3_executions, 0);
+    }
+
+    /// Every v3 error reply carries the executor's bounded text, including the
+    /// 256-byte ceiling and a UTF-8-truncated multi-byte reason.
+    #[test]
+    fn v3_error_reply_reason_roundtrips_bounded_text() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let executor = StubExecutor::new(4096);
+        let exact = "a".repeat(256);
+        let long = "b".repeat(300);
+        let unicode = "é".repeat(200);
+        executor.state().v3_failure_reasons = vec![
+            "target texture 640x360 was refused".to_string(),
+            exact,
+            long,
+            unicode,
+        ];
+        let server = start(host(&dir, executor));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("send register");
+        expect_ack(&mut client, true);
+
+        for (sequence, expected_prefix) in [
+            (1u32, "Metal execution failed: internal Metal error: target texture"),
+            (2, "Metal execution failed: internal Metal error: aaa"),
+            (3, "Metal execution failed: internal Metal error: bbb"),
+            (4, "Metal execution failed: internal Metal error: ééé"),
+        ] {
+            let detail = roundtrip_v3_detail(
+                &mut client,
+                &v3_submission(sequence, None, full_binding(BYTES as u64)),
+            );
+            assert_eq!(detail.sequence, sequence, "the reply echoes the sequence");
+            assert_eq!(detail.status, ReplyStatus::ExecutionFailed);
+            let reason = detail.reason.expect("every error reply carries a reason");
+            assert!(
+                reason.starts_with(expected_prefix),
+                "unexpected reason: {reason}"
+            );
+            assert!(
+                reason.len() <= crate::wire::MAX_REPLY_REASON_BYTES,
+                "reason is {} bytes",
+                reason.len()
+            );
+            assert!(reason.is_char_boundary(reason.len()));
+            assert!(!reason.contains('\n'), "the reason must stay one line");
+        }
+
+        drop(client);
+        let (result, _host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+    }
+
+    /// A reason-carrying validation refusal leaves the sequence and ledger
+    /// exactly as the status-only reply did: no claim is taken and the same
+    /// list identity executes once under the next sequence.
+    #[test]
+    fn v3_reason_reply_leaves_session_state_unchanged() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("send register");
+        expect_ack(&mut client, true);
+
+        let identity = list_identity(77, 1);
+        let failed = v3_submission(
+            1,
+            Some(identity),
+            BufferBinding {
+                allocation_id: ALLOCATION_ID + 1,
+                generation: BASE_GENERATION,
+                offset: 0,
+                length: BYTES as u64,
+            },
+        );
+        let detail = roundtrip_v3_detail(&mut client, &failed);
+        assert_eq!(detail.sequence, 1, "sequence echo is unchanged");
+        assert_eq!(detail.status, ReplyStatus::UnknownHandle);
+        assert!(
+            detail.reason.as_deref().is_some_and(|reason| reason
+                .contains("unregistered allocation, texture or sampler")),
+            "the host's validation text is carried"
+        );
+
+        // The refused submission took no ledger claim; the same list identity
+        // executes once under sequence 2.
+        let retried = v3_submission(2, Some(identity), full_binding(BYTES as u64));
+        assert_eq!(
+            roundtrip_v3(&mut client, &retried),
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let stats = host.session_stats();
+        assert_eq!(stats.submissions, 2);
+        assert_eq!(stats.refused_submissions, 1);
+        assert_eq!(host.executor.state().v3_executions, 1);
+        assert_eq!(host.executor.state().v3_submissions, vec![retried]);
+    }
+
+    /// A framing rejection names the offending envelope/frame field, and a
+    /// sequence mismatch names both the expected and the received sequence.
+    #[test]
+    fn v3_framing_rejection_reason_names_the_failure() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("send register");
+        expect_ack(&mut client, true);
+
+        let submission = v3_submission(1, None, full_binding(BYTES as u64));
+        let mut frame = crate::wire_v3::encode_submission_v3(&submission)
+            .expect("encode the frame to corrupt");
+        // Frame header (20) + list block (12) is the first command's opcode.
+        assert!(frame.len() >= 34, "encoded frame is too short");
+        frame[32..34].copy_from_slice(&0x00FFu16.to_le_bytes());
+        write_frame(
+            &mut client,
+            KIND_SUBMISSION_V3,
+            &v3_envelope_from_frame(1, &frame),
+        )
+        .expect("send corrupt frame");
+
+        let (kind, payload) = read_frame(&mut client)
+            .expect("read rejection")
+            .expect("rejection frame");
+        assert_eq!(kind, KIND_SUBMISSION_V3);
+        let detail = wire::decode_reply_with_reason(&payload).expect("decode rejection");
+        assert_eq!(detail.sequence, 1);
+        assert_eq!(detail.status, ReplyStatus::ExecutionFailed);
+        assert!(
+            detail
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unknown command opcode 255")),
+            "unexpected framing reason: {:?}",
+            detail.reason
+        );
+
+        drop(client);
+        let (result, _host) = server.handle.join().expect("server thread");
+        result.expect("the rejected frame leaves the session usable");
+    }
+
+    #[test]
+    fn v3_sequence_mismatch_reply_carries_a_reason() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("send register");
+        expect_ack(&mut client, true);
+
+        let out_of_order = v3_submission(2, None, full_binding(BYTES as u64));
+        let detail = roundtrip_v3_detail(&mut client, &out_of_order);
+        assert_eq!(detail.sequence, 2, "the reply echoes the received sequence");
+        assert_eq!(detail.status, ReplyStatus::ExecutionFailed);
+        assert!(
+            detail
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("expected 1, got 2")),
+            "unexpected mismatch reason: {:?}",
+            detail.reason
+        );
+
+        drop(client);
+        let (result, _host) = server.handle.join().expect("server thread");
+        assert!(matches!(result, Err(HostError::Protocol(_))));
     }
 
     /// Builds one kind 8 payload for the format-code tests.

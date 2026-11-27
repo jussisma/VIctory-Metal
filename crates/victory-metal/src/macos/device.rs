@@ -66,13 +66,14 @@ const MTL_RESOURCE_USAGE_WRITE: usize = 2;
 /// layouts should place every typed declaration on its natural alignment.
 pub(crate) const MTL_BUFFER_OFFSET_ALIGNMENT: u64 = 4;
 
-/// Maximum bytes of a GPU-failure reason carried host-side.
+/// Maximum bytes of a GPU-failure reason carried host-side or on a Wire v3
+/// error reply.
 ///
-/// The wire reply has no room for a diagnostic (see
-/// [`describe_command_buffer_failure`]), so the reason is stored in telemetry
-/// and logged with the same text. It is sanitised to one bounded line so a
-/// Metal `localizedDescription` cannot flood the log or the JSON record.
-pub(crate) const MAX_GPU_REASON_BYTES: usize = 160;
+/// The bounded text is stored in telemetry, logged, and (for a kind 5 error)
+/// carried in the reply's reason trailer. It is sanitised to one line so a
+/// Metal `localizedDescription` cannot flood the log or the JSON record, and it
+/// never exceeds [`crate::wire::MAX_REPLY_REASON_BYTES`].
+pub(crate) const MAX_GPU_REASON_BYTES: usize = 256;
 
 /// One non-completed command buffer, named by the encoder that built it.
 ///
@@ -146,12 +147,9 @@ fn truncate_reason(text: &str, max: usize) -> String {
 
 /// Names a non-completed command buffer without changing its wire status.
 ///
-/// The wire reply is a fixed four-byte payload (`u16` status plus a reserved
-/// zero word) and its decoder rejects any other length, so there is no
-/// backwards-compatible place for the reason on the wire. This task therefore
-/// uses the documented fallback: the reason is bounded and sanitised here,
-/// logged by the caller, and recorded in host telemetry (`last_error`), while
-/// the guest keeps receiving [`ReplyStatus::ExecutionFailed`] unchanged.
+/// The status stays [`ReplyStatus::ExecutionFailed`]; the bounded reason is
+/// returned to the caller so a kind 5 host can carry it in the Wire v3 reply
+/// reason trailer and record it in telemetry. Only Metal's own text is used.
 pub(crate) fn describe_command_buffer_failure(
     sequence: u64,
     mtl_status: usize,

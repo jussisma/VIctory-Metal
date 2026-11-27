@@ -187,8 +187,36 @@
 //!
 //! A reply payload is a status word plus a reserved word: 0 = ok,
 //! 1 = unknown handle (pipeline or allocation/generation), 2 = execution
-//! failed. The reply sequence echoes the submission sequence. Resolver and
-//! GPU execution are outside this codec.
+//! failed, 3 = the named list already executed. The reply sequence echoes the
+//! submission sequence. Resolver and GPU execution are outside this codec.
+//!
+//! ## Optional failure reason (Wire v3)
+//!
+//! A version 3 host may append a bounded UTF-8 reason trailer to an error
+//! reply so the guest can name the exact Metal/host diagnostic instead of a
+//! bare status. The four-byte legacy payload is unchanged and is followed by:
+//!
+//! | offset | size | field |
+//! | ---: | ---: | --- |
+//! | 0 | 2 | status (unchanged) |
+//! | 2 | 2 | reserved, must be zero (unchanged) |
+//! | 4 | 4 | trailer magic `VMR3` |
+//! | 8 | 2 | reason length in bytes, 1..=[`MAX_REPLY_REASON_BYTES`] |
+//! | 10 | N | UTF-8 reason bytes |
+//!
+//! A reply without the trailer is byte-identical to the legacy reply and
+//! [`decode_reply_with_reason`] reports `reason = None` for it. The trailer is
+//! accepted only when its magic, length and UTF-8 encoding are all valid; a
+//! malformed or overlong trailer is refused instead of being guessed at. The
+//! sequence word lives in the frame header and the status word in the payload,
+//! so a reader that only inspects that six-byte prefix accepts every reply this
+//! codec produces, with or without a trailer.
+//!
+//! [`encode_reply`] always writes exactly the legacy four-byte payload, so the
+//! version 1/version 2 frames stay byte-identical. [`decode_reply`] accepts a
+//! well-formed trailer and discards the reason, while
+//! [`decode_reply_with_reason`] exposes it. The extended form is only written by
+//! [`encode_reply_with_reason`] for a kind 5 Wire v3 reply.
 //!
 //! # Ordering and atomicity
 //!
@@ -263,6 +291,15 @@ const ROOT_CONSTANTS_HEADER_LEN: usize = 8;
 const DESCRIPTOR_TABLE_HEADER_LEN: usize = 12;
 const BINDING_LEN: usize = 32;
 const REPLY_PAYLOAD_LEN: usize = 4;
+
+/// Maximum UTF-8 bytes of a failure reason carried by a Wire v3 error reply.
+pub const MAX_REPLY_REASON_BYTES: usize = 256;
+
+/// Magic guarding the optional Wire v3 reply reason trailer.
+pub const REPLY_REASON_MAGIC: [u8; 4] = *b"VMR3";
+
+/// Trailer magic (`4`) plus the reason length word (`2`).
+const REPLY_REASON_HEADER_LEN: usize = 6;
 
 /// An ordered, atomic batch of commands in one frame.
 ///
@@ -562,6 +599,30 @@ pub struct Reply {
     pub status: ReplyStatus,
 }
 
+/// A reply plus the optional bounded failure reason carried by Wire v3.
+///
+/// A legacy reply decodes with `reason = None`. The reason is owned and bounded
+/// to [`MAX_REPLY_REASON_BYTES`]; nothing from guest memory is ever carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyWithReason {
+    /// Sequence of the submission this reply completes.
+    pub sequence: u32,
+    /// Execution outcome.
+    pub status: ReplyStatus,
+    /// The host's own bounded diagnostic, when the trailer was present.
+    pub reason: Option<String>,
+}
+
+impl ReplyWithReason {
+    /// Drops the reason, returning the legacy reply view.
+    pub fn without_reason(&self) -> Reply {
+        Reply {
+            sequence: self.sequence,
+            status: self.status,
+        }
+    }
+}
+
 /// Distinguishable reply statuses on the version 2 wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyStatus {
@@ -668,6 +729,9 @@ pub enum WireError {
     OffsetOverflow,
     /// A reply status code is not defined by this protocol version.
     UnsupportedStatus(u16),
+    /// A reply reason trailer is malformed (bad magic, empty or overlong
+    /// length, or not valid UTF-8).
+    MalformedReplyReason,
     /// A fixed-size payload did not have its exact declared size.
     LengthMismatch,
     /// Bytes follow the declared payload.
@@ -783,6 +847,7 @@ impl fmt::Display for WireError {
             }
             Self::OffsetOverflow => write!(f, "binding offset plus length overflows u64"),
             Self::UnsupportedStatus(status) => write!(f, "unsupported reply status {status}"),
+            Self::MalformedReplyReason => write!(f, "malformed reply reason trailer"),
             Self::LengthMismatch => write!(f, "payload length does not match field widths"),
             Self::TrailingBytes => write!(f, "trailing bytes after frame payload"),
             Self::FrameTooLarge => write!(f, "frame payload exceeds 32-bit length field"),
@@ -940,25 +1005,66 @@ pub fn decode_submission_with_list(
     ))
 }
 
-/// Encodes one reply frame.
+/// Encodes one legacy (version 1/version 2) reply frame.
+///
+/// The frame is byte-identical to the frozen reply: a four-byte payload
+/// (`status u16`, zero `reserved u16`). Use [`encode_reply_with_reason`] for a
+/// Wire v3 error reply that carries a host diagnostic.
 pub fn encode_reply(reply: &Reply) -> Result<Vec<u8>, WireError> {
+    encode_reply_with_reason(reply, None)
+}
+
+/// Encodes one reply frame, optionally with a bounded Wire v3 reason trailer.
+///
+/// `reason = None` produces exactly the legacy frame. A reason is sanitised to
+/// one line and truncated on a UTF-8 boundary to at most
+/// [`MAX_REPLY_REASON_BYTES`]; an empty reason is encoded as no trailer. The
+/// four-byte legacy payload is always the prefix, so the sequence and status
+/// a legacy reader inspects are unchanged.
+pub fn encode_reply_with_reason(
+    reply: &Reply,
+    reason: Option<&str>,
+) -> Result<Vec<u8>, WireError> {
     validate_sequence(reply.sequence)?;
 
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + REPLY_PAYLOAD_LEN);
-    write_frame_header(
-        &mut out,
-        KIND_REPLY,
-        reply.sequence,
-        0,
-        REPLY_PAYLOAD_LEN as u32,
-    );
+    let reason = reason.map(bound_reply_reason).filter(|text| !text.is_empty());
+    let payload_len = REPLY_PAYLOAD_LEN
+        + reason
+            .as_ref()
+            .map_or(0, |text| REPLY_REASON_HEADER_LEN + text.len());
+    let payload_len = u32::try_from(payload_len).map_err(|_| WireError::FrameTooLarge)?;
+
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload_len as usize);
+    write_frame_header(&mut out, KIND_REPLY, reply.sequence, 0, payload_len);
     write_u16(&mut out, reply.status.code());
     write_u16(&mut out, 0);
+    if let Some(text) = reason {
+        out.extend_from_slice(&REPLY_REASON_MAGIC);
+        write_u16(
+            &mut out,
+            u16::try_from(text.len()).map_err(|_| WireError::FrameTooLarge)?,
+        );
+        out.extend_from_slice(text.as_bytes());
+    }
     Ok(out)
 }
 
-/// Decodes one complete reply frame.
+/// Decodes one complete reply frame, discarding any Wire v3 reason trailer.
+///
+/// This is the strict legacy API for callers that only need the status. A
+/// well-formed trailer is accepted and ignored; a malformed one is refused.
 pub fn decode_reply(bytes: &[u8]) -> Result<Reply, WireError> {
+    decode_reply_with_reason(bytes).map(|reply| reply.without_reason())
+}
+
+/// Decodes one complete reply frame and its optional Wire v3 reason trailer.
+///
+/// A legacy four-byte payload decodes with `reason = None`, so a frame written
+/// before the extension is accepted exactly as before. When the trailer is
+/// present it must carry the [`REPLY_REASON_MAGIC`] guard, a nonzero length of
+/// at most [`MAX_REPLY_REASON_BYTES`], and valid UTF-8; otherwise the frame is
+/// refused rather than guessed at.
+pub fn decode_reply_with_reason(bytes: &[u8]) -> Result<ReplyWithReason, WireError> {
     let (header, payload) = FrameHeader::parse(bytes)?;
     if header.kind != KIND_REPLY {
         return Err(WireError::UnexpectedKind(header.kind));
@@ -966,7 +1072,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Reply, WireError> {
     if header.command_count != 0 {
         return Err(WireError::UnexpectedCommandCount(header.command_count));
     }
-    if payload.len() != REPLY_PAYLOAD_LEN {
+    if payload.len() < REPLY_PAYLOAD_LEN {
         return Err(WireError::LengthMismatch);
     }
 
@@ -976,10 +1082,57 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Reply, WireError> {
         return Err(WireError::NonZeroReserved);
     }
 
-    Ok(Reply {
+    let reason = if reader.is_empty() {
+        None
+    } else {
+        if payload.len() < REPLY_PAYLOAD_LEN + REPLY_REASON_HEADER_LEN {
+            return Err(WireError::LengthMismatch);
+        }
+        if reader.take::<4>()? != REPLY_REASON_MAGIC {
+            return Err(WireError::MalformedReplyReason);
+        }
+        let len = usize::from(reader.u16()?);
+        if len == 0 || len > MAX_REPLY_REASON_BYTES {
+            return Err(WireError::MalformedReplyReason);
+        }
+        let text = std::str::from_utf8(reader.bytes(len)?)
+            .map_err(|_| WireError::MalformedReplyReason)?;
+        if !reader.is_empty() {
+            return Err(WireError::TrailingBytes);
+        }
+        Some(text.to_string())
+    };
+
+    Ok(ReplyWithReason {
         sequence: header.sequence,
         status,
+        reason,
     })
+}
+
+/// Sanitises and bounds a Wire v3 reply reason to one UTF-8 line.
+///
+/// Control characters become single spaces, leading and trailing whitespace is
+/// removed, and the text is truncated on a character boundary at
+/// [`MAX_REPLY_REASON_BYTES`]. Only the host's own diagnostic text is passed
+/// here; no guest memory ever reaches this function.
+pub fn bound_reply_reason(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len().min(MAX_REPLY_REASON_BYTES));
+    for character in text.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if cleaned.len() + character.len_utf8() > MAX_REPLY_REASON_BYTES {
+            break;
+        }
+        if character == ' ' && (cleaned.is_empty() || cleaned.ends_with(' ')) {
+            continue;
+        }
+        cleaned.push(character);
+    }
+    cleaned.trim().to_string()
 }
 
 fn validate_sequence(sequence: u32) -> Result<(), WireError> {
@@ -2603,6 +2756,157 @@ mod tests {
             assert_eq!(decoded.sequence, 42);
             assert_eq!(decoded.status, status);
         }
+    }
+
+    /// A legacy reply has no reason trailer, stays exactly four payload bytes,
+    /// and still decodes through both the legacy and the extended decoder.
+    #[test]
+    fn legacy_reply_decodes_with_no_reason() {
+        let reply = Reply {
+            sequence: 7,
+            status: ReplyStatus::ExecutionFailed,
+        };
+        let frame = encode_reply(&reply).expect("encode legacy reply");
+        assert_eq!(frame.len(), FRAME_HEADER_LEN + REPLY_PAYLOAD_LEN);
+        assert_eq!(
+            frame[FRAME_HEADER_LEN..],
+            [2, 0, 0, 0],
+            "legacy payload is status plus a zero reserved word"
+        );
+
+        let detail = decode_reply_with_reason(&frame).expect("decode legacy reply");
+        assert_eq!(detail.sequence, 7);
+        assert_eq!(detail.status, ReplyStatus::ExecutionFailed);
+        assert_eq!(detail.reason, None);
+        assert_eq!(decode_reply(&frame), Ok(reply));
+    }
+
+    /// A reason round-trips exactly up to the 256-byte ceiling, while longer
+    /// ASCII and multi-byte text is truncated on a character boundary.
+    #[test]
+    fn reply_reason_is_bounded_and_utf8_safe() {
+        let reply = Reply {
+            sequence: 9,
+            status: ReplyStatus::ExecutionFailed,
+        };
+
+        let short = "Metal refused a 640x360 target texture";
+        let detail = decode_reply_with_reason(
+            &encode_reply_with_reason(&reply, Some(short)).expect("encode short reason"),
+        )
+        .expect("decode short reason");
+        assert_eq!(detail.reason.as_deref(), Some(short));
+
+        let exact = "a".repeat(MAX_REPLY_REASON_BYTES);
+        let detail = decode_reply_with_reason(
+            &encode_reply_with_reason(&reply, Some(&exact)).expect("encode exact reason"),
+        )
+        .expect("decode exact reason");
+        assert_eq!(detail.reason.as_deref(), Some(exact.as_str()));
+
+        let long = "b".repeat(300);
+        let detail = decode_reply_with_reason(
+            &encode_reply_with_reason(&reply, Some(&long)).expect("encode long reason"),
+        )
+        .expect("decode long reason");
+        let reason = detail.reason.expect("a reason trailer");
+        assert_eq!(reason.len(), MAX_REPLY_REASON_BYTES);
+        assert!(reason.bytes().all(|byte| byte == b'b'));
+
+        let unicode = "é".repeat(200);
+        let detail = decode_reply_with_reason(
+            &encode_reply_with_reason(&reply, Some(&unicode)).expect("encode unicode reason"),
+        )
+        .expect("decode unicode reason");
+        let reason = detail.reason.expect("a reason trailer");
+        assert!(reason.len() <= MAX_REPLY_REASON_BYTES);
+        assert!(reason.is_char_boundary(reason.len()));
+        assert!(reason.chars().all(|character| character == 'é'));
+
+        // The legacy API still sees the status and ignores the reason.
+        let extended = encode_reply_with_reason(&reply, Some(short)).expect("encode extended");
+        assert_eq!(decode_reply(&extended), Ok(reply));
+    }
+
+    /// A reader that only inspects the legacy six-byte prefix (the header
+    /// sequence plus the status word) accepts an extended reply unchanged.
+    #[test]
+    fn prefix_only_legacy_reader_accepts_an_extended_reply() {
+        let reply = Reply {
+            sequence: 0x1122_3344,
+            status: ReplyStatus::ExecutionFailed,
+        };
+        let frame = encode_reply_with_reason(&reply, Some("a host reason"))
+            .expect("encode extended reply");
+
+        // This is exactly what a prefix-only legacy reader reads: the magic,
+        // the frozen header through the sequence, and the status word.
+        assert_eq!(&frame[..4], &MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([frame[4], frame[5]]),
+            PROTOCOL_VERSION,
+            "the reply frame version is unchanged"
+        );
+        assert_eq!(
+            u16::from_le_bytes([frame[6], frame[7]]),
+            KIND_REPLY,
+            "the kind is unchanged"
+        );
+        let sequence = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]);
+        assert_eq!(sequence, reply.sequence);
+        let status = u16::from_le_bytes([frame[FRAME_HEADER_LEN], frame[FRAME_HEADER_LEN + 1]]);
+        assert_eq!(status, ReplyStatus::ExecutionFailed.code());
+
+        // The new decoder additionally sees the reason.
+        let detail = decode_reply_with_reason(&frame).expect("decode extended reply");
+        assert_eq!(detail.reason.as_deref(), Some("a host reason"));
+    }
+
+    /// A malformed trailer is refused instead of being interpreted as a status
+    /// or silently dropped.
+    #[test]
+    fn malformed_reply_reason_trailer_is_rejected() {
+        let reply = Reply {
+            sequence: 1,
+            status: ReplyStatus::ExecutionFailed,
+        };
+        let valid = encode_reply_with_reason(&reply, Some("reason")).expect("encode reason");
+
+        let mut bad_magic = valid.clone();
+        bad_magic[FRAME_HEADER_LEN + 4] ^= 0xff;
+        assert_eq!(
+            decode_reply_with_reason(&bad_magic),
+            Err(WireError::MalformedReplyReason)
+        );
+
+        let mut zero_length = valid.clone();
+        zero_length[FRAME_HEADER_LEN + 8..FRAME_HEADER_LEN + 10].fill(0);
+        assert_eq!(
+            decode_reply_with_reason(&zero_length),
+            Err(WireError::MalformedReplyReason)
+        );
+
+        let mut overlong = valid.clone();
+        overlong[FRAME_HEADER_LEN + 8..FRAME_HEADER_LEN + 10]
+            .copy_from_slice(&((MAX_REPLY_REASON_BYTES as u16) + 1).to_le_bytes());
+        assert_eq!(
+            decode_reply_with_reason(&overlong),
+            Err(WireError::MalformedReplyReason)
+        );
+
+        let mut invalid_utf8 = valid.clone();
+        invalid_utf8[FRAME_HEADER_LEN + 10] = 0xff;
+        assert_eq!(
+            decode_reply_with_reason(&invalid_utf8),
+            Err(WireError::MalformedReplyReason)
+        );
+
+        let mut trailing = valid;
+        trailing.push(0);
+        assert_eq!(
+            decode_reply_with_reason(&trailing),
+            Err(WireError::TrailingBytes)
+        );
     }
 
     #[test]
