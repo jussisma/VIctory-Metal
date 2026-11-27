@@ -1051,8 +1051,9 @@ int main(void) {
                 g_reason = "the AAA graphics pass was refused";
                 break;
             }
-            if (fence_value(page) < sequence) {
-                g_reason = "the AAA graphics pass did not advance the shared fence";
+            /* ADR-017: the kind-5 reply means "committed", not "complete".
+               Completion is observed only through the shared fence. */
+            if (!wait_fence(page, sequence)) {
                 break;
             }
         }
@@ -1081,8 +1082,7 @@ int main(void) {
                 g_reason = "the post-FX/present submission was refused";
                 break;
             }
-            if (fence_value(page) < sequence) {
-                g_reason = "the post-FX/present submission did not advance the shared fence";
+            if (!wait_fence(page, sequence)) {
                 break;
             }
         }
