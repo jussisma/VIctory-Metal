@@ -606,3 +606,138 @@ State at `6d14b9db`, traced to source:
    ADR-003 entries and no ADR-005 or ADR-010; the directive-03 text for ADR-010
    is the only record of that decision (../.swarm/decisions.json versus
    ../.swarm/prompts/architect-directive-03.md).
+
+## Cycle 05 — live D3D12 wiring, async GPU pipelining, persistent IRConverter, native window
+
+Base `79a5e039` (`cycle-04`). Scaffold `246b48cb`. Integration head is the
+commit this section lands on; local annotated tag `cycle-05` marks it. Every
+number below comes from a command run in this workspace on Apple M4 Max; a
+number that could not be reproduced is labelled as such.
+
+### 5.1 Decisions (ADR-017…022)
+
+- **ADR-017 — async host execution.** Each Wire v3 submission is committed
+  without `waitUntilCompleted`; an `addCompletedHandler` block publishes the
+  contiguous completion watermark into the shared `FencePage` and retires the
+  submission's pinned staging slices and leases through `RetireQueue`. Frames in
+  flight are capped (`VICTORY_METAL_FRAMES_IN_FLIGHT`, default 3); backpressure
+  happens at the frame boundary, never per command list.
+- **ADR-018 — persistent `--stdio` converter.** `victory-irconverter --stdio`
+  stays alive and answers the pool's framed jobs, so Rosetta startup is paid once
+  per worker. A crashed worker is reaped and respawned; the disk cache still
+  absorbs repeats.
+- **ADR-019 — live `victory-gpu` D3D12 wiring.** Under `VICTORY_BACKEND=metal`,
+  device connect, buffer (kind 2), texture (kind 8), surface (kind 9), versioned
+  pipeline (kind 4/129), command-list recording, exactly-once
+  `ExecuteCommandLists`, `Fence::GetCompletedValue` from the shared page, and
+  `Present` all go through `GuestTransport`. An unimplemented call is an explicit
+  native failure with an opcode histogram entry; `d3dmetal_fallback_count` stays 0.
+- **ADR-020 — opt-in native presenter.** `VICTORY_METAL_WINDOW` (or `--window`)
+  opens an `NSWindow` + `CAMetalLayer` and presents the registered surface
+  drawable with no CPU readback. Headless `IOSurface` remains the default.
+- **ADR-021 — reply semantics.** A kind-5 reply means *committed*, not
+  *complete*. Completion is only the shared fence. The Cycle 04 AAA gate polled
+  the fence once right after the reply and failed under the new semantics until
+  it used its bounded `wait_fence` helper.
+- **ADR-022 — reflection-derived ABIs.** The stdio converter returns reflection
+  (`VMRES2`) and the guest builds its `VAB1` ABI from the converter JSON. Without
+  it the host records bindings but binds no root arguments: the gate saw
+  `dispatch_bindings=1` with a zero argument buffer before this landed.
+
+### 5.2 Chronology of the work
+
+| Step | Commit | Evidence |
+|---|---|---|
+| scaffold`retire.rs`/`window.rs` | `246b48cb` | 9 unit tests on the two seams |
+| W5-XMEM-WINE-LEASE-FIX | `c8aa3182` | the four "Wine-only" failures were test isolation (fixed submission ids shared through a process-global registry), not lease lifetime; Wine `xmem::share` 12/12, full Wine 178, aarch64 81 |
+| W5-WAVE64-LIVE-GAP-CLOSE | `9e774b44` | barrier split keyed to `narrow_waves` instead of `narrow_waves \|\| host_wave32` (`emit/lower.rs:853/872`); reproducible 35-program corpus 16 → 11 refusals on a 32-lane host, LDS 7 → 2 |
+| W5-IRCONVERTER-STDIO-POOL | `4de3c508` | one worker served 16 jobs; cold 6.569 ms/job → warm 0.026 ms/job (254.5×); V/P/M/C translated |
+| W5-NATIVE-WINDOW-PRESENT | `ca80fa25` | real window, 2 drawables acquired and presented, windowed checksum == headless, 0 D3DMetal images |
+| W5-ASYNC-SUBMIT-PIPELINE | `fb9161ad` | peak in-flight 3 of cap 3, fence below the sequence while busy, 200-submission checksum, retire depth 0 after Present |
+| W5-MESH-LIVE-ABI-PROOF | `c8a3bb02` | live `submit_v3` mesh draw, 256 px exact `0x98e4ed7c5ed77c00`, resident 4 |
+| W5-TITLE-CMDLIST-LIVE | `04eac489` | device once-connect, texture/surface registration, `ExecuteIndirect`/`CopyTextureRegion`/`Resolve`, fence page, `Present`; `victory-gpu` 178 |
+| W5-HOST-FENCE-AND-MESH-FIX | `b146b545` | completion published only by the GPU handler; content-hashed mesh PSO, mesh-stage descriptor tables, table-buffer retention (removing the retain reproduced the SIGSEGV) |
+| W5-GUEST-PSO-BUFFER-REG | `e05bb51d` | kind 2 buffers idempotent through `GuestRangeResolver`, compute PSO 4/129, `CompilerPool` wired; `victory-gpu` 185 |
+| orchestrator fixes | `e46a0790`, `f514bd14`, `15a51f1b` | daemon forwards fence-page attach; AAA gate waits on the fence; daemon forwards the five `register_*_pipeline*` calls the gate proved were missing |
+| W5-PIPELINE-REG-GRAPHICS | `fd5a1efc` | kind 4 v2: per-stage tickets, `PipelineState`, `PipelineAbi`, root signature; v1 compute byte-compatible |
+| W5-LIVE-D3D12-TITLE-GATE (first) | `df0aec78` | real API path, 120/120, p50 0.374 ms; PARTIAL on the guest's own PSO |
+| W5-PSO-MULTISTAGE-LIB | `d6bb7cca` | one `MTLLibrary` per stage file, BLAKE3 key over every stage, missing function names its stage |
+| W5-COMPUTE-ROOT-BINDINGS | `3aa7ff88` | compute CBV/SRV/UAV/table/constants into Wire v3 bindings, `compute_unbound` counter, dispatch→indirect ordering test |
+| W5-LIVE-D3D12-TITLE-GATE-2 | `22af74d4` | 120/120, p50 0.385 ms; PARTIAL with three named blockers |
+| W5-MESH-PASS-OPEN | `5f274356` | `BeginRenderPass → SetMeshPipeline → DispatchMesh → EndRenderPass` for a mesh pass opened by targets only |
+| W5-STDIO-REFLECTION | `b22866a5` | `VMRES2` reflection, `compile_with_reflection`, ABI from `TopLevelArgumentBuffer`; 576 B reflection, ~6 ms/job extra |
+| W5-LIVE-D3D12-TITLE-GATE-3 | `94caf219` | PASS: guest-owned PSO ids (graphics 3, compute 2, mesh 1), compute-written indirect arguments `3,1,0,0`, exact pixels, 120/120 |
+
+### 5.3 Measured evidence
+
+**Synthetic AAA gate after the async landing** (`tools/macos/metal-poc/aaa-frame-bench.sh`,
+exit 0, 120 measured frames after 20 warmup): p50 **0.577 ms**, p95 **1.285 ms**,
+p99 **1.638 ms**, **1733 FPS** at p50 (script average 1597), 281 executions,
+0-IPC fence read **0.77 ns**, present checksum `0xd5791f96cdb32383` unchanged,
+replay `AlreadyExecuted`, D3DMetal modules 0, leaks 0. Cycle 04's synchronous gate
+was p50 0.624 ms / 1440 FPS.
+
+**Live D3D12 gate** (`tools/macos/metal-poc/live-d3d12-gate.sh`, exit 0,
+1280×720, MRT RGBA8×2 + Depth32Float, 120 measured frames after 20 warmup):
+two independent runs: p50 **0.405 ms** / p95 0.768 / p99 0.793 / **2106 FPS**
+(orchestrator) and p50 0.443 / p95 0.798 / p99 0.820 / 1962 FPS (worker). The graphics
+(id 3), compute (id 2) and mesh (id 1) pipelines are the guest's own v2
+registrations (`owner=guest_v2`), not the daemon's built-ins, and the recorded
+streams name exactly those ids. The compute dispatch carries one root binding and
+a barrier, the argument buffer it writes is the one `ExecuteIndirectDraw` reads
+(`args_after_frames=3,1,0,0`, `unbound_dispatches=0`, linkage 140/140), the
+present checksum is exactly `0xd5791f96cdb32383`, replay is `AlreadyExecuted`
+with the target unchanged, `d3dmetal_fallback_count` 0, host D3DMetal images `[]`,
+the unsupported-opcode histogram is empty, and the fence was observed 140 times
+with 0 timeouts. Pool: 5 jobs, 16.44–31.32 jobs/s across runs, first job 150.9–296.3 ms
+(the converter start dominates), subsequent 1.1–1.3 ms, disk cache 14.7–27.2×. In-flight depth is 1 because this guest waits on the
+fence per frame; the 3-deep overlap is proven separately by
+`async_pipeline_gpu::completion_is_published_only_after_the_gpu_finishes`.
+
+### 5.4 Counts (integration head)
+
+- Compiled: Win64 `diag` `victory` build; `victory-metal`/`victory-gpu`
+  Windows all-targets checks; x86_64 `victory-irconverter`.
+- CPU-tested: `victory-metal` lib **261 passed / 5 ignored**, `victory-shader`
+  **246 + 3** integration, `victory-gpu` **205 passed / 1 ignored**,
+  `victory-hle` **81** aarch64 and **178** under Wine (focused `xmem::share`
+  12/12 re-run by the orchestrator).
+- GPU-verified on M4 Max, serialized with `/tmp/victory-gpu.lock` and
+  `--test-threads=1`: async pipeline, mesh live ABI, window presenter,
+  IRConverter pool (9 tests), AAA gate, live D3D12 gate.
+
+### 5.5 Reproduce
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cd VIctory-Metal
+cargo test --locked -p victory-metal --target aarch64-apple-darwin --lib -- --test-threads=1
+cargo test --locked -p victory-shader --target aarch64-apple-darwin
+cargo test --locked -p victory-gpu -- --test-threads=1
+tools/macos/test-wine.sh -p victory-hle -- --test-threads=1
+tools/macos/metal-poc/aaa-frame-bench.sh
+tools/macos/metal-poc/live-d3d12-gate.sh
+```
+
+### 5.6 Remaining gaps (honest)
+
+- **No title binary has run.** The gate drives the real `victory-gpu` D3D12
+  entry points and the real host, but not a retail title; no proprietary asset
+  was used. Geometry/materials/streaming on a title frame remain unproven, and
+  the >=30 FPS game gate is still unmet.
+- **In-flight depth 1 in the gate** because the harness waits per frame. The
+  3-deep pipeline is proven by a separate GPU test, not by the gate.
+- **Indirect mesh dispatch** (`execute_indirect_dispatch_mesh`) still records
+  outside a render pass and refuses an open pass; direct `DispatchMesh` is fixed.
+- **`narrow_waves` without `host_wave32`** lowers 34/35 corpus programs with a
+  zero high ballot dword — a silent miscompile on the D3DMetal reference path.
+  Deferred with a fail-closed recommendation; not reachable on the native
+  64-lane path.
+- **Placed/aliased textures** share the first registered descriptor.
+- **Guest object stages and multi-entry descriptor tables** are explicit
+  refusals; the ABI witness is the reflection JSON (the host checks it is
+  non-empty, not semantically).
+- **The 105/111 historical compute rejects are not reproduced** from this tree;
+  the census is the 35-program corpus above (11 refusals on a 32-lane host).
+- **xmem registry growth**: one `Retired` entry per submission that ever
+  retained a range; bounded-memory design is still open.
