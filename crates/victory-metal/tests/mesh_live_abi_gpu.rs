@@ -624,7 +624,10 @@ fn packed_pair_and_binding_plan() {
         8
     );
     assert_eq!(reflected.argument_buffer_bytes(), 16);
-    assert_eq!(reflected.descriptor_table_bytes(), 32);
+    // Four table descriptors at the converter's 24-byte entry (ADR: "emit
+    // converter 24-byte descriptor tables"), not the pre-24-byte 8-byte
+    // estimate this assertion carried when it was written.
+    assert_eq!(reflected.descriptor_table_bytes(), 96);
 
     // The explicit plan the GPU test registers: a table plus inline constants
     // and root CBV/SRV/UAV views, in one consistent order on both stages so
@@ -643,7 +646,8 @@ fn packed_pair_and_binding_plan() {
     assert_eq!(constants, 16, "four inline root constant dwords");
     assert!(constants <= MAX_MESH_ROOT_CONSTANT_DWORDS * 4);
     assert_eq!(plan.mesh().parameters().len(), 5);
-    assert_eq!(plan.descriptor_table_bytes(), 32);
+    // One table of four descriptors at the converter's 24-byte entry.
+    assert_eq!(plan.descriptor_table_bytes(), 96);
     assert!(plan.argument_buffer_bytes() > 0);
     let abi = plan.pipeline_abi();
     assert!(abi.mesh.is_some() && abi.object.is_none() && abi.fragment.is_some());
