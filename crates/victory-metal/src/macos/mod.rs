@@ -15,5 +15,7 @@ pub mod present;
 pub mod registry;
 pub mod render;
 pub mod residency;
+pub mod retire;
 pub mod texture;
 pub mod views;
+pub mod window;
