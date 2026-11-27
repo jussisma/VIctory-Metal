@@ -24,9 +24,10 @@
 //! - [`MetalProducer::set_render_targets`] (`OMSetRenderTargets`) records the
 //!   requested attachments but does not emit `BeginRenderPass` yet, so clears
 //!   and viewport/scissor calls that follow fold into the pass.
-//! - The first draw opens the pass. A draw never opens a second pass for the
-//!   same attachments, so a pipeline, viewport or scissor change does not
-//!   split it; changing the render targets or depth attachment does.
+//! - The first draw or mesh dispatch opens the pass. Work never opens a
+//!   second pass for the same attachments, so a pipeline, viewport or scissor
+//!   change does not split it; changing the render targets or depth attachment
+//!   does.
 //! - [`MetalProducer::resource_barrier`], copies, compute dispatches and
 //!   present close the pass first: the wire forbids those inside a pass.
 //! - `flush` closes the pass and returns one submission with the next
@@ -1173,7 +1174,7 @@ impl MetalProducer {
             return Ok(());
         }
         self.require_graphics_pipeline()?;
-        self.open_pass()?;
+        self.open_pass("draw")?;
         self.flush_graphics_state()?;
         self.push(CommandV3::DrawInstanced(DrawInstanced {
             vertex_count_per_instance: vertex_count,
@@ -1196,7 +1197,7 @@ impl MetalProducer {
             return Ok(());
         }
         self.require_graphics_pipeline()?;
-        self.open_pass()?;
+        self.open_pass("draw")?;
         self.flush_graphics_state()?;
         self.push(CommandV3::DrawIndexedInstanced(DrawIndexedInstanced {
             index_count_per_instance: index_count,
@@ -1256,7 +1257,7 @@ impl MetalProducer {
     ) -> Result<(), ProducerError> {
         Self::checked_indirect(&arguments, 16, OP_EXECUTE_INDIRECT_DRAW)?;
         self.require_graphics_pipeline()?;
-        self.open_pass()?;
+        self.open_pass("draw")?;
         self.flush_graphics_state()?;
         self.push(CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
             arguments,
@@ -1270,7 +1271,7 @@ impl MetalProducer {
     ) -> Result<(), ProducerError> {
         Self::checked_indirect(&arguments, 20, OP_EXECUTE_INDIRECT_DRAW_INDEXED)?;
         self.require_graphics_pipeline()?;
-        self.open_pass()?;
+        self.open_pass("draw")?;
         self.flush_graphics_state()?;
         self.push(CommandV3::ExecuteIndirectDrawIndexed(
             ExecuteIndirectDrawIndexed { arguments },
@@ -1279,8 +1280,9 @@ impl MetalProducer {
 
     /// `ExecuteIndirect` of a mesh dispatch signature (record stride 12).
     ///
-    /// Like [`dispatch_mesh`](Self::dispatch_mesh), the wire expresses this
-    /// outside a render pass; a pass already open is refused, not closed.
+    /// This path still records the indirect dispatch outside a render pass; a
+    /// pass already open is refused, not closed. A direct
+    /// [`dispatch_mesh`](Self::dispatch_mesh) opens the pass it needs.
     pub fn execute_indirect_dispatch_mesh(
         &mut self,
         pipeline_id: u64,
@@ -1399,26 +1401,43 @@ impl MetalProducer {
 
     /// `DispatchMesh` with the current mesh pipeline.
     ///
-    /// Mesh dispatches are recorded outside a render pass: the producer
-    /// refuses one while a pass is open instead of closing it under the
-    /// title.
+    /// The host records a mesh dispatch inside a render pass, so this call
+    /// opens the pass like a draw does: `set_render_targets` followed by a
+    /// mesh dispatch records `BeginRenderPass`, `SetMeshPipeline`,
+    /// `DispatchMesh` and, at `flush`/`Close`, `EndRenderPass` even when no
+    /// `Draw` occurs. A pass already open is kept: a later draw joins it.
+    ///
+    /// Group counts follow the host's rules: every dimension must be nonzero
+    /// and their product must fit `u64`. A dispatch with no targets bound or
+    /// no mesh pipeline is refused with a named reason.
     pub fn dispatch_mesh(&mut self, x: u32, y: u32, z: u32) -> Result<(), ProducerError> {
         if x == 0 || y == 0 || z == 0 {
-            return Ok(());
-        }
-        if self.pass_open {
             return Err(ProducerError::unsupported_opcode(
-                "DispatchMesh inside a recorded pass",
+                "DispatchMesh: zero group count",
+                OP_DISPATCH_MESH,
+            ));
+        }
+        if u64::from(x)
+            .checked_mul(u64::from(y))
+            .and_then(|groups| groups.checked_mul(u64::from(z)))
+            .is_none()
+        {
+            return Err(ProducerError::unsupported_opcode(
+                "DispatchMesh: group counts overflow u64",
                 OP_DISPATCH_MESH,
             ));
         }
         let Some(pipeline_id) = self.mesh_pipeline else {
             return Err(ProducerError::MissingPipeline { stage: "mesh" });
         };
+        self.open_pass("DispatchMesh")?;
         if self.emitted_mesh_pipeline != Some(pipeline_id) {
             self.push(CommandV3::SetMeshPipeline(PipelineRef { pipeline_id }))?;
             self.emitted_mesh_pipeline = Some(pipeline_id);
         }
+        // The host drops its graphics pipeline selection at `SetMeshPipeline`:
+        // a following draw must re-emit `SetGraphicsPipeline`.
+        self.dirty.pipeline = true;
         self.push(CommandV3::DispatchMesh(DispatchMesh {
             pipeline_id,
             group_counts: [x, y, z],
@@ -1693,12 +1712,12 @@ impl MetalProducer {
             .ok_or(ProducerError::MissingPipeline { stage: "graphics" })
     }
 
-    fn open_pass(&mut self) -> Result<(), ProducerError> {
+    fn open_pass(&mut self, operation: &'static str) -> Result<(), ProducerError> {
         if self.pass_open {
             return Ok(());
         }
         if self.pass.colors.is_empty() {
-            return Err(ProducerError::NoRenderTargets { operation: "draw" });
+            return Err(ProducerError::NoRenderTargets { operation });
         }
         self.ensure_room(1 + graphics_state_count(&self.graphics))?;
         self.commands
@@ -1709,6 +1728,7 @@ impl MetalProducer {
         self.pass_open = true;
         // A new encoder starts with no state: everything bound is re-emitted.
         self.dirty = GraphicsDirty::all(&self.graphics);
+        self.emitted_mesh_pipeline = None;
         Ok(())
     }
 
@@ -1739,6 +1759,9 @@ impl MetalProducer {
         {
             self.commands
                 .push(CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id }));
+            // The host drops its mesh pipeline selection at
+            // `SetGraphicsPipeline`: a following mesh dispatch must re-emit it.
+            self.emitted_mesh_pipeline = None;
         }
         if dirty.vertex_buffers {
             for set in vertex_buffer_sets(&self.graphics.vertex_buffers) {
@@ -2085,6 +2108,14 @@ mod tests {
             .expect("indexed draw recorded");
     }
 
+    /// The ARM64 host planner (the real encoder-segment rules) accepts the
+    /// recorded stream. Only builds where the host exists can check this.
+    #[cfg(target_os = "macos")]
+    fn assert_host_planner_accepts(commands: &[CommandV3]) {
+        victory_metal::macos::render::plan_encoder_segments(commands)
+            .expect("the host planner accepts the recorded mesh pass");
+    }
+
     #[test]
     fn recorded_sequence_flushes_in_wire_order() {
         let mut producer = MetalProducer::new(7, 1).expect("producer");
@@ -2215,6 +2246,122 @@ mod tests {
                 OP_END_RENDER_PASS,
             ]
         );
+    }
+
+    /// A mesh pass the title records as `OMSetRenderTargets` + `DispatchMesh`
+    /// with no intervening draw still opens and closes its render pass.
+    #[test]
+    fn a_mesh_dispatch_opens_and_records_its_render_pass() {
+        let mut producer = MetalProducer::new(22, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
+        producer.dispatch_mesh(4, 2, 1).expect("mesh dispatch");
+        assert!(
+            producer.has_open_pass(),
+            "a mesh dispatch opens the pass it needs"
+        );
+
+        let mut sink = RecordingSink::new();
+        producer.submit(&mut sink).expect("submit");
+        assert_eq!(sink.submissions().len(), 1, "one mesh pass, one submission");
+        let submission = &sink.submissions()[0];
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_MESH_PIPELINE,
+                OP_DISPATCH_MESH,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        match &submission.commands[2] {
+            CommandV3::DispatchMesh(mesh) => {
+                assert_eq!(mesh.pipeline_id, 0x902);
+                assert_eq!(mesh.group_counts, [4, 2, 1]);
+            }
+            other => panic!("the third command is {other:?}"),
+        }
+        let bytes = MetalProducer::encode(submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), *submission);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A mesh dispatch with no targets to open a pass for is refused, and the
+    /// refusal names the operation instead of recording a partial pass.
+    #[test]
+    fn a_mesh_dispatch_without_render_targets_is_refused_by_name() {
+        let mut producer = MetalProducer::new(23, 1).expect("producer");
+        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
+        let error = producer
+            .dispatch_mesh(1, 1, 1)
+            .expect_err("a mesh dispatch needs a render pass");
+        assert!(matches!(
+            error,
+            ProducerError::NoRenderTargets {
+                operation: "DispatchMesh"
+            }
+        ));
+        assert!(error.to_string().contains("DispatchMesh"));
+        assert!(
+            producer.commands().is_empty(),
+            "a refusal records no command"
+        );
+    }
+
+    #[test]
+    fn a_mesh_dispatch_without_a_mesh_pipeline_is_refused() {
+        let mut producer = MetalProducer::new(24, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        let error = producer
+            .dispatch_mesh(1, 1, 1)
+            .expect_err("a mesh dispatch needs a mesh pipeline");
+        assert!(matches!(
+            error,
+            ProducerError::MissingPipeline { stage: "mesh" }
+        ));
+    }
+
+    /// `SetMeshPipeline` clears the host's graphics pipeline selection, so the
+    /// draw that follows re-emits `SetGraphicsPipeline` in the same pass.
+    #[test]
+    fn a_graphics_draw_after_a_mesh_dispatch_keeps_the_pass_open() {
+        let mut producer = MetalProducer::new(25, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
+        producer.dispatch_mesh(1, 1, 1).expect("mesh dispatch");
+        record_draw(&mut producer);
+        assert!(
+            producer.has_open_pass(),
+            "the draw joins the mesh pass instead of splitting it"
+        );
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_MESH_PIPELINE,
+                OP_DISPATCH_MESH,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
     }
 
     #[test]
@@ -2440,6 +2587,8 @@ mod tests {
             })
             .expect("descriptor table");
         record_draw(&mut producer);
+        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
+        producer.dispatch_mesh(1, 1, 1).expect("mesh dispatch");
         producer
             .resource_barrier(&[BarrierEntry {
                 allocation_id: 0x2000,
@@ -2462,8 +2611,6 @@ mod tests {
         producer.set_compute_pipeline(0x901).expect("compute pipeline");
         producer.dispatch(2, 3, 4).expect("dispatch");
         producer.present(3, 1).expect("present");
-        producer.set_mesh_pipeline(0x902).expect("mesh pipeline");
-        producer.dispatch_mesh(1, 1, 1).expect("mesh dispatch");
 
         let submission = producer.flush().expect("flush");
         let expected = [
@@ -2511,6 +2658,12 @@ mod tests {
                 base_vertex: 0,
                 start_instance: 0,
             }), OP_DRAW_INDEXED_INSTANCED),
+            (CommandV3::SetMeshPipeline(PipelineRef { pipeline_id: 1 }), OP_SET_MESH_PIPELINE),
+            (CommandV3::DispatchMesh(DispatchMesh {
+                pipeline_id: 1,
+                group_counts: [1, 1, 1],
+                bindings: Vec::new(),
+            }), OP_DISPATCH_MESH),
             (CommandV3::EndRenderPass, OP_END_RENDER_PASS),
             (CommandV3::ResourceBarrier(ResourceBarrier { entries: Vec::new() }), OP_RESOURCE_BARRIER),
             (CommandV3::CopyBuffer(CopyBuffer {
@@ -2543,12 +2696,6 @@ mod tests {
                 bindings: Vec::new(),
             }), OP_DISPATCH_3D),
             (CommandV3::Present(Present { surface_id: 1, sync_interval: 0 }), OP_PRESENT),
-            (CommandV3::SetMeshPipeline(PipelineRef { pipeline_id: 1 }), OP_SET_MESH_PIPELINE),
-            (CommandV3::DispatchMesh(DispatchMesh {
-                pipeline_id: 1,
-                group_counts: [1, 1, 1],
-                bindings: Vec::new(),
-            }), OP_DISPATCH_MESH),
         ];
 
         assert_eq!(
