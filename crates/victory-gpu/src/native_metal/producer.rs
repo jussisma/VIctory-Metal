@@ -1280,9 +1280,17 @@ impl MetalProducer {
 
     /// `ExecuteIndirect` of a mesh dispatch signature (record stride 12).
     ///
-    /// This path still records the indirect dispatch outside a render pass; a
-    /// pass already open is refused, not closed. A direct
-    /// [`dispatch_mesh`](Self::dispatch_mesh) opens the pass it needs.
+    /// The host encodes an indirect mesh dispatch on a live
+    /// `MTLRenderCommandEncoder` inside a render pass, exactly like a direct
+    /// [`dispatch_mesh`](Self::dispatch_mesh): this call opens the pass when
+    /// none is open and keeps an already open pass, so the indirect dispatch
+    /// executes between `BeginRenderPass` and the matching `EndRenderPass`.
+    /// `SetMeshPipeline` is emitted before it unless it is already current.
+    ///
+    /// The host drops its graphics pipeline selection at `SetMeshPipeline`, so
+    /// the dirty pipeline is flagged here and a following draw re-emits
+    /// `SetGraphicsPipeline` into the same pass. A pass already open for other
+    /// draws is joined, not split.
     pub fn execute_indirect_dispatch_mesh(
         &mut self,
         pipeline_id: u64,
@@ -1294,16 +1302,14 @@ impl MetalProducer {
                 operation: "ExecuteIndirect(mesh)",
             });
         }
-        if self.pass_open {
-            return Err(ProducerError::unsupported_opcode(
-                "ExecuteIndirect(mesh) inside a recorded pass",
-                OP_EXECUTE_INDIRECT_DISPATCH_MESH,
-            ));
-        }
+        self.open_pass("ExecuteIndirect(mesh)")?;
         if self.emitted_mesh_pipeline != Some(pipeline_id) {
             self.push(CommandV3::SetMeshPipeline(PipelineRef { pipeline_id }))?;
             self.emitted_mesh_pipeline = Some(pipeline_id);
         }
+        // The host drops its graphics pipeline selection at `SetMeshPipeline`:
+        // a following draw must re-emit `SetGraphicsPipeline` in this pass.
+        self.dirty.pipeline = true;
         self.push(CommandV3::ExecuteIndirectDispatchMesh(
             ExecuteIndirectDispatchMesh {
                 pipeline_id,
@@ -2364,6 +2370,148 @@ mod tests {
         assert_host_planner_accepts(&submission.commands);
     }
 
+    /// An indirect mesh dispatch executes inside a render pass: the producer
+    /// opens `BeginRenderPass`, emits `SetMeshPipeline` before the indirect
+    /// command, and keeps the pass open for a following draw.
+    #[test]
+    fn an_indirect_mesh_dispatch_opens_the_pass_and_a_draw_joins_it() {
+        let mut producer = MetalProducer::new(26, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_mesh_pipeline(0xa00).expect("mesh pipeline");
+        producer
+            .execute_indirect_dispatch_mesh(0xa00, arguments(3, false))
+            .expect("indirect mesh dispatch");
+        assert!(
+            producer.has_open_pass(),
+            "an indirect mesh dispatch opens the pass it executes in"
+        );
+
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        record_draw(&mut producer);
+        assert!(
+            producer.has_open_pass(),
+            "the draw joins the indirect mesh pass instead of splitting it"
+        );
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_MESH_PIPELINE,
+                OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        let position = |wanted: u16| {
+            opcodes
+                .iter()
+                .position(|opcode| *opcode == wanted)
+                .unwrap_or_else(|| panic!("opcode {wanted} is missing from {opcodes:?}"))
+        };
+        assert!(
+            position(OP_BEGIN_RENDER_PASS) < position(OP_SET_MESH_PIPELINE),
+            "the mesh pipeline is selected inside the pass"
+        );
+        assert!(
+            position(OP_SET_MESH_PIPELINE) < position(OP_EXECUTE_INDIRECT_DISPATCH_MESH),
+            "SetMeshPipeline must precede ExecuteIndirect"
+        );
+        assert!(
+            position(OP_EXECUTE_INDIRECT_DISPATCH_MESH) < position(OP_DRAW_INDEXED_INSTANCED),
+            "the following draw stays in the same pass"
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| **opcode == OP_END_RENDER_PASS)
+                .count(),
+            1,
+            "the pass closes once, at flush"
+        );
+        match &submission.commands[2] {
+            CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
+                assert_eq!(dispatch.pipeline_id, 0xa00);
+                assert_eq!(dispatch.arguments.max_count, 3);
+            }
+            other => panic!("the third command is {other:?}"),
+        }
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// An indirect mesh dispatch into an already open pass joins it: no second
+    /// `BeginRenderPass` is recorded.
+    #[test]
+    fn an_indirect_mesh_dispatch_joins_an_open_pass() {
+        let mut producer = MetalProducer::new(27, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        record_draw(&mut producer);
+        assert!(producer.has_open_pass(), "the draw opened the pass");
+
+        producer.set_mesh_pipeline(0xa00).expect("mesh pipeline");
+        producer
+            .execute_indirect_dispatch_mesh(0xa00, arguments(1, false))
+            .expect("indirect mesh dispatch");
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| **opcode == OP_BEGIN_RENDER_PASS)
+                .count(),
+            1,
+            "the indirect mesh joins the open pass: {opcodes:?}"
+        );
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| **opcode == OP_END_RENDER_PASS)
+                .count(),
+            1,
+            "one pass, one close: {opcodes:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// An indirect mesh dispatch with no pipeline handle is refused before it
+    /// can open a pass, so no partial stream is recorded.
+    #[test]
+    fn an_indirect_mesh_dispatch_without_a_pipeline_handle_is_refused() {
+        let mut producer = MetalProducer::new(28, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        let error = producer
+            .execute_indirect_dispatch_mesh(0, arguments(1, false))
+            .expect_err("an indirect mesh dispatch needs a pipeline");
+        assert!(matches!(
+            error,
+            ProducerError::InvalidResource {
+                operation: "ExecuteIndirect(mesh)"
+            }
+        ));
+        assert!(!producer.has_open_pass(), "the refusal opens no pass");
+        assert!(
+            producer.commands().is_empty(),
+            "the refusal records no command"
+        );
+    }
+
     #[test]
     fn render_target_changes_split_the_pass() {
         let mut producer = MetalProducer::new(9, 1).expect("producer");
@@ -2768,8 +2916,8 @@ mod tests {
             .execute_indirect_dispatch_mesh(0xa00, arguments(3, false))
             .expect("indirect mesh dispatch");
         assert!(
-            !producer.has_open_pass(),
-            "mesh execution is outside a pass"
+            producer.has_open_pass(),
+            "an indirect mesh dispatch opens the pass it executes in"
         );
 
         producer.set_compute_pipeline(0xb00).expect("compute pipeline");
