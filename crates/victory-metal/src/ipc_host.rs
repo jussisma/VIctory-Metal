@@ -82,13 +82,18 @@
 //! file `MAP_SHARED` and answers kind 128. A rejection closes the session.
 //!
 //! Once registered, every version 3 submission (kind 5 and kind 7) publishes
-//! its sequence as `submitted_fence` before execution and, only when the device
-//! reports success, as `completed_fence` afterwards. A failed, refused or
-//! replayed submission never advances `completed_fence`, and publishing uses
-//! `fetch_max`, so a stale replay can never lower it. Registration starts the
-//! page with [`crate::fence_page::FencePage::begin_session`], which clears both
-//! fences and advances the epoch; the page file must therefore be created for
-//! the session and must not be shared with a different host.
+//! its sequence as `submitted_fence` before execution. `completed_fence` is
+//! published only for work that is actually finished: an asynchronous
+//! transport (ADR-017) publishes the contiguous completion watermark from its
+//! `addCompletedHandler:` block straight into the guest-visible page, while a
+//! synchronous executor — one that reports `false` from
+//! [`BatchExecutor::attach_fence_page`] — keeps the older behaviour and the host
+//! publishes on `ReplyStatus::Ok`. A failed, refused or replayed submission
+//! never advances `completed_fence`, and publishing uses `fetch_max`, so a stale
+//! replay can never lower it. Registration starts the page with
+//! [`crate::fence_page::FencePage::begin_session`], which clears both fences and
+//! advances the epoch; the page file must therefore be created for the session
+//! and must not be shared with a different host.
 //!
 //! Kind 7 is the fire-and-forget path: the same version 3 envelope as kind 5,
 //! executed with the same validation, ledger and fence publication, but with no
@@ -96,10 +101,10 @@
 //! failure from the fence not advancing. A malformed kind 7 frame closes the
 //! session because there is no reply in which to report the error.
 //!
-//! Note that the host still completes the GPU work synchronously inside
-//! [`BatchExecutor::submit_v3`] (the device path waits with
-//! `waitUntilCompleted`), so only the *guest* is asynchronous. Making the host
-//! submit non-blocking needs a `device.rs` change and is tracked separately.
+//! The host submit path no longer waits: an accepted submission is committed and
+//! returns, and the guest observes completion through the shared page. Detaching
+//! the page at session end drains the GPU pipeline first, so a completion
+//! handler can never publish into an unmapped page.
 //!
 //! # Version 3 request envelope
 //!
@@ -187,6 +192,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -437,6 +443,28 @@ pub trait BatchExecutor {
             "surface registration is not enabled by this executor",
         ))
     }
+
+    /// Attaches the host-mapped completion page this executor must publish into.
+    ///
+    /// Returns `true` when the executor took ownership of the page and publishes
+    /// `completed_fence` itself from its GPU completion handler. `false` (the
+    /// default) means the executor finishes a submission synchronously, so the
+    /// host publishes the completion when the executor returns `Ok` — the
+    /// pre-ADR-017 contract for an executor without a GPU completion handler.
+    ///
+    /// The returned page is reference-counted, so an executor that keeps it
+    /// cannot be left with an unmapped page; one that cannot publish
+    /// asynchronously must not retain it.
+    fn attach_fence_page(&self, _page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
+        Ok(false)
+    }
+
+    /// Releases a page attached by [`Self::attach_fence_page`].
+    ///
+    /// Called when the session ends. An executor that publishes asynchronously
+    /// must drain its GPU pipeline here, so no completion handler can publish
+    /// into a page the caller is about to unmap.
+    fn detach_fence_page(&self) {}
 }
 
 impl BatchExecutor for DirectMetalTransport {
@@ -501,6 +529,17 @@ impl BatchExecutor for DirectMetalTransport {
         })?;
         let target = crate::macos::render::RenderTarget::from_objc(retained)?;
         DirectMetalTransport::register_present_surface(self, surface_id, &target)
+    }
+
+    fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
+        DirectMetalTransport::attach_shared_fence_page(self, page)?;
+        Ok(true)
+    }
+
+    fn detach_fence_page(&self) {
+        // Drains the GPU pipeline before the host unmaps the page, so no
+        // completion handler can publish into released memory.
+        let _ = DirectMetalTransport::detach_shared_fence_page(self);
     }
 }
 
@@ -705,7 +744,17 @@ pub struct IpcHost<E: BatchExecutor> {
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
     /// Opt-in shared completion page registered by kind 6.
-    fence_page: Option<FencePageMapping>,
+    ///
+    /// The mapping is reference-counted because the executor keeps a clone while
+    /// it publishes completions from its GPU completion handler.
+    fence_page: Option<Arc<FencePageMapping>>,
+    /// True when the executor publishes `completed_fence` itself.
+    ///
+    /// An asynchronous transport (ADR-017) publishes from the GPU completion
+    /// handler, so the host must not publish after the executor merely accepted
+    /// the submission. A synchronous executor keeps the old contract and the
+    /// host publishes on `ReplyStatus::Ok`.
+    fence_page_attached: bool,
     next_sequence: u32,
     submissions: u64,
     ledger: ListLedger,
@@ -743,6 +792,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
             fence_page: None,
+            fence_page_attached: false,
             next_sequence: 1,
             submissions: 0,
             ledger: ListLedger::new(),
@@ -893,6 +943,13 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// [`FencePageMapping::open`]. The page is cleared and its epoch advanced
     /// before the acknowledgement, so the guest starts from a session-local
     /// fence state.
+    ///
+    /// The mapping is then handed to the executor (ADR-017): an asynchronous
+    /// transport publishes the completion watermark from its GPU completion
+    /// handler straight into the guest-visible page, so the host never reports a
+    /// sequence complete before the GPU finished it. An executor that cannot
+    /// publish asynchronously reports `false` and keeps the synchronous
+    /// publish-on-`Ok` behaviour.
     fn register_fence_page(&mut self, payload: &[u8]) -> Result<(), HostError> {
         if payload.len() != FENCE_PAGE_REGISTER_PAYLOAD_LEN {
             return Err(HostError::Protocol(
@@ -910,8 +967,11 @@ impl<E: BatchExecutor> IpcHost<E> {
             ));
         }
 
-        let mapping = FencePageMapping::open(self.share_dir.join(FENCE_PAGE_FILE_NAME))?;
+        let mapping = Arc::new(FencePageMapping::open(
+            self.share_dir.join(FENCE_PAGE_FILE_NAME),
+        )?);
         mapping.page().begin_session();
+        self.fence_page_attached = self.executor.attach_fence_page(Arc::clone(&mapping))?;
         self.fence_page = Some(mapping);
         Ok(())
     }
@@ -1081,8 +1141,9 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// The frame is decoded, sequenced and executed exactly like kind 5, so the
     /// ledger and fence semantics are identical. There is no reply to carry a
     /// decode error, so any framing or sequencing failure closes the session;
-    /// execution outcomes are reported only through the shared fence. A success
-    /// publishes `completed_fence`; a refusal or executor failure leaves it
+    /// execution outcomes are reported only through the shared fence. Accepted
+    /// work advances `completed_fence` when it actually finishes (see
+    /// [`Self::execute_v3_with_fence`]); a refusal or executor failure leaves it
     /// behind `submitted_fence`, which the guest observes as pending.
     fn serve_async_submission(&mut self, payload: &[u8]) -> Result<(), HostError> {
         let submission = decode_v3_request(payload).map_err(|_| {
@@ -1117,9 +1178,10 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// twice.
     ///
     /// When a fence page is registered, a submission that actually reaches the
-    /// executor publishes its sequence as `submitted_fence`, and only a
-    /// `ReplyStatus::Ok` result publishes it as `completed_fence`. Refused and
-    /// replayed submissions publish nothing.
+    /// executor publishes its sequence as `submitted_fence`; only work that is
+    /// actually finished advances `completed_fence` (from the GPU completion
+    /// handler for an asynchronous transport, from this call for a synchronous
+    /// executor). Refused and replayed submissions publish nothing.
     fn execute_or_refuse_v3(&mut self, submission: &SubmissionV3) -> Reply {
         let response = |status| Reply {
             sequence: submission.sequence,
@@ -1150,6 +1212,13 @@ impl<E: BatchExecutor> IpcHost<E> {
     }
 
     /// Runs one executor submission and publishes its fence transitions.
+    ///
+    /// `submitted_fence` is published before the executor runs. `completed_fence`
+    /// is only published here for a **synchronous** executor, which has already
+    /// finished the GPU work when it returns: an asynchronous transport (ADR-017)
+    /// publishes the real completion from its GPU completion handler, so an
+    /// early publish here would tell the guest that work the GPU has not started
+    /// is done.
     fn execute_v3_with_fence(
         &mut self,
         submission: &SubmissionV3,
@@ -1157,7 +1226,7 @@ impl<E: BatchExecutor> IpcHost<E> {
     ) -> Reply {
         self.publish_submitted(submission.sequence);
         let reply = self.execute_v3(submission, allocations);
-        if reply.status == ReplyStatus::Ok {
+        if reply.status == ReplyStatus::Ok && !self.fence_page_attached {
             self.publish_completed(submission.sequence);
         }
         reply
@@ -1416,6 +1485,12 @@ impl<E: BatchExecutor> IpcHost<E> {
 
 impl<E: BatchExecutor> Drop for IpcHost<E> {
     fn drop(&mut self) {
+        // The guest-visible page is unmapped when this struct drops its mapping.
+        // Detach it first: an asynchronous executor drains its GPU pipeline there,
+        // so no completion handler can publish into released memory.
+        if self.fence_page.take().is_some() {
+            self.executor.detach_fence_page();
+        }
         // `release_all` only needs the executor and the allocation map.
         self.release_all();
     }

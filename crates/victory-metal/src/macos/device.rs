@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
-use crate::fence_page::FencePage;
+use crate::fence_page::{FencePage, FencePageMapping};
 use crate::macos::bindings::{
     ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind,
     ReflectedStage, RootParameterKind, RootSignatureLayout,
@@ -665,6 +665,14 @@ struct AsyncCounters {
 /// completion handler from observing a deallocated buffer.
 struct AsyncSubmitState {
     fence_page: Arc<FencePage>,
+    /// Host-mapped page that takes precedence over `fence_page`.
+    ///
+    /// A native host shares one `MAP_SHARED` page with its guest. The transport
+    /// retains the mapping and publishes the contiguous completion watermark
+    /// into it from the completion handler, so a guest load observes a sequence
+    /// only after the GPU finished that work. The `Arc` keeps the mapping
+    /// mapped for as long as any completion handler can still run.
+    shared_fence: Option<Arc<FencePageMapping>>,
     cap: usize,
     next_fence: u64,
     watermark: CompletionWatermark,
@@ -685,6 +693,7 @@ impl AsyncSubmitState {
     fn new(fence_page: Arc<FencePage>, cap: usize) -> Self {
         Self {
             fence_page,
+            shared_fence: None,
             cap,
             next_fence: 0,
             watermark: CompletionWatermark::new(),
@@ -743,6 +752,47 @@ impl AsyncSubmitState {
         token
     }
 
+    /// Publishes `value` as completed into the page a guest observes.
+    ///
+    /// The host-mapped page wins when one is attached; the process-local page is
+    /// the headless default. Publishing is `fetch_max`, so no replay or stale
+    /// handler can lower a value a guest already read.
+    fn publish_completed(&self, value: u64) {
+        match &self.shared_fence {
+            Some(mapping) => {
+                mapping.page().publish(value);
+            }
+            None => {
+                self.fence_page.publish(value);
+            }
+        }
+    }
+
+    /// Reads the completed value a guest would observe right now.
+    fn completed(&self) -> u64 {
+        match &self.shared_fence {
+            Some(mapping) => mapping.page().completed(),
+            None => self.fence_page.completed(),
+        }
+    }
+
+    /// Completes a submission that encoded no GPU work.
+    ///
+    /// The fence is reserved in commit order and marked done at once, so the
+    /// contiguous watermark advances without publishing across a command buffer
+    /// that is still in flight. No command buffer was committed, so the
+    /// submission counters stay untouched.
+    fn note_empty_submission(&mut self, sequence: u32) {
+        let fence = self.reserve_fence(sequence);
+        self.watermark.push(fence);
+        let _ = self.watermark.mark_done(fence);
+        if let Some(advanced) = self.watermark.advance() {
+            self.publish_completed(advanced);
+            self.held.retain(|&held, _| held > advanced);
+        }
+        self.drain();
+    }
+
     /// Marks `fence` complete and advances the contiguous watermark.
     ///
     /// A completion for a fence this transport never committed is ignored: a
@@ -763,7 +813,7 @@ impl AsyncSubmitState {
             self.counters.failed += 1;
         }
         if let Some(advanced) = self.watermark.advance() {
-            self.fence_page.publish(advanced);
+            self.publish_completed(advanced);
             self.held.retain(|&fence, _| fence > advanced);
         }
         self.drain();
@@ -848,6 +898,19 @@ fn retain_command_buffer(raw: objc::Id) -> Option<ObjcObject> {
     }
     // SAFETY: `raw` is a live retained `MTLCommandBuffer` owned by the async
     // state; `retain` returns it with one extra reference.
+    ObjcObject::from_retained(unsafe { objc::msg_send_id_0(raw, objc::sel(c"retain")) })
+}
+
+/// Retains one more reference to a live Metal object.
+///
+/// Used where an object is owned by a short-lived planner structure but must
+/// stay alive until a command buffer that references it completes.
+fn retain_object(raw: objc::Id) -> Option<ObjcObject> {
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `raw` is a live retained Metal object; `retain` returns it with
+    // one extra reference owned by the returned `ObjcObject`.
     ObjcObject::from_retained(unsafe { objc::msg_send_id_0(raw, objc::sel(c"retain")) })
 }
 
@@ -957,11 +1020,13 @@ impl DirectMetalTransport {
             .map_err(|_| MetalError::InternalError("submit pipeline mutex poisoned".to_string()))
     }
 
-    /// Borrows the completion page this transport publishes into.
+    /// Borrows the process-local completion page this transport publishes into.
     ///
     /// The default page is a process-local allocation; a native host that
-    /// shares a mapped page installs it with [`Self::set_fence_page`] before the
-    /// first submission.
+    /// shares a mapped page either installs it as the process page with
+    /// [`Self::set_fence_page`] or, preferably, attaches it with
+    /// [`Self::attach_shared_fence_page`], which keeps the guest's own mapping
+    /// as the publication target.
     pub fn fence_page(&self) -> Arc<FencePage> {
         match self.async_submit.lock() {
             Ok(state) => Arc::clone(&state.fence_page),
@@ -969,7 +1034,7 @@ impl DirectMetalTransport {
         }
     }
 
-    /// Replaces the completion page later submissions publish into.
+    /// Replaces the process-local completion page later submissions publish into.
     ///
     /// Command buffers already in flight keep publishing into the page that was
     /// current when they were committed, so install a page before submitting.
@@ -977,6 +1042,48 @@ impl DirectMetalTransport {
         let mut state = self.lock_async()?;
         state.fence_page = page;
         Ok(())
+    }
+
+    /// Attaches the host-mapped completion page a guest observes.
+    ///
+    /// From this call on, the contiguous completion watermark is published into
+    /// `mapping.page()` — the same `MAP_SHARED` file the guest maps — from the
+    /// GPU completion handler only. The transport retains the mapping, so it
+    /// cannot be unmapped while a completion handler may still run; detach it
+    /// with [`Self::detach_shared_fence_page`] (or drop the transport, which
+    /// drains the pipeline first).
+    ///
+    /// Install the page before the first submission: Metal publishes into the
+    /// page that was current when a buffer was committed.
+    pub fn attach_shared_fence_page(
+        &self,
+        mapping: Arc<FencePageMapping>,
+    ) -> Result<(), MetalError> {
+        let mut state = self.lock_async()?;
+        state.shared_fence = Some(mapping);
+        Ok(())
+    }
+
+    /// Detaches the host-mapped completion page.
+    ///
+    /// The pipeline is drained first, so no completion handler can publish into
+    /// the mapping after this returns and the caller may unmap it.
+    pub fn detach_shared_fence_page(&self) -> Result<(), MetalError> {
+        self.wait_for_gpu()?;
+        let mut state = self.lock_async()?;
+        state.shared_fence = None;
+        Ok(())
+    }
+
+    /// Contiguous completion value the attached page publishes right now.
+    ///
+    /// This is the host-side view of the same atomic a guest loads: it never
+    /// covers a command buffer that is still in flight.
+    pub fn completed_fence(&self) -> u64 {
+        match self.async_submit.lock() {
+            Ok(state) => state.completed(),
+            Err(_) => 0,
+        }
     }
 
     /// Returns the asynchronous submit counters (ADR-017).
@@ -1099,12 +1206,19 @@ impl DirectMetalTransport {
                         .get(&fence)
                         .and_then(|buffer| retain_command_buffer(buffer.as_raw())),
                     Arc::clone(&state.fence_page),
+                    state.shared_fence.clone(),
                 )
             };
-            let (fence, retained, page) = pending;
+            let (fence, retained, owned_page, shared_page) = pending;
             let deadline = Instant::now() + BACKPRESSURE_SPIN;
             while Instant::now() < deadline {
-                if page.completed() >= fence {
+                // The shared mapping is retained by the same state snapshot, so
+                // reading it here cannot race an unmap.
+                let completed = match &shared_page {
+                    Some(mapping) => mapping.page().completed(),
+                    None => owned_page.completed(),
+                };
+                if completed >= fence {
                     break;
                 }
                 std::hint::spin_loop();
@@ -2528,6 +2642,14 @@ struct PreparedArgumentBuffer {
     stage: ShaderStage,
     index: usize,
     buffer: ObjcObject,
+    /// Converted descriptor tables this argument buffer points at.
+    ///
+    /// Each table is its own `MTLBuffer`, and `AbiPending` is cleared as soon as
+    /// this argument buffer is uploaded — long before the submission is
+    /// encoded. Owning the retains here keeps every table alive until
+    /// `encode_v3_segments` pins the objects in the retire queue; without it the
+    /// GPU (and `useResource:`) reads a released buffer.
+    tables: Vec<ObjcObject>,
     /// Resources the argument buffer references, declared with `useResource:`.
     resources: Vec<objc::Id>,
 }
@@ -3156,6 +3278,7 @@ fn flush_abi(
     for (stage, layout) in stages {
         let mut builder = ArgumentBufferBuilder::new(layout);
         let mut resources: Vec<(objc::Id, usize)> = Vec::new();
+        let mut tables: Vec<ObjcObject> = Vec::new();
         let mut stage_bytes: Option<(usize, Vec<u8>)> = None;
         for binding in &pending.bindings {
             match binding {
@@ -3232,6 +3355,14 @@ fn flush_abi(
                     builder.set_table_address(*parameter, *address)?;
                     resources.push((buffer.as_raw(), MTL_RESOURCE_USAGE_READ));
                     resources.extend(table_resources.iter().copied());
+                    // `pending` is cleared by the caller as soon as this
+                    // argument buffer is uploaded, so the table buffer must be
+                    // retained into the prepared op that will outlive it.
+                    tables.push(retain_object(buffer.as_raw()).ok_or_else(|| {
+                        MetalError::InternalError(
+                            "descriptor table buffer retain returned null".to_string(),
+                        )
+                    })?);
                 }
             }
         }
@@ -3246,10 +3377,34 @@ fn flush_abi(
             stage: *stage,
             index: layout.argument_buffer_index(),
             buffer,
+            tables,
             resources: resources.into_iter().map(|(resource, _)| resource).collect(),
         });
     }
     Ok((buffers, bytes_ops))
+}
+
+/// Stage layouts a render-family pipeline binds converter argument buffers for.
+///
+/// A mesh-family pipeline (mesh/object/fragment) binds its mesh stages; the
+/// converter never emits a vertex stage for a mesh PSO, so looking only at
+/// vertex/fragment would miss every mesh-stage root parameter.
+fn abi_render_stages(
+    abi: &PipelineAbi,
+    mesh_family: bool,
+) -> Vec<(ShaderStage, RootSignatureLayout)> {
+    let stages: Vec<(ShaderStage, &RootSignatureLayout)> = if mesh_family {
+        abi.mesh_stages()
+    } else {
+        abi.stages_for(ReflectedStage::Vertex)
+            .into_iter()
+            .chain(abi.stages_for(ReflectedStage::Fragment))
+            .collect()
+    };
+    stages
+        .into_iter()
+        .map(|(stage, layout)| (stage, layout.clone()))
+        .collect()
 }
 
 /// Flushes collected root-signature bindings for a render-family pipeline.
@@ -3267,18 +3422,7 @@ fn flush_render_abi(
     if pending.is_empty() {
         return Ok(());
     }
-    let stages: Vec<(ShaderStage, RootSignatureLayout)> = if mesh_family {
-        abi.mesh_stages()
-            .into_iter()
-            .map(|(stage, layout)| (stage, layout.clone()))
-            .collect()
-    } else {
-        abi.stages_for(ReflectedStage::Vertex)
-            .into_iter()
-            .chain(abi.stages_for(ReflectedStage::Fragment))
-            .map(|(stage, layout)| (stage, layout.clone()))
-            .collect()
-    };
+    let stages = abi_render_stages(abi, mesh_family);
     let (buffers, bytes_ops) = flush_abi(device, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
@@ -3416,6 +3560,57 @@ fn resolve_compute_pipeline(
     Ok(ResolvedComputePipeline {
         raw: entry.raw(),
         thread_limit: limit as u64,
+    })
+}
+
+/// One resolved mesh dispatch: per-stage threadgroup sizes and grid ceiling.
+///
+/// `DispatchMesh` on the wire names only group counts, so the sizes come from
+/// the selected pipeline: a legacy [`MeshPipeline`] carries them directly and a
+/// content-hashed mesh PSO carries them in its decoded `PipelineState`.
+struct ResolvedMeshPipeline {
+    threads_per_object_threadgroup: MTLSize,
+    threads_per_mesh_threadgroup: MTLSize,
+    max_total_threadgroups_per_mesh_grid: usize,
+}
+
+/// A stage threadgroup size Metal accepts.
+///
+/// A zero dimension in a `PipelineState` blob means "unset" (the descriptor
+/// default), and every `drawMeshThreadgroups` dimension must be at least one.
+fn mesh_threadgroup_size(dimensions: [u32; 3]) -> MTLSize {
+    MTLSize {
+        width: dimensions[0].max(1) as usize,
+        height: dimensions[1].max(1) as usize,
+        depth: dimensions[2].max(1) as usize,
+    }
+}
+
+/// Resolves a mesh dispatch handle through the legacy map or the content
+/// registry.
+///
+/// A content-hashed mesh PSO registered by
+/// [`DirectMetalTransport::register_content_hashed_mesh_pipeline`] is dispatchable
+/// exactly like a legacy [`MeshPipeline`]; the per-stage threadgroup sizes come
+/// from its `PipelineState`.
+fn resolve_mesh_pipeline(
+    state: &DeviceState,
+    id: u64,
+) -> Result<ResolvedMeshPipeline, PrepareAbort> {
+    if let Some(mesh) = state.mesh_pipelines.get(&id) {
+        return Ok(ResolvedMeshPipeline {
+            threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
+            threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
+            max_total_threadgroups_per_mesh_grid: mesh.max_total_threadgroups_per_mesh_grid(),
+        });
+    }
+    let entry = resolve_content_pipeline(state, id, PipelineStage::Mesh)?;
+    let declared = entry.state();
+    let grid_limit = declared.max_total_threadgroups_per_mesh_grid as usize;
+    Ok(ResolvedMeshPipeline {
+        threads_per_object_threadgroup: mesh_threadgroup_size(declared.object_threadgroup),
+        threads_per_mesh_threadgroup: mesh_threadgroup_size(declared.mesh_threadgroup),
+        max_total_threadgroups_per_mesh_grid: grid_limit,
     })
 }
 
@@ -3983,12 +4178,9 @@ fn prepare_render_segment(
                     );
                 }
                 if let Some(active) = abi.as_ref() {
-                    let stages: Vec<(ShaderStage, RootSignatureLayout)> = active
-                        .stages_for(ReflectedStage::Vertex)
-                        .into_iter()
-                        .chain(active.stages_for(ReflectedStage::Fragment))
-                        .map(|(stage, layout)| (stage, layout.clone()))
-                        .collect();
+                    // A mesh pipeline's tables live on its mesh/object stages;
+                    // a vertex/fragment lookup would not find them.
+                    let stages = abi_render_stages(active, mesh_pipeline.is_some());
                     let kind = abi_table_kind(&stages, usize::from(table.set))?;
                     pending.bindings.push(build_descriptor_table(
                         device,
@@ -4049,10 +4241,7 @@ fn prepare_render_segment(
                 ops.push(PreparedRenderOp::Barrier);
             }
             CommandV3::DispatchMesh(dispatch) => {
-                let mesh = state
-                    .mesh_pipelines
-                    .get(&dispatch.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let mesh = resolve_mesh_pipeline(state, dispatch.pipeline_id)?;
                 if mesh_pipeline != Some(dispatch.pipeline_id) {
                     return Err(MetalError::InvalidArg(
                         "mesh dispatch requires a selected mesh pipeline in its render pass",
@@ -4068,7 +4257,7 @@ fn prepare_render_segment(
                 let group_counts = dispatch.checked_group_count().ok_or(
                     MetalError::InvalidArg("mesh dispatch group counts overflow u64"),
                 )?;
-                let limit = mesh.max_total_threadgroups_per_mesh_grid();
+                let limit = mesh.max_total_threadgroups_per_mesh_grid;
                 if limit != 0 && group_counts > limit as u64 {
                     return Err(MetalError::InvalidArg(
                         "mesh dispatch exceeds maxTotalThreadgroupsPerMeshGrid",
@@ -4088,8 +4277,8 @@ fn prepare_render_segment(
                         height: dispatch.group_counts[1] as usize,
                         depth: dispatch.group_counts[2] as usize,
                     },
-                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
-                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
+                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup,
+                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup,
                     bindings: resolve_binding_slots(state, allocations, &dispatch.bindings, 0)?,
                 });
             }
@@ -4274,10 +4463,7 @@ fn prepare_render_segment(
                 });
             }
             CommandV3::ExecuteIndirectDispatchMesh(dispatch) => {
-                let mesh = state
-                    .mesh_pipelines
-                    .get(&dispatch.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let mesh = resolve_mesh_pipeline(state, dispatch.pipeline_id)?;
                 if mesh_pipeline != Some(dispatch.pipeline_id) {
                     return Err(MetalError::InvalidArg(
                         "mesh dispatch requires a selected mesh pipeline in its render pass",
@@ -4299,8 +4485,8 @@ fn prepare_render_segment(
                     &mut ops,
                 )?;
                 ops.push(PreparedRenderOp::DispatchMeshIndirect {
-                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
-                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
+                    threads_per_object_threadgroup: mesh.threads_per_object_threadgroup,
+                    threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup,
                     arguments,
                 });
             }
@@ -5151,9 +5337,12 @@ impl DirectMetalTransport {
     ///   the identity, so the caller may retry a corrected submission.
     /// * `DispatchMesh` is render-encoder work: it must appear inside a
     ///   `BeginRenderPass`/`EndRenderPass` pair and after a `SetMeshPipeline`
-    ///   naming a pipeline registered through
-    ///   [`Self::register_mesh_pipeline`]. The per-stage threadgroup sizes come
-    ///   from that registered pipeline; the wire only carries group counts.
+    ///   naming either a pipeline registered through
+    ///   [`Self::register_mesh_pipeline`] or a content-hashed mesh PSO
+    ///   registered through [`Self::register_content_hashed_mesh_pipeline`].
+    ///   The per-stage threadgroup sizes come from that pipeline (a legacy
+    ///   `MeshPipeline` or the content-hashed `PipelineState`); the wire only
+    ///   carries group counts.
     ///   A mesh dispatch outside a pass, without a mesh pipeline, or naming an
     ///   unknown handle fails before any command buffer exists.
     ///
@@ -5164,11 +5353,15 @@ impl DirectMetalTransport {
     /// buffer was accepted by the GPU, not that it finished. Every encoder or
     /// validation failure still returns its explicit error *before* `commit`, so
     /// a refusal never publishes a fence value. Completion is published into
-    /// [`Self::fence_page`] by an `addCompletedHandler:` block, which also
-    /// releases the staging objects pinned for the submission through the
-    /// per-transport retire queue. At most
+    /// [`Self::fence_page`] — or, when the host attached one, into the shared
+    /// page given to [`Self::attach_shared_fence_page`] — by an
+    /// `addCompletedHandler:` block, which also releases the staging objects
+    /// pinned for the submission through the per-transport retire queue. At most
     /// `VICTORY_METAL_FRAMES_IN_FLIGHT` (1..=3, default 3) buffers are in
     /// flight; a full pipeline waits on the *oldest* command buffer only.
+    ///
+    /// A submission that encodes no GPU work completes immediately through the
+    /// same contiguous watermark, so a guest fence never stalls on it.
     ///
     /// A `Present` command is a frame boundary: it drains completed retire
     /// entries, but never waits for its own command buffer.
@@ -5243,6 +5436,12 @@ impl DirectMetalTransport {
         if prepared.is_empty() {
             if let Some((list_id, generation)) = list_key {
                 state.mark_list_executed(list_id, generation);
+            }
+            // Nothing was encoded, so nothing can still be reading: complete the
+            // sequence through the same watermark path a completion handler
+            // uses, never across an in-flight command buffer.
+            if let Ok(mut async_state) = self.async_submit.lock() {
+                async_state.note_empty_submission(submission.sequence);
             }
             self.note_refusal();
             return Ok((reply(ReplyStatus::Ok), stats));
@@ -5444,6 +5643,7 @@ impl DirectMetalTransport {
                     for op in ops {
                         if let PreparedComputeOp::ArgumentBuffer(argument_buffer) = op {
                             staged.push(argument_buffer.buffer);
+                            staged.extend(argument_buffer.tables);
                         }
                     }
                 }
@@ -5460,6 +5660,7 @@ impl DirectMetalTransport {
                         for op in ops {
                             if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
                                 staged.push(argument_buffer.buffer);
+                                staged.extend(argument_buffer.tables);
                             }
                         }
                         continue;
@@ -5597,6 +5798,7 @@ impl DirectMetalTransport {
                     for op in ops {
                         if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
                             staged.push(argument_buffer.buffer);
+                            staged.extend(argument_buffer.tables);
                         }
                     }
                 }
@@ -8140,6 +8342,40 @@ mod async_pipeline_tests {
         assert_eq!(state.reserve_fence(2), 2);
         // A replay of an older sequence must not move the fence backwards.
         assert_eq!(state.reserve_fence(1), 3);
+    }
+
+    /// A submission with no GPU work completes immediately, but never across a
+    /// command buffer that is still in flight.
+    #[test]
+    fn empty_submission_completes_without_jumping_in_flight_work() {
+        let page = Arc::new(FencePage::new());
+        let mut state = AsyncSubmitState::new(Arc::clone(&page), 3);
+
+        // Fence 1 is committed and still running.
+        let in_flight = state.reserve_fence(1);
+        state.watermark.push(in_flight);
+        assert_eq!(in_flight, 1);
+
+        // An empty submission with sequence 2 must not publish 2 yet.
+        state.note_empty_submission(2);
+        assert_eq!(page.completed(), 0, "published across an in-flight fence");
+        assert_eq!(state.completed(), 0);
+        assert_eq!(
+            state.watermark.front(),
+            Some(1),
+            "fence 1 still gates the contiguous watermark"
+        );
+
+        // Once fence 1 completes, both are published in commit order.
+        state.note_completion(in_flight, true);
+        assert_eq!(page.completed(), 2);
+        assert_eq!(state.completed(), 2);
+        assert!(state.watermark.is_idle());
+
+        // An empty submission with nothing in flight publishes at once.
+        state.note_empty_submission(3);
+        assert_eq!(page.completed(), 3);
+        assert_eq!(state.counters.submitted, 0, "no command buffer was committed");
     }
 
     #[test]

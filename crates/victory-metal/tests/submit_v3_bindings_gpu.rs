@@ -468,6 +468,12 @@ fn graphics_mrt_depth_registry_pixels_are_exact() {
         "one render encoder must cover the pass"
     );
 
+    // `submit_v3` returns after `commit`: wait for the GPU before reading the
+    // registry textures back, so the readback cannot race the render pass.
+    transport
+        .wait_for_gpu()
+        .expect("the MRT pass should complete");
+
     let target0 = transport
         .read_registered_texture_rgba8(0x1000)
         .expect("target 0 readback");
@@ -601,6 +607,12 @@ fn compute_content_pso_abi_runs_exact_value() {
     assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
     assert_eq!(stats.compute_encoders, 1);
 
+    // The submission is asynchronous: the shared page holds the kernel's output
+    // only after the GPU completed it.
+    transport
+        .wait_for_gpu()
+        .expect("the compute submission should complete");
+
     // SAFETY: the shared page holds `THREADS` readable u32 words that Metal wrote.
     for index in 0..THREADS as usize {
         let actual = unsafe { *output.ptr.cast::<u32>().add(index) };
@@ -642,6 +654,9 @@ fn unknown_handles_are_refused_without_encoders() {
         .submit_v3_with_stats(&clear_pass, &allocations)
         .expect("clear-only pass must execute");
     assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    transport
+        .wait_for_gpu()
+        .expect("the clear-only pass should complete");
     let cleared = transport
         .read_registered_texture_rgba8(0x1000)
         .expect("target 0 readback before refusal");

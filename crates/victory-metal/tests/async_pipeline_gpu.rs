@@ -16,6 +16,10 @@
 //! 3. [`refused_submissions_never_publish`] proves that a submission refused
 //!    before `commit` (illegal ordering, unknown handle, unregistered present
 //!    surface) publishes no fence value and counts no submission.
+//! 4. [`completion_is_published_only_after_the_gpu_finishes`] attaches a real
+//!    `MAP_SHARED` fence page, maps it a second time as the guest does, and
+//!    proves the completed word stays below the submitted sequence while the GPU
+//!    is busy and reaches it only from the completion handlers.
 //!
 //! The corresponding CPU-only state-machine proof — a completion for a fence
 //! that was never committed publishes nothing — lives in
@@ -35,10 +39,12 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use victory_metal::MetalTransport;
 use victory_metal::VmBufferId;
+use victory_metal::fence_page::FencePageMapping;
 use victory_metal::macos::device::DirectMetalTransport;
 use victory_metal::macos::render::PixelFormat;
 use victory_metal::wire::{BufferBinding, Dispatch1d, ReplyStatus};
@@ -436,6 +442,121 @@ fn staging_reuse_waits_for_retirement() {
         stats.submitted,
         stats.in_flight_peak,
         stats.retire_max_wait_micros,
+    );
+}
+
+/// A submission is never reported complete before the GPU finished it.
+///
+/// The transport attaches the host view of one `MAP_SHARED` page and the test
+/// maps the same file a second time — the exact load a guest
+/// `GetCompletedValue` performs. Right after the last `submit_v3` returns `Ok`,
+/// the completed word must still be below the submitted sequence and the work
+/// buffer must still be incomplete; the word reaches the sequence only after the
+/// completion handlers publish it.
+#[test]
+fn completion_is_published_only_after_the_gpu_finishes() {
+    /// Submissions in flight; the cap is three, so all three commit before the
+    /// GPU is done with the first.
+    const SUBMISSIONS: u32 = 3;
+    /// Grid size big enough that the GPU is still busy microseconds after the
+    /// last commit returns.
+    const BIG_THREADS: u32 = 1 << 22;
+    const BIG_BYTES: usize = BIG_THREADS as usize * 4;
+
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let pipeline = transport
+        .compile_msl(CHAIN_MSL, "chain")
+        .expect("chain kernel should compile");
+
+    let counter = HostPage::zeroed(PAGE);
+    let work = HostPage::zeroed(BIG_BYTES);
+    let counter_id = counter.register(&transport);
+    let work_id = work.register(&transport);
+    let mut allocations = HashMap::new();
+    allocations.insert((COUNTER_ALLOCATION, GENERATION), counter_id);
+    allocations.insert((WORK_ALLOCATION, GENERATION), work_id);
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "victory-async-fence-{}-{stamp}.page",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let host_page = Arc::new(FencePageMapping::create(&path).expect("create the fence page"));
+    host_page.page().begin_session();
+    // The guest side maps the same file independently.
+    let guest_page = FencePageMapping::open(&path).expect("open the guest fence page");
+    transport
+        .attach_shared_fence_page(Arc::clone(&host_page))
+        .expect("attach the shared fence page");
+    assert_eq!(guest_page.page().completed(), 0);
+    assert_eq!(transport.completed_fence(), 0);
+
+    let bindings = vec![
+        binding(COUNTER_ALLOCATION, 4),
+        binding(WORK_ALLOCATION, BIG_BYTES as u64),
+    ];
+    for sequence in 1..=SUBMISSIONS {
+        let status = submit(
+            &transport,
+            &allocations,
+            sequence,
+            vec![dispatch(pipeline.0, BIG_THREADS, 256, bindings.clone())],
+        );
+        assert_eq!(status, ReplyStatus::Ok, "submission {sequence} was refused");
+    }
+
+    // `submit_v3` returned after `commit`, not after `waitUntilCompleted`: the
+    // guest's completed word is still below the submitted sequence and the work
+    // the submission writes is not final yet.
+    assert!(
+        guest_page.page().completed() < u64::from(SUBMISSIONS),
+        "guest observed completion {} before the GPU finished sequence {SUBMISSIONS}",
+        guest_page.page().completed()
+    );
+    assert!(
+        counter.words()[0] < SUBMISSIONS,
+        "the GPU ran every submission before the fence was observed"
+    );
+
+    // Only the completion handlers advance the guest-visible word.
+    wait_until(
+        || guest_page.page().completed() >= u64::from(SUBMISSIONS),
+        "the guest-visible completion",
+    );
+    assert_eq!(
+        guest_page.page().completed(),
+        u64::from(SUBMISSIONS),
+        "the published completion must name the last submitted sequence exactly"
+    );
+    assert_eq!(transport.completed_fence(), u64::from(SUBMISSIONS));
+    transport
+        .wait_for_gpu()
+        .expect("the pipeline should drain");
+    assert_eq!(
+        counter.words()[0], SUBMISSIONS,
+        "every submission must increment the counter exactly once"
+    );
+    let last = BIG_THREADS as usize - 1;
+    assert_eq!(work.words()[last], (last as u32) ^ WORK_XOR);
+    assert_eq!(work.words()[0], WORK_XOR);
+
+    let stats = transport.async_submit_stats();
+    assert_eq!(stats.completed, u64::from(SUBMISSIONS));
+    assert_eq!(stats.in_flight, 0);
+
+    transport
+        .detach_shared_fence_page()
+        .expect("the shared fence page should detach");
+    drop(guest_page);
+    let _ = std::fs::remove_file(&path);
+
+    eprintln!(
+        "shared fence: submissions={SUBMISSIONS} published={} peak={} \
+         guest_below_sequence_before_completion=1",
+        stats.completed_fence, stats.in_flight_peak,
     );
 }
 
