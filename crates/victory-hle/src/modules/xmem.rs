@@ -21,7 +21,8 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree as HostVirtualFree,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -152,6 +153,31 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // A commit, not a reservation: hand out memory the native host can map
+    // (ADR-039). A 64 KiB placeholder reservation stays a placeholder (its
+    // pages are the physical-page views) and a reservation with no commit
+    // has no pages to back. A failed share path falls through to the private
+    // allocation below, which still resolves as `Pagefile`.
+    let committed = kind & MEM_COMMIT != 0;
+    if committed && !placeholder && protect == PAGE_READWRITE && size > 0 {
+        if let Some(at) = share_alloc(
+            base,
+            size,
+            &mut requirements,
+            constrained,
+            constrained && highest < FOUR_GIB,
+            kind & MEM_REPLACE_PLACEHOLDER != 0,
+            protect,
+        ) {
+            tracing::debug!(
+                size,
+                flags = format_args!("{flags:#x}"),
+                at = format_args!("{at:p}"),
+                "XMemVirtualAlloc (host-visible)"
+            );
+            return at;
+        }
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let allocate = |parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
@@ -199,6 +225,11 @@ pub extern "system" fn XMemVirtualAlloc(
         && size.is_multiple_of(PAGE)
     {
         victory_gpu::alias_region(at as usize, size, false);
+    }
+    // Private committed memory stays resolvable too: the answer is the
+    // explicit `Pagefile` refusal, never "not mapped" or a fabricated id.
+    if !at.is_null() && committed && !placeholder && size > 0 {
+        track_private(at as usize, size);
     }
     if base.is_null() {
         tracing::debug!(
@@ -257,6 +288,10 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+/// A bit in the header's alignment field marking a block that lives in its
+/// own share-backed (or private) virtual region instead of the host heap.
+/// The alignment itself is at most 2^31, so the top bit is free.
+const SHARE_BLOCK: usize = 1 << (usize::BITS - 1);
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
@@ -383,6 +418,20 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // With the share provider configured, a heap block is its own region so
+    // a placed buffer in it resolves (ADR-039). The provider off or failing
+    // keeps the host heap, exactly as before.
+    if let Some(base) = share_heap_block(layout.size(), layout.align()) {
+        // SAFETY: the region holds the alignment and then `size` bytes; the
+        // header's marker tells `XMemFreeDefault` it is not a heap block.
+        unsafe {
+            let user = (base as *mut u8).add(layout.align());
+            user.sub(HEADER)
+                .cast::<[usize; 2]>()
+                .write([layout.size(), layout.align() | SHARE_BLOCK]);
+            return user.cast();
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
@@ -413,17 +462,41 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            victory_gpu::unalias_region(address as usize);
-            VirtualFree(address, 0, MEM_RELEASE);
+            if !free_direct(address as usize) {
+                victory_gpu::unalias_region(address as usize);
+                HostVirtualFree(address, 0, MEM_RELEASE);
+            }
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & SHARE_BLOCK != 0 {
+            // A share-backed block: its region is freed as a whole.
+            let align = align & !SHARE_BLOCK;
+            free_direct(user.sub(align) as usize);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
     }
+}
+
+/// `VirtualFree` for the regions [`XMemVirtualAlloc`] hands out as views of
+/// a share file: the host cannot release a mapped view, so a tracked region
+/// is unmapped and its placeholder released here. Every other call passes
+/// through to the host unchanged.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> BOOL {
+    if !address.is_null()
+        && size == 0
+        && free_type & MEM_RELEASE != 0
+        && free_direct(address as usize)
+    {
+        return 1;
+    }
+    // SAFETY: the title's own call, unchanged.
+    unsafe { HostVirtualFree(address, size, free_type) }
 }
 
 /// A retail console has no tools memory.
@@ -606,6 +679,217 @@ fn pagefile_section(size: usize) -> Option<Arc<Section>> {
     }))
 }
 
+/// The share directory's provider as a direct allocation's backing, when it
+/// is configured. `None` when it is off or failed; the caller then keeps the
+/// pagefile path, and the region resolves as
+/// [`share::ResolveError::Pagefile`] rather than being fabricated.
+fn direct_backing(size: usize) -> Option<Arc<Section>> {
+    match share::section(size) {
+        Ok(section) => Some(section),
+        Err(share::Failure::Unconfigured) => None,
+        Err(error) => {
+            tracing::warn!(
+                size,
+                %error,
+                "host-visible XMem allocation backing failed; keeping private memory"
+            );
+            None
+        }
+    }
+}
+
+/// Records a whole region handed out directly by the virtual allocator, so
+/// `share::resolve_guest_range` can name it.
+fn track_direct(
+    at: usize,
+    size: usize,
+    map_size: usize,
+    section: Option<Arc<Section>>,
+    own_placeholder: bool,
+) {
+    physical().direct.insert(
+        at,
+        Direct {
+            size,
+            map_size,
+            section,
+            own_placeholder,
+        },
+    );
+}
+
+/// Records committed private memory (the pagefile path) so a resolve answers
+/// [`share::ResolveError::Pagefile`] instead of claiming the range is
+/// unmapped.
+fn track_private(at: usize, size: usize) {
+    let Some(map_size) = size.checked_next_multiple_of(PAGE) else {
+        return;
+    };
+    track_direct(at, size, map_size, None, true);
+}
+
+/// Maps a fresh share file over a placeholder at `base` (or anywhere
+/// `requirements` allow, when `base` is null) and records it as a direct
+/// region.
+///
+/// The reservation is exactly the mechanism the physical-page views use: a
+/// 64 KiB placeholder from `VirtualAlloc2`, then `MapViewOfFile3` with
+/// `MEM_REPLACE_PLACEHOLDER` over it. `None` means the provider is off or a
+/// step failed; the caller keeps its private path.
+fn share_alloc(
+    base: *mut c_void,
+    size: usize,
+    requirements: &mut MEM_ADDRESS_REQUIREMENTS,
+    constrained: bool,
+    retry_below_four_gib: bool,
+    replace: bool,
+    protect: u32,
+) -> Option<*mut c_void> {
+    let map_size = size.checked_next_multiple_of(PAGE)?;
+    let section = direct_backing(size)?;
+    // `MEM_REPLACE_PLACEHOLDER` commits part of a placeholder the title
+    // split: the range is already reserved, so map over it without
+    // reserving again.
+    let at = if replace {
+        if base.is_null() {
+            return None;
+        }
+        base
+    } else {
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (requirements as *mut MEM_ADDRESS_REQUIREMENTS).cast();
+        let reserve = |parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                map_size,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                if constrained {
+                    parameter
+                } else {
+                    std::ptr::null_mut()
+                },
+                constrained.into(),
+            )
+        };
+        let mut at = reserve(&mut parameter);
+        if at.is_null() && retry_below_four_gib {
+            at = low_guards::retry(map_size, || reserve(&mut parameter));
+        }
+        if at.is_null() {
+            tracing::warn!(
+                size,
+                error = %std::io::Error::last_os_error(),
+                "XMemVirtualAlloc could not reserve a share-backed region"
+            );
+            return None;
+        }
+        at
+    };
+    // SAFETY: `at` is the placeholder just reserved; `section` is ours and
+    // outlives the view (the tracker holds it).
+    let view = unsafe {
+        MapViewOfFile3(
+            section.handle,
+            GetCurrentProcess(),
+            at as *const c_void,
+            0,
+            map_size,
+            MEM_REPLACE_PLACEHOLDER,
+            protect,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.Value as usize != at as usize {
+        let error = std::io::Error::last_os_error();
+        if !replace {
+            // SAFETY: the placeholder reserved above, with nothing mapped.
+            unsafe { HostVirtualFree(at, 0, MEM_RELEASE) };
+        }
+        tracing::warn!(
+            size,
+            %error,
+            "mapping a share-backed XMem allocation failed; keeping private memory"
+        );
+        return None;
+    }
+    track_direct(at as usize, size, map_size, Some(section), !replace);
+    // New contents, read-write: the GPU side's copies no longer guard it.
+    victory_gpu::title_memory_remapped(at as usize, map_size);
+    tracing::debug!(
+        size,
+        map_size,
+        live = share::live(),
+        "host-visible XMem virtual allocation"
+    );
+    Some(at)
+}
+
+/// A share-backed block of `size` bytes aligned to at least `align`, for a
+/// default heap allocation that a title may place a GPU resource in.
+///
+/// `None` when the provider is off or any step failed; the caller then keeps
+/// the plain host heap, whose memory stays CPU-only, exactly as before.
+fn share_heap_block(size: usize, align: usize) -> Option<*mut c_void> {
+    // A 64 KiB-aligned reservation satisfies smaller alignments; a larger
+    // one has to be stated to the reservation.
+    let constrained = align > PAGE;
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: std::ptr::null_mut(),
+        HighestEndingAddress: std::ptr::null_mut(),
+        Alignment: if constrained { align } else { 0 },
+    };
+    share_alloc(
+        std::ptr::null_mut(),
+        size,
+        &mut requirements,
+        constrained,
+        false,
+        false,
+        PAGE_READWRITE,
+    )
+}
+
+/// Releases the direct region at `base`, if any: a share-backed view goes
+/// back to its placeholder before the placeholder is released. False when
+/// `base` names no region this module handed out, so the caller can pass the
+/// request to the host unchanged.
+fn free_direct(base: usize) -> bool {
+    let Some(region) = physical().direct.remove(&base) else {
+        return false;
+    };
+    victory_gpu::unalias_region(base);
+    if region.section.is_some() {
+        // SAFETY: the view mapped at `base`, and the placeholder under it
+        // when this module reserved the whole range.
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: base as *mut c_void,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            );
+            if region.own_placeholder {
+                HostVirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+            }
+        }
+        victory_gpu::title_memory_remapped(base, region.map_size);
+    } else {
+        // SAFETY: private memory this module reserved; ours to release.
+        unsafe { HostVirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+    }
+    tracing::debug!(
+        base = format_args!("{base:#x}"),
+        size = region.size,
+        "released XMem virtual allocation"
+    );
+    true
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
@@ -633,12 +917,34 @@ struct Slice {
     index: usize,
 }
 
+/// A guest region handed out whole by [`XMemVirtualAlloc`] or one of the
+/// `XMemAllocDefault` paths, not assembled from physical pages. Its own
+/// mapping (a share file when the provider is configured) is the backing, so
+/// `resolve_guest_range` can name it without a page table entry.
+struct Direct {
+    /// The allocation's real size: what the guest may resolve.
+    size: usize,
+    /// The mapped length, always a whole number of 64 KiB pages. `size` can
+    /// be smaller; the difference is padding the guest never resolves.
+    map_size: usize,
+    /// The share backing when the provider was configured and succeeded;
+    /// `None` for private memory (the pagefile path), which resolves as
+    /// [`share::ResolveError::Pagefile`].
+    section: Option<Arc<Section>>,
+    /// Whether this module reserved the placeholder, so releasing the region
+    /// also releases the placeholder. A view replacing part of a title's
+    /// placeholder only gives the page back to that placeholder.
+    own_placeholder: bool,
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Whole regions handed out by the virtual allocator, by base address.
+    direct: BTreeMap<usize, Direct>,
     /// Where each slice (section, page index) is mapped: the addresses of
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others,
@@ -1093,7 +1399,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
+        HostVirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
@@ -1370,8 +1676,18 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
-        dlls: &["xmem.dll"],
+        // `VirtualFree` is not an xmem export, but the regions
+        // `XMemVirtualAlloc` hands out are file views the host's
+        // `VirtualFree` cannot release; the guarded override below answers
+        // for them and passes every other call through.
+        dlls: &[
+            "xmem.dll",
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-memory-*",
+        ],
         exports: vec![
+            hle_export!(VirtualFree),
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
             hle_export!(XMemAllocDefault),
@@ -1697,7 +2013,7 @@ mod tests {
         // Not under Rosetta (`victory_gpu::fault_tracking`).
         assert_eq!(watched == 0, victory_gpu::fault_tracking());
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { HostVirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -1711,7 +2027,7 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { HostVirtualFree(p, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
