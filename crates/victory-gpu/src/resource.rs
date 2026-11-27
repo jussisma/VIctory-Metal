@@ -2722,6 +2722,24 @@ pub(crate) extern "system" fn create_at_address(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // ADR-036: entry record, so a crash inside the creation is distinguishable
+    // from a title that never reached the call at all.
+    if !this.is_null() {
+        let (dimension, width, height, format) = unsafe { desc.as_ref() }
+            .map(|desc| {
+                (
+                    u64::from(desc.dimension),
+                    desc.width,
+                    u64::from(desc.height),
+                    u64::from(desc.format),
+                )
+            })
+            .unwrap_or((0, 0, 0, 0));
+        abi_trace::record(
+            "CreateAtAddressReq",
+            &[address, dimension, width, height, format],
+        );
+    }
     let result = create_at_address_impl(this, address, desc, layout, clear, iid, out);
     #[cfg(any(windows, test, target_os = "macos"))]
     {

@@ -302,8 +302,7 @@ fn address_class(pointer: *mut c_void) -> u64 {
 /// One bounded trace line per allocation when `VICTORY_GUEST_ABI_TRACE` is on.
 /// Values: `[size, attributes, address_class, used_title_hook]`. A title that
 /// asserts on its own allocator's return is then visible as class 0.
-fn trace_alloc(size: usize, attributes: u64, pointer: *mut c_void, hook: usize) {
-    victory_gpu::native_metal::abi_trace::record(
+fn trace_alloc(size: usize, attributes: u64, pointer: *mut c_void, hook: usize) {    victory_gpu::native_metal::abi_trace::record(
         "XMemAlloc",
         &[
             size as u64,
@@ -317,6 +316,17 @@ fn trace_alloc(size: usize, attributes: u64, pointer: *mut c_void, hook: usize) 
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+    // ADR-036: the request is recorded before the title's hook runs, so an
+    // allocator that faults on its own table still leaves the size, the
+    // attributes and which allocator answered visible.
+    victory_gpu::native_metal::abi_trace::record(
+        "XMemAllocReq",
+        &[
+            size as u64,
+            attributes,
+            u64::from(hooks()[0] != 0),
+        ],
+    );
     match hooks()[0] {
         0 => {
             let pointer = XMemAllocDefault(size, attributes);
