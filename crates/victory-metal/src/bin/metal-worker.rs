@@ -364,6 +364,19 @@ impl BatchExecutor for FrameGateExecutor {
     fn unregister_window(&self, id: VmBufferId) -> Result<(), MetalError> {
         BatchExecutor::unregister_window(&self.transport, id)
     }
+
+    /// Forwards a guest sampler registration to the wrapped transport.
+    ///
+    /// Cycle 07: the trait default refuses every sampler, so a frame-gate run
+    /// that binds a guest sampler table would fail here even though the bare
+    /// transport registers it (kind 10).
+    fn register_sampler(
+        &self,
+        id: u64,
+        desc: victory_metal::macos::device::SamplerDesc,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_sampler(&self.transport, id, desc)
+    }
     fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
         BatchExecutor::attach_fence_page(&self.transport, page)
     }

@@ -784,6 +784,21 @@ impl BatchExecutor for DaemonExecutor {
         self.transport.register_registry_texture(id, desc)
     }
 
+    /// Forwards a guest sampler registration to the shared transport.
+    ///
+    /// Cycle 07: the trait default refuses every sampler, so without this
+    /// delegation a guest SRV texture/sampler descriptor table (wire kind 10)
+    /// failed at the daemon even though `ipc_host` decodes it and the bare
+    /// transport implements it. Same defect class as the five missing
+    /// delegations found in Cycle 05.
+    fn register_sampler(
+        &self,
+        id: u64,
+        desc: victory_metal::macos::device::SamplerDesc,
+    ) -> Result<(), MetalError> {
+        BatchExecutor::register_sampler(self.transport.as_ref(), id, desc)
+    }
+
     fn register_surface(&self, surface_id: u64, texture_id: u64) -> Result<(), MetalError> {
         BatchExecutor::register_surface(self.transport.as_ref(), surface_id, texture_id)?;
         let mut stats = self
