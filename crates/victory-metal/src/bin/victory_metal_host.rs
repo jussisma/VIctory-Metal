@@ -337,6 +337,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
+use victory_metal::fence_page::FencePageMapping;
 use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat};
@@ -664,6 +665,15 @@ impl BatchExecutor for DaemonExecutor {
 
     fn unregister_window(&self, id: VmBufferId) -> Result<(), MetalError> {
         BatchExecutor::unregister_window(self.transport.as_ref(), id)
+    }
+    fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
+        // Delegate to the transport so the daemon's sessions publish completion
+        // from the GPU completion handler instead of the synchronous fallback.
+        BatchExecutor::attach_fence_page(self.transport.as_ref(), page)
+    }
+
+    fn detach_fence_page(&self) {
+        BatchExecutor::detach_fence_page(self.transport.as_ref());
     }
 
     fn submit_batch(

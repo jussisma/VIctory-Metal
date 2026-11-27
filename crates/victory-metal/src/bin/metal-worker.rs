@@ -39,8 +39,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
+use victory_metal::fence_page::FencePageMapping;
 use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::PixelFormat;
@@ -359,6 +361,13 @@ impl BatchExecutor for FrameGateExecutor {
 
     fn unregister_window(&self, id: VmBufferId) -> Result<(), MetalError> {
         BatchExecutor::unregister_window(&self.transport, id)
+    }
+    fn attach_fence_page(&self, page: Arc<FencePageMapping>) -> Result<bool, MetalError> {
+        BatchExecutor::attach_fence_page(&self.transport, page)
+    }
+
+    fn detach_fence_page(&self) {
+        BatchExecutor::detach_fence_page(&self.transport);
     }
 
     fn submit_batch(
