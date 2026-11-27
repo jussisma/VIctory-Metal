@@ -51,7 +51,7 @@ use victory_metal::wire::{
 };
 pub use victory_metal::wire::BarrierEntry;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture,
+    BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyBufferToTexture, CopyTexture,
     CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorTableEntryV3,
     DescriptorTableV3,
     DrawIndexedInstanced, DrawInstanced, ExecuteIndirectDispatch, ExecuteIndirectDispatchMesh,
@@ -60,8 +60,8 @@ use victory_metal::wire_v3::{
     ResolveSubresource as WireResolveSubresource, RootBufferView, RootConstantsV3, ScissorRect,
     StoreOp, TextureSubresource, VertexBuffer, VertexBufferSet, Viewport, MAX_BARRIERS_V3,
     MAX_COLOR_ATTACHMENTS, MAX_COMMANDS_V3, MAX_INDIRECT_COMMANDS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
-    MAX_VERTEX_BUFFERS, OP_BEGIN_RENDER_PASS, OP_COPY_BUFFER, OP_COPY_TEXTURE,
-    OP_COPY_TEXTURE_REGION, OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH,
+    MAX_VERTEX_BUFFERS, OP_BEGIN_RENDER_PASS, OP_COPY_BUFFER, OP_COPY_BUFFER_TO_TEXTURE,
+    OP_COPY_TEXTURE, OP_COPY_TEXTURE_REGION, OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH,
     OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH, OP_EXECUTE_INDIRECT_DRAW,
     OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_PRESENT, OP_RESOURCE_BARRIER,
     OP_ROOT_CONSTANTS, OP_SET_INDEX_BUFFER, OP_SET_PRIMITIVE_TOPOLOGY, OP_SET_ROOT_BUFFER_VIEW,
@@ -385,6 +385,21 @@ impl ProducerError {
         }
     }
 
+    /// The D3D12 operation a refusal names, when it names one.
+    ///
+    /// The named-refusal telemetry uses it so calls without a wire opcode are
+    /// still countable by name instead of collapsing into one bucket.
+    pub const fn operation(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidResource { operation }
+            | Self::Unsupported { operation, .. }
+            | Self::Unregistered { operation }
+            | Self::Unresolved { operation }
+            | Self::NoRenderTargets { operation } => Some(operation),
+            _ => None,
+        }
+    }
+
     /// The D3D12 HRESULT the guest entry point returns to the title.
     ///
     /// Unsupported operations are `E_NOTIMPL` (`0x8000_4001`), everything
@@ -560,6 +575,16 @@ impl GraphicsDirty {
     }
 }
 
+/// Which root signature a list committed (`SetGraphicsRootSignature` or
+/// `SetComputeRootSignature`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSignatureStage {
+    /// The graphics root signature.
+    Graphics,
+    /// The compute root signature.
+    Compute,
+}
+
 /// The D3D12 command list as a Wire v3 producer.
 ///
 /// One producer records one list generation. [`flush`](Self::flush) yields
@@ -572,6 +597,8 @@ pub struct MetalProducer {
     pass_open: bool,
     graphics: GraphicsState,
     dirty: GraphicsDirty,
+    graphics_root_signature: Option<u64>,
+    compute_root_signature: Option<u64>,
     compute_pipeline: Option<u64>,
     mesh_pipeline: Option<u64>,
     compute_constants: BTreeMap<u16, Vec<u8>>,
@@ -592,6 +619,8 @@ impl MetalProducer {
             pass_open: false,
             graphics: GraphicsState::default(),
             dirty: GraphicsDirty::default(),
+            graphics_root_signature: None,
+            compute_root_signature: None,
             compute_pipeline: None,
             mesh_pipeline: None,
             compute_constants: BTreeMap::new(),
@@ -1505,6 +1534,34 @@ impl MetalProducer {
         Ok(())
     }
 
+    /// Records `SetGraphicsRootSignature`/`SetComputeRootSignature`.
+    ///
+    /// Wire v3 has no root-signature command: the host binds a PSO's own root
+    /// signature when that PSO is registered (kind 4/129), so the commit
+    /// selects which guest layout the following root arguments describe. It
+    /// is kept on the producer instead of dropped, so the choice survives for
+    /// a later PSO comparison (a zero pointer unbinds it, as D3D12 allows).
+    pub fn commit_root_signature(
+        &mut self,
+        stage: RootSignatureStage,
+        signature: u64,
+    ) -> Result<(), ProducerError> {
+        let slot = match stage {
+            RootSignatureStage::Graphics => &mut self.graphics_root_signature,
+            RootSignatureStage::Compute => &mut self.compute_root_signature,
+        };
+        *slot = (signature != 0).then_some(signature);
+        Ok(())
+    }
+
+    /// The signature committed for `stage`, `None` when unbound.
+    pub const fn root_signature(&self, stage: RootSignatureStage) -> Option<u64> {
+        match stage {
+            RootSignatureStage::Graphics => self.graphics_root_signature,
+            RootSignatureStage::Compute => self.compute_root_signature,
+        }
+    }
+
     // ------------------------------------------------------ copies/barriers
 
     /// `CopyBufferRegion`.
@@ -1580,10 +1637,70 @@ impl MetalProducer {
         }))
     }
 
+    /// `CopyTextureRegion` from a guest buffer footprint into a texture.
+    ///
+    /// The wire carries one pitched copy: `offset` is the first source row,
+    /// `bytes_per_row` its pitch and `extent`/`origin` one destination box.
+    /// The host encodes a single depth slice per command, so an extent deeper
+    /// than one is refused instead of truncated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        source: ResourceId,
+        destination: TextureSubresource,
+        offset: u64,
+        bytes_per_row: u32,
+        extent: [u32; 3],
+        origin: [u32; 3],
+    ) -> Result<(), ProducerError> {
+        ResourceId::new(source.allocation_id, source.generation)?;
+        ResourceId::new(destination.allocation_id, destination.generation)?;
+        if extent.iter().any(|&extent| extent == 0) {
+            return Err(ProducerError::unsupported_opcode(
+                "CopyTextureRegion: empty buffer-upload box",
+                OP_COPY_BUFFER_TO_TEXTURE,
+            ));
+        }
+        if extent[2] != 1 {
+            return Err(ProducerError::unsupported_opcode(
+                "CopyTextureRegion: a buffer upload of more than one depth slice",
+                OP_COPY_BUFFER_TO_TEXTURE,
+            ));
+        }
+        if bytes_per_row == 0 {
+            return Err(ProducerError::unsupported_opcode(
+                "CopyTextureRegion: a buffer upload with no row pitch",
+                OP_COPY_BUFFER_TO_TEXTURE,
+            ));
+        }
+        if !offset.is_multiple_of(4) {
+            return Err(ProducerError::unsupported_opcode(
+                "CopyTextureRegion: a buffer upload offset is not 4-byte aligned",
+                OP_COPY_BUFFER_TO_TEXTURE,
+            ));
+        }
+        self.close_pass()?;
+        self.push(CommandV3::CopyBufferToTexture(CopyBufferToTexture {
+            allocation_id: source.allocation_id,
+            generation: source.generation,
+            destination_allocation_id: destination.allocation_id,
+            destination_generation: destination.generation,
+            offset,
+            bytes_per_row,
+            // One depth slice per command: no image pitch is needed.
+            bytes_per_image: 0,
+            extent,
+            mip_level: destination.mip_level,
+            slice: destination.slice,
+            origin,
+        }))
+    }
+
     /// `CopyTextureRegion` of an explicit texel box between two textures.
     ///
-    /// Buffer footprints (uploads and readbacks) are not expressible here:
-    /// the caller refuses those with [`OP_COPY_TEXTURE_REGION`].
+    /// A buffer footprint is never a texture-to-texture box: uploads lower to
+    /// [`copy_buffer_to_texture`](Self::copy_buffer_to_texture), and readbacks
+    /// are refused by the caller.
     pub fn copy_texture_region(
         &mut self,
         src: TextureSubresource,
@@ -3054,6 +3171,106 @@ mod tests {
         ));
         let bytes = MetalProducer::encode(&submission).expect("encode");
         assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    /// Root signature commits are kept per stage: Wire v3 has no command for
+    /// them, so they live on the producer for a later PSO comparison instead
+    /// of being dropped. A null commit unbinds, as D3D12 allows.
+    #[test]
+    fn root_signature_commits_are_kept_per_stage() {
+        let mut producer = MetalProducer::new(17, 1).expect("producer");
+        assert_eq!(producer.root_signature(RootSignatureStage::Graphics), None);
+        producer
+            .commit_root_signature(RootSignatureStage::Graphics, 0x7000)
+            .expect("graphics root signature");
+        producer
+            .commit_root_signature(RootSignatureStage::Compute, 0x9000)
+            .expect("compute root signature");
+        assert_eq!(
+            producer.root_signature(RootSignatureStage::Graphics),
+            Some(0x7000)
+        );
+        assert_eq!(
+            producer.root_signature(RootSignatureStage::Compute),
+            Some(0x9000)
+        );
+        producer
+            .commit_root_signature(RootSignatureStage::Graphics, 0)
+            .expect("unbind");
+        assert_eq!(producer.root_signature(RootSignatureStage::Graphics), None);
+        assert_eq!(
+            producer.root_signature(RootSignatureStage::Compute),
+            Some(0x9000),
+            "the other stage is untouched"
+        );
+        assert!(producer.commands().is_empty(), "a commit emits no command");
+    }
+
+    /// A guest buffer footprint becomes one pitched `CopyBufferToTexture`
+    /// command: the host receives the source allocation, its offset and row
+    /// pitch, and the destination mip/slice/origin for the texture it resolves.
+    #[test]
+    fn a_buffer_footprint_upload_becomes_a_pitched_copy() {
+        let mut producer = MetalProducer::new(18, 1).expect("producer");
+        let destination = TextureSubresource {
+            allocation_id: 0x2000,
+            generation: 1,
+            mip_level: 1,
+            slice: 2,
+        };
+        producer
+            .copy_buffer_to_texture(
+                resource(0x1000),
+                destination,
+                0x140,
+                256,
+                [16, 16, 1],
+                [8, 4, 0],
+            )
+            .expect("buffer upload");
+        let submission = producer.flush().expect("submission");
+        assert!(matches!(
+            submission.commands.as_slice(),
+            [CommandV3::CopyBufferToTexture(copy)]
+                if copy.allocation_id == 0x1000
+                    && copy.generation == 1
+                    && copy.destination_allocation_id == 0x2000
+                    && copy.destination_generation == 1
+                    && copy.offset == 0x140
+                    && copy.bytes_per_row == 256
+                    && copy.bytes_per_image == 0
+                    && copy.extent == [16, 16, 1]
+                    && copy.origin == [8, 4, 0]
+                    && copy.mip_level == 1
+                    && copy.slice == 2
+        ));
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    /// The host copies one depth slice per blit: a deeper box is refused with
+    /// the pitched-copy opcode instead of being silently truncated.
+    #[test]
+    fn a_multi_slice_buffer_upload_is_refused() {
+        let mut producer = MetalProducer::new(19, 1).expect("producer");
+        let destination = TextureSubresource {
+            allocation_id: 0x2000,
+            generation: 1,
+            mip_level: 0,
+            slice: 0,
+        };
+        let error = producer
+            .copy_buffer_to_texture(
+                resource(0x1000),
+                destination,
+                0,
+                256,
+                [16, 16, 2],
+                [0, 0, 0],
+            )
+            .expect_err("a volume upload");
+        assert_eq!(error.opcode(), Some(OP_COPY_BUFFER_TO_TEXTURE));
+        assert!(producer.commands().is_empty(), "no partial copy is recorded");
     }
 
     // ------------------------------------------------- compute root bindings
