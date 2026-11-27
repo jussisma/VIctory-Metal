@@ -3254,7 +3254,7 @@ mod tests {
     }
     // ---- plan_encoder_segments (pure CPU, no Metal objects) ----------------
 
-    use crate::wire::{BarrierEntry, Dispatch1d, ResourceBarrier};
+    use crate::wire::{BarrierEntry, Dispatch1d, DispatchMesh, ResourceBarrier};
     use crate::wire_v3::{
         BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture, DrawIndexedState,
         DrawState, LoadOp, PipelineRef, Present, ScissorRect as WireScissor, StoreOp,
@@ -3304,6 +3304,18 @@ mod tests {
 
     fn segment_pipeline() -> CommandV3 {
         CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id: 7 })
+    }
+
+    fn segment_mesh_pipeline(pipeline_id: u64) -> CommandV3 {
+        CommandV3::SetMeshPipeline(PipelineRef { pipeline_id })
+    }
+
+    fn segment_mesh_dispatch(pipeline_id: u64) -> CommandV3 {
+        CommandV3::DispatchMesh(DispatchMesh {
+            pipeline_id,
+            group_counts: [1, 1, 1],
+            bindings: Vec::new(),
+        })
     }
 
     fn segment_viewport() -> CommandV3 {
@@ -3634,5 +3646,75 @@ mod tests {
             plan_encoder_segments(&[segment_begin_with_colors(0), CommandV3::EndRenderPass])
                 .expect_err("an empty MRT must be refused");
         assert!(matches!(error, MetalError::InvalidArg(_)), "{error:?}");
+    }
+
+    #[test]
+    fn segment_plan_rejects_mesh_dispatch_without_a_mesh_pipeline() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_mesh_dispatch(7),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("a mesh dispatch without SetMeshPipeline must be refused");
+        assert!(
+            matches!(
+                error,
+                MetalError::InvalidArg(message)
+                    if message.contains("preceding SetMeshPipeline")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_mesh_dispatch_outside_a_render_pass() {
+        let error = plan_encoder_segments(&[segment_mesh_pipeline(7), segment_mesh_dispatch(7)])
+            .expect_err("a mesh dispatch outside a pass must be refused");
+        assert!(
+            matches!(
+                error,
+                MetalError::InvalidArg(message) if message.contains("open render pass")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_rejects_a_mesh_pipeline_named_by_a_draw() {
+        let error = plan_encoder_segments(&[
+            segment_begin(),
+            segment_mesh_pipeline(7),
+            segment_draw(),
+            CommandV3::EndRenderPass,
+        ])
+        .expect_err("a graphics draw must not follow SetMeshPipeline");
+        assert!(
+            matches!(
+                error,
+                MetalError::InvalidArg(message)
+                    if message.contains("requires a preceding SetGraphicsPipeline")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn segment_plan_accepts_a_mesh_dispatch_after_its_pipeline() {
+        let plan = plan_encoder_segments(&[
+            segment_begin(),
+            segment_mesh_pipeline(7),
+            segment_mesh_dispatch(7),
+            CommandV3::EndRenderPass,
+        ])
+        .expect("a mesh pass should plan");
+        assert_eq!(
+            plan,
+            vec![Segment {
+                kind: SegmentKind::Render {
+                    pass_index: 0,
+                    range: 0..3
+                }
+            }]
+        );
     }
 }
