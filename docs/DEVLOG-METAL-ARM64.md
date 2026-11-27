@@ -1297,3 +1297,108 @@ which this cycle did not establish.
   is not a host refusal and is still unnamed.
 - **Present counts are not asserted.** `present_status=0` and `graphics_status=0`
   are success codes; no frame checksum is read back in title mode.
+
+## Cycle 10 — the assert was a headless predicate: real presents, real pipeline attempts, and a measured reference oracle
+
+Base `ba05cee6` (cycle-09). This cycle removed the unnamed submission refusal,
+made the guest-visible ABI measurable, and settled the Cycle 09 question — the
+fatal assert at title image `+0x2215c35` is **not** an ABI/metadata delta. It is
+the title's response to a headless session with no real swapchain. The same
+tree, windowed, submits 72 command batches, presents 70 frames and reaches its
+first real pipeline attempts. No proprietary binary, asset, key, shader or path
+is recorded here: counts, DXGI values, address classes, categories and timings
+only. Every number comes from a run in this workspace on the Apple M4 Max.
+
+### 10.1 What changed
+
+- **ADR-036 — differential guest-ABI parity, measured not guessed.** A bounded,
+  opt-in trace (`VICTORY_GUEST_ABI_TRACE=1`) records the numeric answer of every
+  guest-visible query: `CreateDescriptorHeap` (kind, count, flags, start halves,
+  memory source), `GetCPU/GPUDescriptorHandleForHeapStart`,
+  `GetDescriptorHandleIncrementSize`, `GetGPUVirtualAddress`,
+  `CheckFeatureSupport`, the three resource creators, at-address creation (entry
+  and answer), descriptor writes (destination halves, view kind) and the title's
+  own `__XMemAllocationHooks__` path (size, attributes, address class, whether
+  the hook answered). 64 records per call, 4,096 per process, nothing recorded
+  when unset. `tools/macos/metal-poc/abi-diff.py` diffs two logs and names the
+  first differing call, row and value; `test-abi-diff.sh` proves it hermetically.
+  A zero-descriptor heap is refused (`E_INVALIDARG`) like the reference; the
+  reserved-resource creator is now a named export instead of a silent stub.
+- **ADR-037 — launcher and workspace hygiene.** Both launchers remove the
+  session directory they own on every exit path (success, guest failure,
+  timeout, signal, setup failure, a failure inside cleanup) unless
+  `--keep-session` is passed; removal is ownership-proven, never a wildcard
+  sweep, and a caller's `--out` is never touched. `VICTORY_BACKEND` is resolved
+  once (`metal` default, `d3d12` reference) and printed in the dry run and
+  summary. Integrated worker `target/` directories are pruned per wave.
+- **The unnamed refusal.** Every boot since #2 counted one refused submission
+  with no name. It was an empty list batch: `ExecuteCommandLists` carrying no
+  recorded submission was enqueued, refused as `Empty`, and counted. An empty
+  batch is now not a submission at all, every refusal carries a static name
+  (`SUBMIT_REFUSAL_NAMES`, plus a session-wide `named_submit_refusals`
+  histogram), and a no-client submission defers for a bounded streak before it
+  is counted once. Boot #6 reports `submits=2/0` — zero refusals.
+- **The frame probe.** `VICTORY_METAL_FRAME_PROBE=1` copies a 64x64 grid (8x8
+  blocks of 8x8 texels) from the presented drawable into one 16 KiB staging
+  texture on frame 0 and every 30th frame, with a 10 ms bounded wait and at most
+  one probe in flight, and reports `non_black_pixels`, `unique_luma_buckets`,
+  `frame_crc`, `sampled_frames`, `probe_pixels` and `failure`. Off by default:
+  no command buffer, blit, readback or allocation.
+
+### 10.2 The reference oracle
+
+The D3D12 host reference path (same guest binary, same shim, `VICTORY_BACKEND=d3d12`)
+was run under the same trace for the first time this cycle. It **passes**
+`+0x2215c35` and runs to the launcher timeout: 9,413 submissions, real DXIL
+translation ("shader translated" for vertex and pixel stages), host pipeline
+creation and 168 MB/frame title-memory refreshes. Its first 22 `XMemAlloc`
+rows, all 16 descriptor heaps and all 23 increment queries are **identical** to
+the native run's. The ABI is therefore not the delta; device behaviour is.
+
+### 10.3 Boot progression (counts only)
+
+| | Boot #5 | Boot #6 | Ref #6 (D3D12) | Boot #9 (windowed) |
+|---|---|---|---|---|
+| head | `c652a848` | Wave 10A | Wave 10A | Wave 10A |
+| session | headless | headless | headless | windowed |
+| D3DMetal attempts / fallback | 0 / 0 | 0 / 0 | reference | 0 / 0 |
+| submissions ok/refused | 2 / 1 | **2 / 0** | 9,413 | 72 / 0 |
+| frames presented | 0 | 0 | n/a | **70** (71 drawables) |
+| assert `+0x2215c35` | yes | yes | no | **no** |
+| pipeline attempts (graphics) | 0 | 0 | many | **3** |
+| translator unavailable | 0 | 0 | 0 | 3 |
+| buffers / PSOs registered | 0 / 0 | 0 / 0 | host n/a | 0 / 0 |
+| non-black pixel probe | n/a | n/a (headless) | n/a | 0 of 4,096, 1 luma bucket |
+| furthest event | assert | assert | frames | **real presents, first pipelines** |
+
+### 10.4 Why the headline is a headless predicate
+
+Boots #6, #7 and #8 kept the assert while the trace showed identical call
+sequences, identical increments and no request in flight at the fault: the
+title faults between the last descriptor heap and its next at-address creation
+without calling the shim. Boot #9 changed one variable — `--window` instead of
+`--headless` — and the fault disappeared, with 72 submissions and 70 presented
+frames. The predicate is the title's swapchain/present requirement. Headless
+sessions remain useful for resource-path measurements but cannot cross this
+gate; the harness now reports the mode in every summary.
+
+### 10.5 Counts at the integration head
+
+- `victory-gpu` lib **325 passed / 0 failed / 1 ignored**; `victory-metal` lib
+  **314 / 0 / 7**; `victory-hle` **81 / 0 / 0**; launcher session test 8 checks,
+  process-hygiene 13, GPU lock 10; `test-abi-diff` 8.
+- Windows all-targets checks for `victory-gpu` (diagnostics) and `victory-metal`
+  exit 0; `git diff --check` clean; no surviving process after any boot.
+- Frames are presented but still blank: `non_black_pixels=0`,
+  `unique_luma_buckets=1`, `fallback_clear=1` on every sampled frame.
+
+### 10.6 Remaining gaps (honest)
+
+- **No real draw yet.** All three graphics pipeline attempts are refused as
+  `graphics/converter-unavailable` ("no IRConverter is available to this
+  process"), and every bind is refused for want of the guest range resolver
+  (`registered=0 buffers`, `0 psos`). Those two are the Cycle 10B targets.
+- **Presents are blank**, so no loading screen, title screen or 3D frame is
+  claimed; the probe is the instrument that will say so when it changes.
+- **The headless gate is the title's**, not ours; the harness must run windowed
+  to cross it, which is recorded rather than worked around.
