@@ -70,8 +70,14 @@
 //! shutdown: submission and frame counts, frame-time `p50_ms`/`p95_ms`/
 //! `p99_ms`, sustained `fps`, the unsupported-opcode histogram,
 //! `graphics_status`, `present_status`, `present_checksum`,
+//! `last_error` (the last bounded GPU/protocol refusal reason, or `null`),
 //! `d3dmetal_fallback_count` (always `0` on this path) and the observed D3DMetal
 //! image list. A write failure is reported, never silently ignored.
+//!
+//! Session counters are copied from `IpcHost::session_stats()` after
+//! `serve_once` returns, so an abnormal disconnect still reports how many
+//! submissions the host answered. A GPU `ExecutionFailed` is an ordinary reply
+//! and keeps the daemon serving; only a transport/protocol error is fatal.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
@@ -484,6 +490,8 @@ struct Stats {
     window_drawables: u64,
     /// First native-window error, if any.
     window_error: Option<String>,
+    /// Last bounded GPU/protocol refusal reason observed in this process.
+    last_error: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -506,6 +514,7 @@ impl Default for Stats {
             window_presented: 0,
             window_drawables: 0,
             window_error: None,
+            last_error: None,
         }
     }
 }
@@ -589,7 +598,8 @@ impl DaemonExecutor {
             .stats
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        stats.submissions += 1;
+        // Submission/refusal counters are session-level (IpcHost::session_stats)
+        // so they also reach telemetry when `serve_once` returns an error.
         match result {
             Ok(reply) if reply.status == ReplyStatus::Ok => {
                 stats.frames += 1;
@@ -597,13 +607,12 @@ impl DaemonExecutor {
                     .frame_ms
                     .push(started.elapsed().as_secs_f64() * 1_000.0);
             }
-            Ok(_) => stats.refused += 1,
+            Ok(_) => {}
             Err(MetalError::NotSupported(message)) => {
-                stats.refused += 1;
                 let key: String = message.chars().take(120).collect();
                 *stats.unsupported.entry(key).or_default() += 1;
             }
-            Err(_) => stats.refused += 1,
+            Err(_) => {}
         }
     }
 
@@ -964,6 +973,10 @@ fn write_telemetry(
         || "null".to_string(),
         |message| format!("\"{}\"", json_escape(message)),
     );
+    let last_error = stats.last_error.as_deref().map_or_else(
+        || "null".to_string(),
+        |message| format!("\"{}\"", json_escape(message)),
+    );
 
     let json = format!(
         concat!(
@@ -989,6 +1002,7 @@ fn write_telemetry(
             "  \"window_presented\": {window_presented},\n",
             "  \"window_drawables\": {window_drawables},\n",
             "  \"window_error\": {window_error},\n",
+            "  \"last_error\": {last_error},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0\n",
@@ -1016,6 +1030,7 @@ fn write_telemetry(
         window_presented = stats.window_presented,
         window_drawables = stats.window_drawables,
         window_error = window_error,
+        last_error = last_error,
         images = images,
         loaded = !d3dmetal.is_empty(),
     );
@@ -1139,11 +1154,27 @@ fn run(args: Args) -> Result<(), String> {
         };
 
         let session = host.serve_once(stream);
-        if let Ok(summary) = &session {
+        // Publish session counters even when `serve_once` returned a protocol or
+        // transport error: Boot #1 reached sequence 586 and telemetry still
+        // reported `sessions=0, submissions=0` because this copy only ran on
+        // `Ok`. A GPU `ExecutionFailed` is an answered reply (`Ok(summary)`),
+        // not this error path.
+        let session_stats = host.session_stats();
+        {
             let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
-            stats.sessions += 1;
-            stats.allocations = summary.allocations;
-            stats.bytes_mapped = summary.bytes_mapped;
+            stats.sessions = stats.sessions.saturating_add(1);
+            stats.submissions = stats.submissions.saturating_add(session_stats.submissions);
+            stats.refused = stats.refused.saturating_add(session_stats.refused_submissions);
+            stats.allocations = session_stats.allocations;
+            stats.bytes_mapped = session_stats.bytes_mapped;
+            if let Some(error) = session_stats.last_error {
+                stats.last_error = Some(error);
+            }
+            // An asynchronous v3 fault is observed by the completion handler
+            // after the reply; prefer the newest diagnostic when present.
+            if let Some(failure) = transport.last_gpu_failure() {
+                stats.last_error = Some(failure);
+            }
         }
         if args.aaa_frame {
             read_back_present(transport.as_ref(), &stats);
@@ -1153,6 +1184,8 @@ fn run(args: Args) -> Result<(), String> {
 
         match session {
             Ok(_) => {}
+            // A framing/sequence/transport failure ends the session non-zero;
+            // a GPU refusal is answered with ExecutionFailed and stays here.
             Err(error) => {
                 outcome = Err(format!("session failed: {error}"));
                 break;
@@ -1216,6 +1249,7 @@ impl Clone for Stats {
             window_presented: self.window_presented,
             window_drawables: self.window_drawables,
             window_error: self.window_error.clone(),
+            last_error: self.last_error.clone(),
         }
     }
 }
