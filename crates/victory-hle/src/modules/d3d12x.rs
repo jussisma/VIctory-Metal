@@ -21,6 +21,12 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     #[cfg(windows)]
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    // The native backend resolves guest bindings through the share resolver.
+    // It must exist before the device creates its first resource: a session
+    // that never creates a shared physical-page section would otherwise
+    // refuse every bind. Idempotent, and a no-op on the D3D12 backend.
+    #[cfg(windows)]
+    super::xmem::install_share_resolver();
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

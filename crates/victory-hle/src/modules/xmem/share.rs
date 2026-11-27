@@ -18,6 +18,12 @@
 //! succeeds for a tracked view of a section with a [`Backing`], and reports
 //! [`ResolveError::Pagefile`] otherwise.
 //!
+//! The resolver itself is installed once, at console device creation (and
+//! again, idempotently, from the first shared section or range resolution), so
+//! a Metal session that never creates a shared section still has one. The
+//! install never depends on the directory: an unconfigured session resolves
+//! from the page registry and refuses what it cannot prove.
+//!
 //! Sparse files matter here: the console allocates multi-GiB heaps, so the
 //! file is sized with `set_len` and its pages are never written ahead of the
 //! guest. Only small synthetic sizes are exercised by the tests below.
@@ -43,7 +49,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use super::{PAGE, Section};
@@ -997,19 +1003,50 @@ fn seam_retire_error(error: RegistryError) -> SeamError {
     }
 }
 
+/// Whether [`ShareResolver`] has been installed. Every section allocation and
+/// every bind-time resolution checks this, so it stays an atomic fast path.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Serializes the one installation. The caller re-checks [`INSTALLED`] under
+/// this lock, so two racing installs cannot both name the resolver.
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Installs [`ShareResolver`] as the process-wide guest range resolver when
 /// `VICTORY_BACKEND=metal`.
 ///
-/// Idempotent and read once: the backend switch is fixed for the process.
-/// With the default backend nothing is installed and the pagefile path is
-/// exactly as before.
+/// Idempotent: the console device creation installs it before the device can
+/// create a resource, and the first shared section or range resolution may
+/// call this again. With the default backend nothing is installed and the
+/// pagefile path is exactly as before.
 pub(crate) fn install_if_metal() {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        if GpuBackend::from_env() == GpuBackend::Metal {
-            bindings::set_resolver(ShareResolver);
-        }
-    });
+    install_for_backend(GpuBackend::from_env());
+}
+
+/// Installs the resolver for `backend`, at most once.
+///
+/// Only the native Metal backend resolves guest ranges through this seam; the
+/// D3D12 reference backend must never install it. Whether the share directory
+/// is configured does not matter: the resolver reads the page registry and
+/// refuses a range it cannot prove, rather than fabricating an allocation id.
+fn install_for_backend(backend: GpuBackend) {
+    if backend != GpuBackend::Metal || INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    let _guard = crate::modules::lock(&INSTALL_LOCK);
+    if INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    bindings::set_resolver(ShareResolver);
+    INSTALLED.store(true, Ordering::Release);
+}
+
+/// Drops the one install and its resolver, so an install test can start from
+/// a known state. Tests run with `--test-threads=1`.
+#[cfg(test)]
+fn uninstall_for_test() {
+    let _guard = crate::modules::lock(&INSTALL_LOCK);
+    INSTALLED.store(false, Ordering::Release);
+    let _ = bindings::clear_resolver();
 }
 
 #[cfg(test)]
@@ -1791,6 +1828,104 @@ mod tests {
             "a stale generation must be refused"
         );
         drop(view);
+    }
+
+    /// Console device creation installs the share resolver for a Metal
+    /// session, so every later bind has one, and never installs it for the
+    /// D3D12 reference backend. A second install is a no-op: the same
+    /// resolver stays installed, exactly once.
+    ///
+    /// This is the device-creation path's install entry (the HLE calls
+    /// `install_share_resolver` from `d3d12x::create_device`); the share
+    /// directory is deliberately not consulted, so an unconfigured session
+    /// still resolves ranges from the page registry.
+    #[test]
+    fn device_creation_installs_the_resolver_only_for_metal_and_once() {
+        uninstall_for_test();
+        install_for_backend(GpuBackend::D3d12);
+        assert!(
+            bindings::resolver().is_none(),
+            "the D3D12 reference backend must not install the share resolver"
+        );
+
+        install_for_backend(GpuBackend::Metal);
+        let first = bindings::resolver().expect("the Metal backend installs the resolver");
+        install_for_backend(GpuBackend::Metal);
+        let second = bindings::resolver().expect("the resolver stays installed");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second install must not replace the resolver"
+        );
+
+        uninstall_for_test();
+        assert!(bindings::resolver().is_none());
+    }
+
+    /// The literal device-creation entry (`d3d12x::create_device` calls
+    /// `xmem::install_share_resolver`) installs the resolver in a Metal
+    /// session. Run with `VICTORY_BACKEND=metal`; skipped otherwise, because
+    /// the backend switch is read once per process.
+    #[test]
+    fn device_creation_entry_installs_under_a_metal_session() {
+        let metal = std::env::var("VICTORY_BACKEND")
+            .map(|value| value.trim().eq_ignore_ascii_case("metal"))
+            .unwrap_or(false);
+        if !metal {
+            eprintln!("skipped: VICTORY_BACKEND is not metal");
+            return;
+        }
+        uninstall_for_test();
+        super::super::install_share_resolver();
+        assert!(
+            bindings::resolver().is_some(),
+            "device creation must leave the resolver installed"
+        );
+        uninstall_for_test();
+    }
+
+    /// The resolver installed at device creation is the real share provider:
+    /// it names the page registry's allocation id and refuses an unprovable
+    /// range by name instead of fabricating one.
+    #[test]
+    fn the_installed_resolver_uses_the_real_id_and_refuses_unknown_ranges() {
+        let share = SyntheticShare::new(1);
+        let at = FAKE + 16 * PAGE;
+        let view = FakeView::install(
+            at,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 0,
+            },
+        );
+        uninstall_for_test();
+        install_for_backend(GpuBackend::Metal);
+        let resolver = bindings::resolver().expect("installed at device creation");
+
+        let range = resolver
+            .resolve(at as u64 + 0x40, 0x80)
+            .expect("a tracked range resolves");
+        let id = share.section.share.as_ref().expect("a share backing").id;
+        assert_eq!(range.allocation_id, id, "the registry's real allocation id");
+        assert_eq!(range.generation, 1);
+        assert_eq!((range.byte_offset, range.size), (0, PAGE as u64));
+
+        let token = resolver.retain(&range).expect("pin the resolved range");
+        resolver.retire(token).expect("retire the pin");
+
+        // A page no tracked view shows is refused by name: no allocation id
+        // is invented for it.
+        let missing = at + PAGE;
+        assert_eq!(
+            resolver.resolve(missing as u64, 0x10).unwrap_err(),
+            SeamError::Unmapped {
+                address: missing as u64,
+                len: 0x10,
+            }
+        );
+
+        drop(view);
+        uninstall_for_test();
     }
 
     /// The retired-row cap is a positive default and the env knob only accepts

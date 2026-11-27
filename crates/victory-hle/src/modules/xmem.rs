@@ -36,6 +36,16 @@ use crate::{HleModule, hle_export};
 mod e2e;
 mod share;
 
+/// Installs the native backend's guest-range resolver when this session runs
+/// the Metal backend.
+///
+/// Called from console device creation, so a session that never creates a
+/// shared physical-page section can still resolve guest bindings. The install
+/// is idempotent, and the D3D12 reference backend never installs it.
+pub(crate) fn install_share_resolver() {
+    share::install_if_metal();
+}
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
