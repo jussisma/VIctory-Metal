@@ -1204,6 +1204,208 @@ fn checked_guest_range(range: &GuestRange) -> Result<(), BufferRegistrationError
     Ok(())
 }
 
+// ------------------------------------------------- named range refusals
+
+/// The most distinct guest ranges a boot names. A title that binds the same
+/// backing for every draw names it once and then counts; a boot that touches
+/// more distinct unbacked ranges than this folds the rest into one aggregate
+/// so the log cannot grow with the frame count.
+pub(crate) const MAX_NAMED_RANGE_REFUSALS: usize = 64;
+
+/// One refused guest range, as the census counts it.
+#[derive(Default)]
+struct RangeRefusal {
+    count: u64,
+    branch: &'static str,
+}
+
+/// The bounded census over refused guest ranges.
+#[derive(Default)]
+struct RangeRefusalCensus {
+    /// Keyed by the exact `(address, len)` the resolver was asked for.
+    named: std::collections::HashMap<(u64, u64), RangeRefusal>,
+    /// Distinct ranges seen after the naming cap; only their total is kept.
+    overflow: u64,
+    total: u64,
+}
+
+impl RangeRefusalCensus {
+    /// Counts one refusal and logs the first occurrence of a named range.
+    ///
+    /// The log line carries the branch (`heap_table`, `title_address_table`
+    /// or `xmem_share_table`), the count of refusals for that exact range,
+    /// the table's range when the branch owns one, and the resolver's own
+    /// reason. Repeats only move the count: one line per distinct range, at
+    /// most [`MAX_NAMED_RANGE_REFUSALS`] of them, plus one aggregate line.
+    fn note(
+        &mut self,
+        address: u64,
+        len: u64,
+        branch: crate::resource::RangeRefusalBranch,
+        reason: &str,
+    ) {
+        self.total = self.total.saturating_add(1);
+        let key = (address, len);
+        if let Some(entry) = self.named.get_mut(&key) {
+            entry.count = entry.count.saturating_add(1);
+            // Logarithmic reminders: bounded by the count's bit width, never
+            // one line per draw.
+            if entry.count.is_power_of_two() {
+                tracing::warn!(
+                    address = format_args!("{address:#x}"),
+                    bytes = len,
+                    branch = entry.branch,
+                    count = entry.count,
+                    reason,
+                    "VICTORY_BACKEND=metal: a guest range is still refused"
+                );
+            }
+            return;
+        }
+        if self.named.len() >= MAX_NAMED_RANGE_REFUSALS {
+            let first = self.overflow == 0;
+            self.overflow = self.overflow.saturating_add(1);
+            if first {
+                tracing::warn!(
+                    named = MAX_NAMED_RANGE_REFUSALS,
+                    "VICTORY_BACKEND=metal: further disturbed guest ranges are counted, not named"
+                );
+            }
+            return;
+        }
+        self.named.insert(
+            key,
+            RangeRefusal {
+                count: 1,
+                branch: branch.name(),
+            },
+        );
+        let range = branch.range();
+        tracing::warn!(
+            address = format_args!("{address:#x}"),
+            bytes = len,
+            branch = branch.name(),
+            heap = ?range,
+            reason,
+            "VICTORY_BACKEND=metal: a guest range is refused"
+        );
+    }
+
+    /// The aggregate numbers: `(named, distinct refusals, overflow, total)`.
+    #[cfg(test)]
+    fn counts(&self) -> (usize, u64, u64, u64) {
+        (
+            self.named.len(),
+            self.named.values().map(|entry| entry.count).sum(),
+            self.overflow,
+            self.total,
+        )
+    }
+}
+
+static RANGE_REFUSALS: std::sync::LazyLock<std::sync::Mutex<RangeRefusalCensus>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(RangeRefusalCensus::default()));
+
+/// Counts one refused guest range against the bounded census, naming the
+/// branch that rejected it on the first occurrence.
+///
+/// This is the single place a refusal is counted, so a range refused for
+/// every draw costs one line and a running count, never a line per draw.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub(crate) fn note_refused_guest_range(
+    address: u64,
+    len: u64,
+    branch: crate::resource::RangeRefusalBranch,
+    reason: impl std::fmt::Display,
+) {
+    let reason = reason.to_string();
+    RANGE_REFUSALS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .note(address, len, branch, &reason);
+}
+
+/// The census numbers, for the tests: `(named, refusals they count, overflow,
+/// total)`.
+#[cfg(test)]
+pub(crate) fn guest_range_refusal_counts() -> (usize, u64, u64, u64) {
+    RANGE_REFUSALS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .counts()
+}
+
+/// Empties the range refusal census: tests start each case from a known
+/// state.
+#[cfg(test)]
+pub(crate) fn reset_guest_range_refusals() {
+    *RANGE_REFUSALS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = RangeRefusalCensus::default();
+}
+
+/// The installed resolver, wrapped so a range inside memory this backend
+/// created is refused by name.
+///
+/// The share resolver only knows the `xmem` tables: a D3D12 heap allocated
+/// from host memory, or a resource at a title-mapped address, has no share
+/// file and would otherwise be refused as `no shared xmem range`, which reads
+/// like an `xmem` mapping bug. The wrapper leaves every range the share
+/// table resolves untouched and only renames the refusal of a range this
+/// backend's tables cover (see [`crate::resource::guest_range_branch`]).
+#[cfg(any(windows, test, target_os = "macos"))]
+struct CreatedRangeResolver {
+    inner: std::sync::Arc<dyn GuestRangeResolver>,
+}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+impl GuestRangeResolver for CreatedRangeResolver {
+    fn resolve(&self, guest_address: u64, len: u64) -> Result<GuestRange, ResolveError> {
+        match self.inner.resolve(guest_address, len) {
+            Ok(range) => Ok(range),
+            Err(error) => {
+                let branch = crate::resource::guest_range_branch(guest_address, len);
+                let Some(refusal) = branch.refusal() else {
+                    // The share table's own refusal is already named; still
+                    // count it once per distinct range.
+                    note_refused_guest_range(guest_address, len, branch, &error);
+                    return Err(error);
+                };
+                note_refused_guest_range(guest_address, len, branch, &error);
+                Err(ResolveError::Unsupported(refusal))
+            }
+        }
+    }
+
+    fn retain(&self, range: &GuestRange) -> Result<u64, ResolveError> {
+        self.inner.retain(range)
+    }
+
+    fn retire(&self, token: u64) -> Result<(), ResolveError> {
+        self.inner.retire(token)
+    }
+}
+
+/// Installs [`CreatedRangeResolver`] over the process-wide resolver, once.
+///
+/// Called when this backend creates its first heap or title-mapped range,
+/// which the console device creation has already followed by installing the
+/// share resolver. With no resolver installed (the D3D12 reference backend)
+/// this is a no-op and a later call can still wrap the resolver that appears.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub(crate) fn install_created_range_resolver() {
+    static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match bindings::resolver() {
+        Some(inner) => {
+            bindings::set_resolver_arc(std::sync::Arc::new(CreatedRangeResolver { inner }));
+        }
+        None => INSTALLED.store(false, Ordering::Release),
+    }
+}
+
 /// Registers a translated metallib as a native pipeline (kind 4/129).
 ///
 /// The bytes are written to `<share dir>/{ticket:016x}.metallib` (temporary
@@ -3303,6 +3505,128 @@ mod tests {
         fn retire(&self, _token: u64) -> Result<(), ResolveError> {
             Ok(())
         }
+    }
+
+    // -------------------------------------- named range refusals (heap table)
+
+    /// The Boot #15b range shape: a ~1 MiB vertex buffer at a non-zero offset
+    /// in a heap whose share table has nothing is refused by name, never as
+    /// an `xmem` miss.
+    #[test]
+    fn a_heap_range_with_no_share_backing_is_refused_by_name() {
+        let _serial = serialized();
+        reset_guest_range_refusals();
+        crate::resource::clear_created_ranges_for_test();
+        crate::resource::note_created_range_for_test(
+            0x147a0_0000,
+            0x20_0000,
+            crate::resource::CreatedRangeOrigin::Heap,
+        );
+        let resolver = CreatedRangeResolver {
+            inner: Arc::new(RangeMapResolver::new(&[])),
+        };
+        let error = resolver
+            .resolve(0x147a2_b0f0, 1_010_960)
+            .expect_err("the heap has no share backing");
+        assert_eq!(
+            error,
+            ResolveError::Unsupported("heap has no host-visible backing")
+        );
+        let shown = error.to_string();
+        assert!(
+            shown.contains("heap has no host-visible backing"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("no shared xmem range"),
+            "the heap refusal is distinguishable: {shown}"
+        );
+        let (named, counted, overflow, total) = guest_range_refusal_counts();
+        assert_eq!((named, counted, overflow, total), (1, 1, 0, 1));
+        crate::resource::clear_created_ranges_for_test();
+        reset_guest_range_refusals();
+    }
+
+    /// The same shape inside a heap the share table resolves is a normal
+    /// binding: the wrapper only renames refusals.
+    #[test]
+    fn a_one_mib_buffer_inside_a_resolvable_heap_resolves() {
+        let _serial = serialized();
+        reset_guest_range_refusals();
+        crate::resource::clear_created_ranges_for_test();
+        let base = 0x147a0_0000;
+        let len = 0x20_0000;
+        crate::resource::note_created_range_for_test(
+            base,
+            len,
+            crate::resource::CreatedRangeOrigin::Heap,
+        );
+        let resolver = CreatedRangeResolver {
+            inner: Arc::new(RangeMapResolver::new(&[(base, len, 41)])),
+        };
+        let range = resolver
+            .resolve(base + 0x2b0f0, 1_010_960)
+            .expect("the heap resolves to its share allocation");
+        assert_eq!(range.allocation_id, 41);
+        assert_eq!(
+            range.generation,
+            victory_metal::guest_ipc::REGISTRATION_GENERATION
+        );
+        assert_eq!(guest_range_refusal_counts().3, 0, "nothing was refused");
+        crate::resource::clear_created_ranges_for_test();
+    }
+
+    /// A range no table here covers keeps the share resolver's own name.
+    #[test]
+    fn a_range_outside_every_created_table_keeps_the_share_table_name() {
+        let _serial = serialized();
+        reset_guest_range_refusals();
+        crate::resource::clear_created_ranges_for_test();
+        let resolver = CreatedRangeResolver {
+            inner: Arc::new(RangeMapResolver::new(&[])),
+        };
+        let error = resolver
+            .resolve(0x10_0000, 4096)
+            .expect_err("no range covers it");
+        assert!(matches!(error, ResolveError::Unmapped { .. }));
+        assert!(error.to_string().contains("no shared xmem range"));
+        assert_eq!(
+            crate::resource::guest_range_branch(0x10_0000, 4096),
+            crate::resource::RangeRefusalBranch::ShareTable
+        );
+        let (named, counted, overflow, total) = guest_range_refusal_counts();
+        assert_eq!((named, counted, overflow, total), (1, 1, 0, 1));
+        reset_guest_range_refusals();
+    }
+
+    /// The census names each distinct range once and counts repeats: a range
+    /// refused for every draw cannot produce a line per draw, and the number
+    /// of named ranges is bounded.
+    #[test]
+    fn range_refusals_name_each_distinct_range_once_and_are_bounded() {
+        let _serial = serialized();
+        reset_guest_range_refusals();
+        let branch = crate::resource::RangeRefusalBranch::ShareTable;
+        for index in 0..100u64 {
+            note_refused_guest_range(
+                0x2000_0000 + index * 0x1000,
+                0x1000,
+                branch,
+                "no shared xmem range",
+            );
+        }
+        for _ in 0..50 {
+            note_refused_guest_range(0x2000_0000, 0x1000, branch, "no shared xmem range");
+        }
+        let (named, counted, overflow, total) = guest_range_refusal_counts();
+        assert_eq!(
+            named, MAX_NAMED_RANGE_REFUSALS,
+            "the distinct names are capped"
+        );
+        assert_eq!(overflow, 36, "the rest are counted, not named");
+        assert_eq!(counted, 64 + 50, "repeats only move the count");
+        assert_eq!(total, 150);
+        reset_guest_range_refusals();
     }
 
     /// A session-private share directory with one sparse file per allocation.
