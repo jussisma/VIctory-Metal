@@ -154,6 +154,207 @@ pub struct GuestBinding {
     pub len: u64,
 }
 
+/// Bytes between consecutive live view descriptors (CBV/SRV/UAV) in a guest
+/// descriptor heap.
+///
+/// This is the view entry of `descriptor.rs`'s per-heap increments
+/// `[32, 16, 128, 128]`; the unit tests below compare it with
+/// `crate::descriptor::increment_size` so the two cannot drift.
+pub const VIEW_DESCRIPTOR_INCREMENT: u64 = 32;
+
+/// Bytes between consecutive live sampler descriptors in a guest descriptor
+/// heap (the sampler entry of the same per-heap increments).
+pub const SAMPLER_DESCRIPTOR_INCREMENT: u64 = 16;
+
+/// The guest stride of one descriptor of `kind`.
+pub fn descriptor_increment(kind: DescriptorKind) -> u64 {
+    match kind {
+        DescriptorKind::Sampler => SAMPLER_DESCRIPTOR_INCREMENT,
+        DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav => {
+            VIEW_DESCRIPTOR_INCREMENT
+        }
+    }
+}
+
+/// One guest descriptor slot as a table run reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorSlot {
+    /// A live, expressible descriptor and the kind its entry declares.
+    Live(DescriptorKind, GuestBinding),
+    /// No live descriptor names this slot (freed, stale or never written).
+    Empty,
+    /// A live descriptor this backend cannot put in a table entry.
+    Unresolvable(&'static str),
+}
+
+/// Why a descriptor-table run could not be enumerated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableRunError {
+    /// The table handle is zero (`Set*RootDescriptorTable(null)`).
+    HandleZero,
+    /// The table's first slot holds no live descriptor.
+    Empty,
+    /// The first slot names a descriptor this backend cannot express.
+    Unsupported(&'static str),
+    /// A run of more than [`MAX_DESCRIPTOR_BINDINGS_V3`] same-kind descriptors
+    /// was seen. It is refused instead of silently truncated.
+    OverCap {
+        /// Entries the run would need (the cap plus one at the time it is
+        /// detected).
+        count: usize,
+    },
+    /// A run changes descriptor kind inside one table. Wire v3 carries one
+    /// kind per table, so the boundary must be a separate root parameter.
+    MixedKind {
+        /// Kind of the entries already enumerated.
+        run_kind: DescriptorKind,
+        /// Kind of the slot that ended the run.
+        next_kind: DescriptorKind,
+    },
+}
+
+impl std::fmt::Display for TableRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HandleZero => write!(f, "the descriptor-table handle is zero"),
+            Self::Empty => write!(f, "the descriptor table's first slot holds no live descriptor"),
+            Self::Unsupported(why) => write!(f, "the descriptor table entry is not expressible: {why}"),
+            Self::OverCap { count } => write!(
+                f,
+                "the descriptor table run needs {count} entries, more than the {} a v3 table carries",
+                MAX_DESCRIPTOR_BINDINGS_V3
+            ),
+            Self::MixedKind { run_kind, next_kind } => write!(
+                f,
+                "the descriptor table mixes {run_kind:?} and {next_kind:?} entries; \
+                 bind each range as its own root descriptor table"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TableRunError {}
+
+/// Where a homogeneous descriptor-table run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableRunBoundary {
+    /// The next slot held no live descriptor: the normal table end.
+    Empty,
+    /// The next slot held a descriptor this backend cannot express.
+    Unresolvable(&'static str),
+    /// The next slot held another `kind`: the boundary of the next root
+    /// parameter's table (or a genuinely mixed range, which wire v3 cannot
+    /// carry).
+    KindChange {
+        /// Kind of the slot that ended the run.
+        kind: DescriptorKind,
+    },
+}
+
+/// One homogeneous run of consecutive descriptors in register order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescriptorTableRun {
+    /// The kind every entry carries.
+    pub kind: DescriptorKind,
+    /// The entries, in register order.
+    pub entries: Vec<GuestBinding>,
+    /// Why the run stopped.
+    pub boundary: TableRunBoundary,
+}
+
+impl DescriptorTableRun {
+    /// Number of entries enumerated.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the run has no entries (never: a run always has at least one).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Refuses a run that ended on a different descriptor kind.
+    ///
+    /// The binding paths in `list.rs` stop at the kind change and bind the
+    /// homogeneous prefix: a descriptor heap commonly holds tables of
+    /// different kinds back to back, and each is named by its own
+    /// `Set*RootDescriptorTable`, so a kind change is the normal boundary.
+    /// A caller that knows one root parameter is a single mixed range can use
+    /// this to refuse instead of binding its first range.
+    pub fn require_homogeneous(&self) -> Result<(), TableRunError> {
+        match self.boundary {
+            TableRunBoundary::KindChange { kind } => Err(TableRunError::MixedKind {
+                run_kind: self.kind,
+                next_kind: kind,
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Enumerates the consecutive same-kind descriptors of one table.
+///
+/// `read` returns the slot at a guest descriptor handle. The run starts at
+/// `base_handle`, always includes that slot, and walks forward by the kind's
+/// real per-entry increment ([`descriptor_increment`]) until it meets an empty
+/// slot, an unresolvable slot or a slot of another kind. It never reads past
+/// [`MAX_DESCRIPTOR_BINDINGS_V3`]: a 33rd same-kind live entry is
+/// [`TableRunError::OverCap`], never a silent truncation.
+///
+/// A first slot that is empty, unresolvable, a sampler or zero-handed is an
+/// error: a sampler table has no guest registration route to the host yet.
+pub fn enumerate_descriptor_table<F>(
+    base_handle: u64,
+    mut read: F,
+) -> Result<DescriptorTableRun, TableRunError>
+where
+    F: FnMut(u64) -> DescriptorSlot,
+{
+    if base_handle == 0 {
+        return Err(TableRunError::HandleZero);
+    }
+    let (kind, first) = match read(base_handle) {
+        DescriptorSlot::Live(kind, binding) => (kind, binding),
+        DescriptorSlot::Empty => return Err(TableRunError::Empty),
+        DescriptorSlot::Unresolvable(why) => return Err(TableRunError::Unsupported(why)),
+    };
+    if kind == DescriptorKind::Sampler {
+        return Err(TableRunError::Unsupported(
+            "sampler descriptor tables have no guest registration route to the host",
+        ));
+    }
+    let increment = descriptor_increment(kind);
+    let mut entries = Vec::with_capacity(4);
+    entries.push(first);
+    let mut distance = increment;
+    let boundary = loop {
+        let Some(next_handle) = base_handle.checked_add(distance) else {
+            break TableRunBoundary::Empty;
+        };
+        match read(next_handle) {
+            DescriptorSlot::Empty => break TableRunBoundary::Empty,
+            DescriptorSlot::Unresolvable(why) => break TableRunBoundary::Unresolvable(why),
+            DescriptorSlot::Live(next_kind, binding) => {
+                if next_kind != kind {
+                    break TableRunBoundary::KindChange { kind: next_kind };
+                }
+                if entries.len() >= MAX_DESCRIPTOR_BINDINGS_V3 {
+                    return Err(TableRunError::OverCap {
+                        count: MAX_DESCRIPTOR_BINDINGS_V3 + 1,
+                    });
+                }
+                entries.push(binding);
+                distance += increment;
+            }
+        }
+    };
+    Ok(DescriptorTableRun {
+        kind,
+        entries,
+        boundary,
+    })
+}
+
 /// A Wire v3 entry together with the pins its ranges hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved<T> {
@@ -875,5 +1076,196 @@ mod tests {
         let replaced = clear_resolver().expect("the installed resolver");
         assert!(Arc::ptr_eq(&replaced, &installed));
         assert!(resolver().is_none());
+    }
+
+    /// A synthetic guest descriptor heap: entry `i` lives at
+    /// `TABLE_BASE + i * VIEW_DESCRIPTOR_INCREMENT`.
+    const TABLE_BASE: u64 = 0x2000_0000;
+
+    fn binding_for(index: usize) -> GuestBinding {
+        GuestBinding {
+            address: 0x1_0000 + index as u64 * 0x100,
+            len: 16,
+        }
+    }
+
+    /// Enumerates a heap whose first `kinds.len()` slots are `kinds[i]` and
+    /// whose following slot is empty unless `unresolvable` names it.
+    fn enumerate_heap(
+        kinds: &[Option<DescriptorKind>],
+        unresolvable: Option<(usize, &'static str)>,
+    ) -> Result<DescriptorTableRun, TableRunError> {
+        let slots: Vec<DescriptorSlot> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| match kind {
+                Some(kind) => DescriptorSlot::Live(*kind, binding_for(index)),
+                None => DescriptorSlot::Empty,
+            })
+            .collect();
+        enumerate_descriptor_table(TABLE_BASE, |handle| {
+            let index = ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize;
+            if let Some((at, why)) = unresolvable
+                && at == index
+            {
+                return DescriptorSlot::Unresolvable(why);
+            }
+            slots.get(index).copied().unwrap_or(DescriptorSlot::Empty)
+        })
+    }
+
+    #[test]
+    fn descriptor_runs_enumerate_one_two_four_and_thirty_two_entries() {
+        for count in [1usize, 2, 4, MAX_DESCRIPTOR_BINDINGS_V3] {
+            let mut kinds = vec![Some(DescriptorKind::Cbv); count];
+            kinds.push(None);
+            let run = enumerate_heap(&kinds, None).expect("a homogeneous table");
+            assert_eq!(run.kind, DescriptorKind::Cbv, "run kind");
+            assert_eq!(run.len(), count, "entry count");
+            assert_eq!(run.boundary, TableRunBoundary::Empty, "table end");
+            assert_eq!(run.entries[0], binding_for(0), "first entry");
+            assert_eq!(
+                run.entries[count - 1],
+                binding_for(count - 1),
+                "last entry keeps register order"
+            );
+            run.require_homogeneous().expect("no kind change");
+        }
+    }
+
+    #[test]
+    fn a_thirty_third_same_kind_entry_is_refused_not_truncated() {
+        let kinds = vec![Some(DescriptorKind::Srv); MAX_DESCRIPTOR_BINDINGS_V3 + 1];
+        assert_eq!(
+            enumerate_heap(&kinds, None),
+            Err(TableRunError::OverCap {
+                count: MAX_DESCRIPTOR_BINDINGS_V3 + 1
+            })
+        );
+        // The message names the cap instead of silently dropping entry 33.
+        let message = TableRunError::OverCap { count: 33 }.to_string();
+        assert!(message.contains("33"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_second_slot_leaves_a_one_entry_run() {
+        let run = enumerate_heap(&[Some(DescriptorKind::Srv), None], None)
+            .expect("a one-entry table followed by an empty slot");
+        assert_eq!(run.len(), 1);
+        assert_eq!(run.entries[0], binding_for(0));
+        assert_eq!(run.boundary, TableRunBoundary::Empty);
+    }
+
+    #[test]
+    fn a_kind_change_stops_the_run_and_a_mixed_run_is_refused() {
+        let run = enumerate_heap(
+            &[
+                Some(DescriptorKind::Cbv),
+                Some(DescriptorKind::Cbv),
+                Some(DescriptorKind::Srv),
+                Some(DescriptorKind::Srv),
+            ],
+            None,
+        )
+        .expect("the homogeneous prefix");
+        assert_eq!(run.kind, DescriptorKind::Cbv);
+        assert_eq!(run.len(), 2, "the next root parameter's table is not consumed");
+        assert_eq!(
+            run.boundary,
+            TableRunBoundary::KindChange {
+                kind: DescriptorKind::Srv
+            }
+        );
+        let error = run
+            .require_homogeneous()
+            .expect_err("a single mixed range cannot be carried by one v3 table");
+        assert_eq!(
+            error,
+            TableRunError::MixedKind {
+                run_kind: DescriptorKind::Cbv,
+                next_kind: DescriptorKind::Srv,
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("own root descriptor table"), "{message}");
+    }
+
+    #[test]
+    fn an_unresolvable_slot_stops_the_run() {
+        let run = enumerate_heap(
+            &[
+                Some(DescriptorKind::Uav),
+                Some(DescriptorKind::Uav),
+                Some(DescriptorKind::Uav),
+            ],
+            Some((2, "a texture descriptor cannot be carried by a buffer table")),
+        )
+        .expect("the resolvable prefix");
+        assert_eq!(run.len(), 2);
+        assert_eq!(
+            run.boundary,
+            TableRunBoundary::Unresolvable(
+                "a texture descriptor cannot be carried by a buffer table"
+            )
+        );
+        run.require_homogeneous()
+            .expect("an unresolvable end is not a kind change");
+    }
+
+    #[test]
+    fn a_zero_handle_or_empty_first_slot_is_refused() {
+        assert_eq!(
+            enumerate_descriptor_table(0, |_| DescriptorSlot::Empty),
+            Err(TableRunError::HandleZero)
+        );
+        assert_eq!(
+            enumerate_descriptor_table(TABLE_BASE, |_| DescriptorSlot::Empty),
+            Err(TableRunError::Empty)
+        );
+        assert_eq!(
+            enumerate_descriptor_table(TABLE_BASE, |_| {
+                DescriptorSlot::Unresolvable("a placed view is not a buffer descriptor")
+            }),
+            Err(TableRunError::Unsupported(
+                "a placed view is not a buffer descriptor"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_sampler_first_slot_is_refused_explicitly() {
+        let error = enumerate_descriptor_table(TABLE_BASE, |_| {
+            DescriptorSlot::Live(
+                DescriptorKind::Sampler,
+                GuestBinding {
+                    address: 0x1_0000,
+                    len: 16,
+                },
+            )
+        })
+        .expect_err("sampler tables have no guest route");
+        assert!(matches!(error, TableRunError::Unsupported(_)));
+        assert!(
+            error.to_string().contains("sampler"),
+            "the refusal names samplers: {error}"
+        );
+    }
+
+    #[test]
+    fn the_enumeration_increments_match_the_guest_descriptor_heap() {
+        // `descriptor.rs` owns the heap increments `[32, 16, 128, 128]`; the
+        // enumeration must walk views at 32 and samplers at 16.
+        assert_eq!(
+            VIEW_DESCRIPTOR_INCREMENT,
+            u64::from(crate::descriptor::increment_size(std::ptr::null(), 0))
+        );
+        assert_eq!(
+            SAMPLER_DESCRIPTOR_INCREMENT,
+            u64::from(crate::descriptor::increment_size(std::ptr::null(), 1))
+        );
+        assert_eq!(descriptor_increment(DescriptorKind::Cbv), 32);
+        assert_eq!(descriptor_increment(DescriptorKind::Srv), 32);
+        assert_eq!(descriptor_increment(DescriptorKind::Uav), 32);
+        assert_eq!(descriptor_increment(DescriptorKind::Sampler), 16);
     }
 }

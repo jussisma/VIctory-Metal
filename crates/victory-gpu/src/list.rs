@@ -608,42 +608,51 @@ fn bind_index_buffer(this: This, address: u64, len: u64, format: u32) {
     }
 }
 
-/// One descriptor table entry as the guest's descriptor memory describes it.
+/// One descriptor slot as the guest's descriptor memory describes it.
+///
+/// The slot record (`[tag, index, generation]`) is read at `handle`; a slot
+/// that holds no live view is [`DescriptorSlot::Empty`], while a live view this
+/// backend cannot put in a table entry is [`DescriptorSlot::Unresolvable`] so
+/// the enumeration can stop there instead of mis-reading the next slot.
 #[cfg(windows)]
-fn table_entry(
-    handle: u64,
-) -> Result<
-    (
-        victory_metal::wire_v3::DescriptorKind,
-        crate::native_metal::bindings::GuestBinding,
-    ),
-    &'static str,
-> {
+fn descriptor_slot(handle: u64) -> crate::native_metal::bindings::DescriptorSlot {
     use crate::descriptor::View;
-    use crate::native_metal::bindings::GuestBinding;
+    use crate::native_metal::bindings::{DescriptorSlot, GuestBinding};
     use victory_metal::wire_v3::DescriptorKind;
 
-    let view = crate::descriptor::view(handle)
-        .ok_or("the descriptor slot holds no live view this process recorded")?;
+    let Some(view) = crate::descriptor::view(handle) else {
+        return DescriptorSlot::Empty;
+    };
     match &*view {
         View::Constant(address, size) => {
             if *address == 0 || *size == 0 {
-                return Err("a constant buffer descriptor is null");
+                return DescriptorSlot::Unresolvable("a constant buffer descriptor is null");
             }
-            Ok((
+            DescriptorSlot::Live(
                 DescriptorKind::Cbv,
                 GuestBinding {
                     address: *address,
                     len: u64::from(*size),
                 },
-            ))
+            )
         }
-        View::Shader(resource, _) => buffer_entry(*resource, DescriptorKind::Srv),
-        View::Unordered(resource, _, _) => buffer_entry(*resource, DescriptorKind::Uav),
-        View::Sampler(_) | View::ConsoleSampler(_) => {
-            Err("sampler descriptor tables have no buffer binding")
+        View::Shader(resource, _) => match buffer_entry(*resource, DescriptorKind::Srv) {
+            Ok((kind, binding)) => DescriptorSlot::Live(kind, binding),
+            Err(why) => DescriptorSlot::Unresolvable(why),
+        },
+        View::Unordered(resource, _, _) => match buffer_entry(*resource, DescriptorKind::Uav) {
+            Ok((kind, binding)) => DescriptorSlot::Live(kind, binding),
+            Err(why) => DescriptorSlot::Unresolvable(why),
+        },
+        // A sampler has no guest range: only the host's `MTLSamplerState`
+        // registry can name it, and the guest has no IPC route to register one
+        // yet. Multi-entry sampler tables are therefore refused explicitly.
+        View::Sampler(_) | View::ConsoleSampler(_) => DescriptorSlot::Unresolvable(
+            "sampler descriptor tables have no guest registration route to the host",
+        ),
+        View::Placed(..) => {
+            DescriptorSlot::Unresolvable("a placed view is not a buffer descriptor")
         }
-        View::Placed(..) => Err("a placed view is not a buffer descriptor"),
     }
 }
 
@@ -680,12 +689,16 @@ fn buffer_entry(
 ///
 /// `base_register` is the table's root parameter slot: this backend's local
 /// convention (root views and root constants already use the root parameter
-/// slot as the Metal buffer index). Only a one-entry table is recorded: a
-/// table's descriptor count and register assignment come from the root
-/// signature, which the native path does not track yet, so a table that
-/// visibly reaches a second same-kind descriptor is refused instead of
-/// mis-bound. Sampler and texture tables are refused for the same reason
-/// (Wire v3 tables carry buffer ranges only).
+/// slot as the Metal buffer index).
+///
+/// The table's entries are enumerated from the base handle by walking
+/// consecutive live slots of the same descriptor kind at the kind's real guest
+/// increment (`descriptor.rs`'s 32 bytes for views, 16 for samplers). The run
+/// stops at the first empty, unresolvable or different-kind slot; a different
+/// kind is the boundary of the next root parameter's table in the same heap, so
+/// a genuinely mixed range must be split into separate root parameters (wire
+/// v3 carries one kind per table). Sampler tables are refused because the
+/// guest has no sampler-registration route to the host.
 #[cfg(windows)]
 fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     use crate::native_metal::bindings;
@@ -713,34 +726,20 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let (kind, descriptor) = match table_entry(handle) {
-        Ok(entry) => entry,
-        Err(why) => {
-            refuse_binding(this, "a descriptor table entry is not expressible", why);
+    let run = match bindings::enumerate_descriptor_table(handle, descriptor_slot) {
+        Ok(run) => run,
+        Err(error) => {
+            refuse_binding(this, "a descriptor table could not be enumerated", error);
             return;
         }
     };
-    // A second same-kind slot at the next descriptor address means this may
-    // be a multi-entry table; its register assignment is not known.
-    if let Some(next_handle) = handle.checked_add(32)
-        && let Ok((next_kind, next)) = table_entry(next_handle)
-        && next_kind == kind
-        && next.address != 0
-    {
-        refuse_binding(
-            this,
-            "a multi-entry descriptor table has no tracked register layout",
-            "root signature table layout is not tracked by the native path",
-        );
-        return;
-    }
     let resolved = match bindings::descriptor_table(
         &*resolver,
         handle,
         slot,
         slot,
-        kind,
-        &[descriptor],
+        run.kind,
+        &run.entries,
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -776,10 +775,13 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
 /// buffer's guest backing until the queue retires the list.
 ///
 /// The rules are the graphics table's: the root parameter slot is the Metal
-/// buffer index, only a one-entry table is recorded (a table's descriptor count
-/// and register assignment come from the root signature, which the native path
-/// does not track yet), and sampler or texture tables are refused. A table
-/// whose entry kind is not expressible increments the opcode histogram with
+/// buffer index, entries are enumerated from the base handle by consecutive
+/// same-kind live slots at the kind's guest increment, and the run stops at the
+/// first empty, unresolvable or different-kind slot. A different kind is the
+/// next root parameter's table boundary (a genuinely mixed range must be split
+/// into separate root parameters); sampler tables are refused because the guest
+/// has no sampler-registration route to the host. A table whose first entry is
+/// not expressible increments the opcode histogram with
 /// [`victory_metal::wire_v3::OP_DESCRIPTOR_TABLE`].
 #[cfg(windows)]
 fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
@@ -810,41 +812,26 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let (kind, descriptor) = match table_entry(handle) {
-        Ok(entry) => entry,
-        Err(why) => {
-            tracing::warn!(%why, "a compute descriptor table entry is not expressible");
+    let run = match bindings::enumerate_descriptor_table(handle, descriptor_slot) {
+        Ok(run) => run,
+        Err(error) => {
+            tracing::warn!(%error, "a compute descriptor table could not be enumerated");
             with_metal(this, |p| {
                 p.refuse(
-                    "SetComputeRootDescriptorTable: the table entry kind is not expressible",
+                    "SetComputeRootDescriptorTable: the table could not be enumerated",
                     Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
                 )
             });
             return;
         }
     };
-    // A second same-kind slot at the next descriptor address means this may be
-    // a multi-entry table; its register assignment is not known.
-    if let Some(next_handle) = handle.checked_add(32)
-        && let Ok((next_kind, next)) = table_entry(next_handle)
-        && next_kind == kind
-        && next.address != 0
-    {
-        with_metal(this, |p| {
-            p.refuse(
-                "SetComputeRootDescriptorTable: a multi-entry table has no tracked register layout",
-                Some(victory_metal::wire_v3::OP_DESCRIPTOR_TABLE),
-            )
-        });
-        return;
-    }
     let resolved = match bindings::descriptor_table(
         &*resolver,
         handle,
         slot,
         slot,
-        kind,
-        &[descriptor],
+        run.kind,
+        &run.entries,
     ) {
         Ok(resolved) => resolved,
         Err(error) => {

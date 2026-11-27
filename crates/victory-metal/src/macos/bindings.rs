@@ -965,16 +965,18 @@ impl DescriptorTableBuilder {
     /// Writes one 24-byte texture descriptor (`{texture, texture, 0}`).
     ///
     /// Converted MSL loads element 1, but the runtime writes both pointers, so
-    /// both fields carry the texture handle.
+    /// both fields carry the texture handle. `texture` is an opaque 64-bit
+    /// `gpuResourceID`, not a device address: only zero is invalid, and its
+    /// low bits carry no alignment guarantee.
     pub fn push_texture(&mut self, texture: u64) -> Result<(), MetalError> {
         if self.kind != DescriptorTableKind::Texture {
             return Err(MetalError::InvalidArg(
                 "descriptor table kind is not a texture table",
             ));
         }
-        if texture == 0 || !texture.is_multiple_of(DEVICE_ADDRESS_BYTES as u64) {
+        if texture == 0 {
             return Err(MetalError::InvalidArg(
-                "texture descriptor handle must be nonzero and 8-byte aligned",
+                "texture descriptor resource id must be nonzero",
             ));
         }
         self.bytes.extend_from_slice(&texture.to_le_bytes());
@@ -985,15 +987,17 @@ impl DescriptorTableBuilder {
     }
 
     /// Writes one 24-byte sampler descriptor (`{sampler, 0, 0}`).
+    ///
+    /// `sampler` is an opaque 64-bit `gpuResourceID`; only zero is invalid.
     pub fn push_sampler(&mut self, sampler: u64) -> Result<(), MetalError> {
         if self.kind != DescriptorTableKind::Sampler {
             return Err(MetalError::InvalidArg(
                 "descriptor table kind is not a sampler table",
             ));
         }
-        if sampler == 0 || !sampler.is_multiple_of(DEVICE_ADDRESS_BYTES as u64) {
+        if sampler == 0 {
             return Err(MetalError::InvalidArg(
-                "sampler descriptor handle must be nonzero and 8-byte aligned",
+                "sampler descriptor resource id must be nonzero",
             ));
         }
         self.bytes.extend_from_slice(&sampler.to_le_bytes());
@@ -2209,13 +2213,29 @@ mod tests {
             Err(MetalError::InvalidArg(_))
         ));
         assert!(matches!(
-            DescriptorTableBuilder::new(DescriptorTableKind::Sampler).push_sampler(0x1004),
+            DescriptorTableBuilder::new(DescriptorTableKind::Sampler).push_sampler(0),
             Err(MetalError::InvalidArg(_))
         ));
         assert!(matches!(
             DescriptorTableBuilder::new(DescriptorTableKind::Sampler).binding(0x1000),
             Err(MetalError::InvalidArg(_))
         ));
+    }
+
+    /// `gpuResourceID` is an opaque 64-bit id, not a device address: its low
+    /// bits carry no alignment guarantee, so an unaligned non-zero id is a
+    /// valid texture/sampler descriptor.
+    #[test]
+    fn texture_and_sampler_resource_ids_need_not_be_address_aligned() {
+        let mut textures = DescriptorTableBuilder::new(DescriptorTableKind::Texture);
+        textures.push_texture(0x3).expect("an unaligned texture id");
+        assert_eq!(textures.count(), 1);
+        assert_eq!(&textures.bytes()[0..8], &0x3u64.to_le_bytes());
+
+        let mut samplers = DescriptorTableBuilder::new(DescriptorTableKind::Sampler);
+        samplers.push_sampler(0x5).expect("an unaligned sampler id");
+        assert_eq!(samplers.count(), 1);
+        assert_eq!(&samplers.bytes()[0..8], &0x5u64.to_le_bytes());
     }
 
     #[test]
