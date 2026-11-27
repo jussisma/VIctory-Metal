@@ -444,14 +444,43 @@ impl State {
         self.host_targets = None;
     }
 
+    /// The title's `SetDescriptorHeaps`: every slot is classified and recorded
+    /// in the heap-binding census, and the heaps the native path can serve are
+    /// kept for the next bind. A null slot or a heap with no identity is an
+    /// explicit refusal, never a silent skip.
+    ///
+    /// Reached through `list::heaps` and `with_state`, which needs a host
+    /// D3D12 list; a native-backend list has none, so its call site must
+    /// record before that early return to audit native binds.
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
+        use crate::native_metal::telemetry::{HeapBind, HeapKind, note_heap_bindings};
+
         self.heaps = [0; 2];
+        let mut recorded = Vec::with_capacity(heaps.len());
         for &h in heaps {
-            if !h.is_null() {
-                let samplers = crate::descriptor::heap(h).samplers();
-                self.heaps[usize::from(samplers)] = h as usize;
+            if h.is_null() {
+                // A refused slot; counted under its static name, not skipped.
+                recorded.push(HeapBind::NullSlot);
+                continue;
             }
+            let heap = crate::descriptor::heap(h);
+            let samplers = heap.samplers();
+            // A heap's first descriptor is placeable when its kind has a
+            // descriptor increment; a foreign object or a heap that was never
+            // made has none. Shader-visibility flags are not consulted here:
+            // a heap the title bound is recorded whether or not its flags
+            // mark it visible (the observed flags-0 boot case).
+            let placeable = heap.index(heap.start).is_some();
+            let bind = HeapBind::classify(heap.start, samplers, placeable);
+            if let HeapBind::Bound(bound) = bind {
+                // The same slot selection as before: sampler heaps in slot 1.
+                self.heaps[usize::from(bound.kind == HeapKind::Samplers)] = h as usize;
+            }
+            recorded.push(bind);
         }
+        // One call per `SetDescriptorHeaps`: bound heaps by identity, null or
+        // foreign slots by their static refusal name, and the last set.
+        note_heap_bindings(&recorded);
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {

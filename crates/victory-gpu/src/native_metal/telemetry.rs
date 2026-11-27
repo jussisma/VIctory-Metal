@@ -3,7 +3,11 @@
 //! This module owns guest-side frame accounting: record microseconds, ring
 //! submit microseconds, frame time percentiles (p50/p95/p99), FPS, the
 //! unsupported-opcode histogram and the strict `d3dmetal_fallback_count == 0`
-//! guard.
+//! guard. It also keeps the session's descriptor-heap binding audit: every
+//! heap the title binds is recorded by identity (start and kind), a refused
+//! slot is counted under a static name, and the last bound set is reported on
+//! the frame line, so a heap the native path cannot serve is never a silent
+//! skip.
 //!
 //! # What one sample is
 //!
@@ -36,7 +40,7 @@
 //! `1..=100` therefore answers exactly `50`, `95` and `99`; a single sample
 //! answers itself for every percentile; an empty window answers zero.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -413,6 +417,211 @@ impl CallFailureLatch {
     }
 }
 
+/// Maximum heap identities the last-bound set keeps.
+///
+/// A `SetDescriptorHeaps` call names at most two heaps in D3D12, so eight
+/// leaves room for a title that over-fills the set; the line never grows past
+/// [`MAX_HEAP_BINDINGS`] pairs.
+pub const MAX_HEAP_BINDINGS: usize = 8;
+
+/// Maximum distinct heap identities the session census tracks.
+///
+/// Heap addresses are not reused while a heap lives, so a boot binds a few
+/// dozen at most. The cap keeps the census bounded over a long session;
+/// `heaps_distinct` saturates there instead of growing without limit.
+pub const MAX_DISTINCT_HEAPS: usize = 64;
+
+/// The static refusal classes of the descriptor-heap binding audit.
+///
+/// Every refusal is counted under exactly one of these names, so a boot log
+/// can tell a null slot from a heap the wire cannot serve.
+pub mod heap_refusals {
+    /// A null slot in the bound set.
+    pub const NULL_SLOT: &str = "null_slot";
+    /// A non-null object with no descriptor start: not a heap this path made.
+    pub const UNKNOWN_OBJECT: &str = "unknown_object";
+    /// A heap of a kind the wire cannot express.
+    pub const KIND_NOT_EXPRESSIBLE: &str = "kind_not_expressible";
+}
+
+/// The heap refusal classes, in a stable order.
+pub const HEAP_REFUSAL_NAMES: &[&str] = &[
+    heap_refusals::NULL_SLOT,
+    heap_refusals::UNKNOWN_OBJECT,
+    heap_refusals::KIND_NOT_EXPRESSIBLE,
+];
+
+/// The descriptor-heap kinds the native wire can express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HeapKind {
+    /// A `D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV` heap (the view heap).
+    Views,
+    /// A `D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER` heap.
+    Samplers,
+}
+
+impl HeapKind {
+    /// The static name the snapshot prints alongside the heap's start.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Views => "views",
+            Self::Samplers => "samplers",
+        }
+    }
+}
+
+/// A bound heap's identity: where its first descriptor is and what it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BoundHeap {
+    /// The address of the heap's first descriptor (CPU and GPU start are the
+    /// same on the console).
+    pub start: u64,
+    /// The descriptor kind the heap holds.
+    pub kind: HeapKind,
+}
+
+impl BoundHeap {
+    /// `start:kind` in the snapshot's fixed form (16 hex digits, then kind).
+    fn field(&self) -> String {
+        format!("{:016x}:{}", self.start, self.kind.name())
+    }
+}
+
+/// One slot of a `SetDescriptorHeaps` call, as the binding path classified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapBind {
+    /// A heap whose identity the native path can serve.
+    Bound(BoundHeap),
+    /// A null slot in the bound set.
+    NullSlot,
+    /// A non-null object with no descriptor start (not a heap we made).
+    UnknownObject,
+    /// A heap of a kind the native wire cannot express.
+    KindNotExpressible,
+}
+
+impl HeapBind {
+    /// Classifies one `SetDescriptorHeaps` slot from the facts the binding
+    /// path has: the heap's first descriptor, whether it is a sampler heap,
+    /// and whether that first descriptor is placeable in it.
+    ///
+    /// Shader-visibility flags are deliberately not an input: a heap whose
+    /// flags do not mark it shader-visible is a heap the title still bound, so
+    /// it is recorded like any other one (the observed flags-0 boot case).
+    pub const fn classify(start: u64, samplers: bool, placeable: bool) -> Self {
+        if start == 0 {
+            return Self::UnknownObject;
+        }
+        if !placeable {
+            return Self::KindNotExpressible;
+        }
+        Self::Bound(BoundHeap {
+            start,
+            kind: if samplers {
+                HeapKind::Samplers
+            } else {
+                HeapKind::Views
+            },
+        })
+    }
+}
+
+/// One point-in-time view of the descriptor-heap binding audit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeapBindingSnapshot {
+    /// Heap objects recorded as bound across every `SetDescriptorHeaps` call.
+    pub bindings: u64,
+    /// Slots refused with a static reason.
+    pub refusals: u64,
+    /// Distinct `(start, kind)` identities bound, saturating at
+    /// [`MAX_DISTINCT_HEAPS`].
+    pub distinct: u64,
+    /// The last bound set's heaps, in bind order, at most
+    /// [`MAX_HEAP_BINDINGS`].
+    pub last: Vec<BoundHeap>,
+    /// Refusals by static class name (only the classes seen).
+    pub refusal_classes: BTreeMap<&'static str, u64>,
+}
+
+impl HeapBindingSnapshot {
+    /// The heap fields of the `native frame telemetry` snapshot line:
+    /// `heaps_bound`, `heaps_distinct`, `heaps_last` and
+    /// `heap_bind_refusals`.
+    pub fn fields(&self) -> String {
+        let mut text = format!(
+            "heaps_bound={} heaps_distinct={} heaps_last=[",
+            self.bindings, self.distinct
+        );
+        for (index, heap) in self.last.iter().enumerate() {
+            if index > 0 {
+                text.push_str("; ");
+            }
+            text.push_str(&heap.field());
+        }
+        text.push_str("] heap_bind_refusals=");
+        text.push_str(&self.refusals.to_string());
+        text
+    }
+}
+
+/// The session totals of the descriptor-heap binding audit.
+#[derive(Debug, Default)]
+struct HeapBindCensus {
+    bindings: u64,
+    refusals: u64,
+    refusal_classes: BTreeMap<&'static str, u64>,
+    distinct: BTreeSet<BoundHeap>,
+    last: Vec<BoundHeap>,
+}
+
+impl HeapBindCensus {
+    /// Counts one `SetDescriptorHeaps` call: bound heaps by identity, refused
+    /// slots by their static class, and the call's bound set as `last`.
+    fn record(&mut self, set: &[HeapBind]) {
+        let mut last = Vec::with_capacity(set.len().min(MAX_HEAP_BINDINGS));
+        for bind in set {
+            match *bind {
+                HeapBind::Bound(heap) => {
+                    self.bindings = self.bindings.saturating_add(1);
+                    if self.distinct.len() < MAX_DISTINCT_HEAPS {
+                        self.distinct.insert(heap);
+                    }
+                    if last.len() < MAX_HEAP_BINDINGS {
+                        last.push(heap);
+                    }
+                }
+                HeapBind::NullSlot => self.refuse(heap_refusals::NULL_SLOT),
+                HeapBind::UnknownObject => self.refuse(heap_refusals::UNKNOWN_OBJECT),
+                HeapBind::KindNotExpressible => {
+                    self.refuse(heap_refusals::KIND_NOT_EXPRESSIBLE)
+                }
+            }
+        }
+        // A set that bound nothing leaves an empty last set: the line never
+        // keeps a heap the title has since unbound.
+        self.last = last;
+    }
+
+    fn refuse(&mut self, class: &'static str) {
+        self.refusals = self.refusals.saturating_add(1);
+        let count = self.refusal_classes.entry(class).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == 1 {
+            tracing::warn!(refusal = class, "descriptor heap binding refused");
+        }
+    }
+
+    fn snapshot(&self) -> HeapBindingSnapshot {
+        HeapBindingSnapshot {
+            bindings: self.bindings,
+            refusals: self.refusals,
+            distinct: self.distinct.len() as u64,
+            last: self.last.clone(),
+            refusal_classes: self.refusal_classes.clone(),
+        }
+    }
+}
+
 /// The window and histogram one [`FrameTelemetry`] keeps.
 #[derive(Debug, Default)]
 struct Window {
@@ -467,6 +676,8 @@ pub struct FrameTelemetry {
     compute_dispatches_without_bindings: AtomicU64,
     /// The bounded first-failure latch over the create and map boundary.
     call_failures: CallFailureLatch,
+    /// The descriptor-heap binding audit (session totals).
+    heap_census: Mutex<HeapBindCensus>,
 }
 impl FrameTelemetry {
     /// Empty telemetry.
@@ -769,6 +980,23 @@ impl FrameTelemetry {
         self.call_failures.reset();
     }
 
+    /// Records one `SetDescriptorHeaps` call: every slot as classified by the
+    /// binding path, bound heaps by identity and refused slots by class.
+    pub fn note_heap_bindings(&self, bindings: &[HeapBind]) {
+        self.heap_census
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(bindings);
+    }
+
+    /// The session's descriptor-heap binding audit.
+    pub fn heap_bindings(&self) -> HeapBindingSnapshot {
+        self.heap_census
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot()
+    }
+
     /// Accepted buffer and PSO registrations.
     pub fn registration_counts(&self) -> (u64, u64) {
         (
@@ -844,13 +1072,16 @@ impl FrameTelemetry {
             last_host_error: self.last_host_error(),
             call_failures: self.call_failures.count(),
             first_call_failure: self.call_failures.first(),
+            heaps: self.heap_bindings(),
         }
     }
 
     /// Takes the window and histogram for one log line and clears them.
     ///
     /// The hard fallback counter is deliberately not cleared: it is an
-    /// invariant for the whole session, not window state.
+    /// invariant for the whole session, not window state. The heap-binding
+    /// audit is a session total too, so the last bound set survives a frame
+    /// line that had no `SetDescriptorHeaps` call.
     pub fn snapshot_and_reset(&self) -> TelemetrySnapshot {
         let snapshot = self.snapshot();
         {
@@ -871,7 +1102,8 @@ impl FrameTelemetry {
 
     /// Clears the window and histograms (never the fallback counter).
     ///
-    /// Submit and present counters are session totals and survive a reset too.
+    /// Submit and present counters are session totals and survive a reset too,
+    /// as do the pipeline and heap-binding censuses.
     pub fn reset(&self) {
         let mut window = self.lock();
         window.frames.clear();
@@ -945,6 +1177,9 @@ pub struct TelemetrySnapshot {
     pub call_failures: u64,
     /// The one bounded first failure, if any.
     pub first_call_failure: Option<CallFailure>,
+    /// The descriptor-heap binding audit (session totals: a heap bound in an
+    /// early frame stays counted after a window reset).
+    pub heaps: HeapBindingSnapshot,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -978,6 +1213,7 @@ impl std::fmt::Display for TelemetrySnapshot {
             self.compute_dispatches_without_bindings
         )?;
         write!(f, ", {}", self.pipeline_census.fields())?;
+        write!(f, ", {}", self.heaps.fields())?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))?;
         if self.named_refusals.is_empty() {
@@ -1214,6 +1450,19 @@ pub fn call_failure_histogram() -> BTreeMap<&'static str, u64> {
 /// The process-wide bounded first failure, if any.
 pub fn first_call_failure() -> Option<CallFailure> {
     global().first_call_failure()
+}
+
+/// Records one `SetDescriptorHeaps` call in the process-wide telemetry.
+///
+/// Every slot is recorded: a heap the title bound is never silently dropped,
+/// and a null or foreign slot is counted under its static refusal name.
+pub fn note_heap_bindings(bindings: &[HeapBind]) {
+    global().note_heap_bindings(bindings);
+}
+
+/// The process-wide descriptor-heap binding audit.
+pub fn heap_bindings() -> HeapBindingSnapshot {
+    global().heap_bindings()
 }
 
 /// Declares one D3DMetal fallback in the process-wide telemetry.
@@ -1534,6 +1783,159 @@ mod tests {
             assert!(line.contains(expected), "{expected} missing from {line}");
         }
         assert!(!line.contains('\n'), "the log line must stay one line: {line}");
+    }
+
+    /// Binding 1, then 2, then 8 heaps records the counts, the distinct
+    /// identities and the last set in bind order. Repeating an identity in a
+    /// later set counts the binding but not a second distinct heap.
+    #[test]
+    fn heap_bindings_count_distinct_and_keep_the_last_set() {
+        let telemetry = telemetry();
+        let view = |start: u64| {
+            HeapBind::Bound(BoundHeap {
+                start,
+                kind: HeapKind::Views,
+            })
+        };
+
+        telemetry.note_heap_bindings(&[view(0x1000)]);
+        let snapshot = telemetry.heap_bindings();
+        assert_eq!((snapshot.bindings, snapshot.distinct), (1, 1));
+        assert_eq!(
+            snapshot.last,
+            vec![BoundHeap {
+                start: 0x1000,
+                kind: HeapKind::Views
+            }]
+        );
+
+        telemetry.note_heap_bindings(&[view(0x1000), view(0x2000)]);
+        let snapshot = telemetry.heap_bindings();
+        assert_eq!(
+            (snapshot.bindings, snapshot.distinct),
+            (3, 2),
+            "a repeated heap counts once as a binding and not again as distinct"
+        );
+        assert_eq!(snapshot.last.len(), 2);
+        assert_eq!(
+            snapshot.last[0],
+            BoundHeap {
+                start: 0x1000,
+                kind: HeapKind::Views
+            }
+        );
+        assert_eq!(
+            snapshot.last[1],
+            BoundHeap {
+                start: 0x2000,
+                kind: HeapKind::Views
+            }
+        );
+
+        let eight: Vec<HeapBind> = (0..8).map(|i| view(0x3000 + i * 0x20)).collect();
+        telemetry.note_heap_bindings(&eight);
+        let snapshot = telemetry.heap_bindings();
+        assert_eq!((snapshot.bindings, snapshot.distinct), (11, 10));
+        let last: Vec<BoundHeap> = eight
+            .iter()
+            .map(|bind| match bind {
+                HeapBind::Bound(heap) => *heap,
+                other => panic!("a bound slot: {other:?}"),
+            })
+            .collect();
+        assert_eq!(snapshot.last, last, "the last set keeps bind order");
+        assert_eq!(snapshot.refusals, 0);
+    }
+
+    /// A null slot, an object with no heap identity and an unexpressible kind
+    /// are refusals with distinct static names, never silent skips.
+    #[test]
+    fn null_and_unknown_heaps_are_named_refusals() {
+        let telemetry = telemetry();
+        telemetry.note_heap_bindings(&[
+            HeapBind::NullSlot,
+            HeapBind::UnknownObject,
+            HeapBind::KindNotExpressible,
+            HeapBind::classify(0, false, true),
+        ]);
+
+        let snapshot = telemetry.heap_bindings();
+        assert_eq!(snapshot.bindings, 0);
+        assert_eq!(snapshot.distinct, 0);
+        assert!(snapshot.last.is_empty());
+        assert_eq!(snapshot.refusals, 4);
+        assert_eq!(
+            snapshot.refusal_classes,
+            BTreeMap::from([
+                (heap_refusals::NULL_SLOT, 1),
+                (heap_refusals::UNKNOWN_OBJECT, 2),
+                (heap_refusals::KIND_NOT_EXPRESSIBLE, 1),
+            ])
+        );
+
+        let line = telemetry.snapshot().to_string();
+        assert!(line.contains("heap_bind_refusals=4"), "{line}");
+        assert!(line.contains("heaps_last=[]"), "{line}");
+    }
+
+    /// The boot's observed case: a heap whose flags do not mark it
+    /// shader-visible (`flags 0`) is still bound and recorded. Flags are not
+    /// an input to the classifier at all.
+    #[test]
+    fn a_heap_with_flags_zero_is_still_bound_and_recorded() {
+        let start = 0x10_0000_0000;
+        let bind = HeapBind::classify(start, false, true);
+        assert_eq!(
+            bind,
+            HeapBind::Bound(BoundHeap {
+                start,
+                kind: HeapKind::Views,
+            })
+        );
+
+        let telemetry = telemetry();
+        telemetry.note_heap_bindings(&[bind]);
+        let snapshot = telemetry.heap_bindings();
+        assert_eq!(
+            (snapshot.bindings, snapshot.distinct, snapshot.refusals),
+            (1, 1, 0)
+        );
+        let line = telemetry.snapshot().to_string();
+        assert!(line.contains("heaps_bound=1 heaps_distinct=1"), "{line}");
+        assert!(
+            line.contains("heaps_last=[0000001000000000:views]"),
+            "{line}"
+        );
+    }
+
+    /// The snapshot's heap fields are deterministic, bounded to eight pairs
+    /// and formatted as 16 hex digits plus the kind.
+    #[test]
+    fn the_heap_snapshot_line_is_deterministic_and_bounded() {
+        let telemetry = telemetry();
+        let twelve: Vec<HeapBind> = (0..12u64)
+            .map(|i| HeapBind::classify(0x2000 + i * 0x20, i == 0, true))
+            .collect();
+        telemetry.note_heap_bindings(&twelve);
+
+        let first = telemetry.snapshot().to_string();
+        let second = telemetry.snapshot().to_string();
+        assert_eq!(first, second, "the same census prints the same line");
+        assert!(
+            first.contains("heaps_bound=12 heaps_distinct=12"),
+            "{first}"
+        );
+        assert!(first.contains("heap_bind_refusals=0"), "{first}");
+        assert!(!first.contains('\n'), "one line: {first}");
+
+        let start = first.find("heaps_last=[").expect("the field") + "heaps_last=[".len();
+        let end = start + first[start..].find(']').expect("the field's end");
+        let pairs = &first[start..end];
+        assert_eq!(pairs.matches(':').count(), 8, "bounded to eight pairs: {pairs}");
+        assert!(
+            pairs.starts_with("0000000000002000:samplers; 0000000000002020:views"),
+            "{pairs}"
+        );
     }
 
     #[test]
