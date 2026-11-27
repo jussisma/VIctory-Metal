@@ -111,10 +111,10 @@ const MTL_STENCIL_OPERATION_INCREMENT_WRAP: usize = 6;
 /// `MTLStencilOperationDecrementWrap`.
 const MTL_STENCIL_OPERATION_DECREMENT_WRAP: usize = 7;
 
-/// `MTLTriangleFillModeLines`.
-const MTL_TRIANGLE_FILL_MODE_LINES: usize = 0;
 /// `MTLTriangleFillModeFill`.
-const MTL_TRIANGLE_FILL_MODE_FILL: usize = 1;
+const MTL_TRIANGLE_FILL_MODE_FILL: usize = 0;
+/// `MTLTriangleFillModeLines`.
+const MTL_TRIANGLE_FILL_MODE_LINES: usize = 1;
 
 /// `MTLCullModeNone`.
 const MTL_CULL_MODE_NONE: usize = 0;
@@ -219,6 +219,18 @@ pub(crate) const fn mtl_winding(winding: FrontFaceWinding) -> usize {
     }
 }
 
+/// Maps a D3D12 colour write mask onto `MTLColorWriteMask`.
+///
+/// The two encodings use the same four channels in the opposite bit order:
+/// D3D12 is `R=1, G=2, B=4, A=8` while Metal is `R=8, G=4, B=2, A=1`.
+pub(crate) const fn mtl_write_mask(write_mask: u8) -> usize {
+    let mask = (write_mask & 0b1111) as usize;
+    ((mask & 0b0001) << 3)
+        | ((mask & 0b0010) << 1)
+        | ((mask & 0b0100) >> 1)
+        | ((mask & 0b1000) >> 3)
+}
+
 /// Applies one render target's blend state to an
 /// `MTLRenderPipelineColorAttachmentDescriptor`.
 ///
@@ -235,8 +247,7 @@ pub(crate) unsafe fn apply_blend_attachment(
             "colour attachment descriptor is nil".to_string(),
         ));
     }
-    // The D3D12 write mask uses the same four bits as `MTLColorWriteMask`.
-    let mask = usize::from(state.write_mask & 0b1111);
+    let mask = mtl_write_mask(state.write_mask);
     // SAFETY: the caller guarantees a live attachment descriptor; every value
     // is a documented `MTLBlendFactor`/`MTLBlendOperation`/mask encoding.
     unsafe {
@@ -417,8 +428,13 @@ pub(crate) unsafe fn apply_rasterizer(
             objc::sel(c"setTriangleFillMode:"),
             mtl_fill_mode(state.fill),
         );
-        // TEMP bisect: depth bias disabled
-        let _ = (state.depth_bias, state.slope_scaled_depth_bias, state.depth_bias_clamp);
+        msg_send_void_depth_bias(
+            enc,
+            objc::sel(c"setDepthBias:slopeScale:clamp:"),
+            state.depth_bias as f32,
+            state.slope_scaled_depth_bias,
+            state.depth_bias_clamp,
+        );
     }
     Ok(())
 }
@@ -609,9 +625,24 @@ mod tests {
     }
 
     #[test]
+    fn write_mask_translates_d3d12_bits_to_metal_bits() {
+        // D3D12 R=1,G=2,B=4,A=8 -> Metal R=8,G=4,B=2,A=1.
+        assert_eq!(mtl_write_mask(0b0001), 0b1000);
+        assert_eq!(mtl_write_mask(0b0010), 0b0100);
+        assert_eq!(mtl_write_mask(0b0100), 0b0010);
+        assert_eq!(mtl_write_mask(0b1000), 0b0001);
+        // The GPU proof uses R+B (D3D12 0b0101) which must become Metal 0b1010.
+        assert_eq!(mtl_write_mask(0b0101), 0b1010);
+        assert_eq!(mtl_write_mask(0b1111), 0b1111);
+        assert_eq!(mtl_write_mask(0b0000), 0);
+        // Only the low four bits are meaningful.
+        assert_eq!(mtl_write_mask(0xf5), 0b1010);
+    }
+
+    #[test]
     fn rasterizer_and_winding_map_to_metal_values() {
-        assert_eq!(mtl_fill_mode(FillMode::Wireframe), 0);
-        assert_eq!(mtl_fill_mode(FillMode::Solid), 1);
+        assert_eq!(mtl_fill_mode(FillMode::Solid), 0);
+        assert_eq!(mtl_fill_mode(FillMode::Wireframe), 1);
         assert_eq!(mtl_cull_mode(CullMode::None), 0);
         assert_eq!(mtl_cull_mode(CullMode::Front), 1);
         assert_eq!(mtl_cull_mode(CullMode::Back), 2);

@@ -3192,6 +3192,43 @@ fn build_descriptor_table(
         DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
         _ => MTL_RESOURCE_USAGE_READ,
     };
+    // A converted texture descriptor stores the texture's opaque
+    // `gpuResourceID`, not a device address; the id is not required to be
+    // address-aligned, so the texture table is encoded here rather than through
+    // the address-aligned `DescriptorTableBuilder::push_texture` helper.
+    if kind == DescriptorTableKind::Texture {
+        if table.bindings.is_empty() {
+            return Err(MetalError::InvalidArg("descriptor table is empty").into());
+        }
+        let stride = DescriptorTableKind::Texture.descriptor_bytes();
+        let mut bytes = Vec::with_capacity(table.bindings.len() * stride);
+        for binding in &table.bindings {
+            let texture = resolve_table_texture(state, allocations, binding)
+                .ok_or(PrepareAbort::UnknownHandle)?;
+            let resource_id = resource_gpu_id(texture);
+            if resource_id == 0 {
+                return Err(
+                    MetalError::InvalidArg("texture descriptor resource id is zero").into(),
+                );
+            }
+            bytes.extend_from_slice(&resource_id.to_le_bytes());
+            bytes.extend_from_slice(&resource_id.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            resources.push((texture, usage));
+        }
+        let buffer = new_argument_buffer(device, &bytes)?;
+        let address = buffer_gpu_address(buffer.as_raw());
+        return Ok(PendingAbiBinding::Table {
+            parameter: usize::from(table.set),
+            kind,
+            buffer,
+            address,
+            length: bytes.len() as u64,
+            count: table.bindings.len() as u32,
+            stride,
+            resources,
+        });
+    }
     for binding in &table.bindings {
         match kind {
             DescriptorTableKind::Sampler => {
@@ -3200,12 +3237,7 @@ fn build_descriptor_table(
                 builder.push_sampler(resource_gpu_id(sampler))?;
                 resources.push((sampler, MTL_RESOURCE_USAGE_READ));
             }
-            DescriptorTableKind::Texture => {
-                let texture = resolve_table_texture(state, allocations, binding)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                builder.push_texture(resource_gpu_id(texture))?;
-                resources.push((texture, usage));
-            }
+            DescriptorTableKind::Texture => unreachable!("texture tables return above"),
             _ => {
                 let (buffer, offset, _length) = resolve_buffer_range(
                     state,
@@ -4239,6 +4271,34 @@ fn continuation_depth(
     Some(out)
 }
 
+/// Tracks the last value applied to one encoder-state slot.
+///
+/// A repeated wire state command whose value is unchanged must not emit a
+/// redundant Metal call. This is the whole dedup rule for encoder state; keeping
+/// it in one pure type makes the idempotency unit-testable without a GPU.
+#[derive(Debug)]
+struct StateDedup<T> {
+    last: Option<T>,
+}
+
+impl<T> Default for StateDedup<T> {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl<T: Copy + PartialEq> StateDedup<T> {
+    /// Records `next` and reports whether it differs from the last value.
+    fn should_emit(&mut self, next: T) -> bool {
+        if self.last == Some(next) {
+            false
+        } else {
+            self.last = Some(next);
+            true
+        }
+    }
+}
+
 /// Builds the replayed ops of one render sub-pass.
 ///
 /// `state_from` is the first command of the pass; commands in
@@ -4270,10 +4330,10 @@ fn build_render_ops(
     let mut pending = AbiPending::default();
     // Last-applied encoder state, so a repeated Set command emits no redundant
     // Metal call inside one sub-pass.
-    let mut last_rasterizer: Option<RasterizerState> = None;
-    let mut last_stencil_ref: Option<u8> = None;
-    let mut last_blend_color: Option<[f32; 4]> = None;
-    let mut last_depth_state: Option<objc::Id> = None;
+    let mut last_rasterizer: StateDedup<RasterizerState> = StateDedup::default();
+    let mut last_stencil_ref: StateDedup<u8> = StateDedup::default();
+    let mut last_blend_color: StateDedup<[f32; 4]> = StateDedup::default();
+    let mut last_depth_state: StateDedup<objc::Id> = StateDedup::default();
     // D3D12 depth/stencil state is independent of the PSO. Once a wire state is
     // set, pipeline selection must not overwrite it with the pipeline default.
     let mut depth_overridden = false;
@@ -4440,26 +4500,22 @@ fn build_render_ops(
                     .depth_states
                     .get_or_create(transport, depth)?;
                 depth_overridden = true;
-                if last_depth_state != Some(raw) {
-                    last_depth_state = Some(raw);
+                if last_depth_state.should_emit(raw) {
                     ops.push(PreparedRenderOp::DepthStencil(raw));
                 }
             }
             CommandV3::SetRasterizerState(raster) => {
-                if last_rasterizer.as_ref() != Some(raster) {
-                    last_rasterizer = Some(*raster);
+                if last_rasterizer.should_emit(*raster) {
                     ops.push(PreparedRenderOp::Rasterizer(*raster));
                 }
             }
             CommandV3::SetStencilRef(reference) => {
-                if last_stencil_ref != Some(reference.value) {
-                    last_stencil_ref = Some(reference.value);
+                if last_stencil_ref.should_emit(reference.value) {
                     ops.push(PreparedRenderOp::StencilRef(reference.value));
                 }
             }
             CommandV3::SetBlendFactor(factor) => {
-                if last_blend_color != Some(factor.value) {
-                    last_blend_color = Some(factor.value);
+                if last_blend_color.should_emit(factor.value) {
                     ops.push(PreparedRenderOp::BlendColor(factor.value));
                 }
             }
@@ -5174,8 +5230,8 @@ fn prepare_blit_segment(
                 let (texture, info) = resolve_texture(
                     state,
                     allocations,
-                    copy.allocation_id,
-                    copy.generation,
+                    copy.destination_allocation_id,
+                    copy.destination_generation,
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
                 if mip >= info.mip_levels || slice >= info.slices {
@@ -7518,6 +7574,29 @@ mod tests {
         self, BufferBinding, Command, Dispatch1d, DrawIndexed, Reply, ReplyStatus, RootConstants,
         SetPipeline, Submission,
     };
+
+    /// Encoder state is applied once per change: repeating the same wire state
+    /// must not emit a second op, and a later change must be emitted again.
+    #[test]
+    fn encoder_state_dedup_is_idempotent_and_ordered() {
+        let mut dedup: super::StateDedup<u32> = super::StateDedup::default();
+        // First use, repeat, change, repeat, return to the first value.
+        let sequence = [7u32, 7, 9, 9, 7];
+        let emitted: Vec<bool> = sequence
+            .iter()
+            .map(|value| dedup.should_emit(*value))
+            .collect();
+        assert_eq!(emitted, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn encoder_state_dedup_handles_composite_values() {
+        let mut dedup: super::StateDedup<[u32; 2]> = super::StateDedup::default();
+        assert!(dedup.should_emit([1, 2]));
+        assert!(!dedup.should_emit([1, 2]));
+        assert!(dedup.should_emit([1, 3]));
+        assert!(dedup.should_emit([1, 2]));
+    }
 
     /// Original synthetic compute source. Two entry points prove that a named
     /// function inside the precompiled library is selected, not the first one.

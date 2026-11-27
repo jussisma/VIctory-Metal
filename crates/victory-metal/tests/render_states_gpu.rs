@@ -63,7 +63,7 @@ use victory_metal::wire_v3::{
 
 const EDGE: u32 = 64;
 
-const SAMPLED: u64 = 0x1003;
+const SAMPLED: u64 = 0x1000;
 
 const ALLOC_COLOUR0: u64 = 1;
 const ALLOC_COLOUR1: u64 = 2;
@@ -119,8 +119,17 @@ const TEXTURE_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// Converted descriptor-table contract: `buffer(2)` holds a pointer to an
+// array of 24-byte texture descriptors `{texture, texture, 0}`. The runtime
+// writes the sampled texture into both handle slots, so element 1 is read.
+struct TextureDescriptor {
+    texture2d<float> primary;
+    texture2d<float> sampled;
+    uint64_t reserved;
+};
+
 struct TexAbi {
-    texture2d<float> tex [[id(0)]];
+    constant TextureDescriptor *descriptors [[id(0)]];
 };
 
 struct VOut {
@@ -141,8 +150,8 @@ vertex VOut texture_vertex(uint vid [[vertex_id]]) {
 
 fragment MrtOut texture_fragment(constant TexAbi &abi [[buffer(2)]]) {
     MrtOut out;
-    out.a = abi.tex.read(uint2(1, 1));
-    out.b = abi.tex.read(uint2(2, 2));
+    out.a = abi.descriptors[0].sampled.read(uint2(1, 1));
+    out.b = abi.descriptors[0].sampled.read(uint2(2, 2));
     return out;
 }
 "#;
@@ -519,10 +528,6 @@ const TRIANGLE_BYTES: u64 = 3 * 16;
 #[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
 fn render_states_pixels_are_exact() {
     let dir = TempDir::new("render-states");
-    let Some(_state_lib) = compile_metallib(dir.path(), "state", STATE_MSL) else {
-        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
-        return;
-    };
     let Some(texture_lib) = compile_metallib(dir.path(), "texture", TEXTURE_MSL) else {
         eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
         return;
@@ -585,7 +590,7 @@ fn render_states_pixels_are_exact() {
         "state_fragment",
         &[PixelFormat::Rgba8Unorm, PixelFormat::Rgba8Unorm],
         Some(PixelFormat::Depth32Float),
-        None,
+        Some(&blend_state),
         Some(&depth_state(CompareFunction::Less)),
     )
     .expect("blend pipeline should compile");
@@ -595,14 +600,37 @@ fn render_states_pixels_are_exact() {
         .0;
 
     let red = [1.0, 0.0, 0.0, 1.0];
+    let blue_clear = [0.0f32, 0.0, 1.0, 1.0];
+    let green_clear = [0.0f32, 1.0, 0.0, 1.0];
+    let blue_clear_f64 = [0.0f64, 0.0, 1.0, 1.0];
+    let green_clear_f64 = [0.0f64, 1.0, 0.0, 1.0];
     let blend_commands = vec![
+        // `DontCare` loads model D3D12 render passes that start disengaged; the
+        // three explicit clears below are folded into one continuation pass.
         CommandV3::BeginRenderPass(BeginRenderPass {
             colors: vec![
-                colour_attachment(ALLOC_COLOUR0, LoadOp::Clear, [0.0, 0.0, 1.0, 1.0]),
-                colour_attachment(ALLOC_COLOUR1, LoadOp::Clear, [0.0, 1.0, 0.0, 1.0]),
+                colour_attachment(ALLOC_COLOUR0, LoadOp::DontCare, blue_clear_f64),
+                colour_attachment(ALLOC_COLOUR1, LoadOp::DontCare, green_clear_f64),
             ],
-            depth_stencil: Some(depth_attachment(LoadOp::Clear)),
+            depth_stencil: Some(depth_attachment(LoadOp::DontCare)),
         }),
+        CommandV3::ClearRenderTargetView(ClearRenderTargetView {
+            slot: 0,
+            rect: None,
+            color: blue_clear,
+        }),
+        CommandV3::ClearRenderTargetView(ClearRenderTargetView {
+            slot: 1,
+            rect: None,
+            color: green_clear,
+        }),
+        CommandV3::ClearDepthStencilView(ClearDepthStencilView {
+            depth: Some(1.0),
+            stencil: None,
+            rect: None,
+        }),
+        CommandV3::SetBlendState(blend_state),
+        CommandV3::SetDepthStencilState(depth_state(CompareFunction::Less)),
         CommandV3::SetRasterizerState(raster(CullMode::None, 0)),
         CommandV3::SetGraphicsPipeline(PipelineRef {
             pipeline_id: blend_handle,
@@ -644,7 +672,7 @@ fn render_states_pixels_are_exact() {
         .read_render_target_rgba8(&targets.colour1)
         .expect("target 1 readback");
     for (index, value) in target0.iter().enumerate() {
-        assert_eq!(*value, [255, 0, 0, 255], "target 0 pixel {index}");
+        assert_eq!(*value, [255, 0, 255, 255], "target 0 pixel {index}");
     }
     for (index, value) in target1.iter().enumerate() {
         assert_eq!(*value, [255, 255, 0, 255], "target 1 pixel {index}");
@@ -671,7 +699,7 @@ fn render_states_pixels_are_exact() {
     let blue = [0.0f32, 0.0, 1.0, 1.0];
     let yellow = [1.0f32, 1.0, 0.0, 1.0];
     let cyan = [0.0f32, 1.0, 1.0, 1.0];
-    let draw = |start: usize| CommandV3::Draw(DrawState {
+    let draw = |_start: usize| CommandV3::Draw(DrawState {
         vertex_count: 6,
         instance_count: 1,
         start_vertex: 0,
@@ -833,6 +861,8 @@ fn render_states_pixels_are_exact() {
         CommandV3::CopyBufferToTexture(victory_metal::wire_v3::CopyBufferToTexture {
             allocation_id: ALLOC_UPLOAD,
             generation: 1,
+            destination_allocation_id: ALLOC_SAMPLED,
+            destination_generation: 1,
             offset: 0,
             bytes_per_row: row_pitch as u32,
             bytes_per_image: 0,

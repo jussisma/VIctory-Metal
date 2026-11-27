@@ -1474,6 +1474,10 @@ pub struct CopyBufferToTexture {
     pub allocation_id: u64,
     /// Source generation; never zero.
     pub generation: u32,
+    /// Destination texture allocation ID; never zero.
+    pub destination_allocation_id: u64,
+    /// Destination generation; never zero.
+    pub destination_generation: u32,
     /// Byte offset of the first texel; 4-byte aligned.
     pub offset: u64,
     /// Source row pitch in bytes; nonzero.
@@ -1587,7 +1591,7 @@ const SET_STENCIL_REF_LEN: usize = 8;
 const SET_BLEND_FACTOR_LEN: usize = 24;
 const CLEAR_RENDER_TARGET_VIEW_LEN: usize = 40;
 const CLEAR_DEPTH_STENCIL_VIEW_LEN: usize = 32;
-const COPY_BUFFER_TO_TEXTURE_LEN: usize = 64;
+const COPY_BUFFER_TO_TEXTURE_LEN: usize = 76;
 const PRESENT_LEN: usize = 20;
 
 /// Checked little-endian cursor over a version 3 frame or payload.
@@ -2052,6 +2056,8 @@ fn empty_command(opcode: u16) -> Result<CommandV3, WireError> {
         OP_COPY_BUFFER_TO_TEXTURE => CommandV3::CopyBufferToTexture(CopyBufferToTexture {
             allocation_id: 0,
             generation: 0,
+            destination_allocation_id: 0,
+            destination_generation: 0,
             offset: 0,
             bytes_per_row: 0,
             bytes_per_image: 0,
@@ -2994,6 +3000,9 @@ fn read_copy_buffer_to_texture(
     let allocation_id = reader.u64()?;
     let generation = reader.u32()?;
     validate_handle(allocation_id, generation)?;
+    let destination_allocation_id = reader.u64()?;
+    let destination_generation = reader.u32()?;
+    validate_handle(destination_allocation_id, destination_generation)?;
     let offset = reader.u64()?;
     validate_alignment(offset, "copy source offset alignment")?;
     let bytes_per_row = reader.u32()?;
@@ -3012,6 +3021,8 @@ fn read_copy_buffer_to_texture(
     )?;
     copy.allocation_id = allocation_id;
     copy.generation = generation;
+    copy.destination_allocation_id = destination_allocation_id;
+    copy.destination_generation = destination_generation;
     copy.offset = offset;
     copy.bytes_per_row = bytes_per_row;
     copy.bytes_per_image = bytes_per_image;
@@ -3485,6 +3496,10 @@ fn clear_depth_stencil_view_encoded_len(
 
 fn copy_buffer_to_texture_encoded_len(copy: &CopyBufferToTexture) -> Result<usize, WireError> {
     validate_handle(copy.allocation_id, copy.generation)?;
+    validate_handle(
+        copy.destination_allocation_id,
+        copy.destination_generation,
+    )?;
     validate_alignment(copy.offset, "copy source offset alignment")?;
     validate_pitched_copy(
         copy.offset,
@@ -3879,6 +3894,8 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
         CommandV3::CopyBufferToTexture(copy) => {
             write_u64(out, copy.allocation_id);
             write_u32(out, copy.generation);
+            write_u64(out, copy.destination_allocation_id);
+            write_u32(out, copy.destination_generation);
             write_u64(out, copy.offset);
             write_u32(out, copy.bytes_per_row);
             write_u32(out, copy.bytes_per_image);
@@ -4566,6 +4583,8 @@ mod tests {
             CommandV3::CopyBufferToTexture(CopyBufferToTexture {
                 allocation_id: 13,
                 generation: 2,
+                destination_allocation_id: 14,
+                destination_generation: 3,
                 offset: 1024,
                 bytes_per_row: 256,
                 bytes_per_image: 0,
@@ -5652,6 +5671,8 @@ mod tests {
         CopyBufferToTexture {
             allocation_id: 21,
             generation: 3,
+            destination_allocation_id: 22,
+            destination_generation: 4,
             offset: 0,
             bytes_per_row: 256,
             bytes_per_image: 0,
@@ -5901,6 +5922,12 @@ mod tests {
             CommandV3::CopyBufferToTexture(zero_alloc),
             WireError::ZeroAllocationId,
         );
+        let mut zero_destination = pitched_copy();
+        zero_destination.destination_allocation_id = 0;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(zero_destination),
+            WireError::ZeroAllocationId,
+        );
         assert_decode_error(
             &copy,
             COMMAND_START + 4,
@@ -5909,7 +5936,13 @@ mod tests {
         );
         assert_decode_error(
             &copy,
-            COMMAND_START + 24,
+            COMMAND_START + 16,
+            &[0; 8],
+            WireError::ZeroAllocationId,
+        );
+        assert_decode_error(
+            &copy,
+            COMMAND_START + 36,
             &0u32.to_le_bytes(),
             WireError::ZeroExtent {
                 field: "copy source row pitch",
@@ -5917,7 +5950,7 @@ mod tests {
         );
         assert_decode_error(
             &copy,
-            COMMAND_START + 32,
+            COMMAND_START + 44,
             &0u32.to_le_bytes(),
             WireError::ZeroExtent {
                 field: "copy region width",
