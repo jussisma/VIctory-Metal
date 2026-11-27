@@ -63,6 +63,19 @@ pub(crate) const GENERATION: u64 = 1;
 /// already hold names from an earlier process).
 const ATTEMPTS: usize = 8;
 
+/// Default cap on the registry's submission rows.
+///
+/// Retired rows are evicted, lowest id first, once the map would exceed this,
+/// so sustained streaming cannot grow it without limit. Open submissions are
+/// live and are never evicted; their count is bounded by the host's
+/// frames-in-flight cap, which makes the map O(in-flight) rather than
+/// O(allocations over the session).
+pub(crate) const SUBMISSIONS_CAPACITY: usize = 4096;
+
+/// Overrides [`SUBMISSIONS_CAPACITY`] for the process with a positive integer.
+/// Read once, when the registry is first created.
+pub(crate) const SUBMISSIONS_CAPACITY_ENV: &str = "VICTORY_XMEM_RETIRED_CAPACITY";
+
 /// The next share id; ids are monotonic and never reused.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -175,59 +188,7 @@ impl Lease {
     /// The returned key names the registered range: allocation id,
     /// generation, byte offset and length.
     pub(crate) fn retain(&self, submission: u64) -> Result<RangeKey, RegistryError> {
-        let key = RangeKey::of(&self.range);
-        if key.id == 0 {
-            return Err(RegistryError::ZeroId);
-        }
-        if key.generation != GENERATION {
-            return Err(RegistryError::StaleGeneration {
-                id: key.id,
-                generation: key.generation,
-            });
-        }
-        let end = key
-            .offset
-            .checked_add(key.length)
-            .ok_or(RegistryError::InvalidRange {
-                offset: key.offset,
-                length: key.length,
-            })?;
-        if key.length == 0
-            || !key.offset.is_multiple_of(PAGE as u64)
-            || !key.length.is_multiple_of(PAGE as u64)
-            || end > self.range.file_size
-        {
-            return Err(RegistryError::InvalidRange {
-                offset: key.offset,
-                length: key.length,
-            });
-        }
-        let mut registry = registry();
-        match registry.submissions.get_mut(&submission) {
-            Some(Submission::Retired) => return Err(RegistryError::Retired(submission)),
-            Some(Submission::Open(references)) => {
-                *references.entry(key).or_insert(0) += 1;
-            }
-            None => {
-                let mut references = BTreeMap::new();
-                references.insert(key, 1);
-                registry
-                    .submissions
-                    .insert(submission, Submission::Open(references));
-            }
-        }
-        registry
-            .retained
-            .entry(key)
-            .or_insert_with(|| Retained {
-                lease: self.clone(),
-                submissions: BTreeMap::new(),
-            })
-            .submissions
-            .entry(submission)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        Ok(key)
+        registry().retain(self, submission)
     }
 
     /// Drops one reference `submission` holds on this lease's range.
@@ -340,17 +301,260 @@ enum Submission {
     Retired,
 }
 
-#[derive(Default)]
 struct Registry {
     /// Retained ranges, by identity.
     retained: HashMap<RangeKey, Retained>,
     /// Every submission that retained something, open or retired. Retired
-    /// ones stay so a reused number cannot resurrect a stale range and a
-    /// duplicate retirement is visible.
+    /// rows are evicted once the map would exceed [`Registry::capacity`];
+    /// [`Registry::retired_watermark`] remembers the highest evicted id, so a
+    /// reused number still cannot resurrect a stale range and a duplicate
+    /// retirement is visible.
     submissions: HashMap<u64, Submission>,
+    /// Highest retired submission id ever evicted, or `None` before the first
+    /// eviction. Monotonic: eviction is lowest-id-first and never lowers it.
+    retired_watermark: Option<u64>,
+    /// Soft cap on `submissions`; open rows are never evicted, so a pathological
+    /// caller with more in-flight submissions than this can exceed it.
+    capacity: usize,
 }
 
-static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+impl Registry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            retained: HashMap::new(),
+            submissions: HashMap::new(),
+            retired_watermark: None,
+            capacity,
+        }
+    }
+
+    /// The exact "is this submission retired?" predicate used by every
+    /// lookup.
+    ///
+    /// * A present `Submission::Retired` row is retired.
+    /// * A present `Submission::Open` row is live, even when its id is at or
+    ///   below the watermark (an older submission can still be in flight).
+    /// * An **absent** number at or below [`Self::retired_watermark`] was
+    ///   retired and then evicted: eviction only drops `Submission::Retired`
+    ///   rows, so "absent and <= watermark" can only mean that. It must be
+    ///   refused exactly as if its retired row were still here.
+    /// * An absent number above the watermark was never seen: unknown.
+    fn is_retired(&self, submission: u64) -> bool {
+        match self.submissions.get(&submission) {
+            Some(Submission::Retired) => true,
+            Some(Submission::Open(_)) => false,
+            None => self
+                .retired_watermark
+                .is_some_and(|watermark| submission <= watermark),
+        }
+    }
+
+    /// Drops retired rows, lowest id first, until at most `target` rows remain.
+    ///
+    /// Only `Submission::Retired` rows are evictable. `retire` drops every
+    /// reference a submission held before it marks the row retired, so a
+    /// retired row can never be named by a retained range or a live pin; the
+    /// debug assertion catches a future change that breaks that.
+    ///
+    /// The watermark advances to the highest evicted id and never moves
+    /// backwards, so numbers evicted by an earlier call stay retired forever.
+    fn evict_to(&mut self, target: usize) {
+        if self.submissions.len() <= target {
+            return;
+        }
+        let mut retired: Vec<u64> = self
+            .submissions
+            .iter()
+            .filter(|(_, state)| matches!(state, Submission::Retired))
+            .map(|(submission, _)| *submission)
+            .collect();
+        retired.sort_unstable();
+        let mut excess = self.submissions.len() - target;
+        for submission in retired {
+            if excess == 0 {
+                break;
+            }
+            debug_assert!(
+                !self
+                    .retained
+                    .values()
+                    .any(|entry| entry.submissions.contains_key(&submission)),
+                "retired submission {submission} is still referenced by a retained range"
+            );
+            self.submissions.remove(&submission);
+            self.retired_watermark = Some(match self.retired_watermark {
+                Some(watermark) => watermark.max(submission),
+                None => submission,
+            });
+            excess -= 1;
+        }
+    }
+
+    fn retain(&mut self, lease: &Lease, submission: u64) -> Result<RangeKey, RegistryError> {
+        let key = RangeKey::of(&lease.range);
+        if key.id == 0 {
+            return Err(RegistryError::ZeroId);
+        }
+        if key.generation != GENERATION {
+            return Err(RegistryError::StaleGeneration {
+                id: key.id,
+                generation: key.generation,
+            });
+        }
+        let end = key
+            .offset
+            .checked_add(key.length)
+            .ok_or(RegistryError::InvalidRange {
+                offset: key.offset,
+                length: key.length,
+            })?;
+        if key.length == 0
+            || !key.offset.is_multiple_of(PAGE as u64)
+            || !key.length.is_multiple_of(PAGE as u64)
+            || end > lease.range.file_size
+        {
+            return Err(RegistryError::InvalidRange {
+                offset: key.offset,
+                length: key.length,
+            });
+        }
+        if self.is_retired(submission) {
+            return Err(RegistryError::Retired(submission));
+        }
+        if matches!(self.submissions.get(&submission), Some(Submission::Open(_))) {
+            let Some(Submission::Open(references)) = self.submissions.get_mut(&submission) else {
+                unreachable!("an open submission was checked just above");
+            };
+            *references.entry(key).or_insert(0) += 1;
+        } else {
+            // Make room before adding a row, so a new submission cannot push
+            // the map past capacity while retired rows are evictable.
+            self.evict_to(self.capacity.saturating_sub(1));
+            let mut references = BTreeMap::new();
+            references.insert(key, 1);
+            self.submissions
+                .insert(submission, Submission::Open(references));
+        }
+        self.retained
+            .entry(key)
+            .or_insert_with(|| Retained {
+                lease: lease.clone(),
+                submissions: BTreeMap::new(),
+            })
+            .submissions
+            .entry(submission)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        Ok(key)
+    }
+
+    fn release(&mut self, key: RangeKey, submission: u64) -> Result<(), RegistryError> {
+        if self.is_retired(submission) {
+            return Err(RegistryError::Retired(submission));
+        }
+        let Some(Submission::Open(references)) = self.submissions.get_mut(&submission) else {
+            return Err(RegistryError::UnknownSubmission(submission));
+        };
+        let Some(count) = references.get_mut(&key) else {
+            return Err(RegistryError::NotRetained { submission, key });
+        };
+        if *count > 1 {
+            *count -= 1;
+            if let Some(entry) = self.retained.get_mut(&key)
+                && let Some(count) = entry.submissions.get_mut(&submission)
+            {
+                *count -= 1;
+            }
+            return Ok(());
+        }
+        references.remove(&key);
+        drop_one(self, &key, submission);
+        Ok(())
+    }
+
+    fn retire(&mut self, submission: u64) -> Result<usize, RegistryError> {
+        if self.is_retired(submission) {
+            return Err(RegistryError::Retired(submission));
+        }
+        let Some(Submission::Open(references)) = self.submissions.remove(&submission) else {
+            return Err(RegistryError::UnknownSubmission(submission));
+        };
+        let mut released = 0;
+        for (key, count) in &references {
+            released += count;
+            drop_one(self, key, submission);
+        }
+        self.submissions.insert(submission, Submission::Retired);
+        // Deterministic eviction point: the fence callback that retires this
+        // submission is where a retired row becomes evictable. No timers and
+        // no best-effort heuristics: only rows at or below `capacity` survive,
+        // lowest id first.
+        self.evict_to(self.capacity);
+        Ok(released)
+    }
+
+    fn retained(
+        &self,
+        submission: u64,
+        id: u64,
+        generation: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Lease, RegistryError> {
+        if self.is_retired(submission) {
+            return Err(RegistryError::Retired(submission));
+        }
+        if !self.submissions.contains_key(&submission) {
+            return Err(RegistryError::UnknownSubmission(submission));
+        }
+        let (mut named, mut live_generation) = (false, false);
+        for (key, entry) in &self.retained {
+            if key.id != id {
+                continue;
+            }
+            named = true;
+            if key.generation != generation {
+                continue;
+            }
+            live_generation = true;
+            if key.offset == offset && key.length == length {
+                if entry.submissions.contains_key(&submission) {
+                    return Ok(entry.lease.clone());
+                }
+                return Err(RegistryError::NotRetained {
+                    submission,
+                    key: *key,
+                });
+            }
+        }
+        if !named {
+            return Err(RegistryError::Missing { id });
+        }
+        if !live_generation {
+            return Err(RegistryError::StaleGeneration { id, generation });
+        }
+        Err(RegistryError::MissingRange { id, offset, length })
+    }
+
+    fn is_retained(&self, key: &RangeKey) -> bool {
+        self.retained.contains_key(key)
+    }
+}
+
+/// The configured capacity: [`SUBMISSIONS_CAPACITY`] unless
+/// [`SUBMISSIONS_CAPACITY_ENV`] names a positive integer.
+fn configured_capacity() -> usize {
+    parse_capacity(std::env::var(SUBMISSIONS_CAPACITY_ENV).ok().as_deref())
+}
+
+fn parse_capacity(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(SUBMISSIONS_CAPACITY)
+}
+
+static REGISTRY: LazyLock<Mutex<Registry>> =
+    LazyLock::new(|| Mutex::new(Registry::new(configured_capacity())));
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
     crate::modules::lock(&REGISTRY)
@@ -363,28 +567,7 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 /// no-ops: they mean the fence bookkeeping is wrong. The range (and its
 /// backing) is dropped only when its last reference goes.
 pub(crate) fn release(key: RangeKey, submission: u64) -> Result<(), RegistryError> {
-    let mut registry = registry();
-    match registry.submissions.get_mut(&submission) {
-        None => return Err(RegistryError::UnknownSubmission(submission)),
-        Some(Submission::Retired) => return Err(RegistryError::Retired(submission)),
-        Some(Submission::Open(references)) => {
-            let Some(count) = references.get_mut(&key) else {
-                return Err(RegistryError::NotRetained { submission, key });
-            };
-            if *count > 1 {
-                *count -= 1;
-                if let Some(entry) = registry.retained.get_mut(&key)
-                    && let Some(count) = entry.submissions.get_mut(&submission)
-                {
-                    *count -= 1;
-                }
-                return Ok(());
-            }
-            references.remove(&key);
-        }
-    }
-    drop_one(&mut registry, &key, submission);
-    Ok(())
+    registry().release(key, submission)
 }
 
 /// Retires `submission`'s fence: drops every reference it holds and releases
@@ -394,23 +577,12 @@ pub(crate) fn release(key: RangeKey, submission: u64) -> Result<(), RegistryErro
 /// range twice releases two). A duplicate retirement is
 /// [`RegistryError::Retired`], not a silent success, and a retired
 /// submission may not retain again.
+///
+/// Retirement is also the deterministic eviction point: once this fence is
+/// retired, [`Registry::evict_to`] may drop retired rows, lowest id first, so
+/// the map stays O(in-flight) over a long session.
 pub(crate) fn retire(submission: u64) -> Result<usize, RegistryError> {
-    let mut registry = registry();
-    match registry.submissions.get(&submission) {
-        None => return Err(RegistryError::UnknownSubmission(submission)),
-        Some(Submission::Retired) => return Err(RegistryError::Retired(submission)),
-        Some(Submission::Open(_)) => {}
-    }
-    let Some(Submission::Open(references)) = registry.submissions.remove(&submission) else {
-        unreachable!("an open submission was checked just above");
-    };
-    let mut released = 0;
-    for (key, count) in &references {
-        released += count;
-        drop_one(&mut registry, key, submission);
-    }
-    registry.submissions.insert(submission, Submission::Retired);
-    Ok(released)
+    registry().retire(submission)
 }
 
 /// The lease of a range that `submission` retains, checked against the
@@ -419,8 +591,8 @@ pub(crate) fn retire(submission: u64) -> Result<usize, RegistryError> {
 /// This succeeds after the guest frees the page numbers or unmaps every view
 /// showing the range: the registry, not the guest page table, keeps the
 /// backing alive until retirement. A missing allocation, a stale generation,
-/// a window nobody retained, and a reference from another (or a retired)
-/// submission are all explicit errors.
+/// a window nobody retained, and a reference from another (or a retired or
+/// evicted) submission are all explicit errors.
 pub(crate) fn retained(
     submission: u64,
     id: u64,
@@ -428,45 +600,37 @@ pub(crate) fn retained(
     offset: u64,
     length: u64,
 ) -> Result<Lease, RegistryError> {
-    let registry = registry();
-    match registry.submissions.get(&submission) {
-        None => return Err(RegistryError::UnknownSubmission(submission)),
-        Some(Submission::Retired) => return Err(RegistryError::Retired(submission)),
-        Some(Submission::Open(_)) => {}
-    }
-    let (mut named, mut live_generation) = (false, false);
-    for (key, entry) in &registry.retained {
-        if key.id != id {
-            continue;
-        }
-        named = true;
-        if key.generation != generation {
-            continue;
-        }
-        live_generation = true;
-        if key.offset == offset && key.length == length {
-            if entry.submissions.contains_key(&submission) {
-                return Ok(entry.lease.clone());
-            }
-            return Err(RegistryError::NotRetained {
-                submission,
-                key: *key,
-            });
-        }
-    }
-    if !named {
-        return Err(RegistryError::Missing { id });
-    }
-    if !live_generation {
-        return Err(RegistryError::StaleGeneration { id, generation });
-    }
-    Err(RegistryError::MissingRange { id, offset, length })
+    registry().retained(submission, id, generation, offset, length)
 }
 
 /// Whether the registry still keeps `key`'s backing alive (tests and the
 /// host's audit path).
 pub(crate) fn is_retained(key: RangeKey) -> bool {
-    registry().retained.contains_key(&key)
+    registry().is_retained(&key)
+}
+
+/// A snapshot of the registry's bounds, for tests: how many submission rows
+/// and retained ranges it holds, its capacity, and the eviction watermark.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegistryBounds {
+    pub(crate) submissions: usize,
+    pub(crate) retained: usize,
+    pub(crate) capacity: usize,
+    pub(crate) watermark: Option<u64>,
+}
+
+/// The registry's current bounds. Test-only: production code must not depend
+/// on a particular eviction moment.
+#[cfg(test)]
+pub(crate) fn bounds() -> RegistryBounds {
+    let registry = registry();
+    RegistryBounds {
+        submissions: registry.submissions.len(),
+        retained: registry.retained.len(),
+        capacity: registry.capacity,
+        watermark: registry.retired_watermark,
+    }
 }
 
 /// Removes `submission`'s reference to `key`, dropping the retained range
@@ -1627,5 +1791,156 @@ mod tests {
             "a stale generation must be refused"
         );
         drop(view);
+    }
+
+    /// The retired-row cap is a positive default and the env knob only accepts
+    /// a positive integer; the registry seeds itself with the result.
+    #[test]
+    fn retired_capacity_defaults_and_parses() {
+        assert_eq!(parse_capacity(None), SUBMISSIONS_CAPACITY);
+        assert_eq!(parse_capacity(Some("")), SUBMISSIONS_CAPACITY);
+        assert_eq!(parse_capacity(Some("0")), SUBMISSIONS_CAPACITY);
+        assert_eq!(parse_capacity(Some("-4")), SUBMISSIONS_CAPACITY);
+        assert_eq!(parse_capacity(Some("many")), SUBMISSIONS_CAPACITY);
+        assert_eq!(parse_capacity(Some("17")), 17);
+        assert_eq!(parse_capacity(Some(" 17 ")), 17);
+
+        let registry = Registry::new(SUBMISSIONS_CAPACITY);
+        assert_eq!(registry.capacity, SUBMISSIONS_CAPACITY);
+        assert_eq!(registry.retired_watermark, None);
+        assert!(registry.submissions.is_empty());
+        // The process registry has a real, positive bound.
+        assert!(bounds().capacity >= 1);
+    }
+
+    /// A sustained streaming loop must keep the submission map O(in-flight)
+    /// rather than growing one row per retired submission forever.
+    ///
+    /// 10,000 cycles of retain/use/retire (two pins each) over one retained
+    /// range, with fences retiring out of order and one live pin spanning the
+    /// whole run. A local registry with a small capacity keeps the test
+    /// deterministic and independent of the process registry's contents.
+    #[test]
+    fn sustained_streaming_bounds_the_retired_submission_map() {
+        const CYCLES: u64 = 10_000;
+        const CAPACITY: usize = 64;
+
+        let share = SyntheticShare::new(1);
+        let lease = share.lease(0, PAGE);
+        let mut registry = Registry::new(CAPACITY);
+
+        // The live pin spans the whole run: the retained range and its backing
+        // must survive every eviction until this fence retires.
+        let live = 1;
+        let victim = 2;
+        let key = registry.retain(&lease, live).expect("the live pin retains");
+        registry
+            .retain(&lease, victim)
+            .expect("the reuse victim retains");
+        assert_eq!(registry.retire(victim).expect("retire the victim"), 1);
+
+        let mut watermark = registry.retired_watermark;
+        let mut peak = registry.submissions.len();
+        for cycle in 0..CYCLES {
+            let older = 1000 + cycle * 2;
+            let newer = older + 1;
+            assert_eq!(
+                registry
+                    .retain(&lease, older)
+                    .expect("retain the older fence"),
+                key
+            );
+            assert_eq!(
+                registry
+                    .retain(&lease, newer)
+                    .expect("retain the newer fence"),
+                key
+            );
+
+            // A completion handler may run for the newer fence first: the
+            // registry must not let that release the older fence's reference.
+            assert_eq!(registry.retire(newer).expect("retire the newer fence"), 1);
+            assert_eq!(registry.retire(older).expect("retire the older fence"), 1);
+
+            // The live pin's range is never dropped, at any point in the loop.
+            assert!(
+                registry.is_retained(&key),
+                "cycle {cycle} dropped a live pin's retained range"
+            );
+            assert!(
+                registry
+                    .retained(live, key.id, GENERATION, key.offset, key.length)
+                    .is_ok(),
+                "cycle {cycle} lost the live pin's lease"
+            );
+
+            let len = registry.submissions.len();
+            assert!(
+                len <= registry.capacity,
+                "cycle {cycle}: {len} submission rows exceed capacity {}",
+                registry.capacity
+            );
+            assert!(
+                registry.retained.len() == 1,
+                "cycle {cycle}: one range must stay retained"
+            );
+            peak = peak.max(len);
+
+            // The watermark only exists once the map first exceeds capacity,
+            // then advances monotonically as more retired rows are evicted.
+            if let Some(advanced) = registry.retired_watermark {
+                assert!(
+                    watermark.is_none_or(|watermark| advanced >= watermark),
+                    "cycle {cycle}: the watermark went backwards"
+                );
+                watermark = Some(advanced);
+            }
+        }
+
+        let watermark = watermark.expect("the map was bounded by eviction");
+        assert!(
+            victim <= watermark,
+            "the victim {victim} must be at or below the watermark {watermark}"
+        );
+        assert!(!registry.submissions.contains_key(&victim));
+
+        // Reusing the evicted number must not resurrect a stale range: the
+        // absent row is retired by the watermark, exactly like a present
+        // `Submission::Retired` row.
+        assert_eq!(
+            registry.retain(&lease, victim).unwrap_err(),
+            RegistryError::Retired(victim),
+            "an evicted number must not retain again"
+        );
+        assert_eq!(
+            registry.release(key, victim).unwrap_err(),
+            RegistryError::Retired(victim)
+        );
+        assert_eq!(
+            registry
+                .retained(victim, key.id, GENERATION, key.offset, key.length)
+                .unwrap_err(),
+            RegistryError::Retired(victim)
+        );
+        assert_eq!(
+            registry.retire(victim).unwrap_err(),
+            RegistryError::Retired(victim)
+        );
+        // Above the watermark an absent row is unknown, not retired.
+        let never = 1 << 40;
+        assert_eq!(
+            registry.release(key, never).unwrap_err(),
+            RegistryError::UnknownSubmission(never)
+        );
+
+        // The live pin still owns the range; only its own fence drops it.
+        assert!(registry.is_retained(&key));
+        assert_eq!(registry.retire(live).expect("retire the live pin"), 1);
+        assert!(!registry.is_retained(&key));
+
+        eprintln!(
+            "bounded share registry: cycles={CYCLES} peak={peak} capacity={} watermark={watermark}",
+            registry.capacity
+        );
     }
 }
