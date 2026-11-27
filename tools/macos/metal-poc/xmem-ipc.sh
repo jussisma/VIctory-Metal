@@ -26,6 +26,9 @@
 # WINE is optional; tools/macos/test-wine.sh picks the checkout's Wine.
 set -eu
 
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
+
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Homebrew's rustup is keg-only; test-wine.sh expects it first on PATH too.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
@@ -52,24 +55,26 @@ PIPELINE=""
 METALLIB_TICKET=1
 METALLIB_ENTRY=vm_ipc_metallib_scale
 SHARE_METALLIB="$(printf '%s/%016x.metallib' "$SHARE" "$METALLIB_TICKET")"
+victory_hygiene_work "$WORK"
 
 cleanup() {
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
+    status=$?
+    trap - EXIT INT TERM HUP
     # Stop the private prefix's wineserver before removing its directory, so
     # it cannot fail to save its registry into a deleted tree.
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    if [ "${KEEP:-0}" = "1" ]; then
-        echo "kept harness files in $WORK"
-    else
-        rm -rf "$WORK"
-    fi
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_remove_work
+    victory_hygiene_finalize "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 mkdir -m 700 "$SHARE"
 # 32 secret bytes as hex, readable only by this user. Never echoed.
@@ -111,7 +116,7 @@ EOF
 echo "Offline metallib: ticket=$METALLIB_TICKET entry=$METALLIB_ENTRY bytes=$(wc -c <"$SHARE_METALLIB" | tr -d ' ')"
 
 echo "Building the native ARM64 host worker..."
-cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
 WORKER="$ROOT/target/aarch64-apple-darwin/debug/metal-worker"
 [ -x "$WORKER" ] || { echo "FAIL: $WORKER is missing" >&2; exit 1; }
 
@@ -128,6 +133,7 @@ start_host() {
         --accept-timeout-secs 180 \
         >"$HOST_LOG" 2>"$HOST_ERR" &
     HOST_PID=$!
+    victory_hygiene_track "$HOST_PID"
 
     ready=0
     for _ in $(seq 1 600); do
@@ -162,7 +168,8 @@ start_host() {
 finish_host() {
     expected_submissions=$1
     host_rc=0
-    wait "$HOST_PID" || host_rc=$?
+    victory_hygiene_wait_pid "$HOST_PID" 180 || host_rc=$?
+    victory_hygiene_untrack "$HOST_PID"
     HOST_PID=""
     if [ "$host_rc" -ne 0 ]; then
         echo "FAIL: the native host exited with $host_rc" >&2

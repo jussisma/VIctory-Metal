@@ -23,25 +23,28 @@
 #   VICTORY_FRAME_WARMUP=20     excluded warmup frames (default 20)
 #
 # One GPU task at a time: the script takes /tmp/victory-gpu.lock.
+#
+# Process hygiene (C7 / Wave 7A): every long-lived child (host daemon, Wine
+# guest, the --stdio IRConverter pool helper) is started in the background and
+# registered with `process-hygiene.sh`. The EXIT trap reaps them with TERM, a
+# bounded wait and then KILL for survivors, removes only the lock this run
+# created, and exits 13 if any started PID is still alive afterwards.
+#
+# Exit codes:
+#   0   PASS (all measured assertions held)
+#   1   PARTIAL (a required stage failed; the first failing stage is named)
+#   2   setup failure
+#   13  a child started by this run survived cleanup (orphan)
 set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Homebrew's rustup is keg-only; put it first like the other macOS harnesses.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
-# --- Serialise exclusive GPU work ------------------------------------------
 LOCK="/tmp/victory-gpu.lock"
-acquired=0
-while [ "$acquired" -eq 0 ]; do
-    if mkdir "$LOCK" 2>/dev/null; then
-        acquired=1
-    else
-        if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-            rmdir "$LOCK" 2>/dev/null || true
-        fi
-        sleep 0.5
-    fi
-done
 
 if [ -z "${WINE:-}" ]; then
     for wine in "$ROOT/target/wine-cx/bin/wine" \
@@ -90,41 +93,30 @@ GUEST_RC=0
 HOST_RC=0
 POOL_STATUS="skipped"
 POOL_SUMMARY=""
+victory_hygiene_work "$WORK"
 
 cleanup() {
     status=$?
-    if [ -n "$GUEST_PID" ] && kill -0 "$GUEST_PID" 2>/dev/null; then
-        kill "$GUEST_PID" 2>/dev/null || true
-        wait "$GUEST_PID" 2>/dev/null || true
-    fi
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
+    trap - EXIT INT TERM HUP
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    sleep 0.3
-    leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    if [ -n "$leaked" ]; then
-        echo "PROCESS_LEAK remaining=\"$leaked\"" >&2
-        for pid in $leaked; do kill -9 "$pid" 2>/dev/null || true; done
-        sleep 0.2
-        leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    fi
-    echo "PROCESS_CHECK host=0 guest=0 leaks=${leaked:-0}"
-    rmdir "$LOCK" 2>/dev/null || true
-    if [ "${KEEP:-0}" = "1" ]; then
-        echo "kept harness files in $WORK"
-    else
-        rm -rf "$WORK"
-    fi
-    if [ "$status" -eq 0 ] && [ -n "$leaked" ]; then
-        trap - EXIT INT TERM
-        exit 4
-    fi
+    # Reap tracked PIDs, then use the unique temp dir as an ownership proof for
+    # grandchildren (the Python pool helper's IRConverter worker).
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_lock_release
+    victory_hygiene_remove_work
+    victory_hygiene_finalize "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# --- Serialise exclusive GPU work ------------------------------------------
+victory_hygiene_lock_acquire "$LOCK"
 
 mkdir -m 700 "$SHARE" "$METALLIB_DIR" "$HLSL_DIR" "$DXIL_DIR"
 python3 -c 'import secrets; print(secrets.token_hex(32))' >"$SECRET"
@@ -148,11 +140,11 @@ fi
 
 # --- Build the ARM64 daemon and the x86_64 converter worker ----------------
 echo "Building the ARM64 victory-metal-host daemon..."
-cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host \
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host \
     || fail_setup "the ARM64 host daemon did not build"
 [ -x "$HOST_BIN" ] || fail_setup "missing $HOST_BIN"
 echo "Building the x86_64 victory-irconverter worker..."
-cargo build --locked --quiet -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter \
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter \
     || fail_setup "the x86_64 converter worker did not build"
 [ -x "$IRCONV" ] || fail_setup "missing $IRCONV"
 
@@ -260,9 +252,11 @@ pool_stage() {
     compile_dxil psm.hlsl ps_6_0 main psm || return 0
     compile_dxil cs.hlsl cs_6_6 main cs || return 0
 
-    if ! python3 - "$DXIL_DIR" "$IRCONV" "$CONV" "$METALLIB_DIR" <<'PY'
+    cat >"$WORK/pool_worker.py" <<'PY'
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -277,6 +271,43 @@ env["VICTORY_IRCONVERTER_STDIO_REFLECTION"] = "1"
 proc = subprocess.Popen([worker, "--stdio", "--converter", converter],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, env=env)
+
+
+def _reap_worker():
+    # Reap the stdio worker on normal exit, protocol error, SIGTERM or SIGHUP.
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+
+atexit.register(_reap_worker)
+
+
+def _on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGHUP, _on_signal)
+
 timings = []
 written = {}
 reflections = {}
@@ -349,7 +380,12 @@ summary = {
 }
 print("POOL_SUMMARY " + json.dumps(summary))
 PY
-    then
+    pool_worker_rc=0
+    victory_hygiene_run python3 "$WORK/pool_worker.py" \
+        "$DXIL_DIR" "$IRCONV" "$CONV" "$METALLIB_DIR" \
+        >"$WORK/pool-worker.log" 2>&1 || pool_worker_rc=$?
+    cat "$WORK/pool-worker.log" || true
+    if [ "$pool_worker_rc" -ne 0 ]; then
         echo "POOL_UNAVAILABLE the --stdio worker refused a job (see above)"
         POOL_STATUS="failed"
         return 0
@@ -467,7 +503,7 @@ POOL_CACHE_ERROR=""
 if [ "$POOL_STATUS" = "translated" ]; then
     echo "Measuring the pool's cold-vs-warm disk cache..."
     if VICTORY_IRCONVERTER_WORKER="$IRCONV" VICTORY_METAL_IRCONVERTER="$CONV" \
-        cargo test --locked --quiet -p victory-metal --target aarch64-apple-darwin \
+        victory_hygiene_run cargo test --locked --quiet -p victory-metal --target aarch64-apple-darwin \
         --test irconverter_stdio_gpu cold_and_warm_throughput_amortise_rosetta_startup \
         -- --nocapture --test-threads=1 >"$WORK/pool-cache.log" 2>&1; then
         POOL_CACHE_LINE="$(grep -E 'cache speedup:' "$WORK/pool-cache.log" | tail -1)"
@@ -513,6 +549,7 @@ echo "Starting the ARM64 victory-metal-host daemon..."
     --telemetry-json "$TELEMETRY" \
     >"$HOST_OUT" 2>"$HOST_ERR" &
 HOST_PID=$!
+victory_hygiene_track "$HOST_PID"
 
 ready=0
 for _ in $(seq 1 600); do
@@ -573,6 +610,7 @@ echo "Running the Win64 live gate under Wine (warmup=$VICTORY_FRAME_WARMUP measu
 "$WINE" "$GUEST_EXE" --ignored --exact live_d3d12_guest_gate --test-threads=1 --nocapture \
     >"$GUEST_LOG" 2>&1 &
 GUEST_PID=$!
+victory_hygiene_track "$GUEST_PID"
 guest_deadline=$(( $(date +%s) + 600 ))
 while kill -0 "$GUEST_PID" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$guest_deadline" ]; then
@@ -582,7 +620,9 @@ while kill -0 "$GUEST_PID" 2>/dev/null; do
     fi
     sleep 0.2
 done
-wait "$GUEST_PID" || GUEST_RC=$?
+GUEST_RC=0
+victory_hygiene_wait_pid "$GUEST_PID" 10 || GUEST_RC=$?
+victory_hygiene_untrack "$GUEST_PID"
 GUEST_PID=""
 
 host_deadline=$(( $(date +%s) + 120 ))
@@ -594,7 +634,9 @@ while kill -0 "$HOST_PID" 2>/dev/null; do
     fi
     sleep 0.1
 done
-wait "$HOST_PID" || HOST_RC=$?
+HOST_RC=0
+victory_hygiene_wait_pid "$HOST_PID" 10 || HOST_RC=$?
+victory_hygiene_untrack "$HOST_PID"
 HOST_PID=""
 
 cat "$GUEST_LOG" 2>/dev/null || true
