@@ -11,6 +11,7 @@
 //! Neither module may fall back to D3D12/D3DMetal after native submission
 //! starts: an unimplemented opcode returns an explicit error (ADR-008).
 
+pub mod abi_trace;
 pub mod bindings;
 pub mod client;
 pub mod fence_page_guest;
