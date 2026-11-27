@@ -3955,6 +3955,12 @@ mod tests {
             })
         }
 
+        /// Accepts kind 8 registrations so a session test can submit a
+        /// descriptor table that names a registered texture handle.
+        fn register_texture(&self, _id: u64, _desc: TextureDesc) -> Result<(), MetalError> {
+            Ok(())
+        }
+
         fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
             let mut state = self.state();
             if entry == "vm_fail" {
@@ -5536,6 +5542,71 @@ mod tests {
             "replay reached the executor"
         );
         assert_eq!(state.v3_executions, 1, "replay executed GPU work");
+    }
+
+    #[test]
+    fn v3_mixed_descriptor_table_round_trips_through_the_host() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("send register");
+        expect_ack(&mut client, true);
+        // id 0x21, generation 1, RGBA16Float 2560x1440: the fixture's texture.
+        write_frame(
+            &mut client,
+            KIND_TEXTURE_REG,
+            &texture_registration_payload(9),
+        )
+        .expect("send texture register");
+        expect_ack(&mut client, true);
+
+        let table = crate::wire_v3::DescriptorTableV3 {
+            set: 0,
+            base_register: 0,
+            kind: crate::wire_v3::DescriptorKind::Srv,
+            bindings: vec![
+                DescriptorTableEntryV3::Buffer(full_binding(BYTES as u64)),
+                DescriptorTableEntryV3::Texture(0x21),
+            ],
+        };
+        let submission = SubmissionV3 {
+            sequence: 1,
+            list: None,
+            commands: vec![CommandV3::SetDescriptorTable(table.clone())],
+        };
+        // The guest encodes the mixed table; the host decodes the same bytes
+        // and validates every entry against its live registries.
+        assert_eq!(
+            roundtrip_v3(&mut client, &submission),
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert_eq!(
+            state.v3_submissions,
+            vec![submission],
+            "the mixed table reached the executor with both entries intact"
+        );
+        match &state.v3_submissions[0].commands[0] {
+            CommandV3::SetDescriptorTable(recorded) => {
+                assert_eq!(recorded.bindings, table.bindings);
+                assert_eq!(recorded.kind, table.kind);
+            }
+            other => panic!("expected the descriptor table, got {other:?}"),
+        }
     }
 
     #[test]

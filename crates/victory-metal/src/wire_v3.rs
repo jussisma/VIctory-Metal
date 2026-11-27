@@ -172,9 +172,15 @@
 //! | 6 | 2 | base register |
 //! | 8 | 2 | kind (0 = CBV, 1 = SRV, 2 = UAV, 3 = sampler) |
 //! | 10 | 2 | binding count (1 ..= [`MAX_DESCRIPTOR_BINDINGS_V3`]) |
-//! | 12 | 2 | entry tag (0 = 32-byte buffer ranges, 1 = 8-byte resource handles) |
+//! | 12 | 2 | entry tag (0 = 32-byte buffer ranges, 1 = 8-byte resource handles, 2 = per-entry tagged) |
 //! | 14 | 32 x N | bound buffer ranges, when the tag is 0 |
 //! | 14 | 8 x N | registered texture/sampler handles, when the tag is 1 |
+//!
+//! A tag of 2 carries one per-entry kind byte before every entry, so a table
+//! may mix buffer ranges and registered resources. The per-entry kinds are `0`
+//! (a 32-byte buffer range follows), `1` (an 8-byte registered texture/surface
+//! handle follows) and `2` (an 8-byte registered sampler handle follows). A
+//! homogeneous table keeps tag 0 or 1 and its old byte layout unchanged.
 //!
 //! Opcode 16 opens a render pass with 1 ..= [`MAX_COLOR_ATTACHMENTS`] color
 //! attachments and one optional depth/stencil attachment:
@@ -1605,9 +1611,20 @@ const RESOURCE_HANDLE_LEN: usize = 8;
 /// frames byte-compatibly. `1` is a resource-handle encoding (8 bytes per
 /// entry) whose meaning is fixed by the table kind: `Srv`/`Uav` entries are
 /// registered texture handles and `Sampler` entries are registered sampler
-/// handles.
+/// handles. `2` is the per-entry tagged encoding, used only when a table mixes
+/// buffer and registered-resource entries; every entry then starts with a
+/// one-byte kind tag.
 const DESCRIPTOR_ENTRY_BUFFER: u16 = 0;
 const DESCRIPTOR_ENTRY_RESOURCE: u16 = 1;
+const DESCRIPTOR_ENTRY_TAGGED: u16 = 2;
+/// Width of one per-entry kind tag inside a [`DESCRIPTOR_ENTRY_TAGGED`] table.
+const DESCRIPTOR_ENTRY_TAG_LEN: usize = 1;
+/// Per-entry kind tag for a 32-byte buffer range.
+const DESCRIPTOR_ENTRY_KIND_BUFFER: u8 = 0;
+/// Per-entry kind tag for a registered texture/surface handle.
+const DESCRIPTOR_ENTRY_KIND_TEXTURE: u8 = 1;
+/// Per-entry kind tag for a registered sampler-state handle.
+const DESCRIPTOR_ENTRY_KIND_SAMPLER: u8 = 2;
 const BARRIER_ENTRY_LEN: usize = 40;
 const COLOR_ATTACHMENT_LEN: usize = 56;
 const DEPTH_ATTACHMENT_LEN: usize = 36;
@@ -2416,6 +2433,47 @@ fn read_descriptor_table(
                 } else {
                     DescriptorTableEntryV3::Texture(handle)
                 });
+            }
+        }
+        DESCRIPTOR_ENTRY_TAGGED => {
+            for index in 0..count {
+                let entry_kind = reader.u8()?;
+                match entry_kind {
+                    DESCRIPTOR_ENTRY_KIND_BUFFER => {
+                        if matches!(kind, DescriptorKind::Sampler) {
+                            return Err(WireError::DescriptorEntryMismatch);
+                        }
+                        table
+                            .bindings
+                            .push(DescriptorTableEntryV3::Buffer(read_binding(reader)?));
+                    }
+                    DESCRIPTOR_ENTRY_KIND_TEXTURE => {
+                        if !matches!(kind, DescriptorKind::Srv | DescriptorKind::Uav) {
+                            return Err(WireError::DescriptorEntryMismatch);
+                        }
+                        let handle = reader.u64()?;
+                        if handle == 0 {
+                            return Err(WireError::ZeroDescriptorHandle);
+                        }
+                        table.bindings.push(DescriptorTableEntryV3::Texture(handle));
+                    }
+                    DESCRIPTOR_ENTRY_KIND_SAMPLER => {
+                        if kind != DescriptorKind::Sampler {
+                            return Err(WireError::DescriptorEntryMismatch);
+                        }
+                        let handle = reader.u64()?;
+                        if handle == 0 {
+                            return Err(WireError::ZeroDescriptorHandle);
+                        }
+                        table.bindings.push(DescriptorTableEntryV3::Sampler(handle));
+                    }
+                    other => {
+                        return Err(WireError::InvalidEnumCode {
+                            field: descriptor_entry_tag_field(index),
+                            code: u16::from(other),
+                        });
+                    }
+                }
             }
         }
         other => {
@@ -3338,6 +3396,62 @@ fn root_constants_encoded_len(constants: &RootConstantsV3) -> Result<usize, Wire
         .ok_or(WireError::FrameTooLarge)
 }
 
+/// Wire names of each slot's per-entry kind tag.
+///
+/// [`WireError::InvalidEnumCode`] carries a `&'static str`, so the slot index
+/// is part of the static name; a refusal still names both the offending slot
+/// and the undefined tag.
+const DESCRIPTOR_ENTRY_TAG_FIELDS: [&str; MAX_DESCRIPTOR_BINDINGS_V3] = [
+    "descriptor table entry 0 tag",
+    "descriptor table entry 1 tag",
+    "descriptor table entry 2 tag",
+    "descriptor table entry 3 tag",
+    "descriptor table entry 4 tag",
+    "descriptor table entry 5 tag",
+    "descriptor table entry 6 tag",
+    "descriptor table entry 7 tag",
+    "descriptor table entry 8 tag",
+    "descriptor table entry 9 tag",
+    "descriptor table entry 10 tag",
+    "descriptor table entry 11 tag",
+    "descriptor table entry 12 tag",
+    "descriptor table entry 13 tag",
+    "descriptor table entry 14 tag",
+    "descriptor table entry 15 tag",
+    "descriptor table entry 16 tag",
+    "descriptor table entry 17 tag",
+    "descriptor table entry 18 tag",
+    "descriptor table entry 19 tag",
+    "descriptor table entry 20 tag",
+    "descriptor table entry 21 tag",
+    "descriptor table entry 22 tag",
+    "descriptor table entry 23 tag",
+    "descriptor table entry 24 tag",
+    "descriptor table entry 25 tag",
+    "descriptor table entry 26 tag",
+    "descriptor table entry 27 tag",
+    "descriptor table entry 28 tag",
+    "descriptor table entry 29 tag",
+    "descriptor table entry 30 tag",
+    "descriptor table entry 31 tag",
+];
+
+fn descriptor_entry_tag_field(index: usize) -> &'static str {
+    DESCRIPTOR_ENTRY_TAG_FIELDS
+        .get(index)
+        .copied()
+        .unwrap_or("descriptor table entry tag")
+}
+
+fn descriptor_entry_payload_len(entry: &DescriptorTableEntryV3) -> usize {
+    match entry {
+        DescriptorTableEntryV3::Buffer(_) => BINDING_LEN,
+        DescriptorTableEntryV3::Texture(_) | DescriptorTableEntryV3::Sampler(_) => {
+            RESOURCE_HANDLE_LEN
+        }
+    }
+}
+
 fn descriptor_table_encoded_len(table: &DescriptorTableV3) -> Result<usize, WireError> {
     if table.bindings.is_empty() {
         return Err(WireError::ZeroDescriptorCount);
@@ -3347,66 +3461,104 @@ fn descriptor_table_encoded_len(table: &DescriptorTableV3) -> Result<usize, Wire
             table.bindings.len(),
         ));
     }
-    let entry_len = descriptor_table_entry_len(table)?;
-    table
-        .bindings
-        .len()
-        .checked_mul(entry_len)
-        .and_then(|bindings_len| bindings_len.checked_add(DESCRIPTOR_TABLE_HEADER_LEN))
+    let tag = descriptor_table_entry_tag(table)?;
+    let bindings_len = match tag {
+        DESCRIPTOR_ENTRY_TAGGED => {
+            let mut total = 0usize;
+            for entry in &table.bindings {
+                let entry_len = DESCRIPTOR_ENTRY_TAG_LEN
+                    .checked_add(descriptor_entry_payload_len(entry))
+                    .ok_or(WireError::FrameTooLarge)?;
+                total = total
+                    .checked_add(entry_len)
+                    .ok_or(WireError::FrameTooLarge)?;
+            }
+            total
+        }
+        DESCRIPTOR_ENTRY_BUFFER => table
+            .bindings
+            .len()
+            .checked_mul(BINDING_LEN)
+            .ok_or(WireError::FrameTooLarge)?,
+        _ => table
+            .bindings
+            .len()
+            .checked_mul(RESOURCE_HANDLE_LEN)
+            .ok_or(WireError::FrameTooLarge)?,
+    };
+    bindings_len
+        .checked_add(DESCRIPTOR_TABLE_HEADER_LEN)
         .ok_or(WireError::FrameTooLarge)
 }
 
-/// Validates a table's entries and returns the wire encoding tag.
+/// The legacy single-kind tag one entry would use on its own.
 ///
-/// Tables are homogeneous by construction: the three buffer kinds only hold
-/// [`DescriptorTableEntryV3::Buffer`], SRV/UAV tables hold
-/// [`DescriptorTableEntryV3::Texture`], and sampler tables hold
-/// [`DescriptorTableEntryV3::Sampler`]. A mixed table has no wire encoding.
-fn descriptor_table_entry_tag(table: &DescriptorTableV3) -> Result<u16, WireError> {
-    let mut tag = None;
-    for entry in &table.bindings {
-        let entry_tag = match entry {
-            DescriptorTableEntryV3::Buffer(binding) => {
-                validate_binding(binding)?;
-                if matches!(table.kind, DescriptorKind::Sampler) {
-                    return Err(WireError::DescriptorEntryMismatch);
-                }
-                DESCRIPTOR_ENTRY_BUFFER
-            }
-            DescriptorTableEntryV3::Texture(handle) => {
-                if *handle == 0 {
-                    return Err(WireError::ZeroDescriptorHandle);
-                }
-                if !matches!(table.kind, DescriptorKind::Srv | DescriptorKind::Uav) {
-                    return Err(WireError::DescriptorEntryMismatch);
-                }
-                DESCRIPTOR_ENTRY_RESOURCE
-            }
-            DescriptorTableEntryV3::Sampler(handle) => {
-                if *handle == 0 {
-                    return Err(WireError::ZeroDescriptorHandle);
-                }
-                if table.kind != DescriptorKind::Sampler {
-                    return Err(WireError::DescriptorEntryMismatch);
-                }
-                DESCRIPTOR_ENTRY_RESOURCE
-            }
-        };
-        match tag {
-            Some(existing) if existing != entry_tag => {
+/// Buffer entries use tag 0; texture and sampler handles both use tag 1 with
+/// the table kind discriminating between them.
+fn descriptor_entry_tag(
+    entry: &DescriptorTableEntryV3,
+    kind: DescriptorKind,
+) -> Result<u16, WireError> {
+    match entry {
+        DescriptorTableEntryV3::Buffer(binding) => {
+            validate_binding(binding)?;
+            if matches!(kind, DescriptorKind::Sampler) {
                 return Err(WireError::DescriptorEntryMismatch);
             }
-            _ => tag = Some(entry_tag),
+            Ok(DESCRIPTOR_ENTRY_BUFFER)
+        }
+        DescriptorTableEntryV3::Texture(handle) => {
+            if *handle == 0 {
+                return Err(WireError::ZeroDescriptorHandle);
+            }
+            if !matches!(kind, DescriptorKind::Srv | DescriptorKind::Uav) {
+                return Err(WireError::DescriptorEntryMismatch);
+            }
+            Ok(DESCRIPTOR_ENTRY_RESOURCE)
+        }
+        DescriptorTableEntryV3::Sampler(handle) => {
+            if *handle == 0 {
+                return Err(WireError::ZeroDescriptorHandle);
+            }
+            if kind != DescriptorKind::Sampler {
+                return Err(WireError::DescriptorEntryMismatch);
+            }
+            Ok(DESCRIPTOR_ENTRY_RESOURCE)
         }
     }
-    tag.ok_or(WireError::ZeroDescriptorCount)
 }
 
-fn descriptor_table_entry_len(table: &DescriptorTableV3) -> Result<usize, WireError> {
-    match descriptor_table_entry_tag(table)? {
-        DESCRIPTOR_ENTRY_BUFFER => Ok(BINDING_LEN),
-        _ => Ok(RESOURCE_HANDLE_LEN),
+fn descriptor_entry_kind(entry: &DescriptorTableEntryV3) -> u8 {
+    match entry {
+        DescriptorTableEntryV3::Buffer(_) => DESCRIPTOR_ENTRY_KIND_BUFFER,
+        DescriptorTableEntryV3::Texture(_) => DESCRIPTOR_ENTRY_KIND_TEXTURE,
+        DescriptorTableEntryV3::Sampler(_) => DESCRIPTOR_ENTRY_KIND_SAMPLER,
     }
+}
+
+/// Validates every entry and returns the table's wire encoding tag.
+///
+/// A table whose entries all share a legacy kind keeps tag 0 or 1 and its old
+/// byte layout. A table that mixes buffer and registered-resource entries uses
+/// [`DESCRIPTOR_ENTRY_TAGGED`] and carries one kind byte per entry, so no entry
+/// is dropped or guessed.
+fn descriptor_table_entry_tag(table: &DescriptorTableV3) -> Result<u16, WireError> {
+    let mut tag = None;
+    let mut mixed = false;
+    for entry in &table.bindings {
+        let entry_tag = descriptor_entry_tag(entry, table.kind)?;
+        match tag {
+            Some(existing) if existing != entry_tag => mixed = true,
+            None => tag = Some(entry_tag),
+            _ => {}
+        }
+    }
+    let tag = tag.ok_or(WireError::ZeroDescriptorCount)?;
+    Ok(if mixed {
+        DESCRIPTOR_ENTRY_TAGGED
+    } else {
+        tag
+    })
 }
 
 fn begin_render_pass_encoded_len(pass: &BeginRenderPass) -> Result<usize, WireError> {
@@ -3801,7 +3953,7 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             write_u16(out, tag);
             match tag {
                 DESCRIPTOR_ENTRY_BUFFER => write_table_buffer_bindings(out, &table.bindings),
-                _ => {
+                DESCRIPTOR_ENTRY_RESOURCE => {
                     for entry in &table.bindings {
                         write_u64(
                             out,
@@ -3811,6 +3963,8 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
                         );
                     }
                 }
+                DESCRIPTOR_ENTRY_TAGGED => write_table_tagged_entries(out, &table.bindings),
+                other => unreachable!("unexpected descriptor table tag {other}"),
             }
         }
         CommandV3::BeginRenderPass(pass) => {
@@ -4142,6 +4296,24 @@ fn write_table_buffer_bindings(out: &mut Vec<u8>, entries: &[DescriptorTableEntr
         write_u32(out, 0);
         write_u64(out, binding.offset);
         write_u64(out, binding.length);
+    }
+}
+
+fn write_table_tagged_entries(out: &mut Vec<u8>, entries: &[DescriptorTableEntryV3]) {
+    for entry in entries {
+        out.push(descriptor_entry_kind(entry));
+        match entry {
+            DescriptorTableEntryV3::Buffer(binding) => {
+                write_u64(out, binding.allocation_id);
+                write_u32(out, binding.generation);
+                write_u32(out, 0);
+                write_u64(out, binding.offset);
+                write_u64(out, binding.length);
+            }
+            DescriptorTableEntryV3::Texture(handle) | DescriptorTableEntryV3::Sampler(handle) => {
+                write_u64(out, *handle);
+            }
+        }
     }
 }
 
@@ -5482,6 +5654,105 @@ mod tests {
                 bindings: vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
             }),
             WireError::DescriptorEntryMismatch,
+        );
+    }
+
+    #[test]
+    fn wire_v3_carries_a_mixed_descriptor_table_with_per_entry_tags() {
+        // A buffer and a texture in one SRV table use the tagged form: each
+        // entry starts with its own kind byte, and no entry is dropped.
+        let mixed_table = DescriptorTableV3 {
+            set: 1,
+            base_register: 2,
+            kind: DescriptorKind::Srv,
+            bindings: vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
+        };
+        let frame = single_frame(CommandV3::SetDescriptorTable(mixed_table.clone()));
+        let command = &frame[COMMAND_START..];
+        assert_eq!(&command[12..14], &DESCRIPTOR_ENTRY_TAGGED.to_le_bytes());
+        assert_eq!(
+            frame.len(),
+            COMMAND_START
+                + DESCRIPTOR_TABLE_HEADER_LEN
+                + DESCRIPTOR_ENTRY_TAG_LEN
+                + BINDING_LEN
+                + DESCRIPTOR_ENTRY_TAG_LEN
+                + RESOURCE_HANDLE_LEN
+        );
+        let texture_tag = DESCRIPTOR_TABLE_HEADER_LEN + DESCRIPTOR_ENTRY_TAG_LEN + BINDING_LEN;
+        assert_eq!(
+            command[DESCRIPTOR_TABLE_HEADER_LEN],
+            DESCRIPTOR_ENTRY_KIND_BUFFER
+        );
+        assert_eq!(command[texture_tag], DESCRIPTOR_ENTRY_KIND_TEXTURE);
+        assert_eq!(
+            &command[texture_tag + DESCRIPTOR_ENTRY_TAG_LEN
+                ..texture_tag + DESCRIPTOR_ENTRY_TAG_LEN + RESOURCE_HANDLE_LEN],
+            &0x2100u64.to_le_bytes()
+        );
+        assert_eq!(
+            decode_submission_v3(&frame).expect("mixed table decodes"),
+            submission_with(vec![CommandV3::SetDescriptorTable(mixed_table)])
+        );
+
+        // A homogeneous table keeps its old tag and exact byte layout: no
+        // tagged header, no per-entry bytes.
+        let buffer_frame = single_frame(CommandV3::SetDescriptorTable(DescriptorTableV3 {
+            set: 0,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![entry(0), entry(64)],
+        }));
+        assert_eq!(
+            &buffer_frame[COMMAND_START + 12..COMMAND_START + 14],
+            &DESCRIPTOR_ENTRY_BUFFER.to_le_bytes()
+        );
+        assert_eq!(
+            buffer_frame.len(),
+            COMMAND_START + DESCRIPTOR_TABLE_HEADER_LEN + 2 * BINDING_LEN
+        );
+
+        let texture_frame = single_frame(CommandV3::SetDescriptorTable(DescriptorTableV3 {
+            set: 0,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![
+                DescriptorTableEntryV3::Texture(0x2100),
+                DescriptorTableEntryV3::Texture(0x2101),
+            ],
+        }));
+        assert_eq!(
+            &texture_frame[COMMAND_START + 12..COMMAND_START + 14],
+            &DESCRIPTOR_ENTRY_RESOURCE.to_le_bytes()
+        );
+        assert_eq!(
+            texture_frame.len(),
+            COMMAND_START + DESCRIPTOR_TABLE_HEADER_LEN + 2 * RESOURCE_HANDLE_LEN
+        );
+    }
+
+    #[test]
+    fn wire_v3_names_the_slot_of_an_unknown_per_entry_tag() {
+        let table = DescriptorTableV3 {
+            set: 0,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
+        };
+        let mut frame = single_frame(CommandV3::SetDescriptorTable(table));
+        // The second entry's kind byte follows the header, the first kind
+        // byte and the 32-byte buffer range.
+        let second_tag = COMMAND_START
+            + DESCRIPTOR_TABLE_HEADER_LEN
+            + DESCRIPTOR_ENTRY_TAG_LEN
+            + BINDING_LEN;
+        frame[second_tag] = 9;
+        assert_eq!(
+            decode_submission_v3(&frame),
+            Err(WireError::InvalidEnumCode {
+                field: "descriptor table entry 1 tag",
+                code: 9,
+            })
         );
     }
 
