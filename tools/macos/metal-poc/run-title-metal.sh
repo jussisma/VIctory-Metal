@@ -40,6 +40,12 @@
 # a usage error before anything is created. The rest of the connection variables
 # (port, secret, share dir, fence page) are owned by this launcher.
 #
+# ADR-038 keeps the converter worker and its dylib host-only: the launcher lets
+# `victory_metal_host` inherit VICTORY_IRCONVERTER_WORKER and
+# VICTORY_METAL_IRCONVERTER, then unsets both before the Wine guest starts. The
+# guest must not build a pool around a macOS binary; it reaches the VP3
+# host-translation path instead (see `crates/victory-gpu/src/native_metal/pso.rs`).
+#
 # With VICTORY_BACKEND=d3d12 the native daemon is not started (it can only serve
 # a metal guest) and the D3DMetal DLL override is exported so the guest reaches
 # Apple's translation layer. The summary reports the native-only host fields as
@@ -825,6 +831,19 @@ fi
 
 compute_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.compute.id" 2>/dev/null | tail -1)"
 graphics_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.graphics.id" 2>/dev/null | tail -1)"
+
+# --- Host-only converter environment (ADR-038) -----------------------------
+# `VICTORY_IRCONVERTER_WORKER` and `VICTORY_METAL_IRCONVERTER` name macOS
+# builds that only `victory_metal_host` can run: the host reads them when it
+# creates the ADR-038 translation pool it sandboxes behind Rosetta. They were
+# inherited by this script so `start_host` could pass them on. The Win64 guest
+# must not inherit them: a guest that sees a macOS worker path builds a pool
+# whose child dies at once, and the refusal is reported as `Translation`
+# instead of the `ConverterUnavailable` that selects the VP3 host-translation
+# path. `CONV` (the dylib the gate's own pool stage used above) is already
+# resolved and stays a shell variable only. The share dir, fence page, endpoint
+# and secret below stay in the guest environment.
+unset VICTORY_IRCONVERTER_WORKER VICTORY_METAL_IRCONVERTER
 
 # --- Guest environment -----------------------------------------------------
 export WINEPREFIX="$WORK/wineprefix"
