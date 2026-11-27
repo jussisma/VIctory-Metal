@@ -990,6 +990,11 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
+    /// Raw `MTLRenderCommandEncoder`, or null before the first binding.
+    pub(crate) fn raw_encoder(&self) -> objc::Id {
+        self.enc
+    }
+
     /// Sets a raw render pipeline state and its optional depth-stencil state.
     pub(crate) fn set_pipeline_state(
         &mut self,
@@ -1106,6 +1111,70 @@ impl<'a> RenderEncoder<'a> {
         self.bind_buffer(buffer, offset, index, BufferStage::Mesh)
     }
 
+    /// Binds an `MTLBuffer` for the object stage at `index`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must be a live `id<MTLBuffer>` (or null) whose backing storage
+    /// stays valid until the pass's command buffer completes.
+    pub unsafe fn set_object_buffer(
+        &mut self,
+        buffer: *mut c_void,
+        offset: usize,
+        index: usize,
+    ) -> Result<(), MetalError> {
+        self.bind_buffer(buffer, offset, index, BufferStage::Object)
+    }
+
+    /// Binds one already-uploaded converted argument buffer for `stage`.
+    ///
+    /// `stage` selects the `setVertex|Fragment|Mesh|ObjectBuffer:` selector and
+    /// `index` is the converter-reflected top-level argument buffer index
+    /// (normally `buffer(2)`). Metal copies nothing here: the buffer already
+    /// carries checked device addresses.
+    pub(crate) fn bind_argument_buffer(
+        &mut self,
+        stage: super::device::ShaderStage,
+        buffer: *mut c_void,
+        index: usize,
+    ) -> Result<(), MetalError> {
+        let stage = match stage {
+            super::device::ShaderStage::Vertex => BufferStage::Vertex,
+            super::device::ShaderStage::Fragment => BufferStage::Fragment,
+            super::device::ShaderStage::Mesh => BufferStage::Mesh,
+            super::device::ShaderStage::Object => BufferStage::Object,
+            super::device::ShaderStage::Compute => {
+                return Err(MetalError::InvalidArg(
+                    "a compute argument buffer cannot bind to a render encoder",
+                ));
+            }
+        };
+        // SAFETY: the caller owns the live `MTLBuffer` for the whole encoder
+        // scope; `index` was validated by root-signature layout construction.
+        self.bind_buffer(buffer, 0, index, stage)
+    }
+
+    /// Copies root constants into a reflected `set*Bytes` index for `stage`.
+    pub(crate) fn set_stage_bytes(
+        &mut self,
+        stage: super::device::ShaderStage,
+        bytes: &[u8],
+        index: usize,
+    ) -> Result<(), MetalError> {
+        let stage = match stage {
+            super::device::ShaderStage::Vertex => BufferStage::Vertex,
+            super::device::ShaderStage::Fragment => BufferStage::Fragment,
+            super::device::ShaderStage::Mesh => BufferStage::Mesh,
+            super::device::ShaderStage::Object => BufferStage::Object,
+            super::device::ShaderStage::Compute => {
+                return Err(MetalError::InvalidArg(
+                    "compute root constants cannot bind to a render encoder",
+                ));
+            }
+        };
+        self.set_inline_bytes(bytes, index, stage)
+    }
+
     fn bind_buffer(
         &mut self,
         buffer: *mut c_void,
@@ -1126,6 +1195,7 @@ impl<'a> RenderEncoder<'a> {
             BufferStage::Vertex => objc::sel(c"setVertexBuffer:offset:atIndex:"),
             BufferStage::Fragment => objc::sel(c"setFragmentBuffer:offset:atIndex:"),
             BufferStage::Mesh => objc::sel(c"setMeshBuffer:offset:atIndex:"),
+            BufferStage::Object => objc::sel(c"setObjectBuffer:offset:atIndex:"),
         };
         // SAFETY: `self.enc` is a live render encoder, `buffer` is a caller-
         // provided live `MTLBuffer` (non-null, per the check above), and the
@@ -1166,6 +1236,7 @@ impl<'a> RenderEncoder<'a> {
             BufferStage::Vertex => objc::sel(c"setVertexBytes:length:atIndex:"),
             BufferStage::Fragment => objc::sel(c"setFragmentBytes:length:atIndex:"),
             BufferStage::Mesh => objc::sel(c"setMeshBytes:length:atIndex:"),
+            BufferStage::Object => objc::sel(c"setObjectBytes:length:atIndex:"),
         };
         // SAFETY: `self.enc` is a live render encoder, `bytes` is valid for
         // `bytes.len()` bytes during the call, and Metal copies it immediately.
@@ -1506,6 +1577,7 @@ enum BufferStage {
     Vertex,
     Fragment,
     Mesh,
+    Object,
 }
 
 /// Builds an autoreleased `MTLRenderPassDescriptor` for `pass`.
