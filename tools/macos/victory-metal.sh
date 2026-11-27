@@ -226,6 +226,11 @@ if [ -n "$TIMEOUT" ]; then
 fi
 
 export VICTORY_BACKEND=metal
+# Cycle 08 Boot #1: without this, Rosetta does not report AVX/AVX2 in CPUID and
+# victory.exe's own Xbox-Series preflight refuses to execute the title. The
+# reference launcher (tools/macos/victory.sh) sets the same variable. An
+# explicit value from the caller wins.
+export ROSETTA_ADVERTISE_AVX="${ROSETTA_ADVERTISE_AVX:-1}"
 if [ -n "$TIMEOUT" ]; then
     export GUEST_TIMEOUT="$TIMEOUT"
 fi
