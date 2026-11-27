@@ -30,8 +30,10 @@
 //!   does.
 //! - [`MetalProducer::resource_barrier`], copies, compute dispatches and
 //!   present close the pass first: the wire forbids those inside a pass.
-//! - `flush` closes the pass and returns one submission with the next
-//!   session-wide sequence; a pass never spans two submissions.
+//! - `flush` closes the pass and returns the submission for the commands
+//!   recorded so far, with no sequence assigned; the transport assigns the
+//!   session-wide sequence when the submission is enqueued, so a pass never
+//!   spans two submissions and an empty or dropped stream consumes nothing.
 //!
 //! # Clears
 //!
@@ -110,6 +112,13 @@ pub const MAX_VERTEX_SLOTS: usize = 32;
 
 /// Sequence numbers are session-wide so two lists never collide.
 static NEXT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+
+/// The sequence value that means "not assigned to a transport frame yet".
+///
+/// A submission leaves [`MetalProducer::flush`] with this placeholder; only
+/// the choke points before the wire ([`MetalProducer::submit`] and
+/// `NativeQueue::enqueue`) assign a real sequence, exactly once.
+pub const UNASSIGNED_SEQUENCE: u32 = 0;
 
 /// A resource's stable identity on the wire.
 ///
@@ -1915,9 +1924,12 @@ impl MetalProducer {
 
     /// Closes the pass and returns the submission recorded so far.
     ///
-    /// The submission carries the next session-wide sequence, so every
-    /// flush is strictly increasing across lists. An empty stream still
-    /// consumes its sequence.
+    /// The submission carries no sequence yet ([`UNASSIGNED_SEQUENCE`]):
+    /// the transport assigns the next session-wide sequence when it enqueues
+    /// the frame, exactly once, so an empty stream or a submission a list
+    /// drops before execution consumes nothing and the host's ledger stays
+    /// dense. Everything else about the flush (closing pass, latent clears,
+    /// pending clears) is unchanged.
     ///
     /// Clears that no draw or bind consumed are encoded here too: a recorded
     /// pass whose clear never ran is materialised, and a clear of a target that
@@ -1927,13 +1939,12 @@ impl MetalProducer {
         self.close_pass()?;
         self.materialize_latent_clear()?;
         self.flush_pending_clears()?;
-        let sequence = next_sequence()?;
         let commands = std::mem::take(&mut self.commands);
         self.emitted_compute_pipeline = None;
         self.emitted_mesh_pipeline = None;
         self.dirty = GraphicsDirty::all(&self.graphics);
         Ok(SubmissionV3 {
-            sequence,
+            sequence: UNASSIGNED_SEQUENCE,
             list: Some(self.identity),
             commands,
         })
@@ -1945,8 +1956,12 @@ impl MetalProducer {
     }
 
     /// Flushes and carries the submission to `sink`, checking its reply.
+    ///
+    /// The direct sink path assigns the sequence here, through the same
+    /// single helper the native queue uses at enqueue.
     pub fn submit<S: WireV3Sink + ?Sized>(&mut self, sink: &mut S) -> Result<Reply, ProducerError> {
-        let submission = self.flush()?;
+        let mut submission = self.flush()?;
+        ensure_sequence(&mut submission)?;
         let reply = sink.submit(&submission)?;
         if reply.sequence != submission.sequence {
             return Err(ProducerError::ReplySequenceMismatch {
@@ -2476,6 +2491,30 @@ fn next_sequence() -> Result<u32, ProducerError> {
     Ok(sequence)
 }
 
+/// Assigns the next session-wide sequence to `submission` unless it already
+/// carries one.
+///
+/// This is the only place outside tests where a sequence is handed out.
+/// [`MetalProducer::flush`] leaves the field unassigned, so an empty stream or
+/// a submission a list drops before execution consumes nothing; both choke
+/// points before the wire ([`MetalProducer::submit`] and
+/// `NativeQueue::enqueue`) call this, and a submission that was already sent
+/// keeps its sequence when it is retried, never renumbering it.
+pub fn ensure_sequence(submission: &mut SubmissionV3) -> Result<u32, ProducerError> {
+    if submission.sequence != UNASSIGNED_SEQUENCE {
+        return Ok(submission.sequence);
+    }
+    let sequence = next_sequence()?;
+    submission.sequence = sequence;
+    Ok(sequence)
+}
+
+/// Resets the session sequence counter (tests only: it is process-global).
+#[cfg(test)]
+pub(crate) fn reset_sequences(start: u32) {
+    NEXT_SEQUENCE.store(start, Ordering::Relaxed);
+}
+
 /// One recorded list on the native path: its producer and the submissions
 /// waiting for the bridge.
 ///
@@ -2529,6 +2568,8 @@ impl MetalList {
     ///
     /// If any call was refused, nothing is submitted and the first refusal
     /// is returned so the guest entry point can return its failure HRESULT.
+    /// An empty stream is not kept: it carries no commands and holds no
+    /// sequence, so dropping it cannot open a hole in the host's ledger.
     pub fn close(&mut self) -> Result<(), ProducerError> {
         if let Some(error) = self.failed.take() {
             self.producer.abandon();
@@ -2536,6 +2577,10 @@ impl MetalList {
         }
         let submission = self.producer.flush()?;
         if !submission.commands.is_empty() {
+            debug_assert_eq!(
+                submission.sequence, UNASSIGNED_SEQUENCE,
+                "a list closes a submission before the transport assigns its sequence"
+            );
             self.pending.push(submission);
         }
         Ok(())
@@ -2543,11 +2588,21 @@ impl MetalList {
 
     /// `Reset`: starts the next list generation and drops submissions the
     /// bridge did not take (the title reset before executing this list).
+    ///
+    /// The dropped submissions are still unassigned: `Close` never takes a
+    /// sequence, the queue does at enqueue, so a reset before execution cannot
+    /// desynchronise the host's ledger.
     pub fn reset(&mut self) -> Result<(), ProducerError> {
         if !self.pending.is_empty() {
             tracing::debug!(
                 count = self.pending.len(),
                 "native submissions dropped by a list reset before the bridge took them"
+            );
+            debug_assert!(
+                self.pending
+                    .iter()
+                    .all(|submission| submission.sequence == UNASSIGNED_SEQUENCE),
+                "a pending submission is dropped before the transport assigned it a sequence"
             );
         }
         self.pending.clear();
@@ -2606,6 +2661,14 @@ mod tests {
             .expect("indexed draw recorded");
     }
 
+    /// Flushes `producer` and assigns the sequence the transport would, so a
+    /// test can encode the frame it just recorded.
+    fn flush_for_wire(producer: &mut MetalProducer) -> SubmissionV3 {
+        let mut submission = producer.flush().expect("flush");
+        ensure_sequence(&mut submission).expect("the transport assigns a sequence");
+        submission
+    }
+
     /// The ARM64 host planner (the real encoder-segment rules) accepts the
     /// recorded stream. Only builds where the host exists can check this.
     #[cfg(target_os = "macos")]
@@ -2654,7 +2717,7 @@ mod tests {
             .expect("copy");
         producer.present(3, 1).expect("present");
 
-        let submission = producer.flush().expect("flush");
+        let mut submission = producer.flush().expect("flush");
         assert_eq!(
             submission.list,
             Some(ListIdentity {
@@ -2662,6 +2725,11 @@ mod tests {
                 list_generation: 1
             })
         );
+        assert_eq!(
+            submission.sequence, UNASSIGNED_SEQUENCE,
+            "flush leaves the sequence to the transport, which assigns it once"
+        );
+        ensure_sequence(&mut submission).expect("the transport assigns a sequence");
         assert!(submission.sequence >= 1);
         let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
         assert_eq!(
@@ -3127,7 +3195,8 @@ mod tests {
             .clear_render_target(resource(0x1100), [1.0, 0.0, 0.0, 1.0])
             .expect("pending clear");
 
-        let submission = producer.flush().expect("flush");
+        let mut submission = producer.flush().expect("flush");
+        super::ensure_sequence(&mut submission).expect("sequence");
         let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
         assert_eq!(
             opcodes,
@@ -3603,20 +3672,28 @@ mod tests {
         }
     }
 
+    /// `flush` is sequence-free: the transport (the native queue at enqueue,
+    /// or `submit` for the direct sink) assigns the session sequence exactly
+    /// once, so an empty flush consumes nothing.
     #[test]
-    fn flushes_assign_increasing_sequences() {
+    fn flushes_do_not_consume_sequences() {
         let mut producer = MetalProducer::new(12, 1).expect("producer");
         producer.present(1, 0).expect("present");
-        let first = producer.flush().expect("first flush").sequence;
-        producer.present(1, 0).expect("present");
-        let second = producer.flush().expect("second flush").sequence;
-        // `NEXT_SEQUENCE` is process-global (every producer in the session
-        // draws from it), so another test's flush may run between these two
-        // under `--test-threads=4`. The wire contract is strictly increasing,
-        // not per-producer contiguous.
-        assert!(
-            second > first,
-            "flush sequences must increase: {first} then {second}"
+        let first = producer.flush().expect("first flush");
+        assert_eq!(first.sequence, UNASSIGNED_SEQUENCE);
+        assert!(!first.commands.is_empty(), "the first flush carries a frame");
+        // A second flush with nothing recorded is still unassigned: it must
+        // not take a sequence the host will never see.
+        let empty = producer.flush().expect("second flush");
+        assert_eq!(empty.sequence, UNASSIGNED_SEQUENCE);
+        assert!(empty.commands.is_empty());
+        let mut first = first;
+        let assigned = ensure_sequence(&mut first).expect("the transport assigns");
+        assert!(assigned >= 1);
+        // A submission that already carries a sequence keeps it on a retry.
+        assert_eq!(
+            ensure_sequence(&mut first).expect("an assigned frame is not renumbered"),
+            assigned
         );
     }
 
@@ -3742,7 +3819,7 @@ mod tests {
         producer.dispatch(2, 3, 4).expect("dispatch");
         producer.present(3, 1).expect("present");
 
-        let submission = producer.flush().expect("flush");
+        let submission = flush_for_wire(&mut producer);
         let expected = [
             (CommandV3::BeginRenderPass(BeginRenderPass {
                 colors: Vec::new(),
@@ -3910,7 +3987,7 @@ mod tests {
             .execute_indirect_dispatch(arguments(5, false))
             .expect("indirect dispatch");
 
-        let submission = producer.flush().expect("submission");
+        let submission = flush_for_wire(&mut producer);
         let indirect: Vec<u16> = submission
             .commands
             .iter()
@@ -3986,7 +4063,7 @@ mod tests {
         producer
             .resolve_subresource(src, dst)
             .expect("resolve");
-        let submission = producer.flush().expect("submission");
+        let submission = flush_for_wire(&mut producer);
         assert!(matches!(
             submission.commands.as_slice(),
             [
@@ -4057,7 +4134,8 @@ mod tests {
                 [8, 4, 0],
             )
             .expect("buffer upload");
-        let submission = producer.flush().expect("submission");
+        let mut submission = producer.flush().expect("submission");
+        super::ensure_sequence(&mut submission).expect("sequence");
         assert!(matches!(
             submission.commands.as_slice(),
             [CommandV3::CopyBufferToTexture(copy)]
@@ -4145,7 +4223,7 @@ mod tests {
             .expect("compute root view");
         producer.dispatch(2, 1, 1).expect("dispatch");
 
-        let submission = producer.flush().expect("flush");
+        let submission = flush_for_wire(&mut producer);
         let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
         assert_eq!(
             opcodes,
@@ -4397,7 +4475,7 @@ mod tests {
             .execute_indirect_draw(arguments)
             .expect("indirect draw");
 
-        let submission = producer.flush().expect("flush");
+        let submission = flush_for_wire(&mut producer);
         let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
         let dispatch_at = opcodes
             .iter()
