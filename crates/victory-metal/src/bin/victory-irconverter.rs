@@ -37,19 +37,35 @@
 //! VMJOB <seq> <job-id> <stage> <entry-len> <dxil-len>\n<entry><dxil>
 //! ```
 //!
-//! and each response echoes `seq` and `job-id`:
+//! and each response echoes `seq` and `job-id`. Every job is converted through
+//! the reflection-aware converter API; the *response frame* is selected by
+//! `VICTORY_IRCONVERTER_STDIO_REFLECTION`, which the pool sets on every child
+//! it starts:
 //!
 //! ```text
-//! VMRES <seq> <job-id> <status> <payload-len>\n<payload>
+//! VMRES2 <seq> <job-id> <status> <metallib-len> <reflection-len>\n\
+//!     <metallib><reflection-json>
+//! VMRES  <seq> <job-id> <status> <payload-len>\n<payload>   (no env switch)
 //! ```
 //!
-//! `status == 0` carries the serialized metallib; any other status carries a
-//! UTF-8 diagnostic. A malformed header whose lengths still parse is rejected
-//! with a nonzero status after its payload is drained, so the loop stays alive.
-//! The process exits 0 on a clean stdin EOF. `--reflection-dir` is a daemon
-//! option that writes `<seq>-<job-id>.reflection` for each successful job; the
-//! pool frame carries no per-job reflection path, so the pool itself derives
-//! reflection metadata from the job instead of asking the worker.
+//! `status == 0` carries the serialized metallib plus Apple's reflection JSON
+//! (`IRShaderReflectionCopyJSONString`) for the linked program; any other
+//! status carries a UTF-8 diagnostic and an empty reflection. The reflection is
+//! what the pool hands to the guest so it can build the per-stage
+//! `PipelineAbi`; the stdio path therefore uses
+//! [`convert_dxil_to_metallib_with_reflection`], not the metallib-only
+//! conversion. A converter build without the reflection symbols is an explicit
+//! error, never a metallib with a fabricated layout. Because the switch only
+//! changes the response, an unchanged driver such as the live gate's own DXIL
+//! pool stage keeps reading `VMRES` and is not broken by the new channel.
+//!
+//! A malformed header whose lengths still parse is rejected with a nonzero
+//! status after its payload is drained, so the loop stays alive. The process
+//! exits 0 on a clean stdin EOF. `--reflection-dir` is a daemon option that
+//! writes `<seq>-<job-id>.reflection` (the binary [`ReflectionPayload`]) for
+//! each successful job; the pool frame carries no per-job reflection path, so
+//! the pool itself derives reflection metadata from the job instead of asking
+//! the worker.
 //!
 //! Input limits are fixed by `victory-metal`: at most
 //! `MAX_DXIL_INPUT_BYTES` (16 MiB) of DXIL, at most `MAX_ENTRY_POINT_BYTES`
@@ -86,7 +102,17 @@ mod cli {
     use victory_metal::macos::irconverter::{
         DEFAULT_CONVERTER_VERSION, MAX_DXIL_INPUT_BYTES, MAX_ENTRY_POINT_BYTES,
         MAX_METALLIB_OUTPUT_BYTES, convert_dxil_to_metallib,
+        convert_dxil_to_metallib_with_reflection,
     };
+
+    /// Environment switch that makes a worker answer the `VMRES2` frame.
+    ///
+    /// The pool sets it on every child it starts. A caller that drives the
+    /// worker directly (the live gate's own DXIL pool stage) leaves it unset
+    /// and keeps receiving the original `VMRES` frame, so an unchanged driver
+    /// is not broken by the reflection channel. This is still a *response*
+    /// extension: the request frame and the one-shot CLI are untouched.
+    const REFLECTION_FRAMES_ENV: &str = "VICTORY_IRCONVERTER_STDIO_REFLECTION";
 
     /// Largest accepted stdio request header, matching the pool's own bound.
     const MAX_STDIO_HEADER_BYTES: usize = 4096;
@@ -102,7 +128,7 @@ usage: victory-irconverter --converter <libmetalirconverter.dylib> \\
 
   --converter, -c <path>  explicitly configured x86_64 libmetalirconverter.dylib
   --entry, -e <name>      DXIL entry point (embedded root signature is used)
-  --stdio                 serve VMJOB/VMRES frames on stdin/stdout instead of
+  --stdio                 serve VMJOB/VMRES2 frames on stdin/stdout instead of
                           converting one input/output pair
   --reflection <path>     write the reflection payload (metallib hash, stage,
                           root layout, options and binding metadata)
@@ -407,11 +433,17 @@ root signature <= 1048576 bytes.
         Ok(())
     }
 
-    /// Serves the pool's persistent `VMJOB`/`VMRES` protocol until stdin EOF.
+    /// Serves the pool's persistent `VMJOB`/`VMRES2` protocol until stdin EOF.
     ///
     /// The frame layout is owned by [`victory_metal::compiler_pool`]; this
-    /// function must not invent another one. Every job goes through the same
-    /// validated [`convert_dxil_to_metallib`] call as the one-shot mode.
+    /// function must not invent another one. Every job goes through
+    /// [`convert_dxil_to_metallib_with_reflection`] so the answer carries both
+    /// the metallib and the converter's reflection JSON; the one-shot mode
+    /// keeps the metallib-only [`convert_dxil_to_metallib`] path.
+    ///
+    /// [`REFLECTION_FRAMES_ENV`] selects the response frame. The pool sets it
+    /// and receives `VMRES2`; a direct driver that does not set it keeps
+    /// receiving the original `VMRES` frame (metallib only).
     fn run_stdio(args: &Args) -> i32 {
         if !args.converter.is_file() {
             eprintln!(
@@ -420,6 +452,8 @@ root signature <= 1048576 bytes.
             );
             return 2;
         }
+        let reflection_frames = env::var_os(REFLECTION_FRAMES_ENV)
+            .is_some_and(|value| !value.is_empty() && value != "0");
         if let Some(dir) = &args.reflection_dir {
             if let Err(err) = fs::create_dir_all(dir) {
                 eprintln!(
@@ -474,12 +508,14 @@ root signature <= 1048576 bytes.
                 // Without lengths there is no way to find the next frame; answer
                 // with the ids we could parse and end the loop instead of
                 // silently misparsing binary payload as headers.
-                let _ = write_response(
+                let _ = answer(
                     &mut writer,
+                    reflection_frames,
                     seq.unwrap_or(0),
                     id.unwrap_or(0),
                     2,
                     b"malformed VMJOB header without byte lengths",
+                    &[],
                 );
                 return 2;
             };
@@ -506,12 +542,14 @@ root signature <= 1048576 bytes.
                 && id.is_some()
                 && fields[3].parse::<u32>().is_ok();
             if !header_ok {
-                if write_response(
+                if answer(
                     &mut writer,
+                    reflection_frames,
                     seq.unwrap_or(0),
                     id.unwrap_or(0),
                     2,
                     b"malformed VMJOB header",
+                    &[],
                 )
                 .is_err()
                 {
@@ -524,21 +562,51 @@ root signature <= 1048576 bytes.
             let stage = fields[3].parse::<u32>().expect("checked above");
             let (entry_bytes, dxil) = payload.split_at(entry_len);
             let Ok(entry) = std::str::from_utf8(entry_bytes) else {
-                if write_response(&mut writer, seq, id, 2, b"entry point is not UTF-8").is_err() {
+                if answer(
+                    &mut writer,
+                    reflection_frames,
+                    seq,
+                    id,
+                    2,
+                    b"entry point is not UTF-8",
+                    &[],
+                )
+                .is_err()
+                {
                     return 0;
                 }
                 continue;
             };
 
             match convert_stdio_job(args, seq, id, stage, entry, dxil) {
-                Ok(metallib) => {
+                Ok(job) => {
                     served += 1;
-                    if write_response(&mut writer, seq, id, 0, &metallib).is_err() {
+                    if answer(
+                        &mut writer,
+                        reflection_frames,
+                        seq,
+                        id,
+                        0,
+                        &job.metallib,
+                        &job.reflection,
+                    )
+                    .is_err()
+                    {
                         return 0;
                     }
                 }
                 Err((status, message)) => {
-                    if write_response(&mut writer, seq, id, status, message.as_bytes()).is_err() {
+                    if answer(
+                        &mut writer,
+                        reflection_frames,
+                        seq,
+                        id,
+                        status,
+                        message.as_bytes(),
+                        &[],
+                    )
+                    .is_err()
+                    {
                         return 0;
                     }
                 }
@@ -546,7 +614,18 @@ root signature <= 1048576 bytes.
         }
     }
 
-    /// Runs one stdio job through the one-shot conversion core.
+    /// One stdio answer: the metallib and the converter reflection JSON.
+    struct StdioJob {
+        metallib: Vec<u8>,
+        reflection: Vec<u8>,
+    }
+
+    /// Runs one stdio job through the reflection-aware conversion core.
+    ///
+    /// The stdio path always asks the converter for reflection: the pool's
+    /// `compile` ignores it, but `compile_with_reflection` needs it to build a
+    /// pipeline ABI, so emitting it unconditionally keeps one worker binary
+    /// able to serve both callers.
     fn convert_stdio_job(
         args: &Args,
         seq: u64,
@@ -554,7 +633,7 @@ root signature <= 1048576 bytes.
         stage: u32,
         entry: &str,
         dxil: &[u8],
-    ) -> Result<Vec<u8>, (u32, String)> {
+    ) -> Result<StdioJob, (u32, String)> {
         if entry.is_empty() || entry.len() > MAX_ENTRY_POINT_BYTES {
             return Err((
                 2,
@@ -573,27 +652,35 @@ root signature <= 1048576 bytes.
                 ),
             ));
         }
-        let output = convert_dxil_to_metallib(dxil, entry, &args.converter)
+        let output = convert_dxil_to_metallib_with_reflection(dxil, entry, &args.converter)
             .map_err(|err| (1, format!("conversion failed: {err}")))?;
-        if output.bytes.is_empty() || output.bytes.len() > MAX_METALLIB_OUTPUT_BYTES {
+        let metallib = output.metallib;
+        if metallib.bytes.is_empty() || metallib.bytes.len() > MAX_METALLIB_OUTPUT_BYTES {
             return Err((
                 1,
-                format!("converted metallib has invalid size {}", output.bytes.len()),
+                format!("converted metallib has invalid size {}", metallib.bytes.len()),
             ));
         }
-        if stage != 0 && output.stage != stage {
+        if stage != 0 && metallib.stage != stage {
             return Err((
                 3,
                 format!(
                     "frame declared stage {stage}, converter reported stage {}",
-                    output.stage
+                    metallib.stage
                 ),
             ));
         }
+        let reflection = output.reflection_json.into_bytes();
+        if reflection.is_empty() {
+            return Err((
+                1,
+                "converter returned an empty reflection JSON".to_string(),
+            ));
+        }
         if let Some(dir) = &args.reflection_dir {
-            let reflection = ReflectionPayload::from_translation(
-                &output.bytes,
-                output.stage,
+            let payload = ReflectionPayload::from_translation(
+                &metallib.bytes,
+                metallib.stage,
                 entry,
                 dxil,
                 None,
@@ -602,14 +689,37 @@ root signature <= 1048576 bytes.
                 &args.bindings,
             );
             let path = dir.join(format!("{seq}-{id}.reflection"));
-            if let Err(err) = fs::write(&path, reflection.encode()) {
+            if let Err(err) = fs::write(&path, payload.encode()) {
                 return Err((
                     4,
                     format!("failed to write reflection {}: {err}", path.display()),
                 ));
             }
         }
-        Ok(output.bytes)
+        Ok(StdioJob {
+            metallib: metallib.bytes,
+            reflection,
+        })
+    }
+
+    /// Writes the response in the frame the caller selected.
+    ///
+    /// `VMRES2` carries the reflection next to the metallib; `VMRES` is the
+    /// original metallib-only frame a direct driver keeps receiving.
+    fn answer(
+        writer: &mut impl Write,
+        reflection_frames: bool,
+        seq: u64,
+        id: u64,
+        status: u32,
+        metallib: &[u8],
+        reflection: &[u8],
+    ) -> io::Result<()> {
+        if reflection_frames {
+            write_response_with_reflection(writer, seq, id, status, metallib, reflection)
+        } else {
+            write_response(writer, seq, id, status, metallib)
+        }
     }
 
     fn write_response(
@@ -621,6 +731,25 @@ root signature <= 1048576 bytes.
     ) -> io::Result<()> {
         write!(writer, "VMRES {seq} {id} {status} {}\n", payload.len())?;
         writer.write_all(payload)?;
+        writer.flush()
+    }
+
+    fn write_response_with_reflection(
+        writer: &mut impl Write,
+        seq: u64,
+        id: u64,
+        status: u32,
+        metallib: &[u8],
+        reflection: &[u8],
+    ) -> io::Result<()> {
+        write!(
+            writer,
+            "VMRES2 {seq} {id} {status} {} {}\n",
+            metallib.len(),
+            reflection.len()
+        )?;
+        writer.write_all(metallib)?;
+        writer.write_all(reflection)?;
         writer.flush()
     }
 

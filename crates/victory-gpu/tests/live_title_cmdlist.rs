@@ -47,7 +47,7 @@ use std::time::Duration;
 use victory_gpu::device;
 use victory_gpu::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
 use victory_gpu::native_metal::client::{
-    PIPELINE_FRAME_MAGIC, PIPELINE_KIND_GRAPHICS, PIPELINE_KIND_MESH,
+    PIPELINE_FRAME_MAGIC, PIPELINE_KIND_COMPUTE, PIPELINE_KIND_GRAPHICS, PIPELINE_KIND_MESH,
 };
 use victory_gpu::native_metal::{pso, queue, telemetry};
 use victory_gpu::object::{Object, S_OK};
@@ -63,6 +63,10 @@ const PIXEL_REFLECTION: &str =
     r#"{"EntryPoint":"main","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#;
 const MESH_REFLECTION: &str =
     r#"{"EntryPoint":"main","ShaderType":"Mesh","TopLevelArgumentBuffer":[]}"#;
+/// A compute kernel with one root UAV: the converter puts the 64-bit device
+/// address at argument-buffer offset 0, which is the field `flush_compute_abi`
+/// writes when the guest records `SetComputeRootUnorderedAccessView`.
+const COMPUTE_REFLECTION: &str = r#"{"EntryPoint":"main","ShaderType":"Compute","TopLevelArgumentBuffer":[{"EltOffset":0,"Name":"","Size":8,"Slot":0,"Space":0,"Type":"UAV"}]}"#;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Allocation id the fixture's share file backs.
 const SHARE_ID: u64 = 1;
@@ -867,6 +871,22 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
             pso::converter_available()
         ),
     }
+    // The reflection API a pipeline registration depends on. A Win64 guest
+    // never has the x86_64 converter, so the honest result is an explicit
+    // skip that names the missing converter; nothing is fabricated.
+    match pso::translate_with_reflection(&program) {
+        Ok((compiled, serving)) => eprintln!(
+            "pool served translation + reflection: {} metallib bytes, {} reflection bytes, \
+             warm = {}",
+            compiled.metallib.len(),
+            compiled.reflection.len(),
+            serving.warm
+        ),
+        Err(error) => eprintln!(
+            "reflection skipped (converter available: {}): {error}",
+            pso::converter_available()
+        ),
+    }
     eprintln!(
         "pool worker job counts: {:?}, worker program: {:?}, converter: {:?}",
         pso::pool_worker_jobs(),
@@ -971,6 +991,95 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
             carried.commands
         ),
         other => panic!("expected a graphics submission, saw {other:?}"),
+    }
+
+    // A compute PSO that has converter reflection sends the version 2 frame
+    // with a non-empty `VAB1` ABI. The ABI is exactly the reflection's
+    // `TopLevelArgumentBuffer`, so the host parses the same UAV entry the
+    // executor binds; the producer's dispatch then carries a real binding.
+    let compute_abi = pso::encode_abi(&[(pso::WIRE_STAGE_COMPUTE, COMPUTE_REFLECTION)]);
+    let compute_details = pso::PipelineDetails {
+        state: b"",
+        abi: &compute_abi,
+        root_signature: b"compute root signature",
+    };
+    let compute_id = pso::register_translated(
+        &[(pso::PipelineStage::Compute, b"MTLB compute bytes", "main")],
+        &compute_details,
+    )
+    .expect("the fixture host accepts a v2 compute registration");
+    match seen.recv_timeout(TIMEOUT).expect("the compute registration") {
+        Seen::PipelineV2 {
+            kind,
+            stages,
+            state,
+            abi,
+            root_signature,
+        } => {
+            assert_eq!(kind, PIPELINE_KIND_COMPUTE, "the compute v2 kind");
+            assert_eq!(stages.len(), 1);
+            assert_eq!(stages[0].0, pso::WIRE_STAGE_COMPUTE);
+            assert_eq!(stages[0].2, "main");
+            assert!(state.is_empty(), "a compute state carries no render shape");
+            assert!(!abi.is_empty(), "the compute ABI must not be empty");
+            assert_eq!(abi, compute_abi);
+            assert!(
+                abi.windows(COMPUTE_REFLECTION.len())
+                    .any(|window| window == COMPUTE_REFLECTION.as_bytes()),
+                "the ABI carries the converter reflection verbatim"
+            );
+            assert_eq!(root_signature, b"compute root signature");
+        }
+        other => panic!("expected a v2 compute registration, saw {other:?}"),
+    }
+    let mut compute_producer =
+        victory_gpu::native_metal::producer::MetalProducer::new(12, 1).expect("a list identity");
+    compute_producer
+        .set_compute_pipeline(compute_id)
+        .expect("the compute pipeline id");
+    compute_producer
+        .set_compute_threadgroup_size([64, 1, 1])
+        .expect("a threadgroup size");
+    compute_producer
+        .set_compute_root_buffer_view(victory_metal::wire_v3::RootBufferView {
+            slot: 0,
+            allocation_id: SHARE_ID,
+            generation: 1,
+            offset: 0,
+            length: PAGE_LEN,
+        })
+        .expect("the kernel's root UAV");
+    compute_producer
+        .dispatch(1, 1, 1)
+        .expect("a compute dispatch records");
+    let compute_submission = compute_producer.flush().expect("one submission");
+    queue::submit_recorded_batch(&[compute_submission], 0).expect("the host accepts the batch");
+    match seen.recv_timeout(TIMEOUT).expect("the compute submission") {
+        Seen::Submission(carried) => {
+            assert!(
+                carried.commands.iter().any(|command| matches!(
+                    command,
+                    CommandV3::SetComputePipeline(reference) if reference.pipeline_id == compute_id
+                )),
+                "the submission names the compute id: {:?}",
+                carried.commands
+            );
+            let bindings = carried
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    CommandV3::Dispatch3d(dispatch) => Some(&dispatch.bindings),
+                    _ => None,
+                })
+                .expect("the compute submission carries a Dispatch3d");
+            assert!(
+                !bindings.is_empty(),
+                "the dispatch must carry the root UAV binding, not an empty list"
+            );
+            assert_eq!(bindings[0].allocation_id, SHARE_ID);
+            assert_eq!(bindings[0].length, PAGE_LEN);
+        }
+        other => panic!("expected a compute submission, saw {other:?}"),
     }
 
     // A mesh PSO round-trips the same way and its id reaches `SetMeshPipeline`.
