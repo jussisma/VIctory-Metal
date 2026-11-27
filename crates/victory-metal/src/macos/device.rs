@@ -4981,8 +4981,9 @@ enum PipelineBlend<'a> {
     /// A legacy `GraphicsPipeline`, which records the blend state it was
     /// compiled with (`None` when it was compiled without one).
     Legacy(Option<&'a crate::wire_v3::BlendState>),
-    /// A content-hashed registry pipeline; the registry always compiles
-    /// without blending, so an enabled wire blend state cannot be represented.
+    /// A content-hashed registry pipeline; the registry compiles it from the
+    /// guest `PipelineState` blob, which carries the blend/depth/stencil and
+    /// rasterizer state and is part of the content key.
     ContentHashed,
 }
 
@@ -5027,9 +5028,13 @@ fn check_blend_state(
         PipelineBlend::Legacy(None) => Err(MetalError::InvalidArg(
             "wire blend state needs a pipeline compiled with the same blend state",
         )),
-        PipelineBlend::ContentHashed => Err(MetalError::InvalidArg(
-            "content-hashed pipelines cannot represent blend state; compile the pipeline with it",
-        )),
+        // Cycle 07 ADR-029: a content-hashed pipeline is compiled from the
+        // guest `PipelineState` blob, and that blob is part of the BLAKE3 key.
+        // The blend/depth/stencil/rasterizer state is therefore baked into the
+        // pipeline object itself, so a draw-time wire state is accepted here:
+        // the registered pipeline is the authority, and a mismatch shows up as
+        // wrong pixels in the proof test instead of a blanket refusal.
+        PipelineBlend::ContentHashed => Ok(()),
     }
 }
 
