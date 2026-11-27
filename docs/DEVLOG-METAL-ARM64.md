@@ -1059,3 +1059,114 @@ tools/macos/metal-poc/aaa-preboot-gate.sh --runs 2   # exit 0 required
   a sampled guest texture with no upload samples its cleared contents.
 - **Retire capacity** is a hard bound only where the device pins through
   `push_backpressure`; `RetireQueue::push` remains as documented legacy.
+
+## Cycle 08 — first live title execution on the native path: two presented frames, zero D3DMetal, and the sequence ledger
+
+Base `7d7bc67b` (cycle-07). This cycle crossed into real-title execution under
+`VICTORY_BACKEND=metal` with a locally authorized title. No proprietary binary,
+asset, key or path is recorded here: only counts, formats, opcodes and frame
+times. Every number below comes from a run in this workspace on the Apple M4 Max.
+
+### 8.1 What changed
+
+- **ADR-030 — no silent state drops.** Every former `ignored_state` slot of the
+  console list table now has a named handler: root-signature commits are recorded
+  per stage, `DiscardResource` reuses the clear lowering, and the three console
+  hints with no Wire v3 form (pixel-shader depth order, shading rate, state
+  flush) are refused by name and counted by operation instead of vanishing. A
+  table audit test fails the suite if a future slot becomes a silent stub.
+- **ADR-030 — no host D3D12 device on the metal path.** `host::host()` returns
+  `None` when `VICTORY_BACKEND=metal`, before any `D3D12CreateDevice` or factory,
+  with a one-shot guard line (`host_d3d12_creation_attempts=0`). The d3d12
+  backend is unchanged.
+- **ADR-030 — clear discipline.** `ClearRenderTargetView`/`ClearDepthStencilView`
+  before the bind, inside a pass, and with no following draw are all expressible:
+  pending clears latch onto the attachment at pass open, and an unconsumed clear
+  becomes its own single-attachment pass. Duplicate clear+bind pairs clear once
+  per clear.
+- **ADR-031 — turnkey launcher.** `tools/macos/victory-metal.sh` wraps
+  `run-title-metal.sh`: builds the Win64 `diag` binary, the ARM64 host and the
+  x86_64 converter, supports `--window/--headless/--timeout/--frames/--out/--dry-run`,
+  exports `VICTORY_BACKEND=metal` plus the full IPC/share/fence environment,
+  advertises AVX/AVX2 under Rosetta, bounds the run, and reports backend,
+  endpoint, share dir and fence page without the secret.
+- **ADR-032 — PID-verified GPU lock.** `tools/macos/metal-poc/gpu-lock` and the
+  rewritten `process-hygiene.sh` lock share one protocol: atomic `mkdir`, an
+  `owner` record, stale reclaim when `kill -0` fails, a bounded wait (exit 75),
+  release only by the creator, and re-entrant acquisition by a wrapper's child.
+- **Submission sequence ledger.** `MetalProducer::flush()` no longer consumes a
+  sequence; `NativeQueue::enqueue` assigns exactly one per real frame. An empty
+  `Close` and a reset that drops unassigned pending frames can no longer desync
+  the host.
+- **Formats.** Guest kind-8 code 9 is RGBA16Float (`MTLPixelFormatRGBA16Float`,
+  115) for the title's FP16 present target; codes 10/11 are R32Uint/R32Sint
+  (Metal 53/54, registry codes 18/19).
+- **Host failure telemetry.** A failed Metal command buffer carries its
+  `localizedDescription` coarsely attributed to a command family, host telemetry
+  gains `last_error`, and session counters survive a `serve_once` error. A GPU
+  `ExecutionFailed` is a reply; only transport/protocol errors end the session.
+
+### 8.2 Boot telemetry (counts only)
+
+| | Boot #1 (cycle-07 head) | Boot #2 (integrated head) |
+|---|---|---|
+| host handshake / fence page | ready / registered | ready / registered |
+| `d3dmetal_fallback_count` | 0 | 0 |
+| host D3D12 device created | **yes (defect)** | **no** (`creation_attempts=0`) |
+| D3D12.X device | created (v0x20004) | created (v0x20004) |
+| native submissions / frames presented | 0 / 0 | **2 / 2** (`graphics_status=0`, `present_status=0`) |
+| host p50 / p95 | — | 0.008 / 2.873 ms |
+| guest p50 / p95 / fps sample | — | 0.400 / 3.952 ms / 167.7 |
+| producer refusals | 1 (`ClearRenderTargetView` before targets) | 0 |
+| target texts with no host code | 1 (2560x1440, DXGI 10) | 1 (640x360, DXGI 62) after DXGI 10 and 42 registered |
+| buffers created before the resolver | 6 (largest 182,452,224 B) | 6 (unchanged) |
+| furthest milestone | first present attempt, then title assert | two frames presented, then title assert on the next resource |
+| teardown | 0 survivors | 0 survivors |
+
+Intermediate boots located the two defects that dominated the cycle: an empty
+`Close` consumed a sequence and was then dropped (host answered `protocol
+violation: submission sequence is not the next expected value` at frame 586), and
+the guest still created a host D3D12 device. Both are fixed above.
+
+### 8.3 Why the title still stops
+
+The title probes resource classes in order. DXGI 10 (FP16 present) and DXGI 42
+(R32_UINT storage, 1280x720) now register; DXGI 62 (640x360, UAV flag) does not,
+device creation returns `E_FAIL`, and the title raises its own breakpoint
+(`0x80000003`) and then faults inside Wine's crash logger. This is a format-table
+completeness problem, not an architectural one: the guest maps nine formats and
+the host decodes eleven.
+
+### 8.4 Counts at the integration head
+
+- `victory-gpu` lib **268 passed / 0 failed / 1 ignored**;
+  `victory-metal` lib **294 / 0 / 5**; `victory-shader` **254 / 0 / 2**
+  (+ integration 3 / 0 / 1); `victory-hle` under Wine **180 / 0 / 1** plus two
+  targeted single-test runs; `victory` bin **16 / 0 / 0**.
+- Harness: `test-gpu-lock.sh` and `test-process-hygiene.sh` exit 0.
+- Win64 `diag` build exit 0; `victory-metal`/`victory-hle` Windows all-targets and
+  `victory-gpu` (diagnostics) all-targets exit 0; Win64 `victory-irconverter`
+  exit 0.
+- `aaa-preboot-gate.sh --runs 1` exit 0, `status=PASS`, `not_observed=none`,
+  `d3dmetal_fallback_count=0`, checksum `11527919792119713699` unchanged,
+  p50 0.931 ms (measured while three workers were compiling).
+
+### 8.5 Remaining gaps (honest)
+
+- **Two frames, not a world.** No geometry, materials, streaming or controls have
+  been validated; the two frames are the title's first presented submissions, and
+  no frame checksum is read back in title mode (`present_checksum=-1`).
+- **The title still aborts** on the third unmapped resource format (DXGI 62). The
+  next cycle should replace the incremental format mapping with one complete
+  DXGI-to-host table and prove it against the title's probe order.
+- **Six buffers are created before the guest range resolver exists.** Their first
+  bind is refused unless a later bind resolves again; the 182 MB allocation is
+  the first thing to watch once frames advance.
+- **DStorage creates duplicate queues** for the same source (eleven identical
+  queue descriptions in one startup); not fatal, unexplained.
+- **Wire replies carry no failure text.** The Metal reason reaches host telemetry
+  and tracing only; the guest shows a bare `ExecutionFailed`. A bounded reason
+  frame is the follow-up.
+- **Retail shader translation is unexercised.** No title pipeline reached the
+  converter in these boots; the 19/21 mesh-pair and 111 compute census remains
+  historical.
