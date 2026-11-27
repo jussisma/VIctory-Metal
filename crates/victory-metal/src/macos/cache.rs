@@ -112,6 +112,8 @@ const KEY_MAGIC: &[u8; 4] = b"VTCK";
 const ENTRY_MAGIC: &[u8; 4] = b"VTCE";
 const REFLECTION_MAGIC: &[u8; 4] = b"VTRF";
 const ABSENT_ROOT_LAYOUT_DOMAIN: &[u8] = b"victory-metal/root-layout/absent/v1";
+/// Domain separation for [`archive_content_key`].
+const ARCHIVE_KEY_DOMAIN: &[u8] = b"victory-metal/binary-archive-key/v1";
 const ENTRY_HEADER_BYTES: usize = 88;
 const ENTRY_TRAILER_BYTES: usize = 32;
 
@@ -128,6 +130,41 @@ pub fn root_layout_hash(root_signature: Option<&[u8]>) -> [u8; 32] {
         Some(bytes) => blake3_bytes(bytes),
         None => blake3_bytes(ABSENT_ROOT_LAYOUT_DOMAIN),
     }
+}
+
+/// Content key for a persistent `MTLBinaryArchive` entry.
+///
+/// The key is `BLAKE3` over a fixed domain separator followed by
+/// length-prefixed `metallib` bytes, the entry-point name and the caller's
+/// pipeline `state` bytes. Length prefixes keep `metallib = b"ab", entry = "c"`
+/// distinct from `metallib = b"a", entry = "bc"`.
+///
+/// This is the single key builder for binary archives: `macos::binary_archive`
+/// calls it instead of re-implementing the hash layout, so the on-disk archive
+/// identity can be reproduced by any process.
+pub fn archive_content_key(metallib: &[u8], entry: &str, state: &[u8]) -> [u8; 32] {
+    let mut out = Vec::with_capacity(ARCHIVE_KEY_DOMAIN.len() + 32 + metallib.len() + state.len());
+    out.extend_from_slice(ARCHIVE_KEY_DOMAIN);
+    push_u64(
+        &mut out,
+        u64::try_from(metallib.len()).expect("metallib length exceeds u64"),
+    );
+    out.extend_from_slice(metallib);
+    push_string(&mut out, entry);
+    push_u64(
+        &mut out,
+        u64::try_from(state.len()).expect("state length exceeds u64"),
+    );
+    out.extend_from_slice(state);
+    blake3_bytes(&out)
+}
+
+/// Lowercase hexadecimal rendering of a 32-byte digest.
+///
+/// Public so path construction for content-addressed artifacts is shared with
+/// [`TranslationKey::digest_hex`] instead of copied.
+pub fn hash_hex(hash: &[u8; 32]) -> String {
+    hex(hash)
 }
 
 /// Translation options that can change converter output.
@@ -700,6 +737,10 @@ fn push_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 fn push_hash(out: &mut Vec<u8>, hash: &[u8; 32]) {
     push_u32(out, 32);
     out.extend_from_slice(hash);
@@ -960,6 +1001,23 @@ mod tests {
             blake3_bytes(b"victory-metal/root-layout/absent/v1")
         );
         assert_ne!(root_layout_hash(None), root_layout_hash(Some(b"")));
+    }
+
+    #[test]
+    fn archive_content_key_binds_metallib_entry_and_state() {
+        let base = archive_content_key(b"METALLIB", "main", b"state-v1");
+        assert_eq!(base, archive_content_key(b"METALLIB", "main", b"state-v1"));
+        assert_eq!(hash_hex(&base), hex(&base));
+        assert_eq!(hash_hex(&base).len(), 64);
+
+        assert_ne!(base, archive_content_key(b"METALLIB2", "main", b"state-v1"));
+        assert_ne!(base, archive_content_key(b"METALLIB", "main2", b"state-v1"));
+        assert_ne!(base, archive_content_key(b"METALLIB", "main", b"state-v2"));
+        // Length prefixes keep the field boundary unambiguous.
+        assert_ne!(
+            archive_content_key(b"ab", "c", b""),
+            archive_content_key(b"a", "bc", b"")
+        );
     }
 
     #[test]
