@@ -1,13 +1,14 @@
 //! Standalone ARM64 `victory-metal-host` daemon (ADR-016).
 //!
-//! The daemon owns one [`victory_metal::ipc_host::IpcHost`] session at a time
-//! around a real [`victory_metal::DirectMetalTransport`]. A guest started with
-//! `VICTORY_BACKEND=metal` auto-connects to the loopback listener, authenticates
-//! with the shared secret, registers its file-backed allocations and submits
-//! Wire v3 work directly to the native Metal device. No Wine, D3D12 or D3DMetal
-//! component is loaded or required: the only native libraries touched are Metal
-//! and the C runtime, and startup refuses to continue if a D3DMetal image is
-//! already mapped into the process.
+//! The daemon owns one shared [`victory_metal::DirectMetalTransport`] and one
+//! [`victory_metal::ipc_host::IpcHost`] session per accepted loopback
+//! connection (ADR-041). A guest started with `VICTORY_BACKEND=metal`
+//! auto-connects to the loopback listener, authenticates with the shared
+//! secret, registers its file-backed allocations and submits Wire v3 work
+//! directly to the native Metal device. No Wine, D3D12 or D3DMetal component is
+//! loaded or required: the only native libraries touched are Metal and the C
+//! runtime, and startup refuses to continue if a D3DMetal image is already
+//! mapped into the process.
 //!
 //! # Startup contract
 //!
@@ -37,8 +38,11 @@
 //!
 //! `--port 0` selects an ephemeral loopback port. `--once` serves one session
 //! and exits, which is what the launcher and the tests use. Without `--once`
-//! the daemon keeps accepting sessions, each with a fresh sequence space and
-//! allocation registry.
+//! the daemon keeps accepting sessions, each on its own thread with a fresh
+//! sequence space and allocation registry, up to
+//! [`MAX_CONCURRENT_SESSIONS`] at once. The guest's render connection and its
+//! dedicated pipeline-translation connection are therefore both served; every
+//! session shares the one native device and the content-pipeline handle space.
 //!
 //! The share directory is launcher-owned and holds the allocation `.bin` files,
 //! the optional `gpu-fence.v1.page`, and the `--frame-gate` pipeline ids. It is
@@ -82,7 +86,9 @@
 //! Session counters are copied from `IpcHost::session_stats()` after
 //! `serve_once` returns, so an abnormal disconnect still reports how many
 //! submissions the host answered. A GPU `ExecutionFailed` is an ordinary reply
-//! and keeps the daemon serving; only a transport/protocol error is fatal.
+//! and keeps the daemon serving. With concurrent sessions a transport/protocol
+//! failure ends only that connection; it is logged and kept in `last_error`,
+//! while `--once` still exits non-zero for its single session.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
@@ -187,6 +193,13 @@ const GRAPHICS_PIPELINE_FILE: &str = "victory-metal-host.graphics.id";
 /// Per-read/per-write timeout of one authenticated session. A guest that stops
 /// talking cannot pin the daemon forever.
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded concurrent sessions (ADR-041).
+///
+/// One render session plus one dedicated pipeline-translation session is the
+/// expected production pair; four leaves room for a reconnect overlap while a
+/// closed peer is still unwinding. A peer over the cap is refused with a named
+/// reason instead of waiting for a free slot.
+const MAX_CONCURRENT_SESSIONS: usize = 4;
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> ExitCode {
@@ -353,20 +366,26 @@ use std::ffi::{c_char, CStr};
 #[cfg(target_os = "macos")]
 use std::fs::{self, OpenOptions};
 #[cfg(target_os = "macos")]
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 #[cfg(target_os = "macos")]
 use std::process;
 #[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 use victory_metal::fence_page::FencePageMapping;
 #[cfg(target_os = "macos")]
-use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost, PipelineStageLibrary};
+use victory_metal::ipc_host::{
+    BatchExecutor, HostSecret, IpcHost, PipelineStageLibrary, SessionStats,
+};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat};
 #[cfg(target_os = "macos")]
@@ -862,13 +881,19 @@ fn write_pipeline_id(share: &Path, name: &str, id: u64) -> Result<(), String> {
         .map_err(|error| format!("cannot sync {}: {error}", path.display()))
 }
 
+/// Opens the one native device the daemon shares across sessions, and
+/// registers the optional frame-gate pipelines once.
+///
+/// Every connection gets its own [`IpcHost`] session, but all of them submit
+/// through this transport: a pipeline translated on the dedicated pipeline
+/// connection must be resolvable by the render connection, so the device
+/// registry cannot be per connection.
 #[cfg(target_os = "macos")]
-fn build_executor(
+fn open_transport(
     share: &Path,
     frame_gate: bool,
     stats: &Arc<Mutex<Stats>>,
-    window: Option<Arc<Mutex<NativeWindow>>>,
-) -> Result<(DaemonExecutor, Arc<DirectMetalTransport>), String> {
+) -> Result<Arc<DirectMetalTransport>, String> {
     let transport = Arc::new(
         DirectMetalTransport::new()
             .map_err(|error| format!("cannot open the Metal device: {error}"))?,
@@ -901,8 +926,17 @@ fn build_executor(
             ("graphics".to_string(), graphics.0),
         ];
     }
-    let executor = DaemonExecutor::new(Arc::clone(&transport), Arc::clone(stats), window);
-    Ok((executor, transport))
+    Ok(transport)
+}
+
+/// One per-connection executor over the daemon's shared device.
+#[cfg(target_os = "macos")]
+fn build_executor(
+    transport: &Arc<DirectMetalTransport>,
+    stats: &Arc<Mutex<Stats>>,
+    window: Option<Arc<Mutex<NativeWindow>>>,
+) -> DaemonExecutor {
+    DaemonExecutor::new(Arc::clone(transport), Arc::clone(stats), window)
 }
 
 #[cfg(target_os = "macos")]
@@ -912,6 +946,94 @@ fn pipeline_id(stats: &Stats, name: &str) -> u64 {
         .iter()
         .find(|(label, _)| label == name)
         .map_or(0, |(_, id)| *id)
+}
+
+/// Publishes one finished session's counters into the shared daemon stats.
+///
+/// Called exactly once per accepted connection, under the one `stats` mutex,
+/// whether `serve_once` returned a summary or an error. The accumulation is the
+/// pre-ADR-041 block, unchanged: sessions and submission/refusal totals add,
+/// the allocation snapshot and pool status are the newest session's.
+#[cfg(target_os = "macos")]
+fn publish_session_stats(stats: &Arc<Mutex<Stats>>, session: &SessionStats) {
+    let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+    stats.sessions = stats.sessions.saturating_add(1);
+    stats.submissions = stats.submissions.saturating_add(session.submissions);
+    stats.refused = stats.refused.saturating_add(session.refused_submissions);
+    stats.allocations = session.allocations;
+    stats.bytes_mapped = session.bytes_mapped;
+    if let Some(error) = &session.last_error {
+        stats.last_error = Some(error.clone());
+    }
+    stats.host_pipeline_translations_ok = stats
+        .host_pipeline_translations_ok
+        .saturating_add(session.host_pipeline_translations_ok);
+    stats.host_pipeline_translations_refused = stats
+        .host_pipeline_translations_refused
+        .saturating_add(session.host_pipeline_translations_refused);
+    stats.host_pipeline_cache_hits = stats
+        .host_pipeline_cache_hits
+        .saturating_add(session.host_pipeline_cache_hits);
+    for (index, count) in session.host_translated_stages.iter().enumerate() {
+        stats.host_translated_stages[index] =
+            stats.host_translated_stages[index].saturating_add(*count);
+    }
+    if let Some(reason) = &session.host_translation_reason {
+        stats.host_translation_reason = Some(reason.clone());
+    }
+    stats.pool_status = session.pool_status;
+    stats.pool = session.pool;
+}
+
+/// Serves one accepted connection to completion on the calling thread.
+///
+/// This is the whole per-connection transaction: one executor, one [`IpcHost`]
+/// and one stream. The daemon gives each connection its own thread, so two
+/// peers' frames never interleave and a slow pipeline translation is confined
+/// to its own session.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn serve_session(
+    stream: TcpStream,
+    peer: SocketAddr,
+    share: &Path,
+    secret: HostSecret,
+    stats: &Arc<Mutex<Stats>>,
+    transport: &Arc<DirectMetalTransport>,
+    window: Option<Arc<Mutex<NativeWindow>>>,
+    pipeline_handles: &Arc<AtomicU64>,
+    aaa_frame: bool,
+) -> Result<(), String> {
+    let executor = build_executor(transport, stats, window);
+    let mut host = IpcHost::new(secret, share, executor)
+        .map_err(|error| format!("cannot start the session for {peer}: {error}"))?
+        .with_io_timeout(SESSION_IO_TIMEOUT)
+        .with_content_pipeline_handles(Arc::clone(pipeline_handles));
+
+    let session = host.serve_once(stream);
+    // Publish session counters even when `serve_once` returned a protocol or
+    // transport error: Boot #1 reached sequence 586 and telemetry still
+    // reported `sessions=0, submissions=0` because this copy only ran on `Ok`.
+    // A GPU `ExecutionFailed` is an answered reply (`Ok(summary)`), not this
+    // error path.
+    let session_stats = host.session_stats();
+    publish_session_stats(stats, &session_stats);
+    if aaa_frame {
+        read_back_present(transport.as_ref(), stats);
+    }
+    host.release_all();
+    drop(host);
+
+    // An asynchronous v3 fault is observed by the completion handler after the
+    // reply; prefer the newest diagnostic when present.
+    if let Some(failure) = transport.last_gpu_failure() {
+        let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+        stats.last_error = Some(failure);
+    }
+
+    session
+        .map(|_| ())
+        .map_err(|error| format!("session from {peer} failed: {error}"))
 }
 
 /// Reads the last registered present texture back as RGBA8 and records its
@@ -1207,14 +1329,14 @@ fn run(args: Args) -> Result<(), String> {
         None => None,
     };
 
-    // Build the first session's executor (and its frame-gate pipeline ids)
-    // before the banner, so a launcher that waits for `ready` can read them.
-    let mut prepared = Some(build_executor(
-        &share.path,
-        args.frame_gate,
-        &stats,
-        window.clone(),
-    )?);
+    // Open the one device every connection will share and register the
+    // frame-gate pipelines before the banner, so a launcher that waits for
+    // `ready` can read their ids.
+    let transport = open_transport(&share.path, args.frame_gate, &stats)?;
+    // One content-pipeline handle space for every session: a pipeline
+    // translated on the dedicated pipeline connection must not collide with a
+    // handle the render session minted in the shared device registry.
+    let pipeline_handles = Arc::new(AtomicU64::new(1));
 
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, args.port)))
         .map_err(|error| format!("cannot bind 127.0.0.1:{}: {error}", args.port))?;
@@ -1250,7 +1372,13 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|error| format!("cannot flush the ready banner: {error}"))?;
 
     let mut outcome = Ok(());
+    let mut sessions: Vec<thread::JoinHandle<()>> = Vec::new();
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
+        // Reap finished session handles so a long-lived daemon does not grow
+        // one `JoinHandle` per connection forever.
+        sessions.retain(|session| !session.is_finished());
+
         let (stream, peer) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1260,89 +1388,74 @@ fn run(args: Args) -> Result<(), String> {
             }
         };
         if !peer.ip().is_loopback() {
-            outcome = Err(format!("refused a non-loopback peer {peer}"));
-            break;
+            // Binding is loopback-only, so this cannot normally happen; refuse
+            // the one peer instead of taking the daemon down for every session.
+            eprintln!("victory-metal-host: refused a non-loopback peer {peer}");
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
         }
 
-        let (executor, transport) = match prepared.take() {
-            Some(pair) => pair,
-            None => match build_executor(&share.path, args.frame_gate, &stats, window.clone()) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    outcome = Err(error);
-                    break;
-                }
-            },
-        };
-
-        let mut host = match IpcHost::new(args.secret, &share.path, executor) {
-            Ok(host) => host.with_io_timeout(SESSION_IO_TIMEOUT),
-            Err(error) => {
-                outcome = Err(format!("cannot start the session: {error}"));
-                break;
-            }
-        };
-
-        let session = host.serve_once(stream);
-        // Publish session counters even when `serve_once` returned a protocol or
-        // transport error: Boot #1 reached sequence 586 and telemetry still
-        // reported `sessions=0, submissions=0` because this copy only ran on
-        // `Ok`. A GPU `ExecutionFailed` is an answered reply (`Ok(summary)`),
-        // not this error path.
-        let session_stats = host.session_stats();
-        {
-            let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
-            stats.sessions = stats.sessions.saturating_add(1);
-            stats.submissions = stats.submissions.saturating_add(session_stats.submissions);
-            stats.refused = stats.refused.saturating_add(session_stats.refused_submissions);
-            stats.allocations = session_stats.allocations;
-            stats.bytes_mapped = session_stats.bytes_mapped;
-            if let Some(error) = session_stats.last_error {
-                stats.last_error = Some(error);
-            }
-            stats.host_pipeline_translations_ok = stats
-                .host_pipeline_translations_ok
-                .saturating_add(session_stats.host_pipeline_translations_ok);
-            stats.host_pipeline_translations_refused = stats
-                .host_pipeline_translations_refused
-                .saturating_add(session_stats.host_pipeline_translations_refused);
-            stats.host_pipeline_cache_hits = stats
-                .host_pipeline_cache_hits
-                .saturating_add(session_stats.host_pipeline_cache_hits);
-            for (index, count) in session_stats.host_translated_stages.iter().enumerate() {
-                stats.host_translated_stages[index] =
-                    stats.host_translated_stages[index].saturating_add(*count);
-            }
-            if let Some(reason) = session_stats.host_translation_reason {
-                stats.host_translation_reason = Some(reason);
-            }
-            stats.pool_status = session_stats.pool_status;
-            stats.pool = session_stats.pool;
-            // An asynchronous v3 fault is observed by the completion handler
-            // after the reply; prefer the newest diagnostic when present.
-            if let Some(failure) = transport.last_gpu_failure() {
-                stats.last_error = Some(failure);
-            }
-        }
-        if args.aaa_frame {
-            read_back_present(transport.as_ref(), &stats);
-        }
-        host.release_all();
-        drop(host);
-
-        match session {
-            Ok(_) => {}
-            // A framing/sequence/transport failure ends the session non-zero;
-            // a GPU refusal is answered with ExecutionFailed and stays here.
-            Err(error) => {
-                outcome = Err(format!("session failed: {error}"));
-                break;
-            }
-        }
-
+        // `--once` keeps its documented meaning: serve exactly one connection
+        // on this thread, then exit. Its failure is the daemon's exit status.
         if args.once {
+            outcome = serve_session(
+                stream,
+                peer,
+                &share.path,
+                args.secret,
+                &stats,
+                &transport,
+                window.clone(),
+                &pipeline_handles,
+                args.aaa_frame,
+            );
             break;
         }
+
+        if active.load(Ordering::Acquire) >= MAX_CONCURRENT_SESSIONS {
+            eprintln!(
+                "victory-metal-host: refused a concurrent session from {peer}: \
+                 {MAX_CONCURRENT_SESSIONS} sessions already active"
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
+        }
+        active.fetch_add(1, Ordering::AcqRel);
+
+        let stats = Arc::clone(&stats);
+        let transport = Arc::clone(&transport);
+        let pipeline_handles = Arc::clone(&pipeline_handles);
+        let active = Arc::clone(&active);
+        let window = window.clone();
+        let share_path = share.path.clone();
+        let secret = args.secret;
+        let aaa_frame = args.aaa_frame;
+        sessions.push(thread::spawn(move || {
+            let result = serve_session(
+                stream,
+                peer,
+                &share_path,
+                secret,
+                &stats,
+                &transport,
+                window,
+                &pipeline_handles,
+                aaa_frame,
+            );
+            if let Err(error) = result {
+                // One peer's protocol or transport failure must not stop the
+                // other sessions, so it is recorded and logged instead.
+                {
+                    let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
+                    stats.last_error = Some(one_line(&error));
+                }
+                eprintln!("victory-metal-host: {error}");
+            }
+            active.fetch_sub(1, Ordering::AcqRel);
+        }));
+    }
+    for session in sessions {
+        let _ = session.join();
     }
 
     // `--once` teardown must not hang: closing the window is a synchronous
