@@ -78,10 +78,15 @@
 //! `d3dmetal_fallback_count` (always `0` on this path), the observed D3DMetal
 //! image list, and `frame_probe`. `frame_probe` is `null` unless
 //! `VICTORY_METAL_FRAME_PROBE` opts into the presented-frame probe
-//! (`=1`); it then reports `non_black_pixels`, `unique_luma_buckets`,
-//! `frame_crc`, `sampled_frames`, `probe_pixels`, `last_sampled_frame`,
-//! `dropped_samples`, `fallback_clear`, `probe_every` and a named `failure`.
-//! A write failure is reported, never silently ignored.
+//! (`=1`); it then reports the probe's whole last-sample record:
+//! `sampled_frames`, `probe_pixels`, `last_sampled_frame`, `non_black_pixels`,
+//! `unique_luma_buckets`, `uniform_color` (a name, or `null` before any
+//! sample), `nonzero_bytes`, `frame_crc`, `sample_cost_us`, `dropped_samples`,
+//! `fallback_clear`, `probe_every` and a named `failure` — so a later cycle
+//! reads the probe from telemetry.json alone instead of parsing host.log. The
+//! object has that same key set when the probe was opted into but never
+//! sampled (`failure: "probe_not_sampled"`). A write failure is reported,
+//! never silently ignored.
 //!
 //! Session counters are copied from `IpcHost::session_stats()` after
 //! `serve_once` returns, so an abnormal disconnect still reports how many
@@ -1098,6 +1103,30 @@ fn json_escape(text: &str) -> String {
 #[cfg(target_os = "macos")]
 fn frame_probe_json() -> String {
     let report = victory_metal::macos::present::frame_probe_report();
+    let opted_in = victory_metal::macos::present::FrameProbeConfig::from_env();
+    frame_probe_json_for(report.as_ref(), opted_in.map(|config| config.every))
+}
+
+/// Serialises one probe report, or the not-sampled object, with the same key
+/// set in both cases (ADR-049).
+///
+/// This is the pure half of [`frame_probe_json`]: it takes the report and the
+/// opted-in interval explicitly so a unit test can pin every key for the
+/// sampled and the never-sampled case without touching the environment or the
+/// process-wide probe cell.
+///
+/// The object always carries all thirteen fields of
+/// [`victory_metal::macos::present::FrameProbeReport`] that telemetry needs:
+/// `sampled_frames`, `probe_pixels`, `last_sampled_frame`, `non_black_pixels`,
+/// `unique_luma_buckets`, `uniform_color`, `nonzero_bytes`, `frame_crc`,
+/// `sample_cost_us`, `dropped_samples`, `fallback_clear`, `probe_every` and
+/// `failure`. `uniform_color` is a string once a sample named a colour and
+/// `null` before that (`FrameProbeReport`'s pre-sample default).
+#[cfg(target_os = "macos")]
+fn frame_probe_json_for(
+    report: Option<&victory_metal::macos::present::FrameProbeReport>,
+    opted_in_every: Option<u64>,
+) -> String {
     match report {
         Some(report) => {
             let failure = report.failure.as_deref().map_or_else(
@@ -1107,6 +1136,15 @@ fn frame_probe_json() -> String {
             let last_frame = report
                 .last_sampled_frame
                 .map_or_else(|| "null".to_string(), |frame| frame.to_string());
+            // The pre-sample value means no colour was named yet: JSON says
+            // null rather than inventing one. No sampled colour can be "none".
+            let uniform_color = if report.uniform_color
+                == victory_metal::macos::present::FRAME_PROBE_NO_UNIFORM_COLOR
+            {
+                "null".to_string()
+            } else {
+                format!("\"{}\"", json_escape(&report.uniform_color))
+            };
             format!(
                 concat!(
                     "{{",
@@ -1115,7 +1153,10 @@ fn frame_probe_json() -> String {
                     "\"last_sampled_frame\": {}, ",
                     "\"non_black_pixels\": {}, ",
                     "\"unique_luma_buckets\": {}, ",
+                    "\"uniform_color\": {}, ",
+                    "\"nonzero_bytes\": {}, ",
                     "\"frame_crc\": {}, ",
+                    "\"sample_cost_us\": {}, ",
                     "\"dropped_samples\": {}, ",
                     "\"fallback_clear\": {}, ",
                     "\"probe_every\": {}, ",
@@ -1127,23 +1168,36 @@ fn frame_probe_json() -> String {
                 last_frame,
                 report.non_black_pixels,
                 report.unique_luma_buckets,
+                uniform_color,
+                report.nonzero_bytes,
                 report.frame_crc,
+                report.sample_cost_us,
                 report.dropped_samples,
                 report.fallback_clear,
                 report.probe_every,
                 failure,
             )
         }
-        None => match victory_metal::macos::present::FrameProbeConfig::from_env() {
-            Some(config) => format!(
+        None => match opted_in_every {
+            Some(every) => format!(
                 concat!(
-                    "{{\"sampled_frames\": 0, \"probe_pixels\": 0, ",
-                    "\"last_sampled_frame\": null, \"non_black_pixels\": 0, ",
-                    "\"unique_luma_buckets\": 0, \"frame_crc\": 0, ",
-                    "\"dropped_samples\": 0, \"fallback_clear\": false, ",
-                    "\"probe_every\": {}, \"failure\": \"probe_not_sampled\"}}"
+                    "{{",
+                    "\"sampled_frames\": 0, ",
+                    "\"probe_pixels\": 0, ",
+                    "\"last_sampled_frame\": null, ",
+                    "\"non_black_pixels\": 0, ",
+                    "\"unique_luma_buckets\": 0, ",
+                    "\"uniform_color\": null, ",
+                    "\"nonzero_bytes\": 0, ",
+                    "\"frame_crc\": 0, ",
+                    "\"sample_cost_us\": 0, ",
+                    "\"dropped_samples\": 0, ",
+                    "\"fallback_clear\": false, ",
+                    "\"probe_every\": {}, ",
+                    "\"failure\": \"probe_not_sampled\"",
+                    "}}"
                 ),
-                config.every
+                every
             ),
             None => "null".to_string(),
         },
@@ -1577,5 +1631,157 @@ impl Clone for Stats {
             pool_status: self.pool_status,
             pool: self.pool,
         }
+    }
+}
+
+/// Hermetic proofs for the folded `frame_probe` telemetry object (ADR-049).
+///
+/// The test builds reports directly instead of running a window or a Metal
+/// device, so it is a pure key-set and serialisation contract.
+#[cfg(all(test, target_os = "macos"))]
+mod frame_probe_json_tests {
+    use super::*;
+    use victory_metal::macos::present::{FRAME_PROBE_DEFAULT_EVERY, FrameProbeReport};
+
+    /// Every key `frame_probe` must carry, in the emitted order.
+    const PROBE_KEYS: [&str; 13] = [
+        "sampled_frames",
+        "probe_pixels",
+        "last_sampled_frame",
+        "non_black_pixels",
+        "unique_luma_buckets",
+        "uniform_color",
+        "nonzero_bytes",
+        "frame_crc",
+        "sample_cost_us",
+        "dropped_samples",
+        "fallback_clear",
+        "probe_every",
+        "failure",
+    ];
+
+    /// The object's keys in order: every quoted token followed by a colon.
+    ///
+    /// Values here are numbers, `null`, booleans or short plain strings, so a
+    /// value can never look like a key (no embedded `":`), and scanning for
+    /// `"name":` is enough for a key-set assertion.
+    fn object_keys(json: &str) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let mut keys = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                let start = index + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    if json[end + 1..].trim_start().starts_with(':') {
+                        keys.push(json[start..end].to_string());
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        keys
+    }
+
+    /// A one-line, balanced JSON object with exactly `PROBE_KEYS`.
+    fn assert_complete_probe_object(json: &str) {
+        assert!(!json.contains('\n'), "one line: {json}");
+        assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+        assert_eq!(object_keys(json), PROBE_KEYS, "{json}");
+    }
+
+    /// A sampled report folds every new field into the object. The values are
+    /// the marker numbers, so a field wired to the wrong report member fails.
+    #[test]
+    fn the_sampled_probe_json_carries_every_report_field() {
+        let report = FrameProbeReport {
+            sampled_frames: 7,
+            probe_pixels: 4096,
+            last_sampled_frame: Some(180),
+            non_black_pixels: 12,
+            unique_luma_buckets: 3,
+            frame_crc: 0x0123_4567_89AB_CDEF,
+            dropped_samples: 2,
+            fallback_clear: false,
+            probe_every: 60,
+            failure: None,
+            uniform_color: "transparent_black".to_string(),
+            sample_cost_us: 42,
+            nonzero_bytes: 0,
+            ..Default::default()
+        };
+
+        let json = frame_probe_json_for(Some(&report), None);
+        assert_complete_probe_object(&json);
+        for expected in [
+            "\"sampled_frames\": 7",
+            "\"probe_pixels\": 4096",
+            "\"last_sampled_frame\": 180",
+            "\"non_black_pixels\": 12",
+            "\"unique_luma_buckets\": 3",
+            "\"uniform_color\": \"transparent_black\"",
+            "\"nonzero_bytes\": 0",
+            "\"frame_crc\": 81985529216486895",
+            "\"sample_cost_us\": 42",
+            "\"dropped_samples\": 2",
+            "\"fallback_clear\": false",
+            "\"probe_every\": 60",
+            "\"failure\": null",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+
+    /// A report that never named a colour emits `uniform_color: null` (not the
+    /// internal `none` placeholder) without dropping the key.
+    #[test]
+    fn an_unnamed_uniform_color_is_json_null_not_a_placeholder() {
+        let report = FrameProbeReport::default();
+        let json = frame_probe_json_for(Some(&report), None);
+        assert_complete_probe_object(&json);
+        assert!(json.contains("\"uniform_color\": null"), "{json}");
+        assert!(!json.contains("\"none\""), "{json}");
+    }
+
+    /// The opted-in-but-never-sampled object has the identical key set, so a
+    /// reader never needs a second parser for a boot that presented no frame.
+    #[test]
+    fn the_not_sampled_probe_json_has_the_same_key_set() {
+        let json = frame_probe_json_for(None, Some(FRAME_PROBE_DEFAULT_EVERY));
+        assert_complete_probe_object(&json);
+        assert!(
+            json.contains("\"failure\": \"probe_not_sampled\""),
+            "{json}"
+        );
+        assert!(json.contains("\"uniform_color\": null"), "{json}");
+        assert!(json.contains("\"last_sampled_frame\": null"), "{json}");
+        assert!(json.contains("\"probe_every\": 60"), "{json}");
+        assert!(json.contains("\"nonzero_bytes\": 0"), "{json}");
+        assert!(json.contains("\"sample_cost_us\": 0"), "{json}");
+        assert!(json.contains("\"fallback_clear\": false"), "{json}");
+    }
+
+    /// No opt-in at all stays JSON `null`: the probe never ran and telemetry
+    /// says so instead of reporting a fabricated zero-sample object.
+    #[test]
+    fn no_probe_opt_in_serialises_as_json_null() {
+        assert_eq!(frame_probe_json_for(None, None), "null");
+    }
+
+    /// ADR-049 default: the probe samples every 60th presented frame.
+    #[test]
+    fn the_default_probe_interval_is_sixty_frames() {
+        assert_eq!(FRAME_PROBE_DEFAULT_EVERY, 60);
     }
 }

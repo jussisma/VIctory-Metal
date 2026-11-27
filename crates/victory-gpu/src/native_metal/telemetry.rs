@@ -9,6 +9,19 @@
 //! the frame line, so a heap the native path cannot serve is never a silent
 //! skip.
 //!
+//! # The bounded heap census (ADR-049)
+//!
+//! The session heap census holds no growable state: the distinct identities are a
+//! fixed `[Option<BoundHeap>; MAX_DISTINCT_HEAPS]`, the last bound set a fixed
+//! `[Option<BoundHeap>; MAX_HEAP_BINDINGS]`, and every count a saturating
+//! scalar. A boot that binds heaps four thousand frames long therefore reports
+//! the same byte size as its first frame, and the frame line keeps the two
+//! facts apart: `heaps_bound` is the number of *distinct* heap identities
+//! currently known (at most [`MAX_DISTINCT_HEAPS`]) while `heaps_bind_calls`
+//! is the saturating total of bound slots across every `SetDescriptorHeaps`
+//! call. The old line printed that total as `heaps_bound`, which is how a
+//! boot came to report ~41k heaps for a title that only ever used a few.
+//!
 //! # Named submission refusals
 //!
 //! [`FrameTelemetry::note_submit_refused`] takes a static reason from the fixed
@@ -49,7 +62,7 @@
 //! `1..=100` therefore answers exactly `50`, `95` and `99`; a single sample
 //! answers itself for every percentile; an empty window answers zero.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -435,9 +448,10 @@ pub const MAX_HEAP_BINDINGS: usize = 8;
 
 /// Maximum distinct heap identities the session census tracks.
 ///
-/// Heap addresses are not reused while a heap lives, so a boot binds a few
-/// dozen at most. The cap keeps the census bounded over a long session;
-/// `heaps_distinct` saturates there instead of growing without limit.
+/// The census stores them in a fixed array of this length, so memory does not
+/// depend on how many times a title binds: heap addresses are not reused while
+/// a heap lives, so a boot binds a few dozen at most, and `heaps_bound`
+/// saturates here instead of growing without limit.
 pub const MAX_DISTINCT_HEAPS: usize = 64;
 
 /// The static refusal classes of the descriptor-heap binding audit.
@@ -538,28 +552,37 @@ impl HeapBind {
 /// One point-in-time view of the descriptor-heap binding audit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeapBindingSnapshot {
-    /// Heap objects recorded as bound across every `SetDescriptorHeaps` call.
-    pub bindings: u64,
+    /// Bound slots across every `SetDescriptorHeaps` call, saturating.
+    ///
+    /// This is a count of bind *calls' slots*, not of heaps: a title that binds
+    /// the same two heaps every frame moves it by two per frame. The frame line
+    /// prints it as `heaps_bind_calls`.
+    pub bind_calls: u64,
     /// Slots refused with a static reason.
     pub refusals: u64,
     /// Distinct `(start, kind)` identities bound, saturating at
-    /// [`MAX_DISTINCT_HEAPS`].
+    /// [`MAX_DISTINCT_HEAPS`]. Printed as both `heaps_bound` and
+    /// `heaps_distinct`.
     pub distinct: u64,
     /// The last bound set's heaps, in bind order, at most
     /// [`MAX_HEAP_BINDINGS`].
     pub last: Vec<BoundHeap>,
-    /// Refusals by static class name (only the classes seen).
+    /// Refusals by static class name (at most [`HEAP_REFUSAL_NAMES`].len()).
     pub refusal_classes: BTreeMap<&'static str, u64>,
 }
 
 impl HeapBindingSnapshot {
     /// The heap fields of the `native frame telemetry` snapshot line:
-    /// `heaps_bound`, `heaps_distinct`, `heaps_last` and
+    /// `heaps_bound`, `heaps_distinct`, `heaps_bind_calls`, `heaps_last` and
     /// `heap_bind_refusals`.
+    ///
+    /// `heaps_bound` and `heaps_distinct` are the same bounded value; both
+    /// names are kept so an existing reader keeps working. `heaps_bind_calls`
+    /// is the saturating slot total and is never presented as a heap count.
     pub fn fields(&self) -> String {
         let mut text = format!(
-            "heaps_bound={} heaps_distinct={} heaps_last=[",
-            self.bindings, self.distinct
+            "heaps_bound={} heaps_distinct={} heaps_bind_calls={} heaps_last=[",
+            self.distinct, self.distinct, self.bind_calls
         );
         for (index, heap) in self.last.iter().enumerate() {
             if index > 0 {
@@ -574,29 +597,51 @@ impl HeapBindingSnapshot {
 }
 
 /// The session totals of the descriptor-heap binding audit.
-#[derive(Debug, Default)]
+///
+/// Every collection here is fixed-size: the two arrays are the whole identity
+/// and last-set storage, and the refusal classes are one of three static names,
+/// so the census is O(1) in memory and in time per `SetDescriptorHeaps` call
+/// regardless of how long the boot runs (ADR-049).
+#[derive(Debug)]
 struct HeapBindCensus {
-    bindings: u64,
+    bind_calls: u64,
     refusals: u64,
     refusal_classes: BTreeMap<&'static str, u64>,
-    distinct: BTreeSet<BoundHeap>,
-    last: Vec<BoundHeap>,
+    distinct: [Option<BoundHeap>; MAX_DISTINCT_HEAPS],
+    distinct_len: usize,
+    last: [Option<BoundHeap>; MAX_HEAP_BINDINGS],
+    last_len: usize,
+}
+
+impl Default for HeapBindCensus {
+    fn default() -> Self {
+        Self {
+            bind_calls: 0,
+            refusals: 0,
+            refusal_classes: BTreeMap::new(),
+            distinct: [None; MAX_DISTINCT_HEAPS],
+            distinct_len: 0,
+            last: [None; MAX_HEAP_BINDINGS],
+            last_len: 0,
+        }
+    }
 }
 
 impl HeapBindCensus {
     /// Counts one `SetDescriptorHeaps` call: bound heaps by identity, refused
     /// slots by their static class, and the call's bound set as `last`.
     fn record(&mut self, set: &[HeapBind]) {
-        let mut last = Vec::with_capacity(set.len().min(MAX_HEAP_BINDINGS));
+        // A set that bound nothing leaves an empty last set: the line never
+        // keeps a heap the title has since unbound.
+        self.last_len = 0;
         for bind in set {
             match *bind {
                 HeapBind::Bound(heap) => {
-                    self.bindings = self.bindings.saturating_add(1);
-                    if self.distinct.len() < MAX_DISTINCT_HEAPS {
-                        self.distinct.insert(heap);
-                    }
-                    if last.len() < MAX_HEAP_BINDINGS {
-                        last.push(heap);
+                    self.bind_calls = self.bind_calls.saturating_add(1);
+                    self.remember(heap);
+                    if self.last_len < MAX_HEAP_BINDINGS {
+                        self.last[self.last_len] = Some(heap);
+                        self.last_len += 1;
                     }
                 }
                 HeapBind::NullSlot => self.refuse(heap_refusals::NULL_SLOT),
@@ -606,9 +651,20 @@ impl HeapBindCensus {
                 }
             }
         }
-        // A set that bound nothing leaves an empty last set: the line never
-        // keeps a heap the title has since unbound.
-        self.last = last;
+    }
+
+    /// Adds `heap` to the distinct identities if it is not already known,
+    /// saturating at [`MAX_DISTINCT_HEAPS`]. Never grows an allocation.
+    fn remember(&mut self, heap: BoundHeap) {
+        let known = self.distinct[..self.distinct_len]
+            .iter()
+            .flatten()
+            .any(|seen| *seen == heap);
+        if known || self.distinct_len >= MAX_DISTINCT_HEAPS {
+            return;
+        }
+        self.distinct[self.distinct_len] = Some(heap);
+        self.distinct_len += 1;
     }
 
     fn refuse(&mut self, class: &'static str) {
@@ -622,10 +678,14 @@ impl HeapBindCensus {
 
     fn snapshot(&self) -> HeapBindingSnapshot {
         HeapBindingSnapshot {
-            bindings: self.bindings,
+            bind_calls: self.bind_calls,
             refusals: self.refusals,
-            distinct: self.distinct.len() as u64,
-            last: self.last.clone(),
+            distinct: self.distinct_len as u64,
+            last: self.last[..self.last_len]
+                .iter()
+                .flatten()
+                .copied()
+                .collect(),
             refusal_classes: self.refusal_classes.clone(),
         }
     }
@@ -1954,9 +2014,10 @@ mod tests {
         assert!(!line.contains('\n'), "the log line must stay one line: {line}");
     }
 
-    /// Binding 1, then 2, then 8 heaps records the counts, the distinct
+    /// Binding 1, then 2, then 8 heaps records the bind calls, the distinct
     /// identities and the last set in bind order. Repeating an identity in a
-    /// later set counts the binding but not a second distinct heap.
+    /// later set counts a bind call but not a second distinct heap, and
+    /// `heaps_bound` follows the distinct identities rather than the calls.
     #[test]
     fn heap_bindings_count_distinct_and_keep_the_last_set() {
         let telemetry = telemetry();
@@ -1969,7 +2030,7 @@ mod tests {
 
         telemetry.note_heap_bindings(&[view(0x1000)]);
         let snapshot = telemetry.heap_bindings();
-        assert_eq!((snapshot.bindings, snapshot.distinct), (1, 1));
+        assert_eq!((snapshot.bind_calls, snapshot.distinct), (1, 1));
         assert_eq!(
             snapshot.last,
             vec![BoundHeap {
@@ -1981,9 +2042,9 @@ mod tests {
         telemetry.note_heap_bindings(&[view(0x1000), view(0x2000)]);
         let snapshot = telemetry.heap_bindings();
         assert_eq!(
-            (snapshot.bindings, snapshot.distinct),
+            (snapshot.bind_calls, snapshot.distinct),
             (3, 2),
-            "a repeated heap counts once as a binding and not again as distinct"
+            "a repeated heap counts one bind call and not a second distinct heap"
         );
         assert_eq!(snapshot.last.len(), 2);
         assert_eq!(
@@ -2004,7 +2065,16 @@ mod tests {
         let eight: Vec<HeapBind> = (0..8).map(|i| view(0x3000 + i * 0x20)).collect();
         telemetry.note_heap_bindings(&eight);
         let snapshot = telemetry.heap_bindings();
-        assert_eq!((snapshot.bindings, snapshot.distinct), (11, 10));
+        assert_eq!((snapshot.bind_calls, snapshot.distinct), (11, 10));
+        assert_eq!(
+            snapshot.distinct, 10,
+            "heaps_bound is a count of heaps, not of bind calls"
+        );
+        let line = telemetry.snapshot().to_string();
+        assert!(
+            line.contains("heaps_bound=10 heaps_distinct=10 heaps_bind_calls=11"),
+            "{line}"
+        );
         let last: Vec<BoundHeap> = eight
             .iter()
             .map(|bind| match bind {
@@ -2029,7 +2099,7 @@ mod tests {
         ]);
 
         let snapshot = telemetry.heap_bindings();
-        assert_eq!(snapshot.bindings, 0);
+        assert_eq!(snapshot.bind_calls, 0);
         assert_eq!(snapshot.distinct, 0);
         assert!(snapshot.last.is_empty());
         assert_eq!(snapshot.refusals, 4);
@@ -2066,11 +2136,14 @@ mod tests {
         telemetry.note_heap_bindings(&[bind]);
         let snapshot = telemetry.heap_bindings();
         assert_eq!(
-            (snapshot.bindings, snapshot.distinct, snapshot.refusals),
+            (snapshot.bind_calls, snapshot.distinct, snapshot.refusals),
             (1, 1, 0)
         );
         let line = telemetry.snapshot().to_string();
-        assert!(line.contains("heaps_bound=1 heaps_distinct=1"), "{line}");
+        assert!(
+            line.contains("heaps_bound=1 heaps_distinct=1 heaps_bind_calls=1"),
+            "{line}"
+        );
         assert!(
             line.contains("heaps_last=[0000001000000000:views]"),
             "{line}"
@@ -2091,7 +2164,7 @@ mod tests {
         let second = telemetry.snapshot().to_string();
         assert_eq!(first, second, "the same census prints the same line");
         assert!(
-            first.contains("heaps_bound=12 heaps_distinct=12"),
+            first.contains("heaps_bound=12 heaps_distinct=12 heaps_bind_calls=12"),
             "{first}"
         );
         assert!(first.contains("heap_bind_refusals=0"), "{first}");
@@ -2105,6 +2178,113 @@ mod tests {
             pairs.starts_with("0000000000002000:samplers; 0000000000002020:views"),
             "{pairs}"
         );
+    }
+
+    /// The text with every run of ASCII digits collapsed to one `#`, so two
+    /// snapshots compare by shape rather than by the value of a scalar.
+    fn digit_shape(text: &str) -> String {
+        let mut shape = String::with_capacity(text.len());
+        let mut in_digits = false;
+        for character in text.chars() {
+            if character.is_ascii_digit() {
+                if !in_digits {
+                    shape.push('#');
+                    in_digits = true;
+                }
+            } else {
+                shape.push(character);
+                in_digits = false;
+            }
+        }
+        shape
+    }
+
+    /// ADR-049: the census is O(1) in memory for a whole boot. Ten thousand
+    /// binding sets over five heaps keep the distinct count at five, the last
+    /// set at its cap, and the snapshot's shape identical to the hundredth
+    /// set's; only the saturating `heaps_bind_calls` digits may differ. More
+    /// identities than the cap saturate instead of growing the census.
+    #[test]
+    fn the_heap_census_stays_bounded_over_a_whole_boot() {
+        let telemetry = telemetry();
+        let set: Vec<HeapBind> = (0..5u64)
+            .map(|index| {
+                HeapBind::Bound(BoundHeap {
+                    start: 0x1000 + index * 0x100,
+                    kind: if index == 0 {
+                        HeapKind::Samplers
+                    } else {
+                        HeapKind::Views
+                    },
+                })
+            })
+            .collect();
+
+        for _ in 0..100 {
+            telemetry.note_heap_bindings(&set);
+        }
+        let short_snapshot = telemetry.heap_bindings();
+        let short_line = telemetry.snapshot().to_string();
+
+        for _ in 100..10_000 {
+            telemetry.note_heap_bindings(&set);
+        }
+        let long_snapshot = telemetry.heap_bindings();
+        let long_line = telemetry.snapshot().to_string();
+
+        assert_eq!(short_snapshot.distinct, 5, "five identities, never calls");
+        assert_eq!(long_snapshot.distinct, 5);
+        assert!(long_snapshot.distinct <= MAX_DISTINCT_HEAPS as u64);
+        assert_eq!(short_snapshot.last.len(), 5);
+        assert_eq!(
+            long_snapshot.last.len(),
+            5,
+            "the last set is the five heaps"
+        );
+        assert!(long_snapshot.last.len() <= MAX_HEAP_BINDINGS);
+        assert_eq!(
+            long_snapshot.bind_calls, 50_000,
+            "the slot total still counts"
+        );
+        assert!(long_snapshot.refusal_classes.len() <= HEAP_REFUSAL_NAMES.len());
+
+        // The snapshot's collections and field names are identical at 100 and
+        // at 10,000 sets: only digits of scalar counters differ, and only the
+        // two added by `heaps_bind_calls` growing from three digits to five.
+        assert_eq!(
+            digit_shape(&short_line),
+            digit_shape(&long_line),
+            "the snapshot must not grow a field or a collection with frame count"
+        );
+        assert!(
+            long_line.len() - short_line.len() <= 2,
+            "the only allowed growth is the digits of a saturating counter: \
+             {} vs {} bytes",
+            short_line.len(),
+            long_line.len()
+        );
+
+        // More identities than the cap saturate instead of growing the census.
+        let wide: Vec<HeapBind> = (0..(MAX_DISTINCT_HEAPS as u64 + 36))
+            .map(|index| {
+                HeapBind::Bound(BoundHeap {
+                    start: 0x100_0000 + index * 0x20,
+                    kind: HeapKind::Views,
+                })
+            })
+            .collect();
+        telemetry.note_heap_bindings(&wide);
+        let capped = telemetry.heap_bindings();
+        assert_eq!(
+            capped.distinct, MAX_DISTINCT_HEAPS as u64,
+            "heaps_bound saturates at MAX_DISTINCT_HEAPS"
+        );
+        assert_eq!(
+            capped.last.len(),
+            MAX_HEAP_BINDINGS,
+            "heaps_last is capped at MAX_HEAP_BINDINGS"
+        );
+        assert_eq!(capped.bind_calls, 50_100);
     }
 
     #[test]

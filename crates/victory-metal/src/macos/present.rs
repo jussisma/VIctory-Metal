@@ -734,8 +734,19 @@ fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<
 pub const FRAME_PROBE_ENV: &str = "VICTORY_METAL_FRAME_PROBE";
 /// Environment variable that overrides the sampling interval.
 pub const FRAME_PROBE_EVERY_ENV: &str = "VICTORY_METAL_FRAME_PROBE_EVERY";
-/// Default sampling interval: one probe every 30 presented frames.
-pub const FRAME_PROBE_DEFAULT_EVERY: u64 = 30;
+/// Default sampling interval: one probe every 60 presented frames.
+///
+/// Cycle 13 measured about 1.39 ms per sampled frame at an interval of 30
+/// (about 4.6% of a 30 FPS frame budget); 60 halves that overhead while still
+/// sampling the first frame and every second after it. An explicit
+/// `VICTORY_METAL_FRAME_PROBE_EVERY` overrides this, and `0` is still rejected.
+pub const FRAME_PROBE_DEFAULT_EVERY: u64 = 60;
+
+/// The `uniform_color` value before any sample names a colour.
+///
+/// [`FrameProbeReport::default`] starts here, and the host serialises it as
+/// JSON `null` rather than pretending a colour was measured.
+pub const FRAME_PROBE_NO_UNIFORM_COLOR: &str = "none";
 /// A colour channel counts as content when it differs from the clear value by
 /// more than this many 8-bit steps (out of 255). The comparison is strict: a
 /// difference of exactly 8 is still considered clear. Alpha is not compared.
@@ -996,7 +1007,7 @@ impl Default for FrameProbeReport {
             mean_rgba: [0; 4],
             variance: 0,
             distinct_sample_values: 0,
-            uniform_color: "none".to_string(),
+            uniform_color: FRAME_PROBE_NO_UNIFORM_COLOR.to_string(),
             matches_diagnostic_clear: false,
             sample_cost_us: 0,
             pixel_format: 0,
@@ -3157,6 +3168,8 @@ mod tests {
     #[test]
     fn frame_probe_is_off_by_default_and_the_opt_in_is_explicit() {
         assert_eq!(FrameProbeConfig::from_values(None, None), None);
+        // ADR-049: the default sampling interval is 60 presented frames.
+        assert_eq!(FRAME_PROBE_DEFAULT_EVERY, 60);
         for off in ["", "0", "off", "false", "no", "  "] {
             assert_eq!(
                 FrameProbeConfig::from_values(Some(off), None),
@@ -3196,13 +3209,21 @@ mod tests {
 
     #[test]
     fn probe_schedule_samples_frame_zero_and_every_nth_frame() {
-        let sampled: Vec<u64> = (0..100).filter(|frame| probe_due(*frame, 30)).collect();
-        assert_eq!(sampled, vec![0, 30, 60, 90]);
+        let sampled: Vec<u64> = (0..100)
+            .filter(|frame| probe_due(*frame, FRAME_PROBE_DEFAULT_EVERY))
+            .collect();
+        assert_eq!(
+            sampled,
+            vec![0, 60],
+            "the default cadence samples frame 0 and every 60th frame after it"
+        );
         assert_eq!(
             sampled.last().copied(),
-            Some(90),
+            Some(60),
             "the report carries the last sampled frame index"
         );
+        let every_thirty: Vec<u64> = (0..100).filter(|frame| probe_due(*frame, 30)).collect();
+        assert_eq!(every_thirty, vec![0, 30, 60, 90]);
         assert!(probe_due(0, 1));
         assert!(probe_due(1, 1));
         assert!(!probe_due(0, 0), "zero interval must be inert");
