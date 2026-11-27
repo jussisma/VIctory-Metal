@@ -45,6 +45,10 @@ use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
 /// `MTLPixelFormatRGBA8Unorm`, the AAA frame colour-target format.
 const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
+/// `MTLPixelFormatRGBA16Float`, the title's FP16 present target. It is a
+/// displayable `CAMetalLayer` format on Apple silicon, so a 16F back-buffer is
+/// copied rather than replaced by the diagnostic clear.
+const MTL_PIXEL_FORMAT_RGBA16_FLOAT: usize = 115;
 /// `MTLStorageModeShared`; IOSurface-backed textures are CPU/GPU shared.
 const MTL_STORAGE_MODE_SHARED: usize = 0;
 /// `MTLTextureUsageShaderRead`.
@@ -70,6 +74,48 @@ const BYTES_PER_PIXEL: u32 = 4;
 const SURFACE_ROW_ALIGNMENT: usize = 64;
 /// Apple's maximum 2D texture edge.
 const MAX_SURFACE_DIMENSION: u32 = 16_384;
+
+/// `CGSize` (`CGFloat width, height`; `CGFloat` is `f64` on Apple silicon and
+/// x86-64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+/// Sets a `CAMetalLayer`'s drawable size, the extent of the next drawable.
+///
+/// # Safety
+///
+/// `layer` must be a live `CAMetalLayer` that owns no drawable.
+unsafe fn set_drawable_size(layer: objc::Id, width: u32, height: u32) {
+    type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, CGSize);
+    let send: Fn = unsafe { mem::transmute(objc::msg_send_entry()) };
+    // SAFETY: `layer` is live and `CGSize` is passed by value as the selector
+    // documents.
+    unsafe {
+        send(
+            layer,
+            objc::sel(c"setDrawableSize:"),
+            CGSize {
+                width: f64::from(width),
+                height: f64::from(height),
+            },
+        );
+    }
+}
+
+/// Whether a 4-channel format can back a `CAMetalLayer` drawable and a blit.
+///
+/// RGBA16Float is displayable on Apple silicon, so the title's FP16
+/// back-buffer is copied instead of silently replaced by the diagnostic clear.
+fn drawable_format_supported(format: usize) -> bool {
+    matches!(
+        format,
+        MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM | MTL_PIXEL_FORMAT_RGBA16_FLOAT
+    )
+}
 
 /// Frame pacing requested for one presented frame.
 ///
@@ -210,6 +256,10 @@ pub struct NativeSwapchain {
     /// Opt-in presented-frame probe. `None` (the default) adds no command
     /// buffer, no blit, no readback and no allocation to the present path.
     probe: Option<FrameProbe>,
+    /// Set once when a supplied back-buffer could not be copied into the
+    /// drawable, so the diagnostic fallback is named once instead of once per
+    /// frame.
+    fallback_reported: bool,
 }
 
 impl NativeSwapchain {
@@ -234,6 +284,7 @@ impl NativeSwapchain {
             width,
             height,
             probe,
+            fallback_reported: false,
         })
     }
 
@@ -284,14 +335,77 @@ impl NativeSwapchain {
 
     /// Presents the acquired drawable, optionally copying `source` into it.
     ///
-    /// The blit is GPU-only. A format or extent mismatch falls back to a
-    /// diagnostic clear so the window still shows live, non-black content
-    /// instead of stale memory.
+    /// The blit is GPU-only and never scales or converts: a source whose
+    /// extent or 4-channel format differs from the drawable first resizes the
+    /// `CAMetalLayer` drawable to the source's extent and format (the layer
+    /// scales the drawable into the view). This is what makes a 3840x2160
+    /// title back-buffer visible in a 1280x720 window instead of the
+    /// diagnostic clear. A source the layer cannot display still falls back to
+    /// the clear, named once rather than silently.
     pub fn present(&mut self, source: Option<objc::Id>) -> Result<(), PresentError> {
-        let drawable = self.current.take().ok_or_else(|| {
+        let mut drawable = self.current.take().ok_or_else(|| {
             PresentError::Metal("no CAMetalLayer drawable was acquired".to_string())
         })?;
         let _pool = AutoreleasePool::new();
+
+        // Read the source's immutable properties once, before the drawable can
+        // be released and re-acquired.
+        // SAFETY: `source` is a live `MTLTexture` retained by the caller; these
+        // accessors only read immutable properties.
+        let source_info: Option<(objc::Id, usize, usize, usize)> = source.map(|source| unsafe {
+            (
+                source,
+                objc::msg_send_usize_0(source, objc::sel(c"pixelFormat")),
+                objc::msg_send_usize_0(source, objc::sel(c"width")),
+                objc::msg_send_usize_0(source, objc::sel(c"height")),
+            )
+        });
+
+        // A CAMetalLayer cannot be reconfigured while it owns a drawable, and a
+        // blit cannot scale or convert. Release the acquired drawable, take the
+        // source's displayable format and extent, then acquire a new one.
+        if let Some((_, format, source_width, source_height)) = source_info
+            && drawable_format_supported(format)
+            && source_width > 0
+            && source_height > 0
+            && source_width <= MAX_SURFACE_DIMENSION as usize
+            && source_height <= MAX_SURFACE_DIMENSION as usize
+        {
+            // SAFETY: `drawable` is a live CAMetalDrawable and its texture only
+            // has its immutable format read here.
+            let target_format = unsafe {
+                let texture = objc::msg_send_id_0(drawable.as_raw(), objc::sel(c"texture"));
+                objc::msg_send_usize_0(texture, objc::sel(c"pixelFormat"))
+            };
+            if source_width != self.width as usize
+                || source_height != self.height as usize
+                || format != target_format
+            {
+                drop(drawable);
+                // SAFETY: no drawable is held now; `layer` is the live
+                // CAMetalLayer this swapchain owns and the values were
+                // validated above.
+                unsafe {
+                    set_drawable_size(
+                        self.layer.as_raw(),
+                        source_width as u32,
+                        source_height as u32,
+                    );
+                    msg_send_void_usize(self.layer.as_raw(), objc::sel(c"setPixelFormat:"), format);
+                }
+                self.width = source_width as u32;
+                self.height = source_height as u32;
+                self.next_drawable().ok_or_else(|| {
+                    PresentError::Metal(
+                        "CAMetalLayer.nextDrawable returned nil after a drawable resize"
+                            .to_string(),
+                    )
+                })?;
+                drawable = self.current.take().ok_or_else(|| {
+                    PresentError::Metal("the resized drawable was not retained".to_string())
+                })?;
+            }
+        }
 
         // SAFETY: `drawable` is a live `CAMetalDrawable`; `texture` returns its
         // live `id<MTLTexture>`.
@@ -311,24 +425,16 @@ impl NativeSwapchain {
         }
 
         let mut filled = false;
-        if let Some(source) = source {
-            // SAFETY: `source` is a live `MTLTexture` retained by the caller;
-            // the accessors only read immutable properties.
-            let (source_format, target_format, source_width, source_height) = unsafe {
-                (
-                    objc::msg_send_usize_0(source, objc::sel(c"pixelFormat")),
-                    objc::msg_send_usize_0(target, objc::sel(c"pixelFormat")),
-                    objc::msg_send_usize_0(source, objc::sel(c"width")),
-                    objc::msg_send_usize_0(source, objc::sel(c"height")),
-                )
-            };
-            // BGRA8 is the layer default; RGBA8 is accepted after
-            // `set_pixel_format` switched the layer to match the surface.
+        if let Some((source, source_format, source_width, source_height)) = source_info {
+            // SAFETY: `target` is the live drawable texture; the accessor only
+            // reads an immutable property.
+            let target_format =
+                unsafe { objc::msg_send_usize_0(target, objc::sel(c"pixelFormat")) };
+            // The drawable was resized/retargeted above when the source was
+            // displayable, so a 4-channel source of the same extent blits. A
+            // matching format and extent is the only case a blit can express.
             if source_format == target_format
-                && matches!(
-                    source_format,
-                    MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM
-                )
+                && drawable_format_supported(source_format)
                 && source_width == self.width as usize
                 && source_height == self.height as usize
             {
@@ -337,6 +443,20 @@ impl NativeSwapchain {
             }
         }
         if !filled {
+            if let Some((_, format, width, height)) = source_info
+                && !self.fallback_reported
+            {
+                self.fallback_reported = true;
+                tracing::warn!(
+                    source_format = format,
+                    source_width = width,
+                    source_height = height,
+                    drawable_width = self.width,
+                    drawable_height = self.height,
+                    "VICTORY_BACKEND=metal: a presented back-buffer could not be copied \
+                     into the drawable; presenting the diagnostic clear"
+                );
+            }
             encode_drawable_clear(command_buffer, target)?;
         }
 
