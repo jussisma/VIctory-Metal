@@ -1606,3 +1606,81 @@ connection.
 - **`DrawIndexed` after an explicit null unbind is refused by name (18×).** Correct
   per D3D12, but it drops draws the title expects; it needs a per-list decision in
   Cycle 13.
+
+---
+
+## 13. Cycle 13 — real title shaders reach the converter; heap backing lands; the presented surface is finally sampled honestly
+
+Cycle 13 attacked the three blockers Cycle 12 named and added a fifth track that the
+Boot #17 log justified. Base `73701a70`; ADRs 045–047.
+
+### 13.1 Decisions
+
+- **ADR-045** — the `--stdio` supervisor never converts in-process (a short-lived
+  re-exec per job), reports the child's exit code or signal plus its bounded, path-
+  scrubbed stderr in a structured error frame, and keeps serving. Separately, the
+  host now hands the converter the **complete `DXBC` container**, not a bare `DXIL`
+  part, and takes the entry point from `PSV0`.
+- **ADR-046** — `XMemVirtualAlloc` reserve/commit stays exactly as it was; committed
+  regions are backed by share files at the same address through an additive share-
+  layer hook with an in-place rollback. The allocation-semantics rewrite that asserted
+  twice is not the path and stays reverted.
+- **ADR-047** — `Present` reconfigures the drawable to the source extent before
+  blitting, and `IASetIndexBuffer(null)` keeps the last non-null binding.
+- **ADR-044 completion** — a descriptor table that mixes buffer and registered-
+  resource entries is carried by the per-entry wire tag instead of refused.
+
+### 13.2 Boots (windowed, frame probe on)
+
+| | #17 | #18b | #19 | #20 |
+|---|---|---|---|---|
+| D3DMetal fallback / host D3D12 attempts | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| host frames, refused submits | 5157, 0 | 4257, 0 | 4175, 0 | 4199, 0 |
+| buffers registered | 112 | 112 | **3371** | 3338 |
+| pipelines attempted / created / refused | 6 / 0 / 6 | 6 / 0 / 6 | 6 / 0 / 6 | 6 / 0 / 6 |
+| converter jobs / worker starts / restarts | 11 / 11 / 11 | 11 / 11 / 11 | **11 / 4 / 0** | 11 / 4 / 0 |
+| converter outcome | worker exited (banner only) | container validation refusal | **child SIGSEGV, named** | SIGSEGV + `MSC unavailable` |
+| vertex/index/descriptor refusals | present | present | **0** | **0** |
+| `DrawIndexed` after null unbind | 18 | 18 | **0** | 0 |
+| `SetStateX (0x470)` | 1/frame | 1/frame | **0** | 0 |
+| `non_black_pixels` / buckets | 0 / 1 | 4096 / 1 | 0 / 1 | **0 / 1** |
+| `uniform_color` | — | — | — | **transparent_black**, `nonzero_bytes=0` |
+| `fallback_clear` | true | false | false | **false** |
+| host p50/p95 ms, FPS | 0.017/0.036, 54.3k | 0.016/0.038, 51.5k | 0.011/0.027, 72.7k | 0.011/0.027, ~72k |
+
+The round trip through #18b's `4096` non-black reading was a probe defect, not content:
+#18b counted alpha as a colour. #20 replaced that with one classification pass and
+self-describing fields (`nonzero_bytes`, min/max/mean RGBA, variance, distinct sample
+values, exact sample byte offsets), which prove the drawable is fully transparent and
+that the sampled bytes are inside the 3840×2160 source.
+
+### 13.3 What the converter is actually given
+
+`VICTORY_METAL_PART_CENSUS=1` (opt-in, numbers only) reports, per distinct container:
+`parts=7 [SFI0 ISG1 OSG1 PSV0 HASH DXIL PRIV]`, `dxil=kind:1(Vertex) sm:6.6`,
+`bitcode_offset/size` within a ≤1 KiB container. These are **stub** containers: the
+`DXIL` payload carries 4 bytes of bitcode, and the legacy x86_64 converter segfaults on
+it. `metal-shaderconverter` is not installed next to `libmetalirconverter.dylib` on this
+host, so the new MSC fallback records a named one-line reason instead of panicking.
+
+### 13.4 Counts at the integration head
+
+- `victory-metal` **351 passed / 0 failed / 9 ignored** (`--test-threads=1`);
+  `victory-gpu` **377 / 0 / 1**; Wine `victory-hle` **81 / 0 / 0** (lib,
+  `--test-threads=1`); `victory-shader` clean.
+- Win64 `diag` build exit 0; `victory-metal`, `victory-gpu` and `victory-hle` Windows
+  all-targets checks exit 0; x86_64 `victory-irconverter` exit 0.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.825 / p95 0.892 / p99 0.966 ms,
+  1,209.8 FPS.
+- `git diff --check` clean; `pgrep` empty after every boot; worker `target/`
+  directories pruned each wave; 122 GB free.
+
+### 13.5 Remaining gaps (honest)
+
+- **No PSO exists, so no draw is issued and no non-black frame is claimed.** The single
+  remaining blocker for real geometry is translation of the title's container: the
+  legacy converter dies on the stub `DXIL` payload and MSC is absent on this host.
+- **`heaps_bound` grows every frame** (≈41k after 4.2k frames) — a per-frame heal
+  census that needs bounding.
+- **Probe cost** is ≈1.39 ms on each sampled frame; acceptable at `probe_every=30` but
+  it should be measured against a real frame budget once draws exist.
