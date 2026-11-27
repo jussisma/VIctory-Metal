@@ -1953,8 +1953,12 @@ fn aaa_preboot_guest_gate() {
         offset,
         length: PROBE_SLOT_LEN,
     };
-    let sweep_result: Result<(), String> = (|| {
-        // Measurement 1: compute writes count=1, one indirect mesh group.
+    // The count sweep below reuses the arguments buffer at `ARGS_OFFSET` (it
+    // dispatches the culling compute with count 2), so snapshot the post-frame
+    // words here: `compute_wrote_mesh_counts` must observe what the 120-frame
+    // pass wrote, not the sweep's last dispatch.
+    let frame_end = std::fs::read(&allocation_path).unwrap_or_default();
+    let sweep_result: Result<(), String> = (|| {        // Measurement 1: compute writes count=1, one indirect mesh group.
         let mut one =
             MetalProducer::new(1_000_000 + u64::from(total) + 10, 1).map_err(|e| e.to_string())?;
         one.set_compute_pipeline(compute_id).map_err(|e| e.to_string())?;
@@ -2281,7 +2285,7 @@ fn aaa_preboot_guest_gate() {
 
     // --- Read back what the GPU wrote into the shared allocation. ---
     let after = std::fs::read(&allocation_path).unwrap_or_default();
-    let cull_words_after = hex_words(&after, ARGS_OFFSET, 4);
+    let cull_words_after = hex_words(&frame_end, ARGS_OFFSET, 4);
     let payload_words_after = hex_words(&after, INDIRECT_PROBE_OFFSET, 4);
     let direct_payload_words_after = hex_words(&after, DIRECT_PROBE_OFFSET, 4);
     let graphics_pixels = word(&after, UAV0_OFFSET).unwrap_or(0);
@@ -2334,10 +2338,10 @@ fn aaa_preboot_guest_gate() {
     );
 
     let counts = (
-        word(&after, ARGS_OFFSET),
-        word(&after, ARGS_OFFSET + 4),
-        word(&after, ARGS_OFFSET + 8),
-        word(&after, ARGS_OFFSET + 12),
+        word(&frame_end, ARGS_OFFSET),
+        word(&frame_end, ARGS_OFFSET + 4),
+        word(&frame_end, ARGS_OFFSET + 8),
+        word(&frame_end, ARGS_OFFSET + 12),
     );
     report.stage(
         "compute_wrote_mesh_counts",
