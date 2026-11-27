@@ -3773,11 +3773,13 @@ fn prepare_compute_segment(
                 }
             }
             CommandV3::SetDescriptorTable(table) => {
-                if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
+                if table.bindings.is_empty()
+                    || table.bindings.len() > crate::wire_v3::MAX_DESCRIPTOR_BINDINGS_V3
                 {
-                    return Err(
-                        MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
-                    );
+                    return Err(MetalError::InvalidArg(
+                        "descriptor table needs 1..=32 bindings",
+                    )
+                    .into());
                 }
                 if let Some(active) = abi.as_ref() {
                     let stages: Vec<(ShaderStage, RootSignatureLayout)> = active
@@ -4171,11 +4173,13 @@ fn prepare_render_segment(
                 }
             }
             CommandV3::SetDescriptorTable(table) => {
-                if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
+                if table.bindings.is_empty()
+                    || table.bindings.len() > crate::wire_v3::MAX_DESCRIPTOR_BINDINGS_V3
                 {
-                    return Err(
-                        MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
-                    );
+                    return Err(MetalError::InvalidArg(
+                        "descriptor table needs 1..=32 bindings",
+                    )
+                    .into());
                 }
                 if let Some(active) = abi.as_ref() {
                     // A mesh pipeline's tables live on its mesh/object stages;
