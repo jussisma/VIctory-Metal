@@ -217,6 +217,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -1124,11 +1125,13 @@ pub struct SessionStats {
     pub pool: PoolStats,
 }
 
-/// Synchronous one-peer host session.
+/// Synchronous single-peer host session.
 ///
 /// The caller accepts one loopback stream and passes it to
 /// [`IpcHost::serve_once`]. The host holds all mappings and Metal wrappers until
-/// [`IpcHost::release_all`] or drop.
+/// [`IpcHost::release_all`] or drop. A daemon serving several connections keeps
+/// one `IpcHost` per connection and may share the executor's device and the
+/// content-pipeline handle space across them.
 pub struct IpcHost<E: BatchExecutor> {
     secret: HostSecret,
     share_dir: PathBuf,
@@ -1148,10 +1151,15 @@ pub struct IpcHost<E: BatchExecutor> {
     surfaces: BTreeMap<u64, u64>,
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
-    /// Next wire handle for a content-hashed version 2 pipeline (graphics, mesh
-    /// and compute). The v1 compute request keeps using the executor's own
-    /// `load_pipeline` id space.
-    next_content_pipeline: u64,
+    /// Next wire handle for a content-hashed version 2 or version 3 pipeline
+    /// (graphics, mesh and compute). The v1 compute request keeps using the
+    /// executor's own `load_pipeline` id space.
+    ///
+    /// A daemon that serves several connections shares one device registry, so
+    /// two sessions must never name the same handle;
+    /// [`Self::with_content_pipeline_handles`] injects one process-wide
+    /// counter. A standalone host (tests) gets a private counter starting at 1.
+    next_content_pipeline: Arc<AtomicU64>,
     /// Why the last kind 4 request was refused, with the executor's stage-named
     /// diagnostic when there is one. The wire answer stays one status byte.
     last_pipeline_rejection: Option<String>,
@@ -1225,7 +1233,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             surfaces: BTreeMap::new(),
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
-            next_content_pipeline: 1,
+            next_content_pipeline: Arc::new(AtomicU64::new(1)),
             last_pipeline_rejection: None,
             fence_page: None,
             fence_page_attached: false,
@@ -1261,6 +1269,47 @@ impl<E: BatchExecutor> IpcHost<E> {
     pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
         self.io_timeout = timeout;
         self
+    }
+
+    /// Shares one content-pipeline handle space across host sessions.
+    ///
+    /// The daemon serves each connection with its own [`IpcHost`] but one
+    /// native device and registry, so a handle minted by a translation session
+    /// must be unique with respect to the render session's handles. Passing the
+    /// same `Arc<AtomicU64>` to every session gives that guarantee; without it
+    /// the host keeps a private counter (the historical single-session
+    /// behaviour).
+    pub fn with_content_pipeline_handles(mut self, handles: Arc<AtomicU64>) -> Self {
+        self.next_content_pipeline = handles;
+        self
+    }
+
+    /// Mints the next content-pipeline handle in the shared id space.
+    ///
+    /// Zero is never a valid wire handle, so a wrapped counter skips it.
+    fn allocate_content_pipeline_handle(&self) -> u64 {
+        loop {
+            let handle = self.next_content_pipeline.fetch_add(1, Ordering::Relaxed);
+            if handle != 0 {
+                return handle;
+            }
+        }
+    }
+
+    /// Returns a handle whose registration failed, when no later allocation
+    /// raced past it.
+    ///
+    /// A refused frame must consume no pipeline id (the historical single
+    /// session contract). The compare-exchange gives the handle back only while
+    /// it is still the newest one; under concurrency a lost race leaves a gap,
+    /// which is harmless because handles only have to be unique and nonzero.
+    fn release_content_pipeline_handle(&self, handle: u64) {
+        let _ = self.next_content_pipeline.compare_exchange(
+            handle.wrapping_add(1),
+            handle,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Why the last kind 4 request was refused, if it was.
@@ -1332,6 +1381,14 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// [`SessionSummary`]. Authentication failure sends a rejection
     /// acknowledgement and returns [`HostError::Unauthenticated`]; any other
     /// error closes the stream when it is dropped.
+    ///
+    /// # Atomic transactions
+    ///
+    /// One call owns exactly one stream and one session state, and it reads a
+    /// request and writes its reply before reading the next frame. A daemon
+    /// that serves concurrent peers therefore gives every connection its own
+    /// thread and its own host; two peers' frames can never interleave on one
+    /// stream and a slow pipeline translation cannot delay a submission.
     pub fn serve_once(&mut self, mut stream: TcpStream) -> Result<SessionSummary, HostError> {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.io_timeout))?;
@@ -2222,7 +2279,7 @@ impl<E: BatchExecutor> IpcHost<E> {
                 entry: &stage.entry,
             })
             .collect();
-        let handle = self.next_content_pipeline;
+        let handle = self.allocate_content_pipeline_handle();
         let outcome = match request.kind {
             PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
                 handle,
@@ -2243,6 +2300,7 @@ impl<E: BatchExecutor> IpcHost<E> {
                 abi,
             ),
             _ => {
+                self.release_content_pipeline_handle(handle);
                 self.last_pipeline_rejection = Some("unknown pipeline kind".to_string());
                 return vec![PIPELINE_REPLY_REJECTED];
             }
@@ -2250,6 +2308,7 @@ impl<E: BatchExecutor> IpcHost<E> {
         let id = match outcome {
             Ok(()) => handle,
             Err(error) => {
+                self.release_content_pipeline_handle(handle);
                 self.last_pipeline_rejection = Some(format!(
                     "{} pipeline registration failed: {error}",
                     pipeline_kind_label(request.kind)
@@ -2264,7 +2323,6 @@ impl<E: BatchExecutor> IpcHost<E> {
             .map(|stage| stage.ticket)
             .max()
             .unwrap_or(self.last_pipeline_ticket);
-        self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
         pipeline_reply_ok(id)
     }
 
@@ -2369,7 +2427,7 @@ impl<E: BatchExecutor> IpcHost<E> {
                 entry: &stage.entry,
             })
             .collect();
-        let handle = self.next_content_pipeline;
+        let handle = self.allocate_content_pipeline_handle();
         let outcome = match request.kind {
             PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
                 handle,
@@ -2390,10 +2448,12 @@ impl<E: BatchExecutor> IpcHost<E> {
                 abi,
             ),
             _ => {
+                self.release_content_pipeline_handle(handle);
                 return self.reject_host_translation("unknown pipeline kind");
             }
         };
         if let Err(error) = outcome {
+            self.release_content_pipeline_handle(handle);
             return self.reject_host_translation(format!(
                 "{} pipeline registration failed: {error}",
                 pipeline_kind_label(request.kind)
@@ -2408,7 +2468,6 @@ impl<E: BatchExecutor> IpcHost<E> {
                     self.host_translated_stages[index].saturating_add(1);
             }
         }
-        self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
         pipeline_reply_ok(handle)
     }
 
@@ -5258,6 +5317,99 @@ mod tests {
                 bytes_mapped: 0,
             }
         );
+    }
+
+    /// Two peers accepted by one listener are served as two independent
+    /// sessions. Peer A's `VP3\0` pipeline registration and peer B's v3
+    /// submission each read their own reply frame, exactly the ADR-041 layout
+    /// where a translation connection runs beside the render connection.
+    #[test]
+    fn concurrent_peers_keep_their_own_reply_frames() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the concurrent listener");
+        let addr = listener.local_addr().expect("concurrent listener address");
+        let server = thread::spawn(move || {
+            let (pipeline_stream, _) = listener.accept().expect("accept the pipeline peer");
+            let (submit_stream, _) = listener.accept().expect("accept the submission peer");
+            let mut pipeline_host = host(&dir, StubExecutor::new(4096));
+            let mut submission_host = host(&dir, StubExecutor::new(4096));
+            let pipeline = thread::spawn(move || pipeline_host.serve_once(pipeline_stream));
+            let submission = submission_host.serve_once(submit_stream);
+            (
+                pipeline.join().expect("pipeline session thread"),
+                submission,
+            )
+        });
+
+        let mut pipeline_peer = TcpStream::connect(addr).expect("connect the pipeline peer");
+        let mut submit_peer = TcpStream::connect(addr).expect("connect the submission peer");
+        for peer in [&mut pipeline_peer, &mut submit_peer] {
+            peer.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("peer read timeout");
+            authenticate(peer);
+        }
+
+        // The pipeline frame names stage files that do not exist, so the host
+        // answers a bounded kind 129 refusal without needing a converter or GPU;
+        // the important part is that the frame is routed as a pipeline request.
+        let vertex_name = stage_name(b"missing-vertex-dxil");
+        let pixel_name = stage_name(b"missing-pixel-dxil");
+        let pipeline = pipeline_request_v3(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, vertex_name.as_str(), "vs_main"),
+                (PIPELINE_STAGE_PIXEL, pixel_name.as_str(), "ps_main"),
+            ],
+            &graphics_state(),
+            None,
+        );
+        write_frame(&mut pipeline_peer, KIND_PIPELINE, &pipeline).expect("send the pipeline frame");
+        // The submission session resolves its own allocation snapshot; register
+        // the file on that connection, not the pipeline one.
+        write_frame(
+            &mut submit_peer,
+            KIND_REGISTER,
+            &registration(ALLOCATION_ID, BYTES as u64),
+        )
+        .expect("register the submission allocation");
+        expect_ack(&mut submit_peer, true);
+        write_frame(
+            &mut submit_peer,
+            KIND_SUBMISSION_V3,
+            &v3_envelope(&v3_submission(1, None, full_binding(BYTES as u64))),
+        )
+        .expect("send the v3 submission");
+
+        let (kind, reply) = read_frame(&mut pipeline_peer)
+            .expect("read the pipeline reply")
+            .expect("pipeline reply frame");
+        assert_eq!(
+            kind, KIND_PIPELINE_REPLY,
+            "the pipeline peer reads its own kind 129 reply"
+        );
+        assert_eq!(reply.first().copied(), Some(PIPELINE_REPLY_REJECTED));
+        assert!(
+            reply.len() > 1,
+            "a version 3 rejection carries a bounded reason, not one byte"
+        );
+
+        let (kind, reply) = read_frame(&mut submit_peer)
+            .expect("read the submission reply")
+            .expect("submission reply frame");
+        assert_eq!(
+            kind, KIND_SUBMISSION_V3,
+            "the render peer reads its own kind 5 reply"
+        );
+        let reply = wire::decode_reply(&reply).expect("decode the submission reply");
+        assert_eq!(reply.sequence, 1);
+        assert_eq!(reply.status, ReplyStatus::Ok);
+
+        drop(pipeline_peer);
+        drop(submit_peer);
+        let (pipeline, submission) = server.join().expect("concurrent server thread");
+        pipeline.expect("the pipeline session ends cleanly");
+        submission.expect("the submission session ends cleanly");
     }
 
     #[test]

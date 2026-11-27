@@ -911,29 +911,37 @@ impl LiveConfig {
             timeout,
         )?;
         // The queue owns the client; a pipeline worker borrows this weak view so
-        // host-side DXIL translation sends on the same authenticated session.
+        // host-side DXIL translation uses the dedicated pipeline connection
+        // rather than the render socket.
         publish_live_pipeline_session(client.pipeline_session());
         Ok(client)
     }
 }
 
-/// One authenticated Wire v3 session with the native host.
+/// One authenticated Wire v3 render session with the native host.
 ///
 /// Construction performs the hello exchange, so a client that exists has
-/// already been accepted by the host. The client owns its single socket,
-/// reconnects at most once per send, and never falls back to another backend.
+/// already been accepted by the host. The client owns its render socket and,
+/// lazily, a second authenticated socket for pipeline registration; it
+/// reconnects the render socket at most once per send, and never falls back to
+/// another backend.
 pub struct WireV3Client {
     endpoint: Endpoint,
     secret: Secret,
     timeout: Duration,
-    /// The single session socket, shared with the pipeline-translation seam.
+    /// The single render/submission socket, owned by the queue.
     ///
-    /// The guest may create a PSO on a worker thread while the render thread
-    /// submits; both use the same authenticated host session, so they share
-    /// this mutex and every frame exchange holds it across write and read. A
-    /// second socket would be a second host session, which the host does not
-    /// serve.
+    /// The render thread submits on this connection only. Pipeline requests use
+    /// the dedicated [`PipelineChannel`] instead, so a slow DXIL translation
+    /// never holds this mutex and never delays a submission.
     stream: Arc<Mutex<Option<TcpStream>>>,
+    /// The dedicated pipeline-registration connection (ADR-041).
+    ///
+    /// Opened lazily on the first kind 4 exchange and cached for the session.
+    /// It has its own mutex and its own TCP connection, so it is a second host
+    /// session: a translation can stall here without blocking the render
+    /// thread. Both sockets authenticate with the same secret.
+    pipeline: Arc<PipelineChannel>,
     reconnects: u32,
     transport_errors: u64,
     /// The shared completion page, when the guest mapped one and the host
@@ -1019,11 +1027,21 @@ impl WireV3Client {
                 timeout,
             });
         }
+        // The pipeline channel owns a second copy of the secret; each copy
+        // zeroes itself on drop. It is not dialled here: the first kind 4
+        // exchange opens it, so a host that refuses a second connection never
+        // breaks rendering.
+        let pipeline = Arc::new(PipelineChannel::new(
+            endpoint.clone(),
+            Secret::new(secret.bytes())?,
+            timeout,
+        ));
         let mut client = Self {
             endpoint,
             secret,
             timeout,
             stream: Arc::new(Mutex::new(None)),
+            pipeline,
             reconnects: 0,
             transport_errors: 0,
             fence_page: None,
@@ -1052,12 +1070,11 @@ impl WireV3Client {
             .unwrap_or_else(|failure| failure.into_inner())
     }
 
-    /// Runs one frame exchange on the open socket while holding the shared
-    /// stream lock.
+    /// Runs one frame exchange on the render socket while holding its lock.
     ///
-    /// Holding the lock across the write and the read keeps the session in
-    /// step when a pipeline registration and a submission are issued from
-    /// different guest threads.
+    /// Holding the lock across the write and the read keeps the submission
+    /// stream in step. Pipeline registration never takes this lock; it uses
+    /// [`PipelineChannel`], so a slow translation cannot stall a submission.
     fn with_stream<T>(
         &self,
         exchange: impl FnOnce(&mut TcpStream) -> Result<T, TransportError>,
@@ -1071,14 +1088,15 @@ impl WireV3Client {
         exchange(stream).map_err(|error| NativeQueueError::Transport(error.to_string()))
     }
 
-    /// A handle that can send a version 3 pipeline request on this session.
+    /// A handle that can send a version 3 pipeline request on the dedicated
+    /// pipeline connection.
     ///
-    /// The handle shares the authenticated socket but holds no registration
-    /// state of its own, so it is safe to keep on a pipeline worker thread.
+    /// The handle shares only the pipeline channel; it holds no registration
+    /// state of the render session, so it is safe to keep on a pipeline worker
+    /// thread while the render thread submits.
     pub fn pipeline_session(&self) -> PipelineTranslateSession {
         PipelineTranslateSession {
-            stream: Arc::downgrade(&self.stream),
-            timeout: self.timeout,
+            channel: Arc::downgrade(&self.pipeline),
         }
     }
 
@@ -1146,50 +1164,7 @@ impl WireV3Client {
     /// The returned client is only constructed after the host acknowledged the
     /// secret with `KIND_ACK` and a zero status byte.
     fn handshake(&self) -> Result<TcpStream, TransportError> {
-        let address = self.endpoint.address()?;
-        let mut stream = TcpStream::connect_timeout(&address, self.timeout).map_err(|reason| {
-            TransportError::Connect {
-                endpoint: self.endpoint.to_string(),
-                reason: reason.to_string(),
-            }
-        })?;
-        stream
-            .set_nodelay(true)
-            .map_err(|source| io_error("configure the socket", self.timeout, source))?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|source| io_error("configure the socket", self.timeout, source))?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(|source| io_error("configure the socket", self.timeout, source))?;
-
-        write_frame(
-            &mut stream,
-            KIND_AUTH,
-            self.secret.bytes(),
-            "authenticate",
-            self.timeout,
-        )?;
-        let (kind, payload) = read_frame(
-            &mut stream,
-            "authenticate",
-            MAX_PAYLOAD_LEN as usize,
-            self.timeout,
-        )?;
-        if kind != KIND_ACK {
-            return Err(TransportError::UnexpectedKind {
-                expected: KIND_ACK,
-                actual: kind,
-            });
-        }
-        match payload.as_slice() {
-            [0] => Ok(stream),
-            [1] => Err(TransportError::Unauthenticated),
-            other => Err(TransportError::Protocol(format!(
-                "authentication acknowledgement carried {} bytes, expected one",
-                other.len()
-            ))),
-        }
+        authenticate(&self.endpoint, &self.secret, self.timeout)
     }
 
     /// Closes the current stream, if any, and authenticates a fresh one.
@@ -1218,11 +1193,13 @@ impl WireV3Client {
         Ok(())
     }
 
-    /// Closes the socket. Later sends fail explicitly until `reconnect`.
+    /// Closes the render socket and the pipeline socket. Later sends fail
+    /// explicitly until `reconnect`.
     pub fn close(&mut self) {
         if let Some(stream) = self.stream_slot().take() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        self.pipeline.close();
     }
 
     /// The host's published completion fence, when a shared page is mapped
@@ -1480,17 +1457,7 @@ impl WireV3Client {
         payload.extend_from_slice(&entry_len.to_le_bytes());
         payload.extend_from_slice(entry.as_bytes());
 
-        let result = self.with_stream(|stream| {
-            write_frame(stream, KIND_PIPELINE, &payload, "register pipeline", self.timeout)
-                .and_then(|()| {
-                    read_frame(
-                        stream,
-                        "register pipeline",
-                        MAX_PAYLOAD_LEN as usize,
-                        self.timeout,
-                    )
-                })
-        });
+        let result = self.pipeline.exchange(&payload, "register pipeline");
         match result {
             Ok((KIND_PIPELINE_REPLY, reply)) => {
                 match (reply.first().copied(), reply.len()) {
@@ -1508,27 +1475,27 @@ impl WireV3Client {
                         Ok(id)
                     }
                     (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
-                        format!("the host rejected pipeline ticket {ticket}"),
+                        format!(
+                            "the host rejected pipeline ticket {ticket}; the reply was `{}`",
+                            bounded_reply_preview(&reply)
+                        ),
                     )),
                     _ => Err(NativeQueueError::Transport(format!(
-                        "malformed kind 129 reply of {} byte(s)",
-                        reply.len()
+                        "malformed kind 129 reply of {} byte(s): `{}`",
+                        reply.len(),
+                        bounded_reply_preview(&reply)
                     ))),
                 }
             }
-            Ok((actual, _)) => {
-                self.close();
+            Ok((actual, payload)) => {
                 self.transport_errors = self.transport_errors.saturating_add(1);
-                Err(NativeQueueError::Transport(
-                    TransportError::UnexpectedKind {
-                        expected: KIND_PIPELINE_REPLY,
-                        actual,
-                    }
-                    .to_string(),
-                ))
+                Err(NativeQueueError::Transport(format!(
+                    "expected a kind {KIND_PIPELINE_REPLY} pipeline reply, got kind {actual} \
+                     with `{}`",
+                    bounded_reply_preview(&payload)
+                )))
             }
             Err(error) => {
-                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
                 Err(error)
             }
@@ -1656,23 +1623,7 @@ impl WireV3Client {
             )));
         }
 
-        let result = self.with_stream(|stream| {
-            write_frame(
-                stream,
-                KIND_PIPELINE,
-                &payload,
-                "register pipeline v2",
-                self.timeout,
-            )
-            .and_then(|()| {
-                read_frame(
-                    stream,
-                    "register pipeline v2",
-                    MAX_PAYLOAD_LEN as usize,
-                    self.timeout,
-                )
-            })
-        });
+        let result = self.pipeline.exchange(&payload, "register pipeline v2");
         match result {
             Ok((KIND_PIPELINE_REPLY, reply)) => {
                 match (reply.first().copied(), reply.len()) {
@@ -1690,28 +1641,26 @@ impl WireV3Client {
                         }
                         Ok(id)
                     }
-                    (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
-                        "the host rejected the version 2 pipeline registration".to_string(),
-                    )),
+                    (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(format!(
+                        "the host rejected the version 2 pipeline registration; the reply was `{}`",
+                        bounded_reply_preview(&reply)
+                    ))),
                     _ => Err(NativeQueueError::Transport(format!(
-                        "malformed kind 129 reply of {} byte(s)",
-                        reply.len()
+                        "malformed kind 129 reply of {} byte(s): `{}`",
+                        reply.len(),
+                        bounded_reply_preview(&reply)
                     ))),
                 }
             }
-            Ok((actual, _)) => {
-                self.close();
+            Ok((actual, payload)) => {
                 self.transport_errors = self.transport_errors.saturating_add(1);
-                Err(NativeQueueError::Transport(
-                    TransportError::UnexpectedKind {
-                        expected: KIND_PIPELINE_REPLY,
-                        actual,
-                    }
-                    .to_string(),
-                ))
+                Err(NativeQueueError::Transport(format!(
+                    "expected a kind {KIND_PIPELINE_REPLY} pipeline reply, got kind {actual} \
+                     with `{}`",
+                    bounded_reply_preview(&payload)
+                )))
             }
             Err(error) => {
-                self.close();
                 self.transport_errors = self.transport_errors.saturating_add(1);
                 Err(error)
             }
@@ -1740,23 +1689,7 @@ impl WireV3Client {
     }
 
     fn round_trip_pipeline_v3(&self, payload: &[u8]) -> Result<u64, NativeQueueError> {
-        let result = self.with_stream(|stream| {
-            write_frame(
-                stream,
-                KIND_PIPELINE,
-                payload,
-                "register pipeline v3",
-                self.timeout,
-            )
-            .and_then(|()| {
-                read_frame(
-                    stream,
-                    "register pipeline v3",
-                    MAX_PAYLOAD_LEN as usize,
-                    self.timeout,
-                )
-            })
-        });
+        let result = self.pipeline.exchange(payload, "register pipeline v3");
         decode_pipeline_v3_reply(result)
     }
 
@@ -1964,12 +1897,159 @@ impl WireV3Client {
     }
 }
 
+/// Dials `endpoint` and performs the authenticated hello.
+///
+/// Used by both the render session and the dedicated pipeline channel; each
+/// call opens one TCP connection and returns only after the host acknowledged
+/// the secret. The secret is never logged.
+fn authenticate(
+    endpoint: &Endpoint,
+    secret: &Secret,
+    timeout: Duration,
+) -> Result<TcpStream, TransportError> {
+    let address = endpoint.address()?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|reason| {
+        TransportError::Connect {
+            endpoint: endpoint.to_string(),
+            reason: reason.to_string(),
+        }
+    })?;
+    stream
+        .set_nodelay(true)
+        .map_err(|source| io_error("configure the socket", timeout, source))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|source| io_error("configure the socket", timeout, source))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|source| io_error("configure the socket", timeout, source))?;
+
+    write_frame(&mut stream, KIND_AUTH, secret.bytes(), "authenticate", timeout)?;
+    let (kind, payload) = read_frame(
+        &mut stream,
+        "authenticate",
+        MAX_PAYLOAD_LEN as usize,
+        timeout,
+    )?;
+    if kind != KIND_ACK {
+        return Err(TransportError::UnexpectedKind {
+            expected: KIND_ACK,
+            actual: kind,
+        });
+    }
+    match payload.as_slice() {
+        [0] => Ok(stream),
+        [1] => Err(TransportError::Unauthenticated),
+        other => Err(TransportError::Protocol(format!(
+            "authentication acknowledgement carried {} bytes, expected one",
+            other.len()
+        ))),
+    }
+}
+
+/// The dedicated pipeline-registration connection (ADR-041).
+///
+/// One lazily opened, cached, authenticated TCP connection with its own mutex.
+/// Every kind 4 request/reply pair is one critical section on this mutex, and
+/// the mutex is never taken by the submission path, so a translation that
+/// blocks cannot stall a frame. A transport failure closes only this socket;
+/// the render session stays connected.
+struct PipelineChannel {
+    endpoint: Endpoint,
+    secret: Secret,
+    timeout: Duration,
+    stream: Mutex<Option<TcpStream>>,
+}
+
+impl PipelineChannel {
+    fn new(endpoint: Endpoint, secret: Secret, timeout: Duration) -> Self {
+        Self {
+            endpoint,
+            secret,
+            timeout,
+            stream: Mutex::new(None),
+        }
+    }
+
+    /// One atomic kind 4 request/reply transaction on the pipeline socket.
+    fn exchange(
+        &self,
+        payload: &[u8],
+        operation: &'static str,
+    ) -> Result<(u8, Vec<u8>), NativeQueueError> {
+        let mut slot = self
+            .stream
+            .lock()
+            .unwrap_or_else(|failure| failure.into_inner());
+        if slot.is_none() {
+            let stream = authenticate(&self.endpoint, &self.secret, self.timeout)
+                .map_err(|error| NativeQueueError::Transport(error.to_string()))?;
+            *slot = Some(stream);
+        }
+        let stream = slot.as_mut().expect("the pipeline socket was just opened");
+        let result = write_frame(stream, KIND_PIPELINE, payload, operation, self.timeout)
+            .and_then(|()| {
+                read_frame(stream, operation, MAX_PAYLOAD_LEN as usize, self.timeout)
+            });
+        match result {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                // This socket may be desynchronised; drop it and let the next
+                // pipeline exchange authenticate a fresh one. The render
+                // session is untouched.
+                if let Some(stream) = slot.take() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                Err(NativeQueueError::Transport(error.to_string()))
+            }
+        }
+    }
+
+    /// Closes the pipeline socket, if open.
+    fn close(&self) {
+        if let Some(stream) = self
+            .stream
+            .lock()
+            .unwrap_or_else(|failure| failure.into_inner())
+            .take()
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// A bounded, printable preview of a reply payload.
+///
+/// The first [`MAX_PIPELINE_REJECTION_REASON`] bytes are shown, with line breaks
+/// escaped and non-printable bytes written as `\xNN`, so a boot log says what
+/// actually arrived instead of only its length. This is how a 1-byte rejection
+/// becomes `\x01` and a wrong-magic reply shows its own text.
+fn bounded_reply_preview(payload: &[u8]) -> String {
+    let mut preview = String::with_capacity(payload.len().min(MAX_PIPELINE_REJECTION_REASON));
+    for byte in payload.iter().take(MAX_PIPELINE_REJECTION_REASON) {
+        match byte {
+            b'\n' => preview.push_str("\\n"),
+            b'\r' => preview.push_str("\\r"),
+            b'\t' => preview.push_str("\\t"),
+            b'\\' => preview.push_str("\\\\"),
+            0x20..=0x7e => preview.push(char::from(*byte)),
+            other => preview.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    if payload.len() > MAX_PIPELINE_REJECTION_REASON {
+        preview.push_str("...");
+    }
+    preview
+}
+
 /// Decodes one kind 129 reply to a version 3 pipeline request.
 ///
 /// Status 0 carries the `u64` native id. Status 1 carries either the legacy
 /// bare rejection byte or `reason_len u16` + at most
 /// [`MAX_PIPELINE_REJECTION_REASON`] UTF-8 bytes, so a failed host translation
 /// names its category without ever carrying a title path or shader bytes.
+/// Every error carries a bounded preview of the reply payload (ADR-041), so a
+/// future boot shows what the host actually sent rather than "1-byte".
 fn decode_pipeline_v3_reply(
     result: Result<(u8, Vec<u8>), NativeQueueError>,
 ) -> Result<u64, NativeQueueError> {
@@ -1984,9 +2064,11 @@ fn decode_pipeline_v3_reply(
                 }
                 Ok(id)
             }
-            (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
-                "the host rejected the version 3 pipeline registration".to_string(),
-            )),
+            (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(format!(
+                "the host rejected the version 3 pipeline registration; the reply was `{}` \
+                 (1 byte, not a VP3\\0 reason frame)",
+                bounded_reply_preview(&reply)
+            ))),
             (Some(PIPELINE_REPLY_REJECTED), len) if len >= 3 => {
                 let reason_len = usize::from(u16::from_le_bytes(
                     reply[1..3].try_into().expect("two bytes"),
@@ -1996,43 +2078,42 @@ fn decode_pipeline_v3_reply(
                     || reply.len() != 3 + reason_len
                 {
                     return Err(NativeQueueError::Transport(format!(
-                        "malformed version 3 pipeline rejection of {} byte(s)",
-                        reply.len()
+                        "malformed version 3 pipeline rejection of {} byte(s): `{}`",
+                        reply.len(),
+                        bounded_reply_preview(&reply)
                     )));
                 }
                 let reason = std::str::from_utf8(&reply[3..]).map_err(|_| {
-                    NativeQueueError::Transport(
-                        "the version 3 pipeline rejection reason is not UTF-8".to_string(),
-                    )
+                    NativeQueueError::Transport(format!(
+                        "the version 3 pipeline rejection reason is not UTF-8: `{}`",
+                        bounded_reply_preview(&reply)
+                    ))
                 })?;
                 Err(NativeQueueError::Refused(reason.to_string()))
             }
             _ => Err(NativeQueueError::Transport(format!(
-                "malformed kind 129 reply of {} byte(s)",
-                reply.len()
+                "malformed kind 129 reply of {} byte(s): `{}`",
+                reply.len(),
+                bounded_reply_preview(&reply)
             ))),
         },
-        Ok((actual, _)) => Err(NativeQueueError::Transport(
-            TransportError::UnexpectedKind {
-                expected: KIND_PIPELINE_REPLY,
-                actual,
-            }
-            .to_string(),
-        )),
+        Ok((actual, payload)) => Err(NativeQueueError::Transport(format!(
+            "expected a kind {KIND_PIPELINE_REPLY} pipeline reply, got kind {actual} with `{}`",
+            bounded_reply_preview(&payload)
+        ))),
         Err(error) => Err(error),
     }
 }
 
-/// A borrowed view of the live session's socket for host-side pipeline
+/// A borrowed view of the dedicated pipeline connection for host-side
 /// translation.
 ///
-/// It holds a weak reference: when the session client is dropped or closed the
-/// handle still upgrades, but the socket slot is `None`, so a registration
-/// fails explicitly instead of keeping a dead connection alive.
+/// It holds a weak reference: when the session client is dropped the handle
+/// still upgrades only while the channel lives, so a registration fails
+/// explicitly instead of keeping a dead connection alive.
 #[derive(Clone)]
 pub struct PipelineTranslateSession {
-    stream: Weak<Mutex<Option<TcpStream>>>,
-    timeout: Duration,
+    channel: Weak<PipelineChannel>,
 }
 
 impl PipelineTranslateSession {
@@ -2045,44 +2126,21 @@ impl PipelineTranslateSession {
         root_signature_file: Option<&str>,
     ) -> Result<u64, NativeQueueError> {
         let payload = encode_pipeline_v3_request(kind, stages, state, root_signature_file)?;
-        let Some(stream) = self.stream.upgrade() else {
+        let Some(channel) = self.channel.upgrade() else {
             return Err(NativeQueueError::Transport(
                 TransportError::NotConnected.to_string(),
             ));
         };
-        let result = {
-            let mut slot = stream.lock().unwrap_or_else(|failure| failure.into_inner());
-            let Some(stream) = slot.as_mut() else {
-                return Err(NativeQueueError::Transport(
-                    TransportError::NotConnected.to_string(),
-                ));
-            };
-            write_frame(
-                stream,
-                KIND_PIPELINE,
-                &payload,
-                "register pipeline v3",
-                self.timeout,
-            )
-            .and_then(|()| {
-                read_frame(
-                    stream,
-                    "register pipeline v3",
-                    MAX_PAYLOAD_LEN as usize,
-                    self.timeout,
-                )
-            })
-            .map_err(|error| NativeQueueError::Transport(error.to_string()))
-        };
+        let result = channel.exchange(&payload, "register pipeline v3");
         decode_pipeline_v3_reply(result)
     }
 }
 
 /// The most recent session opened through [`LiveConfig`].
 ///
-/// The queue owns the `WireV3Client`; a pipeline worker borrows this weak
-/// session view so both send on the one authenticated socket instead of opening
-/// a second connection the host would never serve.
+/// The queue owns the `WireV3Client`; a pipeline worker borrows this weak view
+/// so host-side DXIL translation runs on the session's dedicated pipeline
+/// connection (ADR-041). The render socket is never held by a translation.
 static LIVE_PIPELINE_SESSION: Mutex<Option<PipelineTranslateSession>> = Mutex::new(None);
 
 /// The live session a pipeline worker may use, when a client has connected.
@@ -2266,6 +2324,15 @@ mod tests {
     const SECRET: [u8; SECRET_LEN] = [0x5a; SECRET_LEN];
     const SEQUENCE: u32 = 17;
 
+    /// An unmappable fence-page path. Passing it explicitly keeps a pipeline
+    /// test from reading a `VICTORY_METAL_SHARE_DIR` a parallel test leaked into
+    /// the process environment.
+    fn no_fence_page() -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(
+            "/nonexistent/victory-test/gpu-fence.v1.page",
+        ))
+    }
+
     /// A loopback listener for one test, bound to port 0.
     struct TestHost {
         port: u16,
@@ -2391,10 +2458,8 @@ mod tests {
         encode_submission_v3(&submission(sequence, list_id)).expect("canonical v3 encoding")
     }
 
-    /// Accepts one peer, verifies the secret, acknowledges it and hands the
-    /// stream to `serve`.
-    fn accept_authenticated(listener: &TcpListener, secret: &[u8; SECRET_LEN]) -> TcpStream {
-        let (mut stream, _) = listener.accept().expect("accept the guest");
+    /// Configures one accepted peer and performs the authenticated hello.
+    fn authenticate_accepted(mut stream: TcpStream) -> TcpStream {
         stream.set_nonblocking(false).expect("blocking stream");
         stream
             .set_read_timeout(Some(TEST_TIMEOUT))
@@ -2404,9 +2469,35 @@ mod tests {
             .expect("server write timeout");
         let (kind, payload) = TestHost::read_frame(&mut stream);
         assert_eq!(kind, KIND_AUTH, "the first frame must authenticate");
-        assert_eq!(payload, secret, "the hello must carry the exact secret");
+        assert_eq!(payload, &SECRET, "the hello must carry the exact secret");
         TestHost::write_frame(&mut stream, KIND_ACK, &[0]);
         stream
+    }
+
+    /// Accepts one peer, verifies the secret, acknowledges it and hands the
+    /// stream to `serve`.
+    fn accept_authenticated(listener: &TcpListener, _secret: &[u8; SECRET_LEN]) -> TcpStream {
+        let (stream, _) = listener.accept().expect("accept the guest");
+        authenticate_accepted(stream)
+    }
+
+    /// [`accept_authenticated`] on a nonblocking listener, so a missing second
+    /// connection fails the test instead of blocking forever.
+    fn accept_authenticated_bounded(listener: &TcpListener) -> TcpStream {
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return authenticate_accepted(stream),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client did not open the expected connection within {TEST_TIMEOUT:?}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -3030,11 +3121,14 @@ mod tests {
     }
 
     /// A kind 4 frame is `ticket: u64 LE, entry_len: u16 LE, entry`; the host
-    /// answers kind 129 with one status byte and the native pipeline id.
+    /// answers kind 129 with one status byte and the native pipeline id. Since
+    /// ADR-041 every kind 4 exchange runs on the dedicated pipeline connection,
+    /// so the fake host authenticates the render peer and then the pipeline peer.
     #[test]
     fn pipeline_registration_round_trips_kind_4_and_129() {
         let (sender, receiver) = mpsc::channel::<Vec<(u64, String)>>();
         let host = TestHost::spawn(move |listener| {
+            let _render = accept_authenticated(&listener, &SECRET);
             let mut stream = accept_authenticated(&listener, &SECRET);
             let mut seen = Vec::new();
             for id in [0x51u64, 0x52] {
@@ -3056,7 +3150,7 @@ mod tests {
         });
 
         let mut client =
-            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, None)
+            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, no_fence_page())
                 .expect("authenticated connect");
         assert_eq!(client.next_pipeline_ticket(), 1);
         assert_eq!(client.register_pipeline(1, "main"), Ok(0x51));
@@ -3083,11 +3177,13 @@ mod tests {
     }
 
     /// A version 2 frame carries the kind, per-stage tickets/entries and the
-    /// state/ABI/root-signature blobs; the reply is the same kind 129 id.
+    /// state/ABI/root-signature blobs; the reply is the same kind 129 id on the
+    /// dedicated pipeline connection.
     #[test]
     fn pipeline_registration_v2_carries_stages_state_and_abi() {
         let (sender, receiver) = mpsc::channel::<Vec<u8>>();
         let host = TestHost::spawn(move |listener| {
+            let _render = accept_authenticated(&listener, &SECRET);
             let mut stream = accept_authenticated(&listener, &SECRET);
             let (kind, payload) = TestHost::read_frame(&mut stream);
             assert_eq!(kind, KIND_PIPELINE);
@@ -3098,7 +3194,7 @@ mod tests {
         });
 
         let mut client =
-            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, None)
+            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, no_fence_page())
                 .expect("authenticated connect");
         assert_eq!(
             client.register_pipeline_v2(
@@ -3193,5 +3289,150 @@ mod tests {
             .expect_err("a path is not a stage reference");
             assert!(matches!(error, NativeQueueError::Refused(_)), "{bad}");
         }
+    }
+
+    /// ADR-041: a withheld pipeline translation must not stall the render
+    /// submission path. The pipeline exchange holds only the pipeline mutex, so
+    /// a submission on the render socket completes while the host withholds the
+    /// kind 129 reply for over half a second.
+    #[test]
+    fn a_blocked_pipeline_translation_never_stalls_a_submission() {
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+        let (held_sender, held_receiver) = mpsc::channel::<()>();
+        let host = TestHost::spawn(move |listener| {
+            let mut render = accept_authenticated(&listener, &SECRET);
+            let mut pipeline = accept_authenticated(&listener, &SECRET);
+
+            // First exchange opens and proves the dedicated channel.
+            let (kind, _) = TestHost::read_frame(&mut pipeline);
+            assert_eq!(kind, KIND_PIPELINE);
+            let mut reply = vec![PIPELINE_REPLY_OK];
+            reply.extend_from_slice(&0x11u64.to_le_bytes());
+            TestHost::write_frame(&mut pipeline, KIND_PIPELINE_REPLY, &reply);
+
+            // Second exchange is read and then withheld until the test has
+            // proved a submission completed on the render socket.
+            let (kind, _) = TestHost::read_frame(&mut pipeline);
+            assert_eq!(kind, KIND_PIPELINE);
+            held_sender.send(()).expect("report the withheld request");
+
+            // Answer the render submission from another thread: this one stays
+            // blocked in the withheld pipeline exchange.
+            let render_thread = thread::spawn(move || {
+                let (kind, payload) = TestHost::read_frame(&mut render);
+                assert_eq!(kind, KIND_SUBMISSION_V3);
+                assert_eq!(&payload[..4], &V3_REQUEST_MAGIC);
+                TestHost::write_reply(&mut render, SEQUENCE, ReplyStatus::Ok);
+            });
+            release_receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("release the pipeline reply");
+            render_thread.join().expect("render reply thread");
+            let mut reply = vec![PIPELINE_REPLY_OK];
+            reply.extend_from_slice(&0x22u64.to_le_bytes());
+            TestHost::write_frame(&mut pipeline, KIND_PIPELINE_REPLY, &reply);
+        });
+
+        let client = Arc::new(
+            WireV3Client::connect_with_fence_page(
+                &host.endpoint(),
+                &SECRET,
+                TEST_TIMEOUT,
+                no_fence_page(),
+            )
+            .expect("authenticated connect"),
+        );
+        let stage = [Vp3Stage {
+            stage: PIPELINE_STAGE_VERTEX,
+            file: "stages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            entry: "vs_main",
+        }];
+        assert_eq!(
+            client.register_pipeline_v3(PIPELINE_KIND_GRAPHICS, &stage, b"VPS1state", None),
+            Ok(0x11),
+            "the first exchange opens the dedicated pipeline connection"
+        );
+
+        let blocked = {
+            let client = Arc::clone(&client);
+            thread::spawn(move || {
+                client.register_pipeline_v3(PIPELINE_KIND_GRAPHICS, &stage, b"VPS1state", None)
+            })
+        };
+        held_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the host reads the withheld pipeline request");
+
+        let started = std::time::Instant::now();
+        let request = client
+            .request(&encoded(SEQUENCE, 100))
+            .expect("the submission encodes into a v3 request");
+        let reply = client
+            .with_stream(|stream| {
+                write_frame(
+                    stream,
+                    KIND_SUBMISSION_V3,
+                    &request.envelope,
+                    "submit",
+                    TEST_TIMEOUT,
+                )
+                .and_then(|()| {
+                    read_frame(stream, "submit", MAX_PAYLOAD_LEN as usize, TEST_TIMEOUT)
+                })
+            })
+            .expect("the render submission completes while the pipeline reply is withheld");
+        let elapsed = started.elapsed();
+        assert_eq!(reply.0, KIND_SUBMISSION_V3, "the render reply is its own frame");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a withheld pipeline translation stalled the submission for {elapsed:?}"
+        );
+        assert!(!blocked.is_finished(), "the pipeline exchange must still be blocked");
+
+        release_sender.send(()).expect("release the withheld reply");
+        assert_eq!(
+            blocked.join().expect("pipeline thread"),
+            Ok(0x22),
+            "the withheld registration then completes normally"
+        );
+        drop(client);
+    }
+
+    /// ADR-041: every pipeline error carries a bounded preview of what the host
+    /// actually sent, so a future boot shows the text instead of "1 byte".
+    #[test]
+    fn a_wrong_pipeline_reply_is_reported_with_its_bounded_text() {
+        let host = TestHost::spawn(move |listener| {
+            let _render = accept_authenticated(&listener, &SECRET);
+            let mut pipeline = accept_authenticated(&listener, &SECRET);
+            let (kind, _) = TestHost::read_frame(&mut pipeline);
+            assert_eq!(kind, KIND_PIPELINE);
+            // Not `VP3\0`, not a valid status: the reply a racing reader used to
+            // mistake for a real answer.
+            TestHost::write_frame(&mut pipeline, KIND_PIPELINE_REPLY, b"no-vp3\nmagic");
+        });
+
+        let client = WireV3Client::connect_with_fence_page(
+            &host.endpoint(),
+            &SECRET,
+            TEST_TIMEOUT,
+            no_fence_page(),
+        )
+        .expect("authenticated connect");
+        let stage = [Vp3Stage {
+            stage: PIPELINE_STAGE_VERTEX,
+            file: "stages/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            entry: "vs_main",
+        }];
+        let error = client
+            .register_pipeline_v3(PIPELINE_KIND_GRAPHICS, &stage, b"VPS1state", None)
+            .expect_err("a reply that is not a VP3 frame is an error");
+        let text = error.to_string();
+        assert!(text.contains("no-vp3"), "the reply text is surfaced: {text}");
+        assert!(
+            text.contains("\\n"),
+            "line breaks are escaped in the bounded preview: {text}"
+        );
+        drop(client);
     }
 }

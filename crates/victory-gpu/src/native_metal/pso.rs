@@ -2761,15 +2761,25 @@ mod tests {
         stream.flush().expect("flush frame");
     }
 
-    /// One authenticated fake host: it answers the VP3 payload with a native id
-    /// and returns the exact control frame it received.
+    /// One authenticated fake host: it authenticates the render peer, then
+    /// authenticates the DEDICATED pipeline peer (ADR-041) and answers the VP3
+    /// payload on that second connection with a native id, returning the exact
+    /// control frame it received.
     fn fake_host(secret: [u8; 32], id: u64) -> (u16, mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .expect("bind fake host");
         let port = listener.local_addr().expect("listener address").port();
         let (sender, receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept guest");
+            let (mut render, _) = listener.accept().expect("accept guest");
+            let (kind, payload) = read_frame(&mut render);
+            assert_eq!(kind, client::KIND_AUTH);
+            assert_eq!(payload, secret);
+            write_frame(&mut render, client::KIND_ACK, &[0]);
+
+            // The pipeline registration opens its own connection; the render
+            // session above stays open and untouched.
+            let (mut stream, _) = listener.accept().expect("accept pipeline guest");
             let (kind, payload) = read_frame(&mut stream);
             assert_eq!(kind, client::KIND_AUTH);
             assert_eq!(payload, secret);
@@ -2795,6 +2805,16 @@ mod tests {
         let share = TempShare::new();
         let secret = [0x5a; 32];
         let (port, receiver, host) = fake_host(secret, 0x5151);
+
+        // Hermetic fence page: an unmappable path keeps this test from reading a
+        // `VICTORY_METAL_SHARE_DIR` another test leaked into the environment.
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::set_var(
+                crate::native_metal::fence_page_guest::FENCE_PAGE_ENV,
+                "/nonexistent/victory-test/gpu-fence.v1.page",
+            );
+        }
 
         // Production guest configuration: a live authenticated session.
         let config = LiveConfig::resolve(
@@ -2885,6 +2905,7 @@ mod tests {
         // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
         unsafe {
             std::env::remove_var(crate::native_metal::fence_page_guest::SHARE_DIR_ENV);
+            std::env::remove_var(crate::native_metal::fence_page_guest::FENCE_PAGE_ENV);
         }
     }
 
