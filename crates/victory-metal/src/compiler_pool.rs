@@ -76,6 +76,21 @@
 //! pool reaps that answer path and the next job gets a fresh worker, which may
 //! be a newer binary.
 //!
+//! # MSC fallback
+//!
+//! When a legacy job fails because of the shader itself — the supervisor
+//! answered a nonzero `VMRES2` status (including a conversion child that died
+//! by signal) or the worker died before answering — the pool retries that job
+//! through `metal-shaderconverter` (see [`crate::macos::msc::MscTool`]). The
+//! fallback receives the same complete DXIL container, entry point and stage
+//! and must return a metallib plus a non-empty reflection JSON, so the pool's
+//! `VMRES2` payload shape is unchanged. A successful legacy job is never
+//! retried, and environmental failures (missing converter library, timeout,
+//! protocol mismatch) are not treated as shader failures. [`PoolStats`] counts
+//! each path, [`CompilerPool::last_translation`] records the last job's path
+//! plus both bounded, path-scrubbed failure reasons, and
+//! [`CompiledShader::translation`] names the path that answered.
+//!
 //! Requests and responses are strictly alternating on one pipe pair, so the
 //! pool never needs a worker-side scheduler. A worker that exits, closes its
 //! stdout or violates the frame layout is reported as an explicit error, its
@@ -104,6 +119,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+use crate::macos::msc;
 
 /// Largest worker count the pool will ever start.
 pub const MAX_WORKERS: usize = 8;
@@ -345,6 +363,50 @@ pub struct CompiledShader {
     pub metallib: Vec<u8>,
     /// Converter reflection JSON; non-empty for a successful translation.
     pub reflection: Vec<u8>,
+    /// Which translation path answered this job.
+    pub translation: TranslationPath,
+}
+
+/// Which path produced a translated shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationPath {
+    /// The x86_64 `libmetalirconverter.dylib` worker (the primary path).
+    Legacy,
+    /// The `metal-shaderconverter` fallback, after the legacy path failed.
+    Msc,
+    /// A previously stored result; the path that first produced it is not
+    /// re-run on a warm hit.
+    Cache,
+}
+
+impl std::fmt::Display for TranslationPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Legacy => "legacy",
+            Self::Msc => "msc",
+            Self::Cache => "cache",
+        })
+    }
+}
+
+/// Last job's translation outcome, bounded and path-scrubbed.
+///
+/// `legacy_failure` is present when the primary path failed and the fallback
+/// was attempted. `msc_failure` is present when that attempt also failed, so
+/// telemetry can report both reasons instead of only the first one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationReport {
+    /// Caller job id.
+    pub job_id: u64,
+    /// Declared shader stage (`1` vertex, `2` pixel, `5` mesh, `6` object,
+    /// `8` compute).
+    pub stage: u32,
+    /// Path that answered (or the path whose failure was reported).
+    pub path: TranslationPath,
+    /// Bounded legacy failure reason, when the fallback ran.
+    pub legacy_failure: Option<String>,
+    /// Bounded MSC failure reason, when the fallback also failed.
+    pub msc_failure: Option<String>,
 }
 
 /// Pool statistics snapshot.
@@ -376,6 +438,17 @@ pub struct PoolStats {
     pub worker_job_micros_total: u64,
     /// Longest single worker job wall time.
     pub worker_job_micros_max: u64,
+    /// Jobs answered successfully by the legacy x86_64 converter worker.
+    pub legacy_translations: u64,
+    /// MSC invocations actually spawned (successful or not).
+    pub msc_attempts: u64,
+    /// Jobs answered successfully by the MSC fallback.
+    pub msc_translations: u64,
+    /// MSC fallbacks that ran and failed.
+    pub msc_failures: u64,
+    /// Legacy failures whose fallback could not run because no usable MSC
+    /// executable resolved.
+    pub msc_unavailable: u64,
 }
 
 /// Per-worker lifetime counters and wall-time instrumentation.
@@ -622,6 +695,52 @@ struct AtomicStats {
     worker_jobs: AtomicU64,
     worker_job_micros_total: AtomicU64,
     worker_job_micros_max: AtomicU64,
+    legacy_translations: AtomicU64,
+    msc_attempts: AtomicU64,
+    msc_translations: AtomicU64,
+    msc_failures: AtomicU64,
+    msc_unavailable: AtomicU64,
+}
+
+/// How this pool can reach the Metal Shader Converter fallback.
+///
+/// `Disabled` is used by tests and by targets without the macOS framework;
+/// `Unavailable` records a named reason so a legacy failure can still explain
+/// that the second path was absent. Only `Tool` can spawn a process.
+enum MscBinding {
+    /// No fallback configured; legacy behaviour is byte-for-byte unchanged.
+    Disabled,
+    /// A resolved `metal-shaderconverter` executable.
+    #[cfg(target_os = "macos")]
+    Tool(msc::MscTool),
+    /// A fallback was expected but nothing usable resolved.
+    Unavailable(String),
+}
+
+impl MscBinding {
+    /// Whether a legacy failure should record a fallback attempt/absence.
+    fn is_attemptable(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// Resolves the host's fallback once, at pool construction.
+    ///
+    /// A macOS host always records *why* MSC is unusable so a legacy failure
+    /// can name both paths. Other targets have no `metal-shaderconverter`
+    /// wrapper and stay legacy-only.
+    fn from_environment() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            match msc::MscTool::resolve() {
+                Ok(tool) => Self::Tool(tool),
+                Err(err) => Self::Unavailable(err.to_string()),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::Disabled
+        }
+    }
 }
 
 /// Bounded, lazily spawned worker pool with a content-hashed disk cache.
@@ -636,6 +755,10 @@ pub struct CompilerPool {
     /// Converter library every child of this pool is started with, resolved
     /// once from the environment.
     converter: Option<PathBuf>,
+    /// Second translation path, resolved once at construction.
+    msc: MscBinding,
+    /// Last job's path and bounded failure reasons, for telemetry.
+    last_translation: Arc<Mutex<Option<TranslationReport>>>,
     cache: Option<cache_bridge::Slot>,
     slots: Vec<Arc<WorkerSlot>>,
     senders: Vec<SyncSender<JobFrame>>,
@@ -652,8 +775,40 @@ impl CompilerPool {
     /// Builds a pool. `worker_program` is the child executable that speaks the
     /// documented frame protocol (normally the `victory-irconverter` binary);
     /// `None` leaves the pool cache-only.
+    ///
+    /// The MSC fallback is resolved from the environment once, here. A machine
+    /// without `metal-shaderconverter` is a normal state: legacy failures keep
+    /// their original error and record a named "MSC unavailable" reason in the
+    /// diagnostic channel.
     pub fn new(config: PoolConfig, worker_program: Option<PathBuf>) -> Self {
-        Self::build(config, worker_program, converter_from_env(), false)
+        Self::build(
+            config,
+            worker_program,
+            converter_from_env(),
+            false,
+            MscBinding::from_environment(),
+        )
+    }
+
+    /// Builds a pool with an explicit MSC fallback decision.
+    ///
+    /// `Some(path)` names exactly the tool to use (stub or private install);
+    /// `None` disables the fallback. Tests use this so they never depend on the
+    /// host's installation or mutate process-global environment variables.
+    #[cfg(target_os = "macos")]
+    pub fn new_with_msc(
+        config: PoolConfig,
+        worker_program: Option<PathBuf>,
+        msc_tool: Option<PathBuf>,
+    ) -> Self {
+        let msc = match msc_tool {
+            Some(path) => match msc::MscTool::from_path(path) {
+                Ok(tool) => MscBinding::Tool(tool),
+                Err(err) => MscBinding::Unavailable(err.to_string()),
+            },
+            None => MscBinding::Disabled,
+        };
+        Self::build(config, worker_program, converter_from_env(), false, msc)
     }
 
     /// Builds the pool, resolving the converter once and passing it on.
@@ -662,6 +817,7 @@ impl CompilerPool {
         worker_program: Option<PathBuf>,
         converter: Option<PathBuf>,
         require_converter: bool,
+        msc: MscBinding,
     ) -> Self {
         let workers = config.workers.clamp(1, MAX_WORKERS);
         let queue_depth = config.queue_depth.max(1);
@@ -724,6 +880,8 @@ impl CompilerPool {
             },
             program: worker_program,
             converter,
+            msc,
+            last_translation: Arc::new(Mutex::new(None)),
             cache,
             slots,
             senders,
@@ -750,6 +908,28 @@ impl CompilerPool {
     /// resolved at construction.
     pub fn converter(&self) -> Option<&Path> {
         self.converter.as_deref()
+    }
+
+    /// Resolved `metal-shaderconverter` fallback executable, when usable.
+    pub fn msc_tool_path(&self) -> Option<&Path> {
+        match &self.msc {
+            #[cfg(target_os = "macos")]
+            MscBinding::Tool(tool) => Some(tool.path()),
+            _ => None,
+        }
+    }
+
+    /// Last job's translation path and bounded failure reasons.
+    ///
+    /// A successful legacy job reports `Legacy` with no failures, a successful
+    /// fallback reports `Msc` plus `legacy_failure`, and a fallback that also
+    /// failed reports both reasons. The strings are already escaped, bounded
+    /// and path-scrubbed, so they are safe for telemetry.
+    pub fn last_translation(&self) -> Option<TranslationReport> {
+        self.last_translation
+            .lock()
+            .ok()
+            .and_then(|report| report.clone())
     }
 
     /// The bounded, escaped stderr of the last worker that failed a job.
@@ -787,7 +967,13 @@ impl CompilerPool {
                 let sibling = exe.parent()?.join("victory-irconverter");
                 sibling.is_file().then_some(sibling)
             });
-        Self::build(PoolConfig::from_env(), program, converter_from_env(), true)
+        Self::build(
+            PoolConfig::from_env(),
+            program,
+            converter_from_env(),
+            true,
+            MscBinding::from_environment(),
+        )
     }
 
     /// Cache directory actually in use, when caching is enabled and openable.
@@ -810,6 +996,11 @@ impl CompilerPool {
             worker_jobs: load(&self.stats.worker_jobs),
             worker_job_micros_total: load(&self.stats.worker_job_micros_total),
             worker_job_micros_max: load(&self.stats.worker_job_micros_max),
+            legacy_translations: load(&self.stats.legacy_translations),
+            msc_attempts: load(&self.stats.msc_attempts),
+            msc_translations: load(&self.stats.msc_translations),
+            msc_failures: load(&self.stats.msc_failures),
+            msc_unavailable: load(&self.stats.msc_unavailable),
         }
     }
 
@@ -866,8 +1057,8 @@ impl CompilerPool {
             self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        let reply = match self.dispatch(job) {
-            Ok(reply) => reply,
+        let reply = match self.dispatch_translation(job) {
+            Ok((reply, _path)) => reply,
             Err(err) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 return Err(err);
@@ -907,6 +1098,7 @@ impl CompilerPool {
                 return Ok(CompiledShader {
                     metallib,
                     reflection,
+                    translation: TranslationPath::Cache,
                 });
             }
             // A metallib without a reflection sidecar is stale for this call;
@@ -914,8 +1106,8 @@ impl CompilerPool {
             self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        let reply = match self.dispatch(job) {
-            Ok(reply) => reply,
+        let (reply, translation) = match self.dispatch_translation(job) {
+            Ok(answer) => answer,
             Err(err) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 return Err(err);
@@ -946,7 +1138,130 @@ impl CompilerPool {
         Ok(CompiledShader {
             metallib: reply.metallib,
             reflection,
+            translation,
         })
+    }
+
+    /// Runs the legacy dispatch and, only when it failed in a way a shader can
+    /// cause (a nonzero worker status or a dead worker), retries through MSC.
+    ///
+    /// A working legacy path is never replaced: the first attempt must have
+    /// failed before any MSC process exists. A fallback that also fails keeps
+    /// the original [`PoolError`] variant for every existing consumer, while
+    /// both bounded reasons are recorded in [`CompilerPool::last_translation`]
+    /// and the diagnostic channel [`CompilerPool::last_worker_stderr`].
+    fn dispatch_translation(
+        &self,
+        job: &CompileJob<'_>,
+    ) -> Result<(WorkerReply, TranslationPath), PoolError> {
+        match self.dispatch(job) {
+            Ok(reply) => {
+                self.stats.legacy_translations.fetch_add(1, Ordering::Relaxed);
+                self.remember_translation(job, TranslationPath::Legacy, None, None);
+                Ok((reply, TranslationPath::Legacy))
+            }
+            Err(err) if fallback_eligible(&err) && self.msc.is_attemptable() => {
+                let legacy = bounded_legacy_failure(&err);
+                match self.msc_translate(job) {
+                    Ok(reply) => {
+                        self.stats.msc_translations.fetch_add(1, Ordering::Relaxed);
+                        self.remember_translation(
+                            job,
+                            TranslationPath::Msc,
+                            Some(legacy.clone()),
+                            None,
+                        );
+                        tracing::info!(
+                            job_id = job.id,
+                            stage = job.stage,
+                            translation_path = "msc",
+                            legacy_failure = %legacy,
+                            "shader translated by the MSC fallback after the legacy path failed"
+                        );
+                        Ok((reply, TranslationPath::Msc))
+                    }
+                    Err(msc_failure) => {
+                        self.stats.msc_failures.fetch_add(1, Ordering::Relaxed);
+                        let combined = combined_fallback_reason(&legacy, &msc_failure);
+                        record_worker_stderr(&self.last_stderr, &combined);
+                        self.remember_translation(
+                            job,
+                            TranslationPath::Legacy,
+                            Some(legacy),
+                            Some(msc_failure.clone()),
+                        );
+                        tracing::warn!(
+                            job_id = job.id,
+                            stage = job.stage,
+                            reason = %combined,
+                            "legacy shader translation failed and the MSC fallback did not recover"
+                        );
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Retries one job through the resolved MSC executable.
+    ///
+    /// The request is the same complete DXIL container, entry point and stage
+    /// the legacy worker received; a returned metallib is always paired with
+    /// the tool's non-empty reflection JSON.
+    #[cfg(target_os = "macos")]
+    fn msc_translate(&self, job: &CompileJob<'_>) -> Result<WorkerReply, String> {
+        match &self.msc {
+            MscBinding::Tool(tool) => {
+                self.stats.msc_attempts.fetch_add(1, Ordering::Relaxed);
+                let request = msc::MscRequest {
+                    dxil: job.dxil,
+                    entry: job.entry,
+                    stage: job.stage,
+                    timeout: self.config.job_timeout,
+                };
+                tool.convert(&request)
+                    .map(|output| WorkerReply {
+                        metallib: output.metallib,
+                        reflection: Some(output.reflection),
+                    })
+                    .map_err(|err| err.to_string())
+            }
+            MscBinding::Unavailable(reason) => {
+                self.stats.msc_unavailable.fetch_add(1, Ordering::Relaxed);
+                Err(reason.clone())
+            }
+            MscBinding::Disabled => Err("MSC fallback is disabled".to_string()),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn msc_translate(&self, _job: &CompileJob<'_>) -> Result<WorkerReply, String> {
+        self.stats.msc_unavailable.fetch_add(1, Ordering::Relaxed);
+        Err("MSC unavailable: this target has no metal-shaderconverter fallback".to_string())
+    }
+
+    fn remember_translation(
+        &self,
+        job: &CompileJob<'_>,
+        path: TranslationPath,
+        legacy_failure: Option<String>,
+        msc_failure: Option<String>,
+    ) {
+        let report = TranslationReport {
+            job_id: job.id,
+            stage: job.stage,
+            path,
+            legacy_failure: legacy_failure
+                .as_deref()
+                .map(|reason| escape_worker_stderr(reason.as_bytes(), false)),
+            msc_failure: msc_failure
+                .as_deref()
+                .map(|reason| escape_worker_stderr(reason.as_bytes(), false)),
+        };
+        if let Ok(mut slot) = self.last_translation.lock() {
+            *slot = Some(report);
+        }
     }
 
     /// Sends one validated job to a worker and waits for its reply.
@@ -1285,6 +1600,62 @@ fn record_worker_stderr(sink: &Mutex<Option<String>>, text: &str) {
     if let Ok(mut slot) = sink.lock() {
         *slot = Some(text.to_string());
     }
+}
+
+/// Whether a failed legacy dispatch may be retried through MSC.
+///
+/// Only failures caused by the shader/converter qualify: a nonzero worker
+/// answer (`status nonzero`, including a conversion child that died by signal)
+/// or a worker that died before answering. Environmental/protocol failures
+/// (no converter library, timeout, wrong sequence, closed pool) are not shader
+/// failures and must not start a second translator.
+fn fallback_eligible(error: &PoolError) -> bool {
+    matches!(
+        error,
+        PoolError::WorkerFailed { .. } | PoolError::WorkerExited { .. }
+    )
+}
+
+/// One bounded legacy failure reason, path-scrubbed for telemetry.
+fn bounded_legacy_failure(error: &PoolError) -> String {
+    let raw = match error {
+        PoolError::WorkerFailed {
+            status, message, ..
+        } => format!("status {status}: {message}"),
+        PoolError::WorkerExited { death, .. } => format!("worker exited: {death}"),
+        other => other.to_string(),
+    };
+    escape_worker_stderr(raw.as_bytes(), false)
+}
+
+/// Combines both path outcomes into one short telemetry line.
+///
+/// Each side is tail-truncated before joining so the result stays under the
+/// pool's telemetry bound and the host's `host_translation_reason` can name
+/// both the legacy failure and the fallback outcome instead of only one.
+fn combined_fallback_reason(legacy: &str, msc: &str) -> String {
+    let legacy = truncate_chars_head(legacy, 70);
+    let msc = truncate_chars_head(msc, 90);
+    escape_worker_stderr(
+        format!("legacy: {legacy}; msc: {msc}").as_bytes(),
+        false,
+    )
+}
+
+/// Keeps the first `max` bytes of `text` without splitting a character.
+///
+/// A combined reason is a summary, not a crash tail: the legacy category
+/// ("conversion failed", "signal 11") is at the front, so it must survive the
+/// bound even when the converter appended a long path-bearing detail.
+fn truncate_chars_head(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Appends captured stderr to a worker-reported failure, when it fits.
@@ -2131,6 +2502,7 @@ mod tests {
             Some(program),
             None,
             true,
+            MscBinding::Disabled,
         );
         let err = pool
             .compile(&CompileJob {
@@ -2190,6 +2562,7 @@ mod tests {
             Some(program),
             None,
             false,
+            MscBinding::Disabled,
         );
         let err = pool
             .compile(&CompileJob {
@@ -2299,5 +2672,366 @@ mod tests {
         );
         let long = "x".repeat(MAX_WORKER_STDERR_TELEMETRY_CHARS + 1);
         assert_eq!(telemetry_stderr(Some(&long)), None);
+    }
+
+    /// MSC fallback contract, driven by POSIX stubs only.
+    ///
+    /// No real converter, MSC installation or GPU is required: the worker
+    /// fixture speaks `VMJOB`/`VMRES2`, and the "MSC" fixtures are small `sh`
+    /// programs that copy their input or fail. Tests pass unique scratch
+    /// directories so the harness may run them in parallel.
+    #[cfg(target_os = "macos")]
+    mod msc_fallback {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::*;
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(label: &str) -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "victory-msc-fallback-{label}-{}-{}",
+                    std::process::id(),
+                    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).expect("create MSC fallback scratch dir");
+                Self(path)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn write_tool(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("write tool fixture");
+            let mut permissions = std::fs::metadata(&path)
+                .expect("stat tool fixture")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod tool fixture");
+            path
+        }
+
+        /// Worker fixture. Modes by entry point:
+        /// * `legacy` — success with a non-empty reflection (VMRES2);
+        /// * `fail`   — nonzero status naming a converter-child SIGSEGV;
+        /// * `die`    — exits before answering (worker death);
+        /// everything is echoed as `entry ++ dxil` on success.
+        fn legacy_worker(dir: &Path) -> PathBuf {
+            write_tool(
+                dir,
+                "legacy-worker.sh",
+                r#"#!/bin/sh
+set -u
+while IFS=' ' read -r magic seq id stage entry_len dxil_len; do
+    [ "$magic" = "VMJOB" ] || exit 3
+    scratch="${TMPDIR:-/tmp}/victory-msc-worker-$$"
+    dd bs=1 count="$entry_len" of="$scratch.entry" 2>/dev/null
+    dd bs=1 count="$dxil_len" of="$scratch.dxil" 2>/dev/null
+    cat "$scratch.entry" "$scratch.dxil" > "$scratch.payload"
+    exec 5<"$scratch.payload" 6<"$scratch.payload"
+    rm -f "$scratch.entry" "$scratch.dxil" "$scratch.payload"
+    entry=$(dd bs=1 count="$entry_len" <&5 2>/dev/null)
+    case "$entry" in
+        fail)
+            msg='converter child died: signal 11 (SIGSEGV); converter stderr: /Users/private/crash.log'
+            printf 'VMRES2 %s %s 1 %s 0\n%s' "$seq" "$id" "${#msg}" "$msg"
+            ;;
+        die)
+            printf 'worker dying at /Users/private/secret.dylib\n' >&2
+            exit 9
+            ;;
+        *)
+            refl='{"EntryPoint":"main","ShaderType":"Vertex","TopLevelArgumentBuffer":[]}'
+            printf 'VMRES2 %s %s 0 %s %s\n' "$seq" "$id" "$((entry_len + dxil_len))" "${#refl}"
+            cat <&6
+            printf '%s' "$refl"
+            ;;
+    esac
+    exec 5<&- 6<&-
+done
+exit 0
+"#,
+            )
+        }
+
+        /// MSC stub that copies its DXIL input to the metallib output and
+        /// writes a non-empty reflection JSON naming the entry point.
+        fn msc_ok(dir: &Path) -> PathBuf {
+            write_tool(
+                dir,
+                "metal-shaderconverter-ok.sh",
+                r#"#!/bin/sh
+set -u
+input="$1"; shift
+out=''; refl=''; entry=''
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2;;
+        -e) entry="$2"; shift 2;;
+        --reflection) refl="$2"; shift 2;;
+        *) shift;;
+    esac
+done
+cp "$input" "$out"
+printf '{"EntryPoint":"%s","ShaderType":"Vertex","TopLevelArgumentBuffer":[]}' "$entry" > "$refl"
+"#,
+            )
+        }
+
+        fn msc_failing(dir: &Path) -> PathBuf {
+            write_tool(
+                dir,
+                "metal-shaderconverter-fail.sh",
+                "#!/bin/sh\n\
+                 printf 'msc: conversion failed at /Users/private/msc.log\\n' >&2\n\
+                 exit 1\n",
+            )
+        }
+
+        fn msc_without_reflection(dir: &Path) -> PathBuf {
+            write_tool(
+                dir,
+                "metal-shaderconverter-no-reflection.sh",
+                r#"#!/bin/sh
+set -u
+input="$1"; shift
+out=''; refl=''
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2;;
+        --reflection) refl="$2"; shift 2;;
+        *) shift;;
+    esac
+done
+cp "$input" "$out"
+: > "$refl"
+"#,
+            )
+        }
+
+        fn msc_hanging(dir: &Path) -> PathBuf {
+            write_tool(
+                dir,
+                "metal-shaderconverter-hang.sh",
+                "#!/bin/sh\nsleep 30\n",
+            )
+        }
+
+        fn config(_dir: &Path) -> PoolConfig {
+            PoolConfig {
+                workers: 1,
+                queue_depth: 4,
+                job_timeout: Duration::from_secs(10),
+                cache_dir: None,
+                converter_version: "victory-metal-test/msc-fallback/1".to_string(),
+            }
+        }
+
+        fn job<'a>(id: u64, entry: &'a str, dxil: &'a [u8]) -> CompileJob<'a> {
+            CompileJob {
+                id,
+                stage: 1,
+                entry,
+                dxil,
+            }
+        }
+
+        #[test]
+        fn a_working_legacy_path_never_calls_msc() {
+            let dir = Scratch::new("legacy-wins");
+            let worker = legacy_worker(dir.path());
+            let msc = msc_ok(dir.path());
+            let pool =
+                CompilerPool::new_with_msc(config(dir.path()), Some(worker), Some(msc));
+
+            let dxil = b"dxil-bytes-for-legacy";
+            let compiled = pool
+                .compile_with_reflection(&job(1, "legacy", dxil))
+                .expect("the legacy path must answer without MSC");
+            assert_eq!(compiled.translation, TranslationPath::Legacy);
+            let mut expected = b"legacy".to_vec();
+            expected.extend_from_slice(dxil);
+            assert_eq!(compiled.metallib, expected);
+            assert!(!compiled.reflection.is_empty());
+
+            let stats = pool.stats();
+            assert_eq!(stats.legacy_translations, 1);
+            assert_eq!(
+                stats.msc_attempts, 0,
+                "MSC must never run when the legacy path answered"
+            );
+            assert_eq!(stats.msc_translations, 0);
+            let report = pool.last_translation().expect("legacy report");
+            assert_eq!(report.path, TranslationPath::Legacy);
+            assert!(report.legacy_failure.is_none());
+        }
+
+        #[test]
+        fn a_failed_legacy_job_falls_back_to_msc_and_records_both_paths() {
+            let dir = Scratch::new("fallback");
+            let worker = legacy_worker(dir.path());
+            let msc = msc_ok(dir.path());
+            let pool =
+                CompilerPool::new_with_msc(config(dir.path()), Some(worker), Some(msc));
+
+            for (id, entry, dxil) in [
+                (1u64, "fail", &b"container-bytes-for-a-crashing-converter"[..]),
+                (2, "die", &b"container-bytes-for-a-dead-worker"[..]),
+            ] {
+                let compiled = pool
+                    .compile_with_reflection(&job(id, entry, dxil))
+                    .expect("MSC must recover a job the legacy path failed");
+                assert_eq!(compiled.translation, TranslationPath::Msc);
+                assert_eq!(
+                    compiled.metallib, dxil,
+                    "MSC must receive the complete container the legacy path got"
+                );
+                assert!(compiled.reflection.starts_with(b"{"));
+
+                let report = pool.last_translation().expect("fallback report");
+                assert_eq!(report.job_id, id);
+                assert_eq!(report.path, TranslationPath::Msc);
+                let legacy = report.legacy_failure.expect("legacy reason");
+                assert!(
+                    legacy.contains("signal 11") || legacy.contains("exit code 9"),
+                    "legacy reason must name the failure: {legacy}"
+                );
+                assert!(
+                    !legacy.contains("/Users"),
+                    "legacy reason must be path-scrubbed: {legacy}"
+                );
+                assert!(report.msc_failure.is_none());
+            }
+
+            let stats = pool.stats();
+            assert_eq!(stats.msc_attempts, 2);
+            assert_eq!(stats.msc_translations, 2);
+            assert_eq!(stats.msc_failures, 0);
+            assert_eq!(stats.errors, 0, "a recovered job is not a pool error");
+        }
+
+        #[test]
+        fn a_failed_fallback_reports_both_bounded_reasons_and_keeps_the_error() {
+            let dir = Scratch::new("both-fail");
+            let worker = legacy_worker(dir.path());
+            let msc = msc_failing(dir.path());
+            let pool =
+                CompilerPool::new_with_msc(config(dir.path()), Some(worker), Some(msc));
+
+            let err = pool
+                .compile_with_reflection(&job(7, "fail", b"dxil"))
+                .expect_err("both translators failed");
+            assert!(
+                matches!(err, PoolError::WorkerFailed { job_id: 7, status: 1, .. }),
+                "the legacy error variant must stay unchanged: {err:?}"
+            );
+
+            let reason = pool
+                .last_worker_stderr()
+                .expect("both reasons must reach the diagnostic channel");
+            assert!(reason.contains("legacy:"), "{reason}");
+            assert!(reason.contains("msc:"), "{reason}");
+            assert!(reason.contains("signal 11"), "{reason}");
+            assert!(reason.contains("exit code 1"), "{reason}");
+            assert!(!reason.contains("/Users"), "paths must be scrubbed: {reason}");
+            assert!(
+                reason.chars().count() <= MAX_WORKER_STDERR_TELEMETRY_CHARS,
+                "both reasons must fit one telemetry line: {reason}"
+            );
+            assert_eq!(pool.worker_stderr_for_telemetry().as_deref(), Some(reason.as_str()));
+
+            let report = pool.last_translation().expect("failure report");
+            assert!(report.legacy_failure.is_some());
+            assert!(report.msc_failure.is_some());
+            let stats = pool.stats();
+            assert_eq!(stats.msc_attempts, 1);
+            assert_eq!(stats.msc_failures, 1);
+            assert_eq!(stats.msc_translations, 0);
+            assert_eq!(stats.errors, 1);
+        }
+
+        #[test]
+        fn an_unavailable_msc_is_a_named_reason_not_a_panic() {
+            let dir = Scratch::new("unavailable");
+            let worker = legacy_worker(dir.path());
+            let missing = dir.path().join("metal-shaderconverter-does-not-exist");
+            let pool =
+                CompilerPool::new_with_msc(config(dir.path()), Some(worker), Some(missing));
+            assert!(pool.msc_tool_path().is_none());
+
+            let err = pool
+                .compile_with_reflection(&job(3, "fail", b"dxil"))
+                .expect_err("the legacy failure must still be reported");
+            assert!(matches!(err, PoolError::WorkerFailed { status: 1, .. }));
+            let reason = pool
+                .last_worker_stderr()
+                .expect("the missing MSC must be named");
+            assert!(
+                reason.contains("MSC unavailable"),
+                "the absence must be a named reason: {reason}"
+            );
+            assert!(reason.contains("signal 11"), "{reason}");
+            assert_eq!(pool.stats().msc_unavailable, 1);
+        }
+
+        #[test]
+        fn a_fallback_without_reflection_is_a_named_failure() {
+            let dir = Scratch::new("no-reflection");
+            let worker = legacy_worker(dir.path());
+            let msc = msc_without_reflection(dir.path());
+            let pool =
+                CompilerPool::new_with_msc(config(dir.path()), Some(worker), Some(msc));
+
+            let err = pool
+                .compile_with_reflection(&job(4, "fail", b"dxil"))
+                .expect_err("an empty reflection is not a usable translation");
+            assert!(matches!(err, PoolError::WorkerFailed { status: 1, .. }));
+            let reason = pool.last_worker_stderr().expect("both reasons");
+            assert!(reason.contains("reflection"), "{reason}");
+            assert!(reason.contains("empty"), "{reason}");
+            assert_eq!(pool.stats().msc_failures, 1);
+        }
+
+        #[test]
+        fn a_hung_msc_is_killed_and_reported() {
+            let dir = Scratch::new("hang");
+            let worker = legacy_worker(dir.path());
+            let msc = msc_hanging(dir.path());
+            let pool = CompilerPool::new_with_msc(
+                PoolConfig {
+                    job_timeout: Duration::from_millis(1000),
+                    ..config(dir.path())
+                },
+                Some(worker),
+                Some(msc),
+            );
+
+            let started = std::time::Instant::now();
+            let err = pool
+                .compile_with_reflection(&job(5, "fail", b"dxil"))
+                .expect_err("a hung MSC must not hang the job");
+            assert!(matches!(err, PoolError::WorkerFailed { status: 1, .. }));
+            let reason = pool.last_worker_stderr().expect("both reasons");
+            assert!(reason.contains("did not finish"), "{reason}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the MSC deadline must bound the job"
+            );
+            assert_eq!(pool.stats().msc_failures, 1);
+        }
     }
 }
