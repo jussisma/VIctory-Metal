@@ -6,31 +6,26 @@
 //!    persistent `--stdio` [`CompilerPool`], so repeated shader creation reuses
 //!    the same Rosetta worker instead of starting one process per shader;
 //! 2. the metallib is handed to the host as transport kind 4
-//!    (`{ticket:016x}.metallib` in the launcher's share directory, then a
-//!    `ticket + entry` frame) and the native pipeline id the host answers with
-//!    (kind 129) is what a `SetComputePipeline`/`Dispatch` names.
+//!    (`{ticket:016x}.metallib` in the launcher's share directory) and the
+//!    native pipeline id the host answers with (kind 129) is what
+//!    `SetComputePipeline`, `SetPipeline` or `SetMeshPipeline` names.
 //!
-//! # What the host can register today
+//! # Pipeline families
 //!
-//! `ipc_host::register_pipeline` maps the ticket to a library and calls
-//! `DirectMetalTransport::load_metallib`, which builds **one compute
-//! pipeline** (`newComputePipelineStateWithFunction`). The transport also has
-//! `register_content_hashed_graphics_pipeline` / `..._mesh_pipeline` (metallib,
-//! entry, encoded `PipelineState` blob, [`PipelineAbi`]), but the kind 4
-//! payload has no field for a stage, a second library, a state blob or an ABI,
-//! so a graphics or mesh PSO cannot be registered over the wire yet:
+//! A compute PSO keeps the original version 1 frame: one `ticket + entry` and
+//! the host's `load_metallib` compute path.
 //!
-//! | missing in the kind 4 frame | needed for |
-//! |---|---|
-//! | `stage: u8` | selecting graphics/mesh/compute registration |
-//! | per-stage `(ticket, entry)` for vertex + pixel, or mesh + object + pixel | `register_content_hashed_*_pipeline` |
-//! | encoded `PipelineState` bytes (blend, raster, depth-stencil, formats, sample count) | the same |
-//! | encoded `PipelineAbi` (per-stage root layout) | automatic root binding |
+//! A graphics or mesh PSO sends the version 2 frame: one `(stage, ticket,
+//! entry)` per stage, the encoded `PipelineState` (`VPS1`), the encoded
+//! per-stage ABI (`VAB1`) and the raw root-signature bytes. The host reads one
+//! library per stage and creates the pipeline through
+//! `register_content_hashed_graphics_pipeline` / `..._mesh_pipeline`, so the
+//! version 2 path is the same registry the live v3 executor resolves.
 //!
-//! [`register`] therefore registers a compute PSO and refuses a graphics or
-//! mesh PSO with [`PipelineError::HostCannotRegister`], naming those fields.
-//! The refusal is structured and counted; it is never a silent skip and never
-//! a D3DMetal fallback.
+//! A stage set that cannot form one valid pipeline (a vertex without a pixel,
+//! a hull/domain/geometry stage, ...) is [`PipelineError::HostCannotRegister`],
+//! naming the failing stage. It is never a silent skip and never a D3DMetal
+//! fallback.
 //!
 //! # Entry point
 //!
@@ -85,6 +80,16 @@ impl PipelineStage {
         }
     }
 
+    /// The version 2 wire stage code for this stage.
+    pub const fn wire_code(self) -> u8 {
+        match self {
+            Self::Vertex => crate::native_metal::client::PIPELINE_STAGE_VERTEX,
+            Self::Pixel => crate::native_metal::client::PIPELINE_STAGE_PIXEL,
+            Self::Mesh => crate::native_metal::client::PIPELINE_STAGE_MESH,
+            Self::Compute => crate::native_metal::client::PIPELINE_STAGE_COMPUTE,
+        }
+    }
+
     /// The stage name the title pipeline uses (`pipeline::Shader::stage`).
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -129,11 +134,11 @@ pub enum PipelineError {
     Refused(String),
     /// The transport failed.
     Transport(String),
-    /// The host's kind 4 form cannot express this PSO (see the module docs).
+    /// The stage set cannot be expressed as one native pipeline.
     HostCannotRegister {
         /// The stage that cannot be registered.
         stage: PipelineStage,
-        /// The fields the frame would need.
+        /// What the pipeline is missing.
         missing: &'static str,
     },
 }
@@ -156,7 +161,7 @@ impl std::fmt::Display for PipelineError {
             Self::Transport(why) => write!(f, "pipeline transport: {why}"),
             Self::HostCannotRegister { stage, missing } => write!(
                 f,
-                "the host kind 4 form registers compute pipelines only; a {} PSO needs {missing}",
+                "a {} PSO cannot be registered: {missing} (failing stage: {stage:?})",
                 match stage {
                     PipelineStage::Vertex | PipelineStage::Pixel => "graphics",
                     PipelineStage::Mesh => "mesh",
@@ -169,11 +174,112 @@ impl std::fmt::Display for PipelineError {
 
 impl std::error::Error for PipelineError {}
 
-/// Fields the host's kind 4 frame would need before a graphics/mesh PSO can be
-/// registered (kept as one string so the refusal, the log and the report agree).
-pub const GRAPHICS_MESH_FRAME_FIELDS: &str =
-    "a stage field, one (ticket, entry) per stage, an encoded PipelineState blob and an encoded \
-     PipelineAbi";
+/// One pipeline's encoded state, ABI and raw root-signature bytes.
+///
+/// A caller with converter reflection can pass the exact `PipelineState` and
+/// `VAB1` ABI it wants; an empty `state` means "use the stage set's default"
+/// (RGBA8 colour, no depth, the pixel entry as the fragment function).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineDetails<'a> {
+    /// Encoded `PipelineState` bytes (`VPS1`); empty selects the default.
+    pub state: &'a [u8],
+    /// Encoded `VAB1` per-stage ABI container; empty means no auto-binding.
+    pub abi: &'a [u8],
+    /// Raw root-signature bytes; required when `abi` is non-empty.
+    pub root_signature: &'a [u8],
+}
+
+/// Stable `TextureFormat::Rgba8Unorm` code used by the default state.
+pub const DEFAULT_COLOR_FORMAT: u8 = 7;
+/// Wire stage code for a vertex shader.
+pub const WIRE_STAGE_VERTEX: u8 = 0;
+/// Wire stage code for a pixel/fragment shader.
+pub const WIRE_STAGE_PIXEL: u8 = 1;
+/// Wire stage code for a mesh shader.
+pub const WIRE_STAGE_MESH: u8 = 2;
+
+/// Encodes a graphics `PipelineState` (`VPS1`) for the stage set.
+///
+/// Mirrors `victory_metal::macos::registry::PipelineState::encode(Graphics)`:
+/// magic, stage code `0`, colour formats, no depth, a fragment entry, no
+/// object entry and zero mesh budgets.
+pub fn encode_graphics_state(color_formats: &[u8], fragment_entry: &str) -> Vec<u8> {
+    encode_state(0, color_formats, fragment_entry, None, [0; 3], [0; 3])
+}
+
+/// Encodes a mesh `PipelineState` (`VPS1`) for the stage set.
+///
+/// Mirrors `PipelineState::encode(Mesh)`: the fragment entry is required and
+/// the mesh/object threadgroups are set; the object entry is supplied by a
+/// caller that has an object stage.
+pub fn encode_mesh_state(color_formats: &[u8], fragment_entry: &str) -> Vec<u8> {
+    encode_state(
+        1,
+        color_formats,
+        fragment_entry,
+        None,
+        [32, 1, 1],
+        [1, 1, 1],
+    )
+}
+
+fn encode_state(
+    stage: u8,
+    color_formats: &[u8],
+    fragment_entry: &str,
+    object_entry: Option<&str>,
+    mesh_threadgroup: [u16; 3],
+    object_threadgroup: [u16; 3],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + fragment_entry.len());
+    out.extend_from_slice(b"VPS1");
+    out.push(stage);
+    out.push(u8::try_from(color_formats.len()).expect("colour format count exceeds u8"));
+    out.extend_from_slice(color_formats);
+    out.push(0); // no depth attachment
+    let object = object_entry.unwrap_or("");
+    out.push(u8::from(!fragment_entry.is_empty()) | (u8::from(!object.is_empty()) << 1));
+    push_u16_string(&mut out, fragment_entry);
+    push_u16_string(&mut out, object);
+    for value in mesh_threadgroup.iter().chain(object_threadgroup.iter()) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes()); // payload memory length
+    out.extend_from_slice(&0u32.to_le_bytes()); // max threadgroups per mesh grid
+    out
+}
+
+fn push_u16_string(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(
+        &u16::try_from(text.len())
+            .expect("pipeline state string exceeds u16")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// Encodes the `VAB1` per-stage ABI container from converter reflection JSON.
+///
+/// `stages` is `(wire stage, reflection JSON)`; the host parses each JSON with
+/// `RootSignatureLayout::from_converter_reflection_json`. An empty slice is an
+/// empty container, not a blob: the host distinguishes "no ABI" from a
+/// malformed one by the frame's length.
+pub fn encode_abi(stages: &[(u8, &str)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + stages.len() * 8);
+    out.extend_from_slice(b"VAB1");
+    out.push(1);
+    out.push(u8::try_from(stages.len()).expect("ABI stage count exceeds u8"));
+    for (stage, json) in stages {
+        out.push(*stage);
+        out.extend_from_slice(
+            &u32::try_from(json.len())
+                .expect("reflection JSON length exceeds u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(json.as_bytes());
+    }
+    out
+}
 
 /// The process-wide pool. One pool means one persistent worker set for the
 /// whole run (ADR-018); it is created from the environment on first use.
@@ -396,29 +502,165 @@ fn job_id(program: &StageProgram) -> u64 {
 
 /// Registers one PSO's programs with the host and returns the native id.
 ///
-/// A compute PSO translates its single program and round-trips kind 4/129. A
-/// graphics or mesh PSO is refused before any translation with
-/// [`PipelineError::HostCannotRegister`] and the missing frame fields, because
-/// the host's kind 4 form can only build a compute pipeline.
+/// A compute PSO keeps the original v1 `ticket + entry` frame. A graphics or
+/// mesh PSO translates each stage, writes one library per stage and sends the
+/// version 2 frame with the encoded state, ABI and root-signature bytes.
 #[cfg(any(windows, test))]
 pub fn register(programs: &[StageProgram]) -> Result<(u64, PoolServing), PipelineError> {
-    match programs {
-        [program] if program.stage == PipelineStage::Compute => {
-            let (metallib, serving) = translate(program)?;
-            let id = crate::native_metal::queue::register_pipeline(&metallib, &program.entry)
-                .map_err(|error| match error {
+    register_with_details(programs, &PipelineDetails::default())
+}
+
+/// [`register`] with explicit state/ABI/root-signature bytes.
+#[cfg(any(windows, test))]
+pub fn register_with_details(
+    programs: &[StageProgram],
+    details: &PipelineDetails<'_>,
+) -> Result<(u64, PoolServing), PipelineError> {
+    let mut warm = true;
+    let mut translated: Vec<(PipelineStage, Vec<u8>, &str)> = Vec::with_capacity(programs.len());
+    for program in programs {
+        let (metallib, serving) = translate(program)?;
+        warm &= serving.warm;
+        translated.push((program.stage, metallib, &program.entry));
+    }
+    let stages: Vec<(PipelineStage, &[u8], &str)> = translated
+        .iter()
+        .map(|(stage, metallib, entry)| (*stage, metallib.as_slice(), *entry))
+        .collect();
+    let id = register_translated(&stages, details)?;
+    Ok((id, PoolServing { warm }))
+}
+
+/// Registers already-translated stages (one metallib per stage).
+///
+/// This is the seam tests and callers with a prebuilt library use: a compute
+/// stage keeps the v1 frame; graphics/mesh stages send the version 2 frame.
+/// The stage set is validated before anything is written, so an incomplete
+/// pipeline is an explicit [`PipelineError::HostCannotRegister`] naming the
+/// failing stage.
+#[cfg(any(windows, test))]
+pub fn register_translated(
+    stages: &[(PipelineStage, &[u8], &str)],
+    details: &PipelineDetails<'_>,
+) -> Result<u64, PipelineError> {
+    let stage_names: Vec<PipelineStage> = stages.iter().map(|(stage, _, _)| *stage).collect();
+    match pipeline_kind(&stage_names)? {
+        PipelineKind::Compute => {
+            let (_, metallib, entry) = stages[0];
+            crate::native_metal::queue::register_pipeline(metallib, entry).map_err(|error| {
+                match error {
                     crate::native_metal::queue::NativeQueueError::Refused(why) => {
                         PipelineError::Refused(why)
                     }
                     other => PipelineError::Transport(other.to_string()),
-                })?;
-            Ok((id, serving))
+                }
+            })
         }
-        [] => Err(PipelineError::Translation("no shader stage to register".to_string())),
-        [program, ..] => Err(PipelineError::HostCannotRegister {
-            stage: program.stage,
-            missing: GRAPHICS_MESH_FRAME_FIELDS,
+        kind => {
+            for (stage, metallib, _) in stages {
+                if metallib.is_empty() {
+                    return Err(PipelineError::Refused(format!(
+                        "the {stage:?} stage has no metallib"
+                    )));
+                }
+            }
+            let wire: Vec<crate::native_metal::queue::PipelineStageLibrary<'_>> = stages
+                .iter()
+                .map(|(stage, metallib, entry)| crate::native_metal::queue::PipelineStageLibrary {
+                    stage: stage.wire_code(),
+                    metallib,
+                    entry,
+                })
+                .collect();
+            let pixel_entry = stages
+                .iter()
+                .find(|(stage, _, _)| *stage == PipelineStage::Pixel)
+                .map(|(_, _, entry)| *entry)
+                .unwrap_or_default();
+            let kind_code = match kind {
+                PipelineKind::Graphics => crate::native_metal::client::PIPELINE_KIND_GRAPHICS,
+                PipelineKind::Mesh => crate::native_metal::client::PIPELINE_KIND_MESH,
+                PipelineKind::Compute => unreachable!("compute returned above"),
+            };
+            let state_storage;
+            let state = if !details.state.is_empty() {
+                details.state
+            } else {
+                state_storage = if kind == PipelineKind::Mesh {
+                    encode_mesh_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+                } else {
+                    encode_graphics_state(&[DEFAULT_COLOR_FORMAT], pixel_entry)
+                };
+                &state_storage
+            };
+            crate::native_metal::queue::register_pipeline_v2(
+                kind_code,
+                &wire,
+                state,
+                details.abi,
+                details.root_signature,
+            )
+            .map_err(|error| match error {
+                crate::native_metal::queue::NativeQueueError::Refused(why) => {
+                    PipelineError::Refused(why)
+                }
+                other => PipelineError::Transport(other.to_string()),
+            })
+        }
+    }
+}
+
+/// The native pipeline family a stage set describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineKind {
+    Graphics,
+    Mesh,
+    Compute,
+}
+
+/// Validates the stage set and names the family it describes.
+///
+/// Only the stages the native registration understands are accepted; a set
+/// that cannot form one valid graphics/mesh/compute pipeline is refused with
+/// the stage that is missing or unsupported.
+fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError> {
+    match stages {
+        [PipelineStage::Compute] => Ok(PipelineKind::Compute),
+        [PipelineStage::Vertex, PipelineStage::Pixel]
+        | [PipelineStage::Pixel, PipelineStage::Vertex] => Ok(PipelineKind::Graphics),
+        [PipelineStage::Mesh, PipelineStage::Pixel]
+        | [PipelineStage::Pixel, PipelineStage::Mesh] => Ok(PipelineKind::Mesh),
+        [] => Err(PipelineError::Translation(
+            "no shader stage to register".to_string(),
+        )),
+        [stage] => Err(PipelineError::HostCannotRegister {
+            stage: *stage,
+            missing: match stage {
+                PipelineStage::Vertex => "a graphics pipeline also needs a pixel stage",
+                PipelineStage::Pixel => "a render pipeline also needs a vertex or mesh stage",
+                PipelineStage::Mesh => "a mesh pipeline also needs a pixel stage",
+                PipelineStage::Compute => "a compute pipeline needs exactly one stage",
+            },
         }),
+        _ => {
+            let stage = *stages
+                .iter()
+                .find(|stage| {
+                    !matches!(
+                        stage,
+                        PipelineStage::Vertex
+                            | PipelineStage::Pixel
+                            | PipelineStage::Mesh
+                            | PipelineStage::Compute
+                    )
+                })
+                .unwrap_or(&stages[stages.len() - 1]);
+            Err(PipelineError::HostCannotRegister {
+                stage,
+                missing: "the native path registers vertex+pixel, mesh+pixel or one compute \
+                          stage only",
+            })
+        }
     }
 }
 
@@ -447,15 +689,31 @@ mod tests {
     }
 
     #[test]
-    fn the_graphics_refusal_names_the_missing_frame_fields() {
-        let error = PipelineError::HostCannotRegister {
-            stage: PipelineStage::Vertex,
-            missing: GRAPHICS_MESH_FRAME_FIELDS,
-        };
+    fn an_incomplete_stage_set_names_the_failing_stage() {
+        let error = pipeline_kind(&[PipelineStage::Vertex])
+            .expect_err("a vertex-only graphics pipeline is refused");
         let text = error.to_string();
-        assert!(text.contains("graphics"));
-        assert!(text.contains("PipelineState"));
-        assert!(text.contains("PipelineAbi"));
+        assert!(text.contains("graphics"), "{text}");
+        assert!(text.contains("Vertex"), "{text}");
+    }
+
+    #[test]
+    fn graphics_and_mesh_state_blobs_are_vps1() {
+        let graphics = encode_graphics_state(&[DEFAULT_COLOR_FORMAT], "main");
+        assert_eq!(&graphics[..4], b"VPS1");
+        assert_eq!(graphics[4], 0, "graphics stage code");
+        let mesh = encode_mesh_state(&[DEFAULT_COLOR_FORMAT], "main");
+        assert_eq!(&mesh[..4], b"VPS1");
+        assert_eq!(mesh[4], 1, "mesh stage code");
+    }
+
+    #[test]
+    fn abi_container_carries_stage_json() {
+        let abi = encode_abi(&[(WIRE_STAGE_VERTEX, r#"{"TopLevelArgumentBuffer":[]}"#)]);
+        assert_eq!(&abi[..4], b"VAB1");
+        assert_eq!(abi[4], 1);
+        assert_eq!(abi[5], 1);
+        assert_eq!(abi[6], WIRE_STAGE_VERTEX);
     }
 
     #[test]

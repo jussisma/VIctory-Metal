@@ -44,12 +44,23 @@ use std::time::Duration;
 
 use victory_gpu::device;
 use victory_gpu::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
+use victory_gpu::native_metal::client::{
+    PIPELINE_FRAME_MAGIC, PIPELINE_KIND_GRAPHICS, PIPELINE_KIND_MESH,
+};
 use victory_gpu::native_metal::{pso, queue, telemetry};
 use victory_gpu::object::{Object, S_OK};
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{decode_submission_v3, CommandV3, SubmissionV3};
 
 const SECRET_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+/// Minimal converter reflection JSON per stage (only TopLevelArgumentBuffer is
+/// required by the host's `RootSignatureLayout` parser).
+const VERTEX_REFLECTION: &str =
+    r#"{"EntryPoint":"main","ShaderType":"Vertex","TopLevelArgumentBuffer":[]}"#;
+const PIXEL_REFLECTION: &str =
+    r#"{"EntryPoint":"main","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#;
+const MESH_REFLECTION: &str =
+    r#"{"EntryPoint":"main","ShaderType":"Mesh","TopLevelArgumentBuffer":[]}"#;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Allocation id the fixture's share file backs.
 const SHARE_ID: u64 = 1;
@@ -224,8 +235,17 @@ enum Seen {
     Submission(SubmissionV3),
     /// One kind 2 allocation registration: `(id, byte_len)`.
     Buffer(u64, u64),
-    /// One kind 4 pipeline registration: `(ticket, entry)`.
+    /// One kind 4 v1 pipeline registration: `(ticket, entry)`.
     Pipeline(u64, String),
+    /// One kind 4 v2 registration: kind, `(stage, ticket, entry)` list, and
+    /// the exact state/ABI/root-signature bytes.
+    PipelineV2 {
+        kind: u8,
+        stages: Vec<(u8, u64, String)>,
+        state: Vec<u8>,
+        abi: Vec<u8>,
+        root_signature: Vec<u8>,
+    },
 }
 
 /// A loopback V3 host fixture: authenticates one peer, acknowledges surface,
@@ -270,20 +290,75 @@ impl TestHost {
                         sender.send(Seen::Buffer(id, len)).expect("report the registration");
                         write_frame(&mut stream, 128, &[0]);
                     }
-                    // KIND_PIPELINE: ticket, entry length, entry.
+                    // KIND_PIPELINE: v1 `ticket, entry_len, entry`, or the
+                    // v2 frame selected by its magic word.
                     4 => {
-                        let ticket = u64::from_le_bytes(
-                            payload[0..8].try_into().expect("eight bytes"),
-                        );
-                        let entry_len =
-                            u16::from_le_bytes(payload[8..10].try_into().expect("two bytes"))
-                                as usize;
-                        assert_eq!(payload.len(), 10 + entry_len);
-                        let entry = String::from_utf8(payload[10..].to_vec())
-                            .expect("an ASCII entry name");
-                        sender
-                            .send(Seen::Pipeline(ticket, entry))
-                            .expect("report the registration");
+                        if payload.len() >= 4 && payload[..4] == PIPELINE_FRAME_MAGIC {
+                            let kind = payload[5];
+                            let stage_count = usize::from(payload[6]);
+                            let state_len = u32::from_le_bytes(
+                                payload[8..12].try_into().expect("four bytes"),
+                            ) as usize;
+                            let abi_len = u32::from_le_bytes(
+                                payload[12..16].try_into().expect("four bytes"),
+                            ) as usize;
+                            let root_len = u32::from_le_bytes(
+                                payload[16..20].try_into().expect("four bytes"),
+                            ) as usize;
+                            let mut offset = 24;
+                            let mut stages = Vec::with_capacity(stage_count);
+                            for _ in 0..stage_count {
+                                let stage = payload[offset];
+                                offset += 1;
+                                let ticket = u64::from_le_bytes(
+                                    payload[offset..offset + 8]
+                                        .try_into()
+                                        .expect("eight bytes"),
+                                );
+                                offset += 8;
+                                let entry_len = u16::from_le_bytes(
+                                    payload[offset..offset + 2]
+                                        .try_into()
+                                        .expect("two bytes"),
+                                ) as usize;
+                                offset += 2;
+                                let entry = String::from_utf8(
+                                    payload[offset..offset + entry_len].to_vec(),
+                                )
+                                .expect("an ASCII entry name");
+                                offset += entry_len;
+                                stages.push((stage, ticket, entry));
+                            }
+                            let state = payload[offset..offset + state_len].to_vec();
+                            offset += state_len;
+                            let abi = payload[offset..offset + abi_len].to_vec();
+                            offset += abi_len;
+                            let root_signature = payload[offset..offset + root_len].to_vec();
+                            offset += root_len;
+                            assert_eq!(offset, payload.len(), "no trailing bytes");
+                            sender
+                                .send(Seen::PipelineV2 {
+                                    kind,
+                                    stages,
+                                    state,
+                                    abi,
+                                    root_signature,
+                                })
+                                .expect("report the registration");
+                        } else {
+                            let ticket = u64::from_le_bytes(
+                                payload[0..8].try_into().expect("eight bytes"),
+                            );
+                            let entry_len =
+                                u16::from_le_bytes(payload[8..10].try_into().expect("two bytes"))
+                                    as usize;
+                            assert_eq!(payload.len(), 10 + entry_len);
+                            let entry = String::from_utf8(payload[10..].to_vec())
+                                .expect("an ASCII entry name");
+                            sender
+                                .send(Seen::Pipeline(ticket, entry))
+                                .expect("report the registration");
+                        }
                         let mut reply = vec![0u8];
                         reply.extend_from_slice(&next_pipeline.to_le_bytes());
                         next_pipeline += 1;
@@ -796,18 +871,138 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
         pso::pool_worker_program(),
         pso::converter_library()
     );
-    // A graphics PSO cannot be registered over kind 4 (the host form builds a
-    // compute pipeline only); the refusal names the missing frame fields.
-    let graphics = pso::StageProgram {
-        stage: pso::PipelineStage::Vertex,
-        dxil: Vec::new(),
-        entry: "main".to_string(),
+    // A graphics PSO registers with the version 2 frame: one library per stage,
+    // the encoded PipelineState, a VAB1 ABI and the raw root-signature bytes.
+    let graphics_state = pso::encode_graphics_state(&[pso::DEFAULT_COLOR_FORMAT], "main");
+    let graphics_abi = pso::encode_abi(&[
+        (pso::WIRE_STAGE_VERTEX, VERTEX_REFLECTION),
+        (pso::WIRE_STAGE_PIXEL, PIXEL_REFLECTION),
+    ]);
+    let graphics_details = pso::PipelineDetails {
+        state: &graphics_state,
+        abi: &graphics_abi,
+        root_signature: b"graphics root signature",
     };
-    match pso::register(&[graphics]) {
-        Err(pso::PipelineError::HostCannotRegister { missing, .. }) => {
-            assert!(missing.contains("PipelineState"));
+    let graphics_id = pso::register_translated(
+        &[
+            (pso::PipelineStage::Vertex, b"MTLB vertex bytes", "main"),
+            (pso::PipelineStage::Pixel, b"MTLB pixel bytes", "main"),
+        ],
+        &graphics_details,
+    )
+    .expect("the fixture host accepts a v2 graphics registration");
+    match seen.recv_timeout(TIMEOUT).expect("the second kind 4 registration") {
+        Seen::PipelineV2 {
+            kind,
+            stages,
+            state,
+            abi,
+            root_signature,
+        } => {
+            assert_eq!(kind, PIPELINE_KIND_GRAPHICS);
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[0].0, pso::WIRE_STAGE_VERTEX);
+            assert_eq!(stages[1].0, pso::WIRE_STAGE_PIXEL);
+            assert_eq!(state, graphics_state);
+            assert_eq!(abi, graphics_abi);
+            assert_eq!(root_signature, b"graphics root signature");
         }
-        other => panic!("a graphics PSO must be refused explicitly, saw {other:?}"),
+        other => panic!("expected a v2 graphics registration, saw {other:?}"),
+    }
+
+    // The registered graphics id is what `SetPipelineState` names, and the
+    // submission carries it in `SetGraphicsPipeline`.
+    let mut graphics_producer =
+        victory_gpu::native_metal::producer::MetalProducer::new(10, 1).expect("a list identity");
+    graphics_producer
+        .set_pipeline(graphics_id)
+        .expect("the graphics pipeline id");
+    graphics_producer
+        .set_render_targets(
+            &[victory_gpu::native_metal::producer::RenderTarget::cleared(
+                victory_gpu::native_metal::producer::ResourceId::new(SHARE_ID, 1)
+                    .expect("a target identity"),
+                [0.0, 0.0, 0.0, 1.0],
+            )],
+            None,
+        )
+        .expect("one colour target");
+    graphics_producer
+        .draw(3, 1, 0, 0)
+        .expect("a draw records the graphics pipeline");
+    let graphics_submission = graphics_producer.flush().expect("one submission");
+    queue::submit_recorded_batch(&[graphics_submission], 0).expect("the host accepts the batch");
+    match seen.recv_timeout(TIMEOUT).expect("the graphics submission") {
+        Seen::Submission(carried) => assert!(
+            carried.commands.iter().any(|command| matches!(
+                command,
+                CommandV3::SetGraphicsPipeline(reference) if reference.pipeline_id == graphics_id
+            )),
+            "the submission names the host's graphics id: {:?}",
+            carried.commands
+        ),
+        other => panic!("expected a graphics submission, saw {other:?}"),
+    }
+
+    // A mesh PSO round-trips the same way and its id reaches `SetMeshPipeline`.
+    let mesh_state = pso::encode_mesh_state(&[pso::DEFAULT_COLOR_FORMAT], "main");
+    let mesh_abi = pso::encode_abi(&[
+        (pso::WIRE_STAGE_MESH, MESH_REFLECTION),
+        (pso::WIRE_STAGE_PIXEL, PIXEL_REFLECTION),
+    ]);
+    let mesh_details = pso::PipelineDetails {
+        state: &mesh_state,
+        abi: &mesh_abi,
+        root_signature: b"mesh root signature",
+    };
+    let mesh_id = pso::register_translated(
+        &[
+            (pso::PipelineStage::Mesh, b"MTLB mesh bytes", "main"),
+            (pso::PipelineStage::Pixel, b"MTLB pixel bytes", "main"),
+        ],
+        &mesh_details,
+    )
+    .expect("the fixture host accepts a v2 mesh registration");
+    match seen.recv_timeout(TIMEOUT).expect("the mesh registration") {
+        Seen::PipelineV2 { kind, stages, .. } => {
+            assert_eq!(kind, PIPELINE_KIND_MESH);
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[0].0, pso::WIRE_STAGE_MESH);
+        }
+        other => panic!("expected a v2 mesh registration, saw {other:?}"),
+    }
+    let mut mesh_producer =
+        victory_gpu::native_metal::producer::MetalProducer::new(11, 1).expect("a list identity");
+    mesh_producer
+        .set_mesh_pipeline(mesh_id)
+        .expect("the mesh pipeline id");
+    mesh_producer
+        .dispatch_mesh(1, 1, 1)
+        .expect("a mesh dispatch records");
+    let mesh_submission = mesh_producer.flush().expect("one submission");
+    queue::submit_recorded_batch(&[mesh_submission], 0).expect("the host accepts the batch");
+    match seen.recv_timeout(TIMEOUT).expect("the mesh submission") {
+        Seen::Submission(carried) => assert!(
+            carried.commands.iter().any(|command| matches!(
+                command,
+                CommandV3::SetMeshPipeline(reference) if reference.pipeline_id == mesh_id
+            )),
+            "the submission names the host's mesh id: {:?}",
+            carried.commands
+        ),
+        other => panic!("expected a mesh submission, saw {other:?}"),
+    }
+
+    // A stage set that cannot form one pipeline is an explicit refusal naming
+    // the failing stage; it never produces a partial registration.
+    match pso::register_translated(
+        &[(pso::PipelineStage::Vertex, b"MTLB vertex bytes", "main")],
+        &graphics_details,
+    ) {
+        Err(pso::PipelineError::HostCannotRegister { stage, .. }) => {
+            assert_eq!(stage, pso::PipelineStage::Vertex);
+        }
+        other => panic!("a vertex-only PSO must be refused explicitly, saw {other:?}"),
     }
 
     // Signal advances the fence; GetCompletedValue reads it.

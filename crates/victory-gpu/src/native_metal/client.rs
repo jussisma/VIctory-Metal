@@ -122,6 +122,36 @@ pub const PIPELINE_REPLY_OK: u8 = 0;
 pub const PIPELINE_REPLY_REJECTED: u8 = 1;
 /// Exact length of a successful kind 129 reply: status plus `u64` id.
 pub const PIPELINE_REPLY_OK_LEN: usize = 1 + 8;
+/// First four bytes of a version 2 kind 4 request (`ipc_host`).
+pub const PIPELINE_FRAME_MAGIC: [u8; 4] = *b"VP2\0";
+/// Version byte of the version 2 pipeline frame.
+pub const PIPELINE_FRAME_VERSION_V2: u8 = 1;
+/// Fixed header length of a version 2 pipeline frame.
+pub const PIPELINE_V2_HEADER_LEN: usize = 24;
+/// Largest number of stage entries one version 2 frame may carry.
+pub const PIPELINE_V2_MAX_STAGES: usize = 4;
+/// Version 2 pipeline kinds.
+pub const PIPELINE_KIND_COMPUTE: u8 = 0;
+/// A vertex/fragment render pipeline.
+pub const PIPELINE_KIND_GRAPHICS: u8 = 1;
+/// A mesh/object/fragment render pipeline.
+pub const PIPELINE_KIND_MESH: u8 = 2;
+/// Version 2 per-stage codes.
+pub const PIPELINE_STAGE_VERTEX: u8 = 0;
+/// Pixel/fragment stage.
+pub const PIPELINE_STAGE_PIXEL: u8 = 1;
+/// Mesh stage.
+pub const PIPELINE_STAGE_MESH: u8 = 2;
+/// Object stage.
+pub const PIPELINE_STAGE_OBJECT: u8 = 3;
+/// Compute stage.
+pub const PIPELINE_STAGE_COMPUTE: u8 = 4;
+/// Largest encoded state/ABI/root-signature blob the guest will send.
+pub const MAX_PIPELINE_STATE_BYTES: usize = 4 * 1024;
+/// Largest encoded pipeline ABI bytes.
+pub const MAX_PIPELINE_ABI_BYTES: usize = 16 * 1024;
+/// Largest raw root-signature bytes.
+pub const MAX_ROOT_SIGNATURE_BYTES: usize = 16 * 1024;
 /// Frame kind registering the shared completion fence page (`ipc_host`).
 pub const KIND_FENCE_PAGE: u8 = 6;
 /// Frame kind registering a host texture (`ipc_host`).
@@ -1101,6 +1131,193 @@ impl WireV3Client {
                     }
                     (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
                         format!("the host rejected pipeline ticket {ticket}"),
+                    )),
+                    _ => Err(NativeQueueError::Transport(format!(
+                        "malformed kind 129 reply of {} byte(s)",
+                        reply.len()
+                    ))),
+                }
+            }
+            Ok((actual, _)) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                self.transport_errors = self.transport_errors.saturating_add(1);
+                Err(NativeQueueError::Transport(
+                    TransportError::UnexpectedKind {
+                        expected: KIND_PIPELINE_REPLY,
+                        actual,
+                    }
+                    .to_string(),
+                ))
+            }
+            Err(error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                self.transport_errors = self.transport_errors.saturating_add(1);
+                Err(NativeQueueError::Transport(error.to_string()))
+            }
+        }
+    }
+
+    /// Registers a multi-stage graphics, mesh or compute pipeline (kind 4 v2).
+    ///
+    /// `stages` is one `(wire stage, ticket, entry)` per shader; each ticket
+    /// names the `{ticket:016x}.metallib` the caller already wrote. `state`,
+    /// `abi` and `root_signature` are the encoded `PipelineState`, the `VAB1`
+    /// per-stage ABI container and the raw root-signature bytes. Compute also
+    /// accepts the v1 form; this method is the only way to express graphics and
+    /// mesh.
+    ///
+    /// Tickets must be nonzero and strictly increasing, exactly like the host's
+    /// ledger. The host validates every field and either registers the whole
+    /// pipeline or answers one rejection byte; there is no partial pipeline.
+    pub fn register_pipeline_v2(
+        &mut self,
+        kind: u8,
+        stages: &[(u8, u64, &str)],
+        state: &[u8],
+        abi: &[u8],
+        root_signature: &[u8],
+    ) -> Result<u64, NativeQueueError> {
+        if !matches!(
+            kind,
+            PIPELINE_KIND_COMPUTE | PIPELINE_KIND_GRAPHICS | PIPELINE_KIND_MESH
+        ) {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline kind {kind} is not compute, graphics or mesh"
+            )));
+        }
+        if stages.is_empty() || stages.len() > PIPELINE_V2_MAX_STAGES {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline registration needs 1..={PIPELINE_V2_MAX_STAGES} stages, got {}",
+                stages.len()
+            )));
+        }
+        if state.len() > MAX_PIPELINE_STATE_BYTES
+            || abi.len() > MAX_PIPELINE_ABI_BYTES
+            || root_signature.len() > MAX_ROOT_SIGNATURE_BYTES
+        {
+            return Err(NativeQueueError::Refused(
+                "pipeline state, ABI or root signature exceeds its limit".to_string(),
+            ));
+        }
+        let mut previous_ticket = self.last_pipeline_ticket;
+        let mut seen = Vec::with_capacity(stages.len());
+        for (stage, ticket, entry) in stages {
+            if *ticket == 0 || *ticket <= previous_ticket {
+                return Err(NativeQueueError::Refused(format!(
+                    "pipeline ticket {ticket} is not greater than the last accepted ticket \
+                     {previous_ticket}"
+                )));
+            }
+            if !matches!(
+                *stage,
+                PIPELINE_STAGE_VERTEX
+                    | PIPELINE_STAGE_PIXEL
+                    | PIPELINE_STAGE_MESH
+                    | PIPELINE_STAGE_OBJECT
+                    | PIPELINE_STAGE_COMPUTE
+            ) || seen.contains(stage)
+            {
+                return Err(NativeQueueError::Refused(format!(
+                    "pipeline stage {stage} is unknown or repeated"
+                )));
+            }
+            if !valid_pipeline_entry(entry) {
+                return Err(NativeQueueError::Refused(format!(
+                    "pipeline entry `{entry}` is not a bounded ASCII Metal identifier"
+                )));
+            }
+            previous_ticket = *ticket;
+            seen.push(*stage);
+        }
+
+        let mut payload = Vec::with_capacity(
+            PIPELINE_V2_HEADER_LEN
+                + stages.iter().map(|(_, _, entry)| 11 + entry.len()).sum::<usize>()
+                + state.len()
+                + abi.len()
+                + root_signature.len(),
+        );
+        payload.extend_from_slice(&PIPELINE_FRAME_MAGIC);
+        payload.push(PIPELINE_FRAME_VERSION_V2);
+        payload.push(kind);
+        payload.push(u8::try_from(stages.len()).expect("stage count is bounded"));
+        payload.push(0);
+        payload.extend_from_slice(
+            &u32::try_from(state.len())
+                .expect("state length is bounded")
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u32::try_from(abi.len())
+                .expect("ABI length is bounded")
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &u32::try_from(root_signature.len())
+                .expect("root signature length is bounded")
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for (stage, ticket, entry) in stages {
+            payload.push(*stage);
+            payload.extend_from_slice(&ticket.to_le_bytes());
+            payload.extend_from_slice(
+                &u16::try_from(entry.len())
+                    .expect("entry length is bounded")
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(entry.as_bytes());
+        }
+        payload.extend_from_slice(state);
+        payload.extend_from_slice(abi);
+        payload.extend_from_slice(root_signature);
+        if payload.len() > MAX_PAYLOAD_LEN as usize {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline registration is {} bytes, over the {MAX_PAYLOAD_LEN}-byte transport limit",
+                payload.len()
+            )));
+        }
+
+        let Some(mut stream) = self.stream.take() else {
+            return Err(NativeQueueError::Transport(
+                TransportError::NotConnected.to_string(),
+            ));
+        };
+        let result = write_frame(
+            &mut stream,
+            KIND_PIPELINE,
+            &payload,
+            "register pipeline v2",
+            self.timeout,
+        )
+        .and_then(|()| {
+            read_frame(
+                &mut stream,
+                "register pipeline v2",
+                MAX_PAYLOAD_LEN as usize,
+                self.timeout,
+            )
+        });
+        match result {
+            Ok((KIND_PIPELINE_REPLY, reply)) => {
+                self.stream = Some(stream);
+                match (reply.first().copied(), reply.len()) {
+                    (Some(PIPELINE_REPLY_OK), PIPELINE_REPLY_OK_LEN) => {
+                        let id =
+                            u64::from_le_bytes(reply[1..].try_into().expect("eight bytes"));
+                        if id == 0 {
+                            return Err(NativeQueueError::Transport(
+                                "the host answered pipeline registration with id zero".to_string(),
+                            ));
+                        }
+                        self.last_pipeline_ticket = previous_ticket;
+                        for (_, ticket, _) in stages {
+                            self.pipelines.insert(*ticket, id);
+                        }
+                        Ok(id)
+                    }
+                    (Some(PIPELINE_REPLY_REJECTED), 1) => Err(NativeQueueError::Refused(
+                        "the host rejected the version 2 pipeline registration".to_string(),
                     )),
                     _ => Err(NativeQueueError::Transport(format!(
                         "malformed kind 129 reply of {} byte(s)",
@@ -2169,6 +2386,59 @@ mod tests {
         assert_eq!(
             receiver.recv_timeout(TEST_TIMEOUT).expect("frame list"),
             vec![(1, "main".to_string()), (2, "main".to_string())]
+        );
+    }
+
+    /// A version 2 frame carries the kind, per-stage tickets/entries and the
+    /// state/ABI/root-signature blobs; the reply is the same kind 129 id.
+    #[test]
+    fn pipeline_registration_v2_carries_stages_state_and_abi() {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let (kind, payload) = TestHost::read_frame(&mut stream);
+            assert_eq!(kind, KIND_PIPELINE);
+            sender.send(payload).expect("report the frame");
+            let mut reply = vec![PIPELINE_REPLY_OK];
+            reply.extend_from_slice(&0x77u64.to_le_bytes());
+            TestHost::write_frame(&mut stream, KIND_PIPELINE_REPLY, &reply);
+        });
+
+        let mut client =
+            WireV3Client::connect_with_fence_page(&host.endpoint(), &SECRET, TEST_TIMEOUT, None)
+                .expect("authenticated connect");
+        assert_eq!(
+            client.register_pipeline_v2(
+                PIPELINE_KIND_GRAPHICS,
+                &[
+                    (PIPELINE_STAGE_VERTEX, 1, "main"),
+                    (PIPELINE_STAGE_PIXEL, 2, "main"),
+                ],
+                b"VPS1state",
+                b"VAB1abi",
+                b"root-signature",
+            ),
+            Ok(0x77)
+        );
+        assert_eq!(client.pipeline_registered(1), Some(0x77));
+        assert_eq!(client.pipeline_registered(2), Some(0x77));
+        assert_eq!(client.next_pipeline_ticket(), 3);
+        drop(client);
+
+        let payload = receiver.recv_timeout(TEST_TIMEOUT).expect("one frame");
+        assert_eq!(&payload[..4], &PIPELINE_FRAME_MAGIC);
+        assert_eq!(payload[4], PIPELINE_FRAME_VERSION_V2);
+        assert_eq!(payload[5], PIPELINE_KIND_GRAPHICS);
+        assert_eq!(payload[6], 2, "two stage entries");
+        assert_eq!(payload[7], 0);
+        let state_len = u32::from_le_bytes(payload[8..12].try_into().expect("four bytes")) as usize;
+        let abi_len = u32::from_le_bytes(payload[12..16].try_into().expect("four bytes")) as usize;
+        let root_len = u32::from_le_bytes(payload[16..20].try_into().expect("four bytes")) as usize;
+        assert_eq!((state_len, abi_len, root_len), (9, 7, 14));
+        let entries_len = 2 * (1 + 8 + 2 + "main".len());
+        assert_eq!(
+            &payload[PIPELINE_V2_HEADER_LEN + entries_len..][..state_len],
+            b"VPS1state"
         );
     }
 }
