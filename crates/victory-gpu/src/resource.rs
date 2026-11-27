@@ -2099,6 +2099,49 @@ pub(crate) fn texture_table_registration(
     }))
 }
 
+/// Canonical DXGI -> kind 8 wire code, after resolving a typeless format to
+/// the concrete base the host creates.
+///
+/// The canonical table in `victory_metal::macos::registry::FORMAT_TABLE` is the
+/// source of truth. The Windows guest cannot link that macOS-only module, so
+/// this mirror carries the same numbers; the macOS test
+/// `wire_codes_match_the_canonical_table` asserts they agree row for row.
+#[allow(dead_code)]
+const DXGI_WIRE_CODES: &[(u32, u8)] = &[
+    (1, 12), (2, 12), (3, 13), (4, 14),
+    (9, 9), (10, 9), (11, 16), (12, 17), (13, 18), (14, 19),
+    (15, 21), (16, 21), (17, 22), (18, 23),
+    (19, 8), (20, 8), (21, 25), (22, 26),
+    (23, 6), (24, 6), (25, 28), (26, 5),
+    (27, 0), (28, 0), (29, 2), (30, 30), (31, 31), (32, 32),
+    (33, 34), (34, 34), (35, 35), (36, 36), (37, 37), (38, 38),
+    (39, 3), (40, 7), (41, 3), (42, 10), (43, 11),
+    (44, 41), (45, 41), (46, 42), (47, 43),
+    (48, 45), (49, 45), (50, 46), (51, 47), (52, 48),
+    (53, 4), (54, 4), (55, 54), (56, 50), (57, 51), (58, 52), (59, 53),
+    (60, 56), (61, 56), (62, 57), (63, 58), (64, 59), (65, 61), (67, 62),
+    (70, 70), (71, 70), (72, 71), (73, 72), (74, 72), (75, 73),
+    (76, 74), (77, 74), (78, 75), (79, 76), (80, 76), (81, 77),
+    (82, 78), (83, 78), (84, 79),
+    (85, 63), (86, 64), (87, 1), (88, 67), (90, 1), (91, 65), (92, 67), (93, 68),
+    (94, 80), (95, 80), (96, 81), (97, 82), (98, 82), (99, 83),
+];
+
+#[cfg(target_os = "macos")]
+fn wire_format_code(dxgi: u32) -> Option<u8> {
+    let format = victory_metal::macos::registry::TextureFormat::from_dxgi(dxgi).ok()?;
+    let concrete = format.typeless_base().unwrap_or(format);
+    Some(concrete.wire_code())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wire_format_code(dxgi: u32) -> Option<u8> {
+    DXGI_WIRE_CODES
+        .iter()
+        .find(|(value, _)| *value == dxgi)
+        .map(|(_, code)| *code)
+}
+
 /// Maps a texture description to the kind 8 `(dimension, format, usage)` codes.
 #[cfg(any(windows, test))]
 fn texture_registration_codes(
@@ -2112,28 +2155,8 @@ fn texture_registration_codes(
         4 => 5,                                  // D3
         _ => return Err("texture registration: unknown dimension"),
     };
-    let format = match desc.format {
-        28 => 0,
-        87 => 1,
-        29 => 2,
-        41 => 3,
-        54 => 4,
-        26 => 5,
-        24 => 6,
-        40 => 7,
-        20 => 8,
-        // DXGI_FORMAT_R16G16B16A16_FLOAT: the title's SDR-presented FP16
-        // back-buffer. Host code 9 decodes to `TextureFormat::Rgba16Float`
-        // (`MTLPixelFormatRGBA16Float`, 115).
-        10 => 9,
-        // DXGI_FORMAT_R32_UINT and R32_SINT: integer storage/colour targets.
-        // Host codes 10 and 11 decode to `TextureFormat::R32Uint`
-        // (`MTLPixelFormatR32Uint`, 53) and `TextureFormat::R32Sint`
-        // (`MTLPixelFormatR32Sint`, 54).
-        42 => 10,
-        43 => 11,
-        _ => return Err("texture registration: format has no host code"),
-    };
+    let format = wire_format_code(desc.format)
+        .ok_or("texture registration: format has no host code")?;
     Ok((dimension, format, usage))
 }
 
@@ -2966,12 +2989,65 @@ mod tests {
     fn an_unmapped_texture_format_still_refuses_explicitly() {
         let desc = ResourceDesc {
             flags: 0x4,
-            ..texture(2560, 1440, 11, 1) // R8G8B8A8_UINT, no host code
+            ..texture(2560, 1440, 6, 1) // R32G32B32_FLOAT: Metal has no 3-channel format
         };
         assert_eq!(
             native_texture_registration(&desc),
             Some(Err("texture registration: format has no host code"))
         );
+        // XR_BIAS has no Metal format either.
+        let xr_bias = ResourceDesc { format: 89, ..desc };
+        assert_eq!(
+            native_texture_registration(&xr_bias),
+            Some(Err("texture registration: format has no host code"))
+        );
+    }
+
+    /// ADR-033: the Boot #2 target and the format families it needed resolve
+    /// to distinct kind 8 codes. 62 is R8_UINT (not R16_UINT), 63 R8_SNORM,
+    /// 64 R8_SINT, 65 A8_UNORM, 88 B8G8R8X8_UNORM and 93 its sRGB pair.
+    #[test]
+    fn the_full_format_set_resolves_to_wire_codes() {
+        for (dxgi, wire) in [
+            (24u32, 6u8),  // R10G10B10A2_UNORM
+            (26, 5),      // R11G11B10_FLOAT
+            (62, 57),     // R8_UINT -> R8_UNORM base layout, new code
+            (63, 58),     // R8_SNORM
+            (64, 59),     // R8_SINT
+            (65, 61),     // A8_UNORM
+            (88, 67),     // B8G8R8X8_UNORM
+            (93, 68),     // B8G8R8X8_UNORM_SRGB
+            (71, 70),     // BC1_UNORM
+            (77, 74),     // BC3_UNORM
+            (98, 82),     // BC7_UNORM
+        ] {
+            assert_eq!(wire_format_code(dxgi), Some(wire), "DXGI {dxgi}");
+            let desc = ResourceDesc {
+                flags: 0x4,
+                ..texture(640, 360, dxgi, 1)
+            };
+            assert!(
+                native_texture_registration(&desc).is_some_and(|r| r.is_ok()),
+                "DXGI {dxgi} must register"
+            );
+        }
+        // A typeless resource registers with its concrete base's code.
+        assert_eq!(wire_format_code(27), Some(0), "R8G8B8A8_TYPELESS -> RGBA8");
+        assert_eq!(wire_format_code(44), Some(41), "R24G8_TYPELESS -> D24S8");
+        assert_eq!(wire_format_code(97), Some(82), "BC7_TYPELESS -> BC7");
+    }
+
+    /// The Windows mirror and the canonical Metal table agree row for row.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wire_codes_match_the_canonical_table() {
+        use victory_metal::macos::registry::TextureFormat;
+        for &(dxgi, wire) in DXGI_WIRE_CODES {
+            let format = TextureFormat::from_dxgi(dxgi)
+                .unwrap_or_else(|error| panic!("DXGI {dxgi}: {error}"));
+            let concrete = format.typeless_base().unwrap_or(format);
+            assert_eq!(concrete.wire_code(), wire, "{} wire", format.name());
+        }
     }
 
     fn heap(size: u64) -> This {

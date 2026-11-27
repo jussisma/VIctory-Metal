@@ -42,6 +42,7 @@ use thiserror::Error;
 use crate::abi::VmBufferId;
 use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
+use crate::macos::registry::{FormatKind, TextureFormat};
 use crate::macos::texture::{VmTextureId, MAX_TEXTURE_DIMENSION_2D};
 use crate::transport::{MetalError, MetalTransport};
 
@@ -59,6 +60,9 @@ const MTL_TEXTURE_USAGE_SHADER_READ: usize = 1;
 const MTL_TEXTURE_USAGE_SHADER_WRITE: usize = 2;
 /// `MTLTextureUsageRenderTarget` (also the usage bit for depth/stencil targets).
 const MTL_TEXTURE_USAGE_RENDER_TARGET: usize = 4;
+/// `MTLTextureUsagePixelFormatView`; required before a texture may be viewed
+/// with a different pixel format.
+const MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW: usize = 16;
 /// `MTLCommandBufferStatusCompleted`.
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// Widest 2D mip chain for a `16384` edge (`log2(16384) + 1`).
@@ -130,388 +134,36 @@ pub struct FormatSupport {
 
 /// Guest DXGI pixel formats mapped by the native renderer.
 ///
-/// The numeric DXGI values are the ones in the Windows SDK
-/// (`DXGI_FORMAT_*`); `R8UnormSrgb` and `Rg8UnormSrgb` are Metal-only mirrors
-/// because DXGI has no 8-bit single/dual-channel sRGB encoding (they are
-/// reachable through [`PixelFormat::from_mtl_pixel_format`] only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PixelFormat {
-    /// `DXGI_FORMAT_R8_UNORM` / `MTLPixelFormatR8Unorm`.
-    R8Unorm,
-    /// `MTLPixelFormatR8Unorm_sRGB` (no DXGI equivalent).
-    R8UnormSrgb,
-    /// `DXGI_FORMAT_R8G8_UNORM` / `MTLPixelFormatRG8Unorm`.
-    Rg8Unorm,
-    /// `MTLPixelFormatRG8Unorm_sRGB` (no DXGI equivalent).
-    Rg8UnormSrgb,
-    /// `DXGI_FORMAT_R8G8B8A8_UNORM` / `MTLPixelFormatRGBA8Unorm`.
-    Rgba8Unorm,
-    /// `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB` / `MTLPixelFormatRGBA8Unorm_sRGB`.
-    Rgba8UnormSrgb,
-    /// `DXGI_FORMAT_B8G8R8A8_UNORM` / `MTLPixelFormatBGRA8Unorm`.
-    Bgra8Unorm,
-    /// `DXGI_FORMAT_B8G8R8A8_UNORM_SRGB` / `MTLPixelFormatBGRA8Unorm_sRGB`.
-    Bgra8UnormSrgb,
-    /// `DXGI_FORMAT_R16_FLOAT` / `MTLPixelFormatR16Float`.
-    R16Float,
-    /// `DXGI_FORMAT_R16G16_FLOAT` / `MTLPixelFormatRG16Float`.
-    Rg16Float,
-    /// `DXGI_FORMAT_R16G16B16A16_FLOAT` / `MTLPixelFormatRGBA16Float`.
-    Rgba16Float,
-    /// `DXGI_FORMAT_R32_FLOAT` / `MTLPixelFormatR32Float`.
-    R32Float,
-    /// `DXGI_FORMAT_R32G32_FLOAT` / `MTLPixelFormatRG32Float`.
-    Rg32Float,
-    /// `DXGI_FORMAT_R32G32B32A32_FLOAT` / `MTLPixelFormatRGBA32Float`.
-    Rgba32Float,
-    /// `DXGI_FORMAT_R32_UINT` / `MTLPixelFormatR32Uint`.
-    R32Uint,
-    /// `DXGI_FORMAT_R32G32_UINT` / `MTLPixelFormatRG32Uint`.
-    Rg32Uint,
-    /// `DXGI_FORMAT_R32G32B32A32_UINT` / `MTLPixelFormatRGBA32Uint`.
-    Rgba32Uint,
-    /// `DXGI_FORMAT_D32_FLOAT` / `MTLPixelFormatDepth32Float`.
-    Depth32Float,
+/// `PixelFormat` is now the canonical [`crate::macos::registry::TextureFormat`]
+/// table (ADR-033): one `DXGI_FORMAT` -> `MTLPixelFormat` map shared with the
+/// host registry and the guest pipeline/registration code. The numeric DXGI
+/// values are the Windows SDK's; `R8UnormSrgb` and `Rg8UnormSrgb` are
+/// Metal-only mirrors because DXGI has no 8-bit single/dual-channel sRGB
+/// encoding (they are reachable through
+/// [`PixelFormat::from_mtl_pixel_format`] only).
+pub use crate::macos::registry::TextureFormat as PixelFormat;
+
+#[allow(non_upper_case_globals)]
+impl TextureFormat {
+    /// `MTLPixelFormatBC1_RGBA` (the pre-ADR-033 views name).
+    pub const Bc1Unorm: Self = Self::Bc1Rgba;
+    /// `MTLPixelFormatBC1_RGBA_sRGB`.
+    pub const Bc1UnormSrgb: Self = Self::Bc1RgbaSrgb;
+    /// `MTLPixelFormatBC3_RGBA`.
+    pub const Bc3Unorm: Self = Self::Bc3Rgba;
+    /// `MTLPixelFormatBC3_RGBA_sRGB`.
+    pub const Bc3UnormSrgb: Self = Self::Bc3RgbaSrgb;
+    /// `MTLPixelFormatBC7_RGBAUnorm`.
+    pub const Bc7Unorm: Self = Self::Bc7Rgba;
+    /// `MTLPixelFormatBC7_RGBAUnorm_sRGB`.
+    pub const Bc7UnormSrgb: Self = Self::Bc7RgbaSrgb;
     /// `DXGI_FORMAT_D24_UNORM_S8_UINT`; 24-bit depth where supported,
     /// otherwise `MTLPixelFormatDepth32Float_Stencil8`.
-    Depth24UnormStencil8,
-    /// `DXGI_FORMAT_D16_UNORM` / `MTLPixelFormatDepth16Unorm`.
-    Depth16Unorm,
-    /// `DXGI_FORMAT_D32_FLOAT_S8X24_UINT` /
-    /// `MTLPixelFormatDepth32Float_Stencil8`.
-    Depth32FloatStencil8,
-    /// `DXGI_FORMAT_BC1_UNORM` / `MTLPixelFormatBC1_RGBA`.
-    Bc1Unorm,
-    /// `DXGI_FORMAT_BC1_UNORM_SRGB` / `MTLPixelFormatBC1_RGBA_sRGB`.
-    Bc1UnormSrgb,
-    /// `DXGI_FORMAT_BC3_UNORM` / `MTLPixelFormatBC3_RGBA`.
-    Bc3Unorm,
-    /// `DXGI_FORMAT_BC3_UNORM_SRGB` / `MTLPixelFormatBC3_RGBA_sRGB`.
-    Bc3UnormSrgb,
-    /// `DXGI_FORMAT_BC7_UNORM` / `MTLPixelFormatBC7_RGBAUnorm`.
-    Bc7Unorm,
-    /// `DXGI_FORMAT_BC7_UNORM_SRGB` / `MTLPixelFormatBC7_RGBAUnorm_sRGB`.
-    Bc7UnormSrgb,
-}
-
-impl PixelFormat {
-    /// Every mapped format, in table order.
-    pub const ALL: [Self; 27] = [
-        Self::R8Unorm,
-        Self::R8UnormSrgb,
-        Self::Rg8Unorm,
-        Self::Rg8UnormSrgb,
-        Self::Rgba8Unorm,
-        Self::Rgba8UnormSrgb,
-        Self::Bgra8Unorm,
-        Self::Bgra8UnormSrgb,
-        Self::R16Float,
-        Self::Rg16Float,
-        Self::Rgba16Float,
-        Self::R32Float,
-        Self::Rg32Float,
-        Self::Rgba32Float,
-        Self::R32Uint,
-        Self::Rg32Uint,
-        Self::Rgba32Uint,
-        Self::Depth32Float,
-        Self::Depth24UnormStencil8,
-        Self::Depth16Unorm,
-        Self::Depth32FloatStencil8,
-        Self::Bc1Unorm,
-        Self::Bc1UnormSrgb,
-        Self::Bc3Unorm,
-        Self::Bc3UnormSrgb,
-        Self::Bc7Unorm,
-        Self::Bc7UnormSrgb,
-    ];
-
-    /// Human-readable DXGI-style name for diagnostics.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::R8Unorm => "R8_UNORM",
-            Self::R8UnormSrgb => "R8_UNORM_SRGB",
-            Self::Rg8Unorm => "R8G8_UNORM",
-            Self::Rg8UnormSrgb => "R8G8_UNORM_SRGB",
-            Self::Rgba8Unorm => "R8G8B8A8_UNORM",
-            Self::Rgba8UnormSrgb => "R8G8B8A8_UNORM_SRGB",
-            Self::Bgra8Unorm => "B8G8R8A8_UNORM",
-            Self::Bgra8UnormSrgb => "B8G8R8A8_UNORM_SRGB",
-            Self::R16Float => "R16_FLOAT",
-            Self::Rg16Float => "R16G16_FLOAT",
-            Self::Rgba16Float => "R16G16B16A16_FLOAT",
-            Self::R32Float => "R32_FLOAT",
-            Self::Rg32Float => "R32G32_FLOAT",
-            Self::Rgba32Float => "R32G32B32A32_FLOAT",
-            Self::R32Uint => "R32_UINT",
-            Self::Rg32Uint => "R32G32_UINT",
-            Self::Rgba32Uint => "R32G32B32A32_UINT",
-            Self::Depth32Float => "D32_FLOAT",
-            Self::Depth24UnormStencil8 => "D24_UNORM_S8_UINT",
-            Self::Depth16Unorm => "D16_UNORM",
-            Self::Depth32FloatStencil8 => "D32_FLOAT_S8X24_UINT",
-            Self::Bc1Unorm => "BC1_UNORM",
-            Self::Bc1UnormSrgb => "BC1_UNORM_SRGB",
-            Self::Bc3Unorm => "BC3_UNORM",
-            Self::Bc3UnormSrgb => "BC3_UNORM_SRGB",
-            Self::Bc7Unorm => "BC7_UNORM",
-            Self::Bc7UnormSrgb => "BC7_UNORM_SRGB",
-        }
-    }
-
-    /// The guest `DXGI_FORMAT_*` value, or `None` for the Metal-only sRGB
-    /// mirrors.
-    pub const fn dxgi(self) -> Option<u32> {
-        match self {
-            Self::R8Unorm => Some(61),
-            Self::R8UnormSrgb => None,
-            Self::Rg8Unorm => Some(49),
-            Self::Rg8UnormSrgb => None,
-            Self::Rgba8Unorm => Some(28),
-            Self::Rgba8UnormSrgb => Some(29),
-            Self::Bgra8Unorm => Some(87),
-            Self::Bgra8UnormSrgb => Some(91),
-            Self::R16Float => Some(54),
-            Self::Rg16Float => Some(34),
-            Self::Rgba16Float => Some(10),
-            Self::R32Float => Some(41),
-            Self::Rg32Float => Some(16),
-            Self::Rgba32Float => Some(2),
-            Self::R32Uint => Some(42),
-            Self::Rg32Uint => Some(17),
-            Self::Rgba32Uint => Some(3),
-            Self::Depth32Float => Some(40),
-            Self::Depth24UnormStencil8 => Some(45),
-            Self::Depth16Unorm => Some(55),
-            Self::Depth32FloatStencil8 => Some(20),
-            Self::Bc1Unorm => Some(71),
-            Self::Bc1UnormSrgb => Some(72),
-            Self::Bc3Unorm => Some(77),
-            Self::Bc3UnormSrgb => Some(78),
-            Self::Bc7Unorm => Some(98),
-            Self::Bc7UnormSrgb => Some(99),
-        }
-    }
-
-    /// Resolves a guest `DXGI_FORMAT_*` value, naming the value on failure.
-    pub fn from_dxgi(value: u32) -> Result<Self, ResourceError> {
-        match value {
-            61 => Ok(Self::R8Unorm),
-            49 => Ok(Self::Rg8Unorm),
-            28 => Ok(Self::Rgba8Unorm),
-            29 => Ok(Self::Rgba8UnormSrgb),
-            87 => Ok(Self::Bgra8Unorm),
-            91 => Ok(Self::Bgra8UnormSrgb),
-            54 => Ok(Self::R16Float),
-            34 => Ok(Self::Rg16Float),
-            10 => Ok(Self::Rgba16Float),
-            41 => Ok(Self::R32Float),
-            16 => Ok(Self::Rg32Float),
-            2 => Ok(Self::Rgba32Float),
-            42 => Ok(Self::R32Uint),
-            17 => Ok(Self::Rg32Uint),
-            3 => Ok(Self::Rgba32Uint),
-            40 => Ok(Self::Depth32Float),
-            45 => Ok(Self::Depth24UnormStencil8),
-            55 => Ok(Self::Depth16Unorm),
-            20 => Ok(Self::Depth32FloatStencil8),
-            71 => Ok(Self::Bc1Unorm),
-            72 => Ok(Self::Bc1UnormSrgb),
-            77 => Ok(Self::Bc3Unorm),
-            78 => Ok(Self::Bc3UnormSrgb),
-            98 => Ok(Self::Bc7Unorm),
-            99 => Ok(Self::Bc7UnormSrgb),
-            other => Err(ResourceError::UnmappedDxgiFormat(other)),
-        }
-    }
-
-    /// The nominal Metal pixel format, ignoring per-device substitutions.
-    ///
-    /// Prefer [`Self::mtl_pixel_format_on`] for descriptor creation: a 24-bit
-    /// depth descriptor aborts on GPUs without 24-bit support.
-    pub const fn mtl_pixel_format(self) -> usize {
-        match self {
-            Self::R8Unorm => 10,
-            Self::R8UnormSrgb => 11,
-            Self::Rg8Unorm => 30,
-            Self::Rg8UnormSrgb => 31,
-            Self::Rgba8Unorm => 70,
-            Self::Rgba8UnormSrgb => 71,
-            Self::Bgra8Unorm => 80,
-            Self::Bgra8UnormSrgb => 81,
-            Self::R16Float => 25,
-            Self::Rg16Float => 65,
-            Self::Rgba16Float => 115,
-            Self::R32Float => 55,
-            Self::Rg32Float => 105,
-            Self::Rgba32Float => 125,
-            Self::R32Uint => 53,
-            Self::Rg32Uint => 103,
-            Self::Rgba32Uint => 123,
-            Self::Depth32Float => MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
-            Self::Depth24UnormStencil8 => MTL_PIXEL_FORMAT_DEPTH24_UNORM_STENCIL8,
-            Self::Depth16Unorm => MTL_PIXEL_FORMAT_DEPTH16_UNORM,
-            Self::Depth32FloatStencil8 => MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8,
-            Self::Bc1Unorm => 130,
-            Self::Bc1UnormSrgb => 131,
-            Self::Bc3Unorm => 134,
-            Self::Bc3UnormSrgb => 135,
-            Self::Bc7Unorm => 152,
-            Self::Bc7UnormSrgb => 153,
-        }
-    }
-
-    /// The Metal pixel format a descriptor may use on `support`'s device.
-    pub const fn mtl_pixel_format_on(self, support: FormatSupport) -> usize {
-        match self {
-            Self::Depth24UnormStencil8 if !support.depth24_stencil8 => {
-                MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8
-            }
-            _ => self.mtl_pixel_format(),
-        }
-    }
-
-    /// The stencil-plane pixel format for a combined depth/stencil format, or
-    /// `None` for formats without a stencil plane.
-    pub const fn stencil_plane_format(self, support: FormatSupport) -> Option<usize> {
-        match self {
-            Self::Depth24UnormStencil8 => Some(if support.depth24_stencil8 {
-                MTL_PIXEL_FORMAT_X24_STENCIL8
-            } else {
-                MTL_PIXEL_FORMAT_X32_STENCIL8
-            }),
-            Self::Depth32FloatStencil8 => Some(MTL_PIXEL_FORMAT_X32_STENCIL8),
-            _ => None,
-        }
-    }
-
-    /// Reverse lookup from a Metal pixel format.
-    pub const fn from_mtl_pixel_format(pixel_format: usize) -> Option<Self> {
-        match pixel_format {
-            10 => Some(Self::R8Unorm),
-            11 => Some(Self::R8UnormSrgb),
-            30 => Some(Self::Rg8Unorm),
-            31 => Some(Self::Rg8UnormSrgb),
-            70 => Some(Self::Rgba8Unorm),
-            71 => Some(Self::Rgba8UnormSrgb),
-            80 => Some(Self::Bgra8Unorm),
-            81 => Some(Self::Bgra8UnormSrgb),
-            25 => Some(Self::R16Float),
-            65 => Some(Self::Rg16Float),
-            115 => Some(Self::Rgba16Float),
-            55 => Some(Self::R32Float),
-            105 => Some(Self::Rg32Float),
-            125 => Some(Self::Rgba32Float),
-            53 => Some(Self::R32Uint),
-            103 => Some(Self::Rg32Uint),
-            123 => Some(Self::Rgba32Uint),
-            MTL_PIXEL_FORMAT_DEPTH16_UNORM => Some(Self::Depth16Unorm),
-            MTL_PIXEL_FORMAT_DEPTH32_FLOAT => Some(Self::Depth32Float),
-            MTL_PIXEL_FORMAT_DEPTH24_UNORM_STENCIL8 => Some(Self::Depth24UnormStencil8),
-            MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8 => Some(Self::Depth32FloatStencil8),
-            130 => Some(Self::Bc1Unorm),
-            131 => Some(Self::Bc1UnormSrgb),
-            134 => Some(Self::Bc3Unorm),
-            135 => Some(Self::Bc3UnormSrgb),
-            152 => Some(Self::Bc7Unorm),
-            153 => Some(Self::Bc7UnormSrgb),
-            _ => None,
-        }
-    }
-
-    /// Whether this is a depth or depth/stencil format.
-    pub const fn is_depth_stencil(self) -> bool {
-        matches!(
-            self,
-            Self::Depth32Float
-                | Self::Depth24UnormStencil8
-                | Self::Depth16Unorm
-                | Self::Depth32FloatStencil8
-        )
-    }
-
-    /// Whether this format carries a stencil plane.
-    pub const fn has_stencil(self) -> bool {
-        matches!(self, Self::Depth24UnormStencil8 | Self::Depth32FloatStencil8)
-    }
-
-    /// Whether this is a block-compressed colour format.
-    pub const fn is_block_compressed(self) -> bool {
-        matches!(
-            self,
-            Self::Bc1Unorm
-                | Self::Bc1UnormSrgb
-                | Self::Bc3Unorm
-                | Self::Bc3UnormSrgb
-                | Self::Bc7Unorm
-                | Self::Bc7UnormSrgb
-        )
-    }
-
-    /// Uncompressed bytes per pixel (`None` for depth and BC formats).
-    pub const fn bytes_per_pixel(self) -> Option<u32> {
-        match self {
-            Self::R8Unorm | Self::R8UnormSrgb => Some(1),
-            Self::Rg8Unorm | Self::Rg8UnormSrgb => Some(2),
-            Self::Rgba8Unorm
-            | Self::Rgba8UnormSrgb
-            | Self::Bgra8Unorm
-            | Self::Bgra8UnormSrgb => Some(4),
-            Self::R16Float => Some(2),
-            Self::Rg16Float => Some(4),
-            Self::Rgba16Float => Some(8),
-            Self::R32Float | Self::R32Uint => Some(4),
-            Self::Rg32Float | Self::Rg32Uint => Some(8),
-            Self::Rgba32Float | Self::Rgba32Uint => Some(16),
-            _ => None,
-        }
-    }
-
-    /// Bytes in one 4x4 BC block (`None` for unconpressed and depth formats).
-    pub const fn block_bytes(self) -> Option<u32> {
-        match self {
-            Self::Bc1Unorm | Self::Bc1UnormSrgb => Some(8),
-            Self::Bc3Unorm | Self::Bc3UnormSrgb | Self::Bc7Unorm | Self::Bc7UnormSrgb => Some(16),
-            _ => None,
-        }
-    }
-
-    /// Exact bytes in one row of `width` pixels, without pitch padding.
-    ///
-    /// `None` for depth/stencil formats (no guest upload layout) and for a
-    /// block width that is not a multiple of the 4-pixel block.
-    pub fn row_bytes(self, width: u32) -> Option<u64> {
-        if let Some(bytes_per_pixel) = self.bytes_per_pixel() {
-            return Some(u64::from(width) * u64::from(bytes_per_pixel));
-        }
-        let block = self.block_bytes()?;
-        if width == 0 || !width.is_multiple_of(4) {
-            return None;
-        }
-        Some(u64::from(width / 4) * u64::from(block))
-    }
-
-    /// The paired sRGB or linear format, if the pair keeps the same memory
-    /// layout (D3D12 allows this cast for SRVs and RTVs).
-    pub const fn srgb_pair(self) -> Option<Self> {
-        match self {
-            Self::R8Unorm => Some(Self::R8UnormSrgb),
-            Self::R8UnormSrgb => Some(Self::R8Unorm),
-            Self::Rg8Unorm => Some(Self::Rg8UnormSrgb),
-            Self::Rg8UnormSrgb => Some(Self::Rg8Unorm),
-            Self::Rgba8Unorm => Some(Self::Rgba8UnormSrgb),
-            Self::Rgba8UnormSrgb => Some(Self::Rgba8Unorm),
-            Self::Bgra8Unorm => Some(Self::Bgra8UnormSrgb),
-            Self::Bgra8UnormSrgb => Some(Self::Bgra8Unorm),
-            Self::Bc1Unorm => Some(Self::Bc1UnormSrgb),
-            Self::Bc1UnormSrgb => Some(Self::Bc1Unorm),
-            Self::Bc3Unorm => Some(Self::Bc3UnormSrgb),
-            Self::Bc3UnormSrgb => Some(Self::Bc3Unorm),
-            Self::Bc7Unorm => Some(Self::Bc7UnormSrgb),
-            Self::Bc7UnormSrgb => Some(Self::Bc7Unorm),
-            _ => None,
-        }
-    }
+    pub const Depth24UnormStencil8: Self = Self::Depth24Stencil8;
+    /// `MTLPixelFormatBGRA8Unorm_sRGB`.
+    pub const Bgra8UnormSrgb: Self = Self::Bgra8Srgb;
+    /// `MTLPixelFormatRGBA8Unorm_sRGB`.
+    pub const Rgba8UnormSrgb: Self = Self::Rgba8Srgb;
 }
 
 /// Whether a raw Metal pixel format is a depth or stencil format.
@@ -538,6 +190,8 @@ impl TextureUsage {
     pub const SHADER_WRITE: Self = Self(1 << 1);
     /// Bound as a render target or depth/stencil target (RTV/DSV).
     pub const RENDER_TARGET: Self = Self(1 << 2);
+    /// May be viewed with a different pixel format (typeless resources).
+    pub const PIXEL_FORMAT_VIEW: Self = Self(1 << 3);
 
     /// Raw Metal `MTLTextureUsage` bits.
     pub const fn bits(self) -> usize {
@@ -550,6 +204,9 @@ impl TextureUsage {
         }
         if self.0 & Self::RENDER_TARGET.0 != 0 {
             metal |= MTL_TEXTURE_USAGE_RENDER_TARGET;
+        }
+        if self.0 & Self::PIXEL_FORMAT_VIEW.0 != 0 {
+            metal |= MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW;
         }
         metal
     }
@@ -937,6 +594,12 @@ fn validate_texture_desc(
     }
 
     let is_depth = format.is_depth_stencil();
+    if matches!(format.kind(), FormatKind::Stencil) {
+        return Err(ResourceError::InvalidDescriptor(format!(
+            "{} is a stencil-only view format, not a texture format",
+            format.name()
+        )));
+    }
     if is_depth != desc.depth_stencil {
         return Err(ResourceError::InvalidDescriptor(format!(
             "{} descriptor {} a depth/stencil format",
@@ -1020,7 +683,12 @@ fn validate_texture_desc(
 
     Ok(ValidatedTexture {
         mtl_format,
-        usage_bits: desc.usage.bits(),
+        usage_bits: desc.usage.bits()
+            | if format.is_typeless() {
+                MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW
+            } else {
+                0
+            },
         mip_levels: desc.mip_levels,
         array_layers: desc.array_layers,
     })
@@ -1227,7 +895,7 @@ impl DirectMetalTransport {
                         "texture was not created with shader-read usage".to_string(),
                     ));
                 }
-                if !format_compatible(view_mtl, info.pixel_format) {
+                if !format_compatible(view.format, view_mtl, info.pixel_format, info.usage) {
                     return Err(ResourceError::InvalidView(format!(
                         "{} cannot view a texture stored as Metal format {}",
                         view.format.name(),
@@ -1251,7 +919,7 @@ impl DirectMetalTransport {
                         "texture was not created with shader-write usage".to_string(),
                     ));
                 }
-                if view_mtl != info.pixel_format {
+                if !format_compatible(view.format, view_mtl, info.pixel_format, info.usage) {
                     return Err(ResourceError::InvalidView(format!(
                         "UAV format {} (Metal {view_mtl}) must match the texture format ({})",
                         view.format.name(),
@@ -1270,7 +938,7 @@ impl DirectMetalTransport {
                         "texture was not created with render-target usage".to_string(),
                     ));
                 }
-                if !format_compatible(view_mtl, info.pixel_format) {
+                if !format_compatible(view.format, view_mtl, info.pixel_format, info.usage) {
                     return Err(ResourceError::InvalidView(format!(
                         "{} cannot view a texture stored as Metal format {}",
                         view.format.name(),
@@ -1559,13 +1227,42 @@ const fn texture_usage_has(usage: usize, bit: usize) -> bool {
 }
 
 /// Whether a view's Metal format can address a texture of `stored` format.
-fn format_compatible(view_mtl: usize, stored: usize) -> bool {
-    if view_mtl == stored {
+///
+/// The sRGB pair is always allowed (D3D12's SRV/RTV cast); a wider typeless
+/// reinterpretation (any format of the same element-size family, or the depth
+/// or stencil plane of a combined target) is allowed only when the stored
+/// texture was created with `MTLTextureUsagePixelFormatView`.
+fn format_compatible(
+    view: TextureFormat,
+    view_mtl: usize,
+    stored_mtl: usize,
+    stored_usage: usize,
+) -> bool {
+    if view_mtl == stored_mtl {
         return true;
     }
-    PixelFormat::from_mtl_pixel_format(stored)
-        .and_then(PixelFormat::srgb_pair)
-        .is_some_and(|pair| pair.mtl_pixel_format() == view_mtl)
+    let Some(stored) = TextureFormat::from_mtl_pixel_format(stored_mtl) else {
+        return false;
+    };
+    if view
+        .srgb_pair()
+        .is_some_and(|pair| pair.mtl_pixel_format() == stored_mtl)
+    {
+        return true;
+    }
+    if !texture_usage_has(stored_usage, MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW) {
+        return false;
+    }
+    match (stored.kind(), view.kind()) {
+        (
+            FormatKind::DepthStencil,
+            FormatKind::Depth | FormatKind::DepthStencil | FormatKind::Stencil,
+        ) => true,
+        (FormatKind::Depth, FormatKind::Depth) => true,
+        (FormatKind::Stencil, FormatKind::Stencil) => true,
+        (FormatKind::Colour, FormatKind::Colour) => stored.view_class() == view.view_class(),
+        _ => false,
+    }
 }
 
 /// Validates an upload region against a live texture.
@@ -1917,57 +1614,90 @@ mod tests {
 
     #[test]
     fn maps_every_required_guest_format_and_rejects_unknown_values() {
+        // Canonical Windows SDK values (cross-checked against the `windows`
+        // crate). The cycle directive's 63/65/88 examples were off by one:
+        // 63 is R8_SNORM, 64 is R8_SINT, 65 is A8_UNORM, 57 is R16_UINT and
+        // 88 is B8G8R8X8_UNORM (87 is B8G8R8A8_UNORM).
         let required = [
-            (61u32, PixelFormat::R8Unorm),
-            (49, PixelFormat::Rg8Unorm),
-            (28, PixelFormat::Rgba8Unorm),
-            (29, PixelFormat::Rgba8UnormSrgb),
-            (87, PixelFormat::Bgra8Unorm),
-            (91, PixelFormat::Bgra8UnormSrgb),
-            (54, PixelFormat::R16Float),
-            (34, PixelFormat::Rg16Float),
-            (10, PixelFormat::Rgba16Float),
-            (41, PixelFormat::R32Float),
-            (16, PixelFormat::Rg32Float),
-            (2, PixelFormat::Rgba32Float),
-            (42, PixelFormat::R32Uint),
-            (17, PixelFormat::Rg32Uint),
-            (3, PixelFormat::Rgba32Uint),
-            (40, PixelFormat::Depth32Float),
-            (45, PixelFormat::Depth24UnormStencil8),
-            (55, PixelFormat::Depth16Unorm),
-            (20, PixelFormat::Depth32FloatStencil8),
-            (71, PixelFormat::Bc1Unorm),
-            (72, PixelFormat::Bc1UnormSrgb),
-            (77, PixelFormat::Bc3Unorm),
-            (78, PixelFormat::Bc3UnormSrgb),
-            (98, PixelFormat::Bc7Unorm),
-            (99, PixelFormat::Bc7UnormSrgb),
+            (61u32, PixelFormat::R8Unorm, 10usize),
+            (62, PixelFormat::R8Uint, 13),
+            (63, PixelFormat::R8Snorm, 12),
+            (64, PixelFormat::R8Sint, 14),
+            (65, PixelFormat::A8Unorm, 1),
+            (49, PixelFormat::Rg8Unorm, 30),
+            (28, PixelFormat::Rgba8Unorm, 70),
+            (29, PixelFormat::Rgba8UnormSrgb, 71),
+            (30, PixelFormat::Rgba8Uint, 73),
+            (87, PixelFormat::Bgra8Unorm, 80),
+            (91, PixelFormat::Bgra8UnormSrgb, 81),
+            (88, PixelFormat::Bgrx8Unorm, 80),
+            (93, PixelFormat::Bgrx8Srgb, 81),
+            (54, PixelFormat::R16Float, 25),
+            (57, PixelFormat::R16Uint, 23),
+            (34, PixelFormat::Rg16Float, 65),
+            (10, PixelFormat::Rgba16Float, 115),
+            (41, PixelFormat::R32Float, 55),
+            (42, PixelFormat::R32Uint, 53),
+            (43, PixelFormat::R32Sint, 54),
+            (16, PixelFormat::Rg32Float, 105),
+            (2, PixelFormat::Rgba32Float, 125),
+            (24, PixelFormat::Rgb10a2Unorm, 90),
+            (26, PixelFormat::Rg11g11b10Float, 92),
+            (67, PixelFormat::Rg9b9e5Float, 93),
+            (85, PixelFormat::B5g6r5Unorm, 40),
+            (86, PixelFormat::Bgr5a1Unorm, 43),
+            (40, PixelFormat::Depth32Float, 252),
+            (45, PixelFormat::Depth24UnormStencil8, 255),
+            (55, PixelFormat::Depth16Unorm, 250),
+            (20, PixelFormat::Depth32FloatStencil8, 260),
+            (71, PixelFormat::Bc1Unorm, 130),
+            (72, PixelFormat::Bc1UnormSrgb, 131),
+            (74, PixelFormat::Bc2Rgba, 132),
+            (77, PixelFormat::Bc3Unorm, 134),
+            (80, PixelFormat::Bc4RUnorm, 140),
+            (83, PixelFormat::Bc5RgUnorm, 142),
+            (95, PixelFormat::Bc6hRgbUf16, 151),
+            (98, PixelFormat::Bc7Unorm, 152),
+            (99, PixelFormat::Bc7UnormSrgb, 153),
         ];
-        for (dxgi, expected) in required {
+        for (dxgi, expected, mtl) in required {
             assert_eq!(
                 PixelFormat::from_dxgi(dxgi).expect("DXGI value should be mapped"),
                 expected,
                 "DXGI format {dxgi}"
             );
             assert_eq!(expected.dxgi(), Some(dxgi), "{} DXGI value", expected.name());
-            let roundtrip = PixelFormat::from_mtl_pixel_format(expected.mtl_pixel_format())
-                .expect("nominal Metal format should map back");
             assert_eq!(
-                roundtrip.mtl_pixel_format(),
                 expected.mtl_pixel_format(),
-                "{} Metal roundtrip",
+                mtl,
+                "{} Metal pixel format",
+                expected.name()
+            );
+            let roundtrip = PixelFormat::from_mtl_pixel_format(expected.mtl_pixel_format());
+            assert!(
+                roundtrip.is_some(),
+                "{} nominal Metal format should map back",
                 expected.name()
             );
         }
 
-        assert_eq!(PixelFormat::ALL.len(), 27, "mapped format table size");
+        // Every row has a distinct PSO code, every code round-trips and every
+        // row has a distinct kind 8 wire code.
+        let mut codes = std::collections::HashSet::new();
+        let mut wires = std::collections::HashSet::new();
+        for format in PixelFormat::ALL {
+            assert!(codes.insert(format.code()), "duplicate code for {format:?}");
+            assert_eq!(PixelFormat::from_code(format.code()), Some(format));
+            assert!(wires.insert(format.wire_code()), "duplicate wire code");
+            assert_eq!(PixelFormat::from_wire_code(format.wire_code()), Some(format));
+        }
+        assert_eq!(PixelFormat::ALL.len(), 93, "mapped format table size");
         assert_eq!(
             PixelFormat::ALL
                 .iter()
                 .filter(|format| format.dxgi().is_some())
                 .count(),
-            25,
+            91,
             "DXGI-backed entries"
         );
 
@@ -1986,6 +1716,66 @@ mod tests {
         assert_eq!(PixelFormat::Bc1Unorm.row_bytes(6), None);
         assert_eq!(PixelFormat::Bc3Unorm.row_bytes(8), Some(32));
         assert_eq!(PixelFormat::Depth16Unorm.row_bytes(4), None);
+    }
+
+    #[test]
+    fn directive_format_values_are_corrected_by_name() {
+        // The SDK says 62=R8_UINT, 63=R8_SNORM, 64=R8_SINT, 65=A8_UNORM,
+        // 57=R16_UINT, 87=B8G8R8A8_UNORM and 88=B8G8R8X8_UNORM.
+        assert_eq!(PixelFormat::from_dxgi(62).unwrap(), PixelFormat::R8Uint);
+        assert_eq!(PixelFormat::from_dxgi(63).unwrap(), PixelFormat::R8Snorm);
+        assert_eq!(PixelFormat::from_dxgi(64).unwrap(), PixelFormat::R8Sint);
+        assert_eq!(PixelFormat::from_dxgi(65).unwrap(), PixelFormat::A8Unorm);
+        assert_eq!(PixelFormat::from_dxgi(57).unwrap(), PixelFormat::R16Uint);
+        assert_eq!(PixelFormat::from_dxgi(87).unwrap(), PixelFormat::Bgra8Unorm);
+        assert_eq!(PixelFormat::from_dxgi(88).unwrap(), PixelFormat::Bgrx8Unorm);
+    }
+
+    #[test]
+    fn typeless_views_are_family_checked() {
+        let rgb32 = PixelFormat::Rgba8Typeless;
+        let view_bit = PixelFormat::Rgba8Typeless.mtl_pixel_format() != 0;
+        assert!(view_bit && rgb32.is_typeless());
+        // Same 32-bit family: RGBA8 typeless may be viewed as R32_UINT and as
+        // RGBA8. Different sizes or depth never pass.
+        assert!(format_compatible(
+            PixelFormat::R32Uint,
+            PixelFormat::R32Uint.mtl_pixel_format(),
+            rgb32.mtl_pixel_format(),
+            MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
+        ));
+        assert!(format_compatible(
+            PixelFormat::Rgba8Unorm,
+            PixelFormat::Rgba8Unorm.mtl_pixel_format(),
+            rgb32.mtl_pixel_format(),
+            MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
+        ));
+        assert!(!format_compatible(
+            PixelFormat::Rgba16Float,
+            PixelFormat::Rgba16Float.mtl_pixel_format(),
+            rgb32.mtl_pixel_format(),
+            MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
+        ));
+        assert!(!format_compatible(
+            PixelFormat::Depth32Float,
+            PixelFormat::Depth32Float.mtl_pixel_format(),
+            rgb32.mtl_pixel_format(),
+            MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW,
+        ));
+        // A typed texture (no pixel-format-view usage) refuses the same cast.
+        assert!(!format_compatible(
+            PixelFormat::R32Uint,
+            PixelFormat::R32Uint.mtl_pixel_format(),
+            PixelFormat::Rgba8Unorm.mtl_pixel_format(),
+            0,
+        ));
+        // The sRGB pair stays available without the view bit.
+        assert!(format_compatible(
+            PixelFormat::Rgba8Srgb,
+            PixelFormat::Rgba8Srgb.mtl_pixel_format(),
+            PixelFormat::Rgba8Unorm.mtl_pixel_format(),
+            0,
+        ));
     }
 
     #[test]
@@ -2101,6 +1891,12 @@ mod tests {
         let mut depth = 0usize;
         let mut stencil_planes = 0usize;
         for format in PixelFormat::ALL {
+            if matches!(format.kind(), FormatKind::Stencil) {
+                // Stencil-only read views (`X24/X32_STENCIL8`) are view
+                // formats, not textures a guest creates; they are exercised
+                // through the stencil plane below.
+                continue;
+            }
             if format.is_block_compressed() && !support.bc_texture_compression {
                 continue;
             }
@@ -2191,7 +1987,11 @@ mod tests {
             }
         }
 
-        assert_eq!(colour + depth, PixelFormat::ALL.len(), "every format created");
+        let creatable = PixelFormat::ALL
+            .iter()
+            .filter(|format| !matches!(format.kind(), FormatKind::Stencil))
+            .count();
+        assert_eq!(colour + depth, creatable, "every creatable format created");
         assert_eq!(stencil_planes, 2, "D24 and D32 stencil planes created");
         println!(
             "created {} formats ({colour} colour, {depth} depth) and {stencil_planes} stencil planes",

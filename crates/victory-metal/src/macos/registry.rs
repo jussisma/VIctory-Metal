@@ -67,6 +67,7 @@ use std::mem;
 use crate::abi::VmBufferId;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
+use crate::macos::views::FormatSupport;
 use crate::transport::MetalError;
 use crate::wire_v3::{
     BlendAttachment, BlendFactor, BlendOperation, BlendState, CompareFunction, CullMode,
@@ -217,156 +218,664 @@ pub enum TextureDimension {
 }
 
 /// Host texture formats mirrored from D3D12/DXGI.
+///
+/// `TextureFormat` is a handle into [`FORMAT_TABLE`], the one canonical
+/// `DXGI_FORMAT` -> `MTLPixelFormat` table shared by the Metal registry, the
+/// native views layer and the guest-side pipeline/registration code
+/// (ADR-033). The numeric `DXGI_FORMAT_*` values are the ones in the Windows
+/// SDK, cross-checked against `windows` crate 0.62 (`Win32::Graphics::Dxgi::
+/// Common`): 62 is `R8_UINT`, 63 `R8_SNORM`, 64 `R8_SINT`, 65 `A8_UNORM`,
+/// 57 `R16_UINT`, 87 `B8G8R8A8_UNORM` and 88 `B8G8R8X8_UNORM`.
+///
+/// The associated constants preserve every name the existing registry code
+/// and its callers used. The private index keeps the table authoritative:
+/// [`TextureFormat::mtl_pixel_format`], [`TextureFormat::code`] and the family
+/// questions all read the same entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TextureFormat {
-    /// `MTLPixelFormatBC1_RGBA`.
-    Bc1Rgba,
-    /// `MTLPixelFormatBC2_RGBA`.
-    Bc2Rgba,
-    /// `MTLPixelFormatBC3_RGBA`.
-    Bc3Rgba,
-    /// `MTLPixelFormatBC4_RUnorm`.
-    Bc4Rgba,
-    /// `MTLPixelFormatBC5_RGUnorm`.
-    Bc5Rgba,
-    /// `MTLPixelFormatBC6H_RGBUfloat`.
-    Bc6hRgbUf16,
-    /// `MTLPixelFormatBC7_RGBAUnorm`.
-    Bc7Rgba,
-    /// `MTLPixelFormatRGBA8Unorm`.
-    Rgba8Unorm,
-    /// `MTLPixelFormatRGBA8Unorm_sRGB`.
-    Rgba8Srgb,
-    /// `MTLPixelFormatBGRA8Unorm`.
-    Bgra8Unorm,
-    /// `MTLPixelFormatRGBA16Float` (DXGI_FORMAT_R16G16B16A16_FLOAT, the
-    /// title's FP16 present/render target).
-    Rgba16Float,
-    /// `MTLPixelFormatRG11B10Float`.
-    Rg11g11b10Float,
-    /// `MTLPixelFormatRGB10A2Unorm`.
-    Rgb10a2Unorm,
-    /// `MTLPixelFormatR32Float`.
-    R32Float,
-    /// `MTLPixelFormatR32Uint` (DXGI_FORMAT_R32_UINT): an integer storage
-    /// (UAV) and colour target.
-    R32Uint,
-    /// `MTLPixelFormatR32Sint` (DXGI_FORMAT_R32_SINT): a signed integer
-    /// storage (UAV) and colour target.
-    R32Sint,
-    /// `MTLPixelFormatR16Float`.
-    R16Float,
-    /// `MTLPixelFormatDepth32Float`.
-    Depth32Float,
-    /// `MTLPixelFormatDepth24Unorm_Stencil8`.
-    Depth24Stencil8,
-    /// `MTLPixelFormatDepth32Float_Stencil8`.
-    Depth32FloatStencil8,
+pub struct TextureFormat(u16);
+
+/// A DXGI value this build cannot represent on Metal.
+///
+/// The value is kept so callers can name it; [`Self::name`] returns the
+/// canonical `DXGI_FORMAT_*` name instead of a guessed substitute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnsupportedDxgiFormat(pub u32);
+
+impl UnsupportedDxgiFormat {
+    /// Canonical name of the refused format.
+    pub const fn name(self) -> &'static str {
+        match self.0 {
+            0 => "DXGI_FORMAT_UNKNOWN",
+            5 => "DXGI_FORMAT_R32G32B32_TYPELESS",
+            6 => "DXGI_FORMAT_R32G32B32_FLOAT",
+            7 => "DXGI_FORMAT_R32G32B32_UINT",
+            8 => "DXGI_FORMAT_R32G32B32_SINT",
+            68 => "DXGI_FORMAT_R8G8_B8G8_UNORM",
+            69 => "DXGI_FORMAT_G8R8_G8B8_UNORM",
+            89 => "DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM",
+            103..=132 => "a video/planar DXGI format",
+            _ => "an unmapped DXGI format",
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedDxgiFormat {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{} ({}) has no Metal pixel format", self.name(), self.0)
+    }
+}
+
+/// What a pixel format is used for as an attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormatKind {
+    /// Colour (including packed and block-compressed formats).
+    Colour,
+    /// Depth only (`D32_FLOAT`, `D16_UNORM`).
+    Depth,
+    /// Combined depth and stencil (`D24_UNORM_S8_UINT`,
+    /// `D32_FLOAT_S8X24_UINT`).
+    DepthStencil,
+    /// Stencil-only read view (`X32_STENCIL8`, `X24_STENCIL8`).
+    Stencil,
+}
+
+impl FormatKind {
+    /// Whether the kind carries guest depth state.
+    pub const fn is_depth(self) -> bool {
+        matches!(self, Self::Depth | Self::DepthStencil)
+    }
+}
+
+/// View-compatibility family for typeless reinterpretation.
+///
+/// D3D12 groups formats by element size and category: a typeless resource may
+/// be viewed with any format in its family, never across families. The sizes
+/// are the whole element sizes Metal's `newTextureViewWithPixelFormat:` also
+/// accepts, so `R8G8B8A8_TYPELESS` can be viewed as `R32_UINT` (both 32 bits)
+/// but not as `R16G16B16A16_FLOAT` (64 bits) or `D32_FLOAT` (depth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewClass {
+    /// A 128-bit colour element (16 bytes).
+    Bits128,
+    /// A 64-bit colour element (8 bytes).
+    Bits64,
+    /// A 32-bit colour element (4 bytes).
+    Bits32,
+    /// A 16-bit colour element (2 bytes).
+    Bits16,
+    /// An 8-bit colour element (1 byte).
+    Bits8,
+    /// An 8-byte 4x4 block (`BC1`, `BC4`).
+    Block64,
+    /// A 16-byte 4x4 block (`BC2`, `BC3`, `BC5`, `BC6H`, `BC7`).
+    Block128,
+    /// A depth-only plane.
+    Depth,
+    /// A combined depth/stencil plane.
+    DepthStencil,
+    /// A stencil-only plane.
+    Stencil,
+}
+
+/// One row of the canonical format table.
+///
+/// Every field answers one question the renderer asks of a guest format: the
+/// DXGI value, the Metal pixel format, the stable PSO code, the stable kind 8
+/// wire code, the depth/stencil kind, the view-compatibility family, the
+/// element size, the block size, the sRGB bit, the concrete base of a typeless
+/// format, and whether a pixel-format view may reinterpret it.
+#[derive(Debug, Clone, Copy)]
+pub struct FormatEntry {
+    /// Handle this row describes.
+    pub format: TextureFormat,
+    /// Canonical `DXGI_FORMAT_*` name.
+    pub name: &'static str,
+    /// Canonical DXGI value; `None` for the Metal-only sRGB mirrors.
+    pub dxgi: Option<u32>,
+    /// `MTLPixelFormat` value for this row's nominal format.
+    pub mtl: usize,
+    /// Stable one-byte `VPS1`/`VPS2` format code.
+    pub code: u8,
+    /// Stable one-byte kind 8 host-registration code.
+    pub wire: u8,
+    /// View-compatibility family.
+    pub view_class: ViewClass,
+    /// Depth/stencil kind.
+    pub kind: FormatKind,
+    /// Uncompressed bytes per pixel (`0` for depth and block formats).
+    pub bytes_per_pixel: u8,
+    /// Bytes in one 4x4 block (`0` for uncompressed and depth formats).
+    pub block_bytes: u8,
+    /// Whether this is the sRGB variant of its family.
+    pub srgb: bool,
+    /// For a `*_TYPELESS` resource format: the concrete format to create with.
+    pub typeless_base: Option<TextureFormat>,
+    /// Whether a pixel-format view may reinterpret a resource of this family.
+    pub view_compatible: bool,
+}
+
+macro_rules! format_table {
+    ($count:literal; $(
+        $idx:literal => $variant:ident ($name:literal): dxgi $dxgi:expr, mtl $mtl:literal,
+        code $code:literal, wire $wire:literal, class $class:ident, kind $kind:ident,
+        bpp $bpp:literal, block $block:literal, srgb $srgb:literal,
+        typeless $typeless:expr, view $view:literal;
+    )*) => {
+        #[allow(non_upper_case_globals)]
+        impl TextureFormat {
+            $(pub const $variant: Self = Self($idx);)*
+
+            /// `MTLPixelFormatBC4_RUnorm` (the pre-ADR-033 registry name).
+            pub const Bc4Rgba: Self = Self::Bc4RUnorm;
+            /// `MTLPixelFormatBC5_RGUnorm` (the pre-ADR-033 registry name).
+            pub const Bc5Rgba: Self = Self::Bc5RgUnorm;
+
+            /// Every mapped format, in canonical table order.
+            pub const ALL: [Self; $count] = [$(Self($idx)),*];
+        }
+
+        /// The canonical `DXGI_FORMAT` -> `MTLPixelFormat` table (ADR-033).
+        pub const FORMAT_TABLE: &[FormatEntry] = &[
+            $(FormatEntry {
+                format: TextureFormat($idx),
+                name: $name,
+                dxgi: $dxgi,
+                mtl: $mtl,
+                code: $code,
+                wire: $wire,
+                view_class: ViewClass::$class,
+                kind: FormatKind::$kind,
+                bytes_per_pixel: $bpp,
+                block_bytes: $block,
+                srgb: $srgb,
+                typeless_base: $typeless,
+                view_compatible: $view,
+            }),*
+        ];
+    };
+}
+
+format_table! {
+    93;
+    0 => Rgba32Float ("DXGI_FORMAT_R32G32B32A32_FLOAT"): dxgi Some(2), mtl 125,
+        code 20, wire 12, class Bits128, kind Colour, bpp 16, block 0, srgb false,
+        typeless None, view true;
+    1 => Rgba32Uint ("DXGI_FORMAT_R32G32B32A32_UINT"): dxgi Some(3), mtl 123,
+        code 21, wire 13, class Bits128, kind Colour, bpp 16, block 0, srgb false,
+        typeless None, view true;
+    2 => Rgba32Sint ("DXGI_FORMAT_R32G32B32A32_SINT"): dxgi Some(4), mtl 124,
+        code 22, wire 14, class Bits128, kind Colour, bpp 16, block 0, srgb false,
+        typeless None, view true;
+    3 => Rgba32Typeless ("DXGI_FORMAT_R32G32B32A32_TYPELESS"): dxgi Some(1), mtl 125,
+        code 23, wire 15, class Bits128, kind Colour, bpp 16, block 0, srgb false,
+        typeless Some(TextureFormat::Rgba32Float), view true;
+    4 => Rgba16Float ("DXGI_FORMAT_R16G16B16A16_FLOAT"): dxgi Some(10), mtl 115,
+        code 17, wire 9, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    5 => Rgba16Unorm ("DXGI_FORMAT_R16G16B16A16_UNORM"): dxgi Some(11), mtl 110,
+        code 24, wire 16, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    6 => Rgba16Uint ("DXGI_FORMAT_R16G16B16A16_UINT"): dxgi Some(12), mtl 113,
+        code 25, wire 17, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    7 => Rgba16Snorm ("DXGI_FORMAT_R16G16B16A16_SNORM"): dxgi Some(13), mtl 112,
+        code 26, wire 18, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    8 => Rgba16Sint ("DXGI_FORMAT_R16G16B16A16_SINT"): dxgi Some(14), mtl 114,
+        code 27, wire 19, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    9 => Rgba16Typeless ("DXGI_FORMAT_R16G16B16A16_TYPELESS"): dxgi Some(9), mtl 115,
+        code 28, wire 20, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless Some(TextureFormat::Rgba16Float), view true;
+    10 => Rg32Float ("DXGI_FORMAT_R32G32_FLOAT"): dxgi Some(16), mtl 105,
+        code 29, wire 21, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    11 => Rg32Uint ("DXGI_FORMAT_R32G32_UINT"): dxgi Some(17), mtl 103,
+        code 30, wire 22, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    12 => Rg32Sint ("DXGI_FORMAT_R32G32_SINT"): dxgi Some(18), mtl 104,
+        code 31, wire 23, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless None, view true;
+    13 => Rg32Typeless ("DXGI_FORMAT_R32G32_TYPELESS"): dxgi Some(15), mtl 105,
+        code 32, wire 24, class Bits64, kind Colour, bpp 8, block 0, srgb false,
+        typeless Some(TextureFormat::Rg32Float), view true;
+    14 => Depth32FloatStencil8 ("DXGI_FORMAT_D32_FLOAT_S8X24_UINT"): dxgi Some(20), mtl 260,
+        code 16, wire 8, class DepthStencil, kind DepthStencil, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    15 => R32FloatX8X24Typeless ("DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS"): dxgi Some(21), mtl 252,
+        code 33, wire 25, class DepthStencil, kind Depth, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    16 => X32TypelessG8X24Uint ("DXGI_FORMAT_X32_TYPELESS_G8X24_UINT"): dxgi Some(22), mtl 261,
+        code 34, wire 26, class Stencil, kind Stencil, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    17 => R32G8X24Typeless ("DXGI_FORMAT_R32G8X24_TYPELESS"): dxgi Some(19), mtl 260,
+        code 35, wire 27, class DepthStencil, kind DepthStencil, bpp 0, block 0, srgb false,
+        typeless Some(TextureFormat::Depth32FloatStencil8), view true;
+    18 => Rgb10a2Unorm ("DXGI_FORMAT_R10G10B10A2_UNORM"): dxgi Some(24), mtl 90,
+        code 11, wire 6, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    19 => Rgb10a2Uint ("DXGI_FORMAT_R10G10B10A2_UINT"): dxgi Some(25), mtl 91,
+        code 36, wire 28, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    20 => Rgb10a2Typeless ("DXGI_FORMAT_R10G10B10A2_TYPELESS"): dxgi Some(23), mtl 90,
+        code 37, wire 29, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::Rgb10a2Unorm), view true;
+    21 => Rg11g11b10Float ("DXGI_FORMAT_R11G11B10_FLOAT"): dxgi Some(26), mtl 92,
+        code 10, wire 5, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    22 => Rgba8Unorm ("DXGI_FORMAT_R8G8B8A8_UNORM"): dxgi Some(28), mtl 70,
+        code 7, wire 0, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    23 => Rgba8Srgb ("DXGI_FORMAT_R8G8B8A8_UNORM_SRGB"): dxgi Some(29), mtl 71,
+        code 8, wire 2, class Bits32, kind Colour, bpp 4, block 0, srgb true,
+        typeless None, view true;
+    24 => Rgba8Uint ("DXGI_FORMAT_R8G8B8A8_UINT"): dxgi Some(30), mtl 73,
+        code 38, wire 30, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    25 => Rgba8Snorm ("DXGI_FORMAT_R8G8B8A8_SNORM"): dxgi Some(31), mtl 72,
+        code 39, wire 31, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    26 => Rgba8Sint ("DXGI_FORMAT_R8G8B8A8_SINT"): dxgi Some(32), mtl 74,
+        code 40, wire 32, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    27 => Rgba8Typeless ("DXGI_FORMAT_R8G8B8A8_TYPELESS"): dxgi Some(27), mtl 70,
+        code 41, wire 33, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::Rgba8Unorm), view true;
+    28 => Rg16Float ("DXGI_FORMAT_R16G16_FLOAT"): dxgi Some(34), mtl 65,
+        code 42, wire 34, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    29 => Rg16Unorm ("DXGI_FORMAT_R16G16_UNORM"): dxgi Some(35), mtl 60,
+        code 43, wire 35, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    30 => Rg16Uint ("DXGI_FORMAT_R16G16_UINT"): dxgi Some(36), mtl 63,
+        code 44, wire 36, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    31 => Rg16Snorm ("DXGI_FORMAT_R16G16_SNORM"): dxgi Some(37), mtl 62,
+        code 45, wire 37, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    32 => Rg16Sint ("DXGI_FORMAT_R16G16_SINT"): dxgi Some(38), mtl 64,
+        code 46, wire 38, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    33 => Rg16Typeless ("DXGI_FORMAT_R16G16_TYPELESS"): dxgi Some(33), mtl 65,
+        code 47, wire 39, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::Rg16Float), view true;
+    34 => R32Float ("DXGI_FORMAT_R32_FLOAT"): dxgi Some(41), mtl 55,
+        code 12, wire 3, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    35 => R32Uint ("DXGI_FORMAT_R32_UINT"): dxgi Some(42), mtl 53,
+        code 18, wire 10, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    36 => R32Sint ("DXGI_FORMAT_R32_SINT"): dxgi Some(43), mtl 54,
+        code 19, wire 11, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    37 => Depth32Float ("DXGI_FORMAT_D32_FLOAT"): dxgi Some(40), mtl 252,
+        code 14, wire 7, class Depth, kind Depth, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    38 => R32Typeless ("DXGI_FORMAT_R32_TYPELESS"): dxgi Some(39), mtl 55,
+        code 48, wire 40, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::R32Float), view true;
+    39 => Depth24Stencil8 ("DXGI_FORMAT_D24_UNORM_S8_UINT"): dxgi Some(45), mtl 255,
+        code 15, wire 41, class DepthStencil, kind DepthStencil, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    40 => R24UnormX8Typeless ("DXGI_FORMAT_R24_UNORM_X8_TYPELESS"): dxgi Some(46), mtl 252,
+        code 49, wire 42, class DepthStencil, kind Depth, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    41 => X24TypelessG8Uint ("DXGI_FORMAT_X24_TYPELESS_G8_UINT"): dxgi Some(47), mtl 261,
+        code 50, wire 43, class Stencil, kind Stencil, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    42 => R24G8Typeless ("DXGI_FORMAT_R24G8_TYPELESS"): dxgi Some(44), mtl 260,
+        code 51, wire 44, class DepthStencil, kind DepthStencil, bpp 0, block 0, srgb false,
+        typeless Some(TextureFormat::Depth24Stencil8), view true;
+    43 => Rg8Unorm ("DXGI_FORMAT_R8G8_UNORM"): dxgi Some(49), mtl 30,
+        code 52, wire 45, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    44 => Rg8Uint ("DXGI_FORMAT_R8G8_UINT"): dxgi Some(50), mtl 33,
+        code 53, wire 46, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    45 => Rg8Snorm ("DXGI_FORMAT_R8G8_SNORM"): dxgi Some(51), mtl 32,
+        code 54, wire 47, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    46 => Rg8Sint ("DXGI_FORMAT_R8G8_SINT"): dxgi Some(52), mtl 34,
+        code 55, wire 48, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    47 => Rg8Typeless ("DXGI_FORMAT_R8G8_TYPELESS"): dxgi Some(48), mtl 30,
+        code 56, wire 49, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless Some(TextureFormat::Rg8Unorm), view true;
+    48 => R16Float ("DXGI_FORMAT_R16_FLOAT"): dxgi Some(54), mtl 25,
+        code 13, wire 4, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    49 => R16Unorm ("DXGI_FORMAT_R16_UNORM"): dxgi Some(56), mtl 20,
+        code 57, wire 50, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    50 => R16Uint ("DXGI_FORMAT_R16_UINT"): dxgi Some(57), mtl 23,
+        code 58, wire 51, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    51 => R16Snorm ("DXGI_FORMAT_R16_SNORM"): dxgi Some(58), mtl 22,
+        code 59, wire 52, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    52 => R16Sint ("DXGI_FORMAT_R16_SINT"): dxgi Some(59), mtl 24,
+        code 60, wire 53, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view true;
+    53 => Depth16Unorm ("DXGI_FORMAT_D16_UNORM"): dxgi Some(55), mtl 250,
+        code 61, wire 54, class Depth, kind Depth, bpp 0, block 0, srgb false,
+        typeless None, view true;
+    54 => R16Typeless ("DXGI_FORMAT_R16_TYPELESS"): dxgi Some(53), mtl 25,
+        code 62, wire 55, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless Some(TextureFormat::R16Float), view true;
+    55 => R8Unorm ("DXGI_FORMAT_R8_UNORM"): dxgi Some(61), mtl 10,
+        code 63, wire 56, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless None, view true;
+    56 => R8Uint ("DXGI_FORMAT_R8_UINT"): dxgi Some(62), mtl 13,
+        code 64, wire 57, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless None, view true;
+    57 => R8Snorm ("DXGI_FORMAT_R8_SNORM"): dxgi Some(63), mtl 12,
+        code 65, wire 58, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless None, view true;
+    58 => R8Sint ("DXGI_FORMAT_R8_SINT"): dxgi Some(64), mtl 14,
+        code 66, wire 59, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless None, view true;
+    59 => R8Typeless ("DXGI_FORMAT_R8_TYPELESS"): dxgi Some(60), mtl 10,
+        code 67, wire 60, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless Some(TextureFormat::R8Unorm), view true;
+    60 => A8Unorm ("DXGI_FORMAT_A8_UNORM"): dxgi Some(65), mtl 1,
+        code 68, wire 61, class Bits8, kind Colour, bpp 1, block 0, srgb false,
+        typeless None, view false;
+    61 => Rg9b9e5Float ("DXGI_FORMAT_R9G9B9E5_SHAREDEXP"): dxgi Some(67), mtl 93,
+        code 69, wire 62, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view false;
+    62 => B5g6r5Unorm ("DXGI_FORMAT_B5G6R5_UNORM"): dxgi Some(85), mtl 40,
+        code 70, wire 63, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view false;
+    63 => Bgr5a1Unorm ("DXGI_FORMAT_B5G5R5A1_UNORM"): dxgi Some(86), mtl 43,
+        code 71, wire 64, class Bits16, kind Colour, bpp 2, block 0, srgb false,
+        typeless None, view false;
+    64 => Bgra8Unorm ("DXGI_FORMAT_B8G8R8A8_UNORM"): dxgi Some(87), mtl 80,
+        code 9, wire 1, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    65 => Bgra8Srgb ("DXGI_FORMAT_B8G8R8A8_UNORM_SRGB"): dxgi Some(91), mtl 81,
+        code 72, wire 65, class Bits32, kind Colour, bpp 4, block 0, srgb true,
+        typeless None, view true;
+    66 => Bgra8Typeless ("DXGI_FORMAT_B8G8R8A8_TYPELESS"): dxgi Some(90), mtl 80,
+        code 73, wire 66, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::Bgra8Unorm), view true;
+    67 => Bgrx8Unorm ("DXGI_FORMAT_B8G8R8X8_UNORM"): dxgi Some(88), mtl 80,
+        code 74, wire 67, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless None, view true;
+    68 => Bgrx8Srgb ("DXGI_FORMAT_B8G8R8X8_UNORM_SRGB"): dxgi Some(93), mtl 81,
+        code 75, wire 68, class Bits32, kind Colour, bpp 4, block 0, srgb true,
+        typeless None, view true;
+    69 => Bgrx8Typeless ("DXGI_FORMAT_B8G8R8X8_TYPELESS"): dxgi Some(92), mtl 80,
+        code 76, wire 69, class Bits32, kind Colour, bpp 4, block 0, srgb false,
+        typeless Some(TextureFormat::Bgrx8Unorm), view true;
+    70 => Bc1Rgba ("DXGI_FORMAT_BC1_UNORM"): dxgi Some(71), mtl 130,
+        code 0, wire 70, class Block64, kind Colour, bpp 0, block 8, srgb false,
+        typeless None, view true;
+    71 => Bc1RgbaSrgb ("DXGI_FORMAT_BC1_UNORM_SRGB"): dxgi Some(72), mtl 131,
+        code 77, wire 71, class Block64, kind Colour, bpp 0, block 8, srgb true,
+        typeless None, view true;
+    72 => Bc2Rgba ("DXGI_FORMAT_BC2_UNORM"): dxgi Some(74), mtl 132,
+        code 1, wire 72, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    73 => Bc2RgbaSrgb ("DXGI_FORMAT_BC2_UNORM_SRGB"): dxgi Some(75), mtl 133,
+        code 78, wire 73, class Block128, kind Colour, bpp 0, block 16, srgb true,
+        typeless None, view true;
+    74 => Bc3Rgba ("DXGI_FORMAT_BC3_UNORM"): dxgi Some(77), mtl 134,
+        code 2, wire 74, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    75 => Bc3RgbaSrgb ("DXGI_FORMAT_BC3_UNORM_SRGB"): dxgi Some(78), mtl 135,
+        code 79, wire 75, class Block128, kind Colour, bpp 0, block 16, srgb true,
+        typeless None, view true;
+    76 => Bc4RUnorm ("DXGI_FORMAT_BC4_UNORM"): dxgi Some(80), mtl 140,
+        code 3, wire 76, class Block64, kind Colour, bpp 0, block 8, srgb false,
+        typeless None, view true;
+    77 => Bc4RSnorm ("DXGI_FORMAT_BC4_SNORM"): dxgi Some(81), mtl 141,
+        code 80, wire 77, class Block64, kind Colour, bpp 0, block 8, srgb false,
+        typeless None, view true;
+    78 => Bc5RgUnorm ("DXGI_FORMAT_BC5_UNORM"): dxgi Some(83), mtl 142,
+        code 4, wire 78, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    79 => Bc5RgSnorm ("DXGI_FORMAT_BC5_SNORM"): dxgi Some(84), mtl 143,
+        code 81, wire 79, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    80 => Bc6hRgbUf16 ("DXGI_FORMAT_BC6H_UF16"): dxgi Some(95), mtl 151,
+        code 5, wire 80, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    81 => Bc6hRgbSf16 ("DXGI_FORMAT_BC6H_SF16"): dxgi Some(96), mtl 150,
+        code 82, wire 81, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    82 => Bc7Rgba ("DXGI_FORMAT_BC7_UNORM"): dxgi Some(98), mtl 152,
+        code 6, wire 82, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless None, view true;
+    83 => Bc7RgbaSrgb ("DXGI_FORMAT_BC7_UNORM_SRGB"): dxgi Some(99), mtl 153,
+        code 83, wire 83, class Block128, kind Colour, bpp 0, block 16, srgb true,
+        typeless None, view true;
+    84 => Bc1Typeless ("DXGI_FORMAT_BC1_TYPELESS"): dxgi Some(70), mtl 130,
+        code 84, wire 84, class Block64, kind Colour, bpp 0, block 8, srgb false,
+        typeless Some(TextureFormat::Bc1Rgba), view true;
+    85 => Bc2Typeless ("DXGI_FORMAT_BC2_TYPELESS"): dxgi Some(73), mtl 132,
+        code 85, wire 85, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless Some(TextureFormat::Bc2Rgba), view true;
+    86 => Bc3Typeless ("DXGI_FORMAT_BC3_TYPELESS"): dxgi Some(76), mtl 134,
+        code 86, wire 86, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless Some(TextureFormat::Bc3Rgba), view true;
+    87 => Bc4Typeless ("DXGI_FORMAT_BC4_TYPELESS"): dxgi Some(79), mtl 140,
+        code 87, wire 87, class Block64, kind Colour, bpp 0, block 8, srgb false,
+        typeless Some(TextureFormat::Bc4RUnorm), view true;
+    88 => Bc5Typeless ("DXGI_FORMAT_BC5_TYPELESS"): dxgi Some(82), mtl 142,
+        code 88, wire 88, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless Some(TextureFormat::Bc5RgUnorm), view true;
+    89 => Bc6hTypeless ("DXGI_FORMAT_BC6H_TYPELESS"): dxgi Some(94), mtl 151,
+        code 89, wire 89, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless Some(TextureFormat::Bc6hRgbUf16), view true;
+    90 => Bc7Typeless ("DXGI_FORMAT_BC7_TYPELESS"): dxgi Some(97), mtl 152,
+        code 90, wire 90, class Block128, kind Colour, bpp 0, block 16, srgb false,
+        typeless Some(TextureFormat::Bc7Rgba), view true;
+    91 => R8UnormSrgb ("Metal MTLPixelFormatR8Unorm_sRGB"): dxgi None, mtl 11,
+        code 91, wire 91, class Bits8, kind Colour, bpp 1, block 0, srgb true,
+        typeless None, view true;
+    92 => Rg8UnormSrgb ("Metal MTLPixelFormatRG8Unorm_sRGB"): dxgi None, mtl 31,
+        code 92, wire 92, class Bits16, kind Colour, bpp 2, block 0, srgb true,
+        typeless None, view true;
 }
 
 impl TextureFormat {
-    /// Exact `MTLPixelFormat` value for this host format.
+    /// The canonical table row for this format.
+    pub const fn entry(self) -> &'static FormatEntry {
+        &FORMAT_TABLE[self.0 as usize]
+    }
+
+    /// Human-readable DXGI-style name for diagnostics.
+    pub const fn name(self) -> &'static str {
+        self.entry().name
+    }
+
+    /// The canonical `DXGI_FORMAT_*` value, or `None` for a Metal-only mirror.
+    pub const fn dxgi(self) -> Option<u32> {
+        self.entry().dxgi
+    }
+
+    /// The nominal Metal pixel format.
+    ///
+    /// For a `*_TYPELESS` resource format this is the concrete base the texture
+    /// is created with; typed views select their own family member.
     pub const fn mtl_pixel_format(self) -> usize {
-        match self {
-            Self::Bc1Rgba => 130,
-            Self::Bc2Rgba => 132,
-            Self::Bc3Rgba => 134,
-            Self::Bc4Rgba => 140,
-            Self::Bc5Rgba => 142,
-            Self::Bc6hRgbUf16 => 151,
-            Self::Bc7Rgba => 152,
-            Self::Rgba8Unorm => 70,
-            Self::Rgba8Srgb => 71,
-            Self::Bgra8Unorm => 80,
-            Self::Rgba16Float => 115,
-            Self::Rg11g11b10Float => 92,
-            Self::Rgb10a2Unorm => 90,
-            Self::R32Float => 55,
-            Self::R32Uint => 53,
-            Self::R32Sint => 54,
-            Self::R16Float => 25,
-            Self::Depth32Float => 252,
-            Self::Depth24Stencil8 => 255,
-            Self::Depth32FloatStencil8 => 260,
-        }
+        self.entry().mtl
     }
 
-    /// Whether this format is a depth or depth/stencil format.
+    /// Stable one-byte `VPS1`/`VPS2` code. Unique per table row.
+    pub const fn code(self) -> u8 {
+        self.entry().code
+    }
+
+    /// Stable one-byte kind 8 host-registration code. Unique per table row.
+    pub const fn wire_code(self) -> u8 {
+        self.entry().wire
+    }
+
+    /// View-compatibility family.
+    pub const fn view_class(self) -> ViewClass {
+        self.entry().view_class
+    }
+
+    /// Depth/stencil kind.
+    pub const fn kind(self) -> FormatKind {
+        self.entry().kind
+    }
+
+    /// Whether this is a depth or combined depth/stencil format.
     pub const fn is_depth_stencil(self) -> bool {
-        matches!(
-            self,
-            Self::Depth32Float | Self::Depth24Stencil8 | Self::Depth32FloatStencil8
-        )
+        self.entry().kind.is_depth()
     }
 
-    /// Whether this format is block-compressed.
+    /// Whether this format carries a stencil plane.
+    pub const fn has_stencil(self) -> bool {
+        matches!(self.entry().kind, FormatKind::DepthStencil)
+    }
+
+    /// Whether this is a block-compressed colour format.
     pub const fn is_block_compressed(self) -> bool {
-        matches!(
-            self,
-            Self::Bc1Rgba
-                | Self::Bc2Rgba
-                | Self::Bc3Rgba
-                | Self::Bc4Rgba
-                | Self::Bc5Rgba
-                | Self::Bc6hRgbUf16
-                | Self::Bc7Rgba
-        )
+        self.entry().block_bytes != 0
     }
 
     /// Whether this format may back a colour render target.
     pub const fn is_color_render_target(self) -> bool {
-        !self.is_depth_stencil() && !self.is_block_compressed()
+        matches!(self.entry().kind, FormatKind::Colour) && !self.is_block_compressed()
     }
 
-    /// Stable one-byte code used by [`PipelineState`] encodings.
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Bc1Rgba => 0,
-            Self::Bc2Rgba => 1,
-            Self::Bc3Rgba => 2,
-            Self::Bc4Rgba => 3,
-            Self::Bc5Rgba => 4,
-            Self::Bc6hRgbUf16 => 5,
-            Self::Bc7Rgba => 6,
-            Self::Rgba8Unorm => 7,
-            Self::Rgba8Srgb => 8,
-            Self::Bgra8Unorm => 9,
-            Self::Rgba16Float => 17,
-            Self::Rg11g11b10Float => 10,
-            Self::Rgb10a2Unorm => 11,
-            Self::R32Float => 12,
-            Self::R16Float => 13,
-            Self::Depth32Float => 14,
-            Self::Depth24Stencil8 => 15,
-            Self::Depth32FloatStencil8 => 16,
-            Self::R32Uint => 18,
-            Self::R32Sint => 19,
+    /// Whether this is a `*_TYPELESS` resource format.
+    pub const fn is_typeless(self) -> bool {
+        self.entry().typeless_base.is_some()
+    }
+
+    /// For a `*_TYPELESS` format, the concrete format to create the texture
+    /// with; `None` for typed formats.
+    pub const fn typeless_base(self) -> Option<Self> {
+        self.entry().typeless_base
+    }
+
+    /// Whether this row is the sRGB variant of its family.
+    pub const fn is_srgb(self) -> bool {
+        self.entry().srgb
+    }
+
+    /// Whether a pixel-format view may reinterpret a resource of this family.
+    pub const fn is_view_compatible(self) -> bool {
+        self.entry().view_compatible
+    }
+
+    /// Uncompressed bytes per pixel (`None` for depth and BC formats).
+    pub const fn bytes_per_pixel(self) -> Option<u32> {
+        if self.entry().bytes_per_pixel == 0 {
+            None
+        } else {
+            Some(self.entry().bytes_per_pixel as u32)
         }
     }
 
-    /// Decodes a stable one-byte format code.
-    pub const fn from_code(code: u8) -> Option<Self> {
-        Some(match code {
-            0 => Self::Bc1Rgba,
-            1 => Self::Bc2Rgba,
-            2 => Self::Bc3Rgba,
-            3 => Self::Bc4Rgba,
-            4 => Self::Bc5Rgba,
-            5 => Self::Bc6hRgbUf16,
-            6 => Self::Bc7Rgba,
-            7 => Self::Rgba8Unorm,
-            8 => Self::Rgba8Srgb,
-            9 => Self::Bgra8Unorm,
-            17 => Self::Rgba16Float,
-            10 => Self::Rg11g11b10Float,
-            11 => Self::Rgb10a2Unorm,
-            12 => Self::R32Float,
-            13 => Self::R16Float,
-            14 => Self::Depth32Float,
-            15 => Self::Depth24Stencil8,
-            16 => Self::Depth32FloatStencil8,
-            18 => Self::R32Uint,
-            19 => Self::R32Sint,
+    /// Bytes in one 4x4 BC block (`None` for uncompressed and depth formats).
+    pub const fn block_bytes(self) -> Option<u32> {
+        if self.entry().block_bytes == 0 {
+            None
+        } else {
+            Some(self.entry().block_bytes as u32)
+        }
+    }
+
+    /// Exact bytes in one row of `width` pixels, without pitch padding.
+    pub fn row_bytes(self, width: u32) -> Option<u64> {
+        if let Some(bytes_per_pixel) = self.bytes_per_pixel() {
+            return Some(u64::from(width) * u64::from(bytes_per_pixel));
+        }
+        let block = self.block_bytes()?;
+        if width == 0 || !width.is_multiple_of(4) {
+            return None;
+        }
+        Some(u64::from(width / 4) * u64::from(block))
+    }
+
+    /// Resolves a canonical guest `DXGI_FORMAT_*` value.
+    ///
+    /// A typeless value resolves to its typeless table row; callers that need
+    /// a concrete creation format use [`Self::typeless_base`]. A value Metal
+    /// cannot represent is [`UnsupportedDxgiFormat`], named, never guessed.
+    pub fn from_dxgi(value: u32) -> Result<Self, UnsupportedDxgiFormat> {
+        FORMAT_TABLE
+            .iter()
+            .find(|entry| entry.dxgi == Some(value))
+            .map(|entry| entry.format)
+            .ok_or(UnsupportedDxgiFormat(value))
+    }
+
+    /// Decodes a stable one-byte `VPS1`/`VPS2` format code.
+    pub fn from_code(code: u8) -> Option<Self> {
+        FORMAT_TABLE
+            .iter()
+            .find(|entry| entry.code == code)
+            .map(|entry| entry.format)
+    }
+
+    /// Decodes a stable one-byte kind 8 host-registration code.
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        FORMAT_TABLE
+            .iter()
+            .find(|entry| entry.wire == code)
+            .map(|entry| entry.format)
+    }
+
+    /// The Metal pixel format a descriptor may use on `support`'s device.
+    pub const fn mtl_pixel_format_on(self, support: FormatSupport) -> usize {
+        match self {
+            Self::Depth24Stencil8 if !support.depth24_stencil8 => 260,
+            Self::Depth24Stencil8 => 255,
+            _ => self.mtl_pixel_format(),
+        }
+    }
+
+    /// The stencil-plane pixel format for a combined depth/stencil format, or
+    /// `None` for formats without a stencil plane.
+    pub const fn stencil_plane_format(self, support: FormatSupport) -> Option<usize> {
+        match self {
+            Self::Depth24Stencil8 => Some(if support.depth24_stencil8 { 262 } else { 261 }),
+            Self::Depth32FloatStencil8 => Some(261),
+            _ => None,
+        }
+    }
+
+    /// Reverse lookup from a Metal pixel format.
+    ///
+    /// Several guest formats can share one Metal format (a typeless base and
+    /// its typed member, or `B8G8R8X8` and `B8G8R8A8`). The typed, non-typeless
+    /// row is preferred so callers get an uploadable format.
+    pub fn from_mtl_pixel_format(pixel_format: usize) -> Option<Self> {
+        FORMAT_TABLE
+            .iter()
+            .find(|entry| entry.mtl == pixel_format && !entry.format.is_typeless())
+            .or_else(|| FORMAT_TABLE.iter().find(|entry| entry.mtl == pixel_format))
+            .map(|entry| entry.format)
+    }
+
+    /// The paired sRGB or linear format, when the pair keeps the same memory
+    /// layout (D3D12 allows this cast for SRVs and RTVs).
+    pub const fn srgb_pair(self) -> Option<Self> {
+        Some(match self {
+            Self::R8Unorm => Self::R8UnormSrgb,
+            Self::R8UnormSrgb => Self::R8Unorm,
+            Self::Rg8Unorm => Self::Rg8UnormSrgb,
+            Self::Rg8UnormSrgb => Self::Rg8Unorm,
+            Self::Rgba8Unorm => Self::Rgba8Srgb,
+            Self::Rgba8Srgb => Self::Rgba8Unorm,
+            Self::Bgra8Unorm => Self::Bgra8Srgb,
+            Self::Bgra8Srgb => Self::Bgra8Unorm,
+            Self::Bgrx8Unorm => Self::Bgrx8Srgb,
+            Self::Bgrx8Srgb => Self::Bgrx8Unorm,
+            Self::Bc1Rgba => Self::Bc1RgbaSrgb,
+            Self::Bc1RgbaSrgb => Self::Bc1Rgba,
+            Self::Bc2Rgba => Self::Bc2RgbaSrgb,
+            Self::Bc2RgbaSrgb => Self::Bc2Rgba,
+            Self::Bc3Rgba => Self::Bc3RgbaSrgb,
+            Self::Bc3RgbaSrgb => Self::Bc3Rgba,
+            Self::Bc7Rgba => Self::Bc7RgbaSrgb,
+            Self::Bc7RgbaSrgb => Self::Bc7Rgba,
             _ => return None,
         })
     }
@@ -508,6 +1017,11 @@ impl TextureDesc {
         if self.usage.is_empty() {
             return Err(RegistryError::InvalidDesc(
                 "at least one usage flag must be set",
+            ));
+        }
+        if matches!(self.format.kind(), FormatKind::Stencil) {
+            return Err(RegistryError::InvalidDesc(
+                "a stencil-only view format cannot back a texture",
             ));
         }
 
@@ -684,6 +1198,22 @@ impl TextureDesc {
     }
 }
 
+/// Whether a typed view of a resource stored as `stored` may use `view`.
+///
+/// D3D12 typeless reinterpretation stays inside one element-size family; a
+/// combined depth/stencil resource may additionally expose its depth or
+/// stencil plane. Depth never mixes with colour.
+fn view_classes_compatible(stored: TextureFormat, view: TextureFormat) -> bool {
+    use FormatKind::{Colour, Depth, DepthStencil, Stencil};
+    match (stored.kind(), view.kind()) {
+        (DepthStencil, Depth | DepthStencil | Stencil) => true,
+        (Depth, Depth) => true,
+        (Stencil, Stencil) => true,
+        (Colour, Colour) => stored.view_class() == view.view_class(),
+        _ => false,
+    }
+}
+
 /// Kind of view to create over a registered texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureViewKind {
@@ -754,10 +1284,30 @@ struct ViewPlan {
 }
 
 impl ViewPlan {
+    #[cfg(test)]
     fn resolve(
         desc: &TextureDesc,
         kind: TextureViewKind,
         sub: TextureSubresource,
+    ) -> Result<Self, RegistryError> {
+        Self::resolve_as(
+            desc,
+            kind,
+            sub,
+            desc.format,
+            FormatSupport {
+                bc_texture_compression: true,
+                depth24_stencil8: false,
+            },
+        )
+    }
+
+    fn resolve_as(
+        desc: &TextureDesc,
+        kind: TextureViewKind,
+        sub: TextureSubresource,
+        format: TextureFormat,
+        support: FormatSupport,
     ) -> Result<Self, RegistryError> {
         use TextureDimension::{Cube, CubeArray, D1, D2, D2Array, D3};
         if sub.mip_level_count == 0 || sub.array_layer_count == 0 {
@@ -861,6 +1411,15 @@ impl ViewPlan {
             }
         };
 
+        if format != desc.format {
+            let allowed = desc.format.is_typeless() || desc.format.srgb_pair() == Some(format);
+            if !allowed || !view_classes_compatible(desc.format, format) {
+                return Err(RegistryError::Unsupported(
+                    "view format is not in the texture's typeless family",
+                ));
+            }
+        }
+
         match kind {
             TextureViewKind::Rtv => {
                 if !desc.usage.render_target {
@@ -868,7 +1427,7 @@ impl ViewPlan {
                         "texture was not registered with render_target usage",
                     ));
                 }
-                if !desc.format.is_color_render_target() {
+                if !format.is_color_render_target() {
                     return Err(RegistryError::Unsupported(
                         "RTV views require a colour, non-block-compressed format",
                     ));
@@ -880,7 +1439,7 @@ impl ViewPlan {
                         "texture was not registered with depth_stencil usage",
                     ));
                 }
-                if !desc.format.is_depth_stencil() {
+                if !format.is_depth_stencil() {
                     return Err(RegistryError::Unsupported(
                         "DSV views require a depth or depth/stencil format",
                     ));
@@ -899,16 +1458,16 @@ impl ViewPlan {
                         "texture was not registered with shader_write usage",
                     ));
                 }
-                if desc.format.is_depth_stencil() {
+                if format.is_depth_stencil() || format.is_block_compressed() {
                     return Err(RegistryError::Unsupported(
-                        "depth formats cannot be UAVs on this path",
+                        "depth and block-compressed formats cannot be UAVs on this path",
                     ));
                 }
             }
         }
 
         Ok(Self {
-            pixel_format: desc.format.mtl_pixel_format(),
+            pixel_format: format.mtl_pixel_format_on(support),
             texture_type,
             levels: NSRange {
                 location: sub.base_mip_level as usize,
@@ -979,6 +1538,7 @@ impl TextureView {
 pub struct TextureRegistry {
     device: ObjcObject,
     queue: ObjcObject,
+    support: FormatSupport,
     textures: HashMap<u64, TextureEntry>,
 }
 
@@ -988,6 +1548,7 @@ impl TextureRegistry {
         Ok(Self {
             device: retain(transport.device_raw())?,
             queue: retain(transport.queue_raw())?,
+            support: transport.format_support(),
             textures: HashMap::new(),
         })
     }
@@ -1007,7 +1568,7 @@ impl TextureRegistry {
         desc.validate()?;
 
         let _pool = AutoreleasePool::new();
-        let descriptor = new_texture_descriptor(&desc)?;
+        let descriptor = new_texture_descriptor(&desc, self.support)?;
         let raw = unsafe {
             objc::msg_send_id_1(
                 self.device.as_raw(),
@@ -1021,7 +1582,7 @@ impl TextureRegistry {
             ))
         })?;
 
-        verify_texture_attributes(&texture, &desc)?;
+        verify_texture_attributes(&texture, &desc, self.support)?;
         self.textures.insert(id, TextureEntry { texture, desc });
         Ok(())
     }
@@ -1065,8 +1626,30 @@ impl TextureRegistry {
         kind: TextureViewKind,
         subresource: TextureSubresource,
     ) -> Result<TextureView, RegistryError> {
+        let format = self
+            .get(id)
+            .ok_or(RegistryError::UnknownTexture(id))?
+            .desc
+            .format;
+        self.create_view_as(id, kind, subresource, format)
+    }
+
+    /// Creates a typed view of `format` over `subresource` of texture `id`.
+    ///
+    /// A typeless source texture may be viewed with any format of its
+    /// element-size family (a combined depth/stencil source may expose its
+    /// depth or stencil plane); a typed source only accepts its own format or
+    /// its sRGB pair. The view is created with
+    /// `newTextureViewWithPixelFormat:` before any caller can bind it.
+    pub fn create_view_as(
+        &self,
+        id: u64,
+        kind: TextureViewKind,
+        subresource: TextureSubresource,
+        format: TextureFormat,
+    ) -> Result<TextureView, RegistryError> {
         let entry = self.get(id).ok_or(RegistryError::UnknownTexture(id))?;
-        let plan = ViewPlan::resolve(&entry.desc, kind, subresource)?;
+        let plan = ViewPlan::resolve_as(&entry.desc, kind, subresource, format, self.support)?;
         let _pool = AutoreleasePool::new();
         let raw = unsafe { new_texture_view(entry.raw(), plan) };
         let texture = ObjcObject::from_retained(raw).ok_or_else(|| {
@@ -1078,7 +1661,7 @@ impl TextureRegistry {
             texture,
             source_id: id,
             kind,
-            format: entry.desc.format,
+            format,
             subresource,
         })
     }
@@ -2845,18 +3428,15 @@ fn set_attachment_formats(
 /// 115), never depth; block-compressed and depth formats stay out of the
 /// colour path exactly as before.
 fn attachment_pixel_format(format: TextureFormat) -> Result<(usize, bool), RegistryError> {
-    match format {
-        TextureFormat::Rgba8Unorm
-        | TextureFormat::Bgra8Unorm
-        | TextureFormat::Rgba16Float
-        | TextureFormat::R32Uint
-        | TextureFormat::R32Sint
-        | TextureFormat::Depth32Float => Ok((format.mtl_pixel_format(), false)),
-        TextureFormat::Depth32FloatStencil8 => Ok((format.mtl_pixel_format(), true)),
-        _ => Err(RegistryError::Unsupported(
-            "attachment format is not supported by the render pipeline path",
-        )),
+    if format.is_depth_stencil() {
+        return Ok((format.mtl_pixel_format(), format.has_stencil()));
     }
+    if format.is_color_render_target() {
+        return Ok((format.mtl_pixel_format(), false));
+    }
+    Err(RegistryError::Unsupported(
+        "attachment format is not supported by the render pipeline path",
+    ))
 }
 
 fn threadgroup_product(dims: [u32; 3]) -> Option<usize> {
@@ -2934,7 +3514,10 @@ fn retain(raw: objc::Id) -> Result<ObjcObject, RegistryError> {
     })
 }
 
-fn new_texture_descriptor(desc: &TextureDesc) -> Result<ObjcObject, RegistryError> {
+fn new_texture_descriptor(
+    desc: &TextureDesc,
+    support: FormatSupport,
+) -> Result<ObjcObject, RegistryError> {
     let class = objc::class(c"MTLTextureDescriptor");
     if class.is_null() {
         return Err(RegistryError::Unsupported(
@@ -2956,7 +3539,7 @@ fn new_texture_descriptor(desc: &TextureDesc) -> Result<ObjcObject, RegistryErro
         objc::msg_send_void_usize(
             descriptor.as_raw(),
             objc::sel(c"setPixelFormat:"),
-            desc.format.mtl_pixel_format(),
+            desc.format.mtl_pixel_format_on(support),
         );
         objc::msg_send_void_usize(
             descriptor.as_raw(),
@@ -3011,6 +3594,7 @@ fn new_texture_descriptor(desc: &TextureDesc) -> Result<ObjcObject, RegistryErro
 fn verify_texture_attributes(
     texture: &ObjcObject,
     desc: &TextureDesc,
+    support: FormatSupport,
 ) -> Result<(), RegistryError> {
     let raw = texture.as_raw();
     let check = |selector, expected: usize| -> Result<(), RegistryError> {
@@ -3024,7 +3608,7 @@ fn verify_texture_attributes(
         Ok(())
     };
     check(c"textureType", desc.mtl_texture_type())?;
-    check(c"pixelFormat", desc.format.mtl_pixel_format())?;
+    check(c"pixelFormat", desc.format.mtl_pixel_format_on(support))?;
     check(c"width", desc.width as usize)?;
     check(c"height", desc.height as usize)?;
     check(c"depth", desc.depth as usize)?;
@@ -3972,4 +4556,391 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
         assert_eq!(registry.created_count(), 2);
         assert_eq!(registry.reuse_count(), 1);
     }
+    /// ADR-033: one canonical table covers the standard D3D12 / Xbox Series
+    /// set, the BC formats and every `*_TYPELESS` family. Every row has a
+    /// distinct PSO code and kind 8 wire code; the pre-ADR codes 0-19 keep
+    /// their meaning.
+    #[test]
+    fn canonical_table_covers_the_standard_set_and_round_trips_codes() {
+        let required = [
+            (2u32, "R32G32B32A32_FLOAT"),
+            (10, "R16G16B16A16_FLOAT"),
+            (11, "R16G16B16A16_UNORM"),
+            (12, "R16G16B16A16_UINT"),
+            (13, "R16G16B16A16_SNORM"),
+            (14, "R16G16B16A16_SINT"),
+            (16, "R32G32_FLOAT"),
+            (17, "R32G32_UINT"),
+            (18, "R32G32_SINT"),
+            (20, "D32_FLOAT_S8X24_UINT"),
+            (24, "R10G10B10A2_UNORM"),
+            (25, "R10G10B10A2_UINT"),
+            (26, "R11G11B10_FLOAT"),
+            (28, "R8G8B8A8_UNORM"),
+            (29, "R8G8B8A8_UNORM_SRGB"),
+            (30, "R8G8B8A8_UINT"),
+            (31, "R8G8B8A8_SNORM"),
+            (32, "R8G8B8A8_SINT"),
+            (34, "R16G16_FLOAT"),
+            (35, "R16G16_UNORM"),
+            (36, "R16G16_UINT"),
+            (37, "R16G16_SNORM"),
+            (38, "R16G16_SINT"),
+            (40, "D32_FLOAT"),
+            (41, "R32_FLOAT"),
+            (42, "R32_UINT"),
+            (43, "R32_SINT"),
+            (45, "D24_UNORM_S8_UINT"),
+            (49, "R8G8_UNORM"),
+            (50, "R8G8_UINT"),
+            (51, "R8G8_SNORM"),
+            (52, "R8G8_SINT"),
+            (54, "R16_FLOAT"),
+            (55, "D16_UNORM"),
+            (56, "R16_UNORM"),
+            (57, "R16_UINT"),
+            (58, "R16_SNORM"),
+            (59, "R16_SINT"),
+            (61, "R8_UNORM"),
+            (62, "R8_UINT"),
+            (63, "R8_SNORM"),
+            (64, "R8_SINT"),
+            (65, "A8_UNORM"),
+            (67, "R9G9B9E5_SHAREDEXP"),
+            (71, "BC1_UNORM"),
+            (72, "BC1_UNORM_SRGB"),
+            (74, "BC2_UNORM"),
+            (75, "BC2_UNORM_SRGB"),
+            (77, "BC3_UNORM"),
+            (78, "BC3_UNORM_SRGB"),
+            (80, "BC4_UNORM"),
+            (81, "BC4_SNORM"),
+            (83, "BC5_UNORM"),
+            (84, "BC5_SNORM"),
+            (85, "B5G6R5_UNORM"),
+            (86, "B5G5R5A1_UNORM"),
+            (87, "B8G8R8A8_UNORM"),
+            (88, "B8G8R8X8_UNORM"),
+            (91, "B8G8R8A8_UNORM_SRGB"),
+            (93, "B8G8R8X8_UNORM_SRGB"),
+            (95, "BC6H_UF16"),
+            (96, "BC6H_SF16"),
+            (98, "BC7_UNORM"),
+            (99, "BC7_UNORM_SRGB"),
+        ];
+        for (dxgi, name) in required {
+            let format = TextureFormat::from_dxgi(dxgi)
+                .unwrap_or_else(|error| panic!("DXGI {dxgi}: {error}"));
+            assert!(
+                format.name().contains(name),
+                "DXGI {dxgi} maps to {} ({})",
+                format.name(),
+                format.mtl_pixel_format()
+            );
+        }
+
+        // Every typeless family resolves and names its concrete base.
+        for dxgi in [1u32, 9, 15, 19, 23, 27, 33, 39, 44, 48, 53, 60, 70, 73, 76, 79, 82, 90, 92, 94, 97] {
+            let format = TextureFormat::from_dxgi(dxgi)
+                .unwrap_or_else(|error| panic!("typeless DXGI {dxgi}: {error}"));
+            assert!(format.is_typeless(), "DXGI {dxgi} must be typeless");
+            assert!(
+                format.typeless_base().is_some(),
+                "DXGI {dxgi} must name a concrete base"
+            );
+        }
+
+        // Codes 0-19 keep their pre-ADR meaning.
+        for (code, expected) in [
+            (0u8, TextureFormat::Bc1Rgba),
+            (1, TextureFormat::Bc2Rgba),
+            (2, TextureFormat::Bc3Rgba),
+            (3, TextureFormat::Bc4RUnorm),
+            (4, TextureFormat::Bc5RgUnorm),
+            (5, TextureFormat::Bc6hRgbUf16),
+            (6, TextureFormat::Bc7Rgba),
+            (7, TextureFormat::Rgba8Unorm),
+            (8, TextureFormat::Rgba8Srgb),
+            (9, TextureFormat::Bgra8Unorm),
+            (10, TextureFormat::Rg11g11b10Float),
+            (11, TextureFormat::Rgb10a2Unorm),
+            (12, TextureFormat::R32Float),
+            (13, TextureFormat::R16Float),
+            (14, TextureFormat::Depth32Float),
+            (15, TextureFormat::Depth24Stencil8),
+            (16, TextureFormat::Depth32FloatStencil8),
+            (17, TextureFormat::Rgba16Float),
+            (18, TextureFormat::R32Uint),
+            (19, TextureFormat::R32Sint),
+        ] {
+            assert_eq!(TextureFormat::from_code(code), Some(expected), "code {code}");
+            assert_eq!(expected.code(), code, "{} code", expected.name());
+        }
+        let mut codes = std::collections::HashSet::new();
+        let mut wires = std::collections::HashSet::new();
+        for format in TextureFormat::ALL {
+            assert!(codes.insert(format.code()), "duplicate code for {format:?}");
+            assert_eq!(TextureFormat::from_code(format.code()), Some(format));
+            assert!(wires.insert(format.wire_code()), "duplicate wire code");
+        }
+
+        // Unsupported DXGI values are named refusals, never substitutes.
+        for (dxgi, name) in [
+            (5u32, "R32G32B32_TYPELESS"),
+            (6, "R32G32B32_FLOAT"),
+            (7, "R32G32B32_UINT"),
+            (8, "R32G32B32_SINT"),
+            (68, "R8G8_B8G8_UNORM"),
+            (69, "G8R8_G8B8_UNORM"),
+            (89, "R10G10B10_XR_BIAS_A2_UNORM"),
+        ] {
+            let error = TextureFormat::from_dxgi(dxgi).expect_err("must be refused");
+            assert!(error.name().contains(name), "DXGI {dxgi}: {error}");
+        }
+    }
+
+    /// The D24S8 substitution keeps Metal from aborting on Apple Silicon while
+    /// devices that report 24-bit support keep the 24-bit descriptor.
+    #[test]
+    fn d24s8_substitutes_on_devices_without_24_bit_depth() {
+        let legacy = FormatSupport {
+            bc_texture_compression: true,
+            depth24_stencil8: false,
+        };
+        let native = FormatSupport {
+            bc_texture_compression: true,
+            depth24_stencil8: true,
+        };
+        assert_eq!(
+            TextureFormat::Depth24Stencil8.mtl_pixel_format_on(legacy),
+            260
+        );
+        assert_eq!(
+            TextureFormat::Depth24Stencil8.mtl_pixel_format_on(native),
+            255
+        );
+        assert_eq!(
+            TextureFormat::Depth24Stencil8.stencil_plane_format(legacy),
+            Some(261)
+        );
+        assert_eq!(
+            TextureFormat::Depth24Stencil8.stencil_plane_format(native),
+            Some(262)
+        );
+        // The typeless D24G8 base is always created with the safe combined
+        // format; its depth and stencil views use the plane formats.
+        assert_eq!(TextureFormat::R24G8Typeless.mtl_pixel_format(), 260);
+        assert_eq!(TextureFormat::R24UnormX8Typeless.mtl_pixel_format(), 252);
+        assert_eq!(TextureFormat::X24TypelessG8Uint.mtl_pixel_format(), 261);
+    }
+
+    /// Typeless -> typed views are accepted inside one element-size family and
+    /// refused across families; typed textures need the sRGB pair or their own
+    /// format.
+    #[test]
+    fn typeless_view_reinterpretation_is_family_limited() {
+        let typeless = |format| {
+            TextureDesc {
+                width: 64,
+                height: 64,
+                depth: 1,
+                mip_levels: 1,
+                sample_count: 1,
+                array_layers: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsage {
+                    shader_read: true,
+                    shader_write: true,
+                    render_target: true,
+                    depth_stencil: false,
+                },
+                label: None,
+            }
+        };
+        let rgba8 = typeless(TextureFormat::Rgba8Typeless);
+        // Inside the 32-bit family: R32_UINT and RGBA8 both resolve.
+        assert!(ViewPlan::resolve_as(
+            &rgba8,
+            TextureViewKind::Uav,
+            TextureSubresource::single(0, 0),
+            TextureFormat::R32Uint,
+            FormatSupport {
+                bc_texture_compression: true,
+                depth24_stencil8: false,
+            },
+        )
+        .is_ok());
+        assert!(ViewPlan::resolve_as(
+            &rgba8,
+            TextureViewKind::Srv,
+            TextureSubresource::single(0, 0),
+            TextureFormat::Rgba8Unorm,
+            FormatSupport {
+                bc_texture_compression: true,
+                depth24_stencil8: false,
+            },
+        )
+        .is_ok());
+        // Across the 64-bit family and to depth: refused.
+        for refused in [
+            TextureFormat::Rgba16Float,
+            TextureFormat::Depth32Float,
+        ] {
+            assert!(
+                ViewPlan::resolve_as(
+                    &rgba8,
+                    TextureViewKind::Srv,
+                    TextureSubresource::single(0, 0),
+                    refused,
+                    FormatSupport {
+                        bc_texture_compression: true,
+                        depth24_stencil8: false,
+                    },
+                )
+                .is_err(),
+                "{} must not view a typeless RGBA8 resource",
+                refused.name()
+            );
+        }
+    }
+
+    /// The GPU proof required by ADR-033: on the real device, create the
+    /// Boot #2 target and every family the table grew, and create the typed
+    /// views. Ignored by default; run under `.swarm/bin/gpu-lock` with
+    /// `--ignored`.
+    #[test]
+    #[ignore = "GPU proof; run under .swarm/bin/gpu-lock with --ignored"]
+    fn gpu_creates_the_full_format_set_and_typeless_views() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let support = transport.format_support();
+        println!(
+            "gpu proof: BC {}, 24-bit depth {}",
+            support.bc_texture_compression,
+            support.depth24_stencil8
+        );
+        let mut registry = TextureRegistry::new(&transport).expect("texture registry");
+
+        let colour = |format, shader_write, render_target| TextureDesc {
+            width: 640,
+            height: 360,
+            depth: 1,
+            mip_levels: 1,
+            sample_count: 1,
+            array_layers: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsage {
+                shader_read: true,
+                shader_write,
+                render_target,
+                depth_stencil: false,
+            },
+            label: None,
+        };
+
+        // Boot #2: a 640x360 R8Uint UAV + RT texture, exactly the resource
+        // the live title failed to register.
+        registry
+            .register(1, colour(TextureFormat::R8Uint, true, true))
+            .expect("640x360 R8Uint UAV+RT creation");
+        registry
+            .create_view(1, TextureViewKind::Uav, TextureSubresource::single(0, 0))
+            .expect("R8Uint UAV view");
+        registry
+            .create_view(1, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("R8Uint RTV view");
+
+        // Typeless RGBA8 viewed as R32Uint and as RGBA8.
+        registry
+            .register(2, colour(TextureFormat::Rgba8Typeless, true, true))
+            .expect("typeless RGBA8 creation");
+        registry
+            .create_view_as(
+                2,
+                TextureViewKind::Uav,
+                TextureSubresource::single(0, 0),
+                TextureFormat::R32Uint,
+            )
+            .expect("typeless RGBA8 -> R32Uint UAV");
+        registry
+            .create_view_as(
+                2,
+                TextureViewKind::Srv,
+                TextureSubresource::single(0, 0),
+                TextureFormat::Rgba8Unorm,
+            )
+            .expect("typeless RGBA8 -> RGBA8 SRV");
+        assert!(
+            registry
+                .create_view_as(
+                    2,
+                    TextureViewKind::Srv,
+                    TextureSubresource::single(0, 0),
+                    TextureFormat::Rgba16Float,
+                )
+                .is_err(),
+            "cross-family typeless view must be refused"
+        );
+
+        // BC1/BC3/BC7 (the device reports BC support on Apple Silicon).
+        if support.bc_texture_compression {
+            for (id, format) in [
+                (3u64, TextureFormat::Bc1Rgba),
+                (4, TextureFormat::Bc3Rgba),
+                (5, TextureFormat::Bc7Rgba),
+            ] {
+                let mut desc = colour(format, false, false);
+                desc.width = 64;
+                desc.height = 64;
+                registry.register(id, desc).unwrap_or_else(|error| {
+                    panic!("{} creation: {error}", format.name())
+                });
+                registry
+                    .create_view(id, TextureViewKind::Srv, TextureSubresource::single(0, 0))
+                    .unwrap_or_else(|error| panic!("{} SRV: {error}", format.name()));
+            }
+        }
+
+        // R11G11B10F colour target.
+        registry
+            .register(6, colour(TextureFormat::Rg11g11b10Float, false, true))
+            .expect("R11G11B10F target creation");
+        registry
+            .create_view(6, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("R11G11B10F RTV view");
+
+        // D32F and D24S8 targets; D24S8 uses the substitution on Apple.
+        let depth = |format| TextureDesc {
+            width: 640,
+            height: 360,
+            depth: 1,
+            mip_levels: 1,
+            sample_count: 1,
+            array_layers: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsage::depth_attachment(),
+            label: None,
+        };
+        registry
+            .register(7, depth(TextureFormat::Depth32Float))
+            .expect("D32F target creation");
+        registry
+            .create_view(7, TextureViewKind::Dsv, TextureSubresource::single(0, 0))
+            .expect("D32F DSV view");
+        registry
+            .register(8, depth(TextureFormat::Depth24Stencil8))
+            .expect("D24S8 target creation (substituted on Apple Silicon)");
+        registry
+            .create_view(8, TextureViewKind::Dsv, TextureSubresource::single(0, 0))
+            .expect("D24S8 DSV view");
+        assert_eq!(
+            registry.get(8).unwrap().desc().format.mtl_pixel_format_on(support),
+            if support.depth24_stencil8 { 255 } else { 260 },
+            "D24S8 effective Metal format"
+        );
+        println!("gpu proof: every creation and view succeeded ({} textures)", registry.len());
+    }
+
 }
