@@ -849,8 +849,20 @@ impl<'a> Lower<'a> {
             one_console_wave = x.native.wave64 && one_wave;
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
+            //
+            // When: whenever the host's waves are narrower than the console
+            // wave's. That is certain where the host refuses `WaveSize(64)` and
+            // the program is translated in halves (`host_wave32`: one console
+            // wave of 33-64 threads is two host waves), and it is what
+            // `narrow_waves` tells us where the host is only *believed* to run a
+            // wave64 program in 32-lane waves (D3DMetal). Keying the barriers
+            // to `narrow_waves` alone refused every one-wave LDS group on a host
+            // that is genuinely 32 lanes wide (NVIDIA, Intel) although the same
+            // barriers are sound and needed there; the two option sets now
+            // translate such a program to the same DXIL.
+            let host_splits = x.native.wave64 && (x.narrow_waves || x.host_wave32);
             let mut synced = false;
-            if x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0 {
+            if host_splits && one_wave && group > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -869,7 +881,7 @@ impl<'a> Lower<'a> {
             // width only where wave operations need it, or LDS is not synced.
             // On a host of 32-lane waves that width is two halves, which
             // refuse LDS only where no barriers sync it.
-            let fits = x.narrow_waves && (synced || group <= 32);
+            let fits = (x.narrow_waves || host_splits) && (synced || group <= 32);
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
             if halves && !synced {

@@ -678,9 +678,9 @@ mod lane_mask_tests {
     }
 
     pub(super) const V_LSHLREV_V16_5_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
-    const V_MOV_V1_S12: u32 = 0x7E02_020C; // v_mov_b32 v1, s12
+    pub(super) const V_MOV_V1_S12: u32 = 0x7E02_020C; // v_mov_b32 v1, s12
     const V_MOV_V1_VCC_HI: u32 = 0x7E02_026B; // v_mov_b32 v1, vcc_hi
-    const S_BCNT1_S12_VCC: u32 = 0xBE8C_106A; // s_bcnt1_i32_b64 s12, vcc
+    pub(super) const S_BCNT1_S12_VCC: u32 = 0xBE8C_106A; // s_bcnt1_i32_b64 s12, vcc
     const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
     const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
     const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
@@ -796,7 +796,7 @@ mod lane_mask_tests {
 
     /// A one-wave group (64 threads) whose loop count is a uniform first lane
     /// (1): the loop body is `in_step`, so the ballot goes there.
-    fn uniform_count_loop_reading_inside() -> Vec<u32> {
+    pub(super) fn uniform_count_loop_reading_inside() -> Vec<u32> {
         let mut after = Vec::new();
         after.extend(store(1, 0));
         looped(&[V_MOV_V2_1, READFIRSTLANE_S21_V2], &mask_body(), &after)
@@ -804,7 +804,7 @@ mod lane_mask_tests {
 
     /// The same, with the first-lane read under a lane-dependent mask: each
     /// half's first lane differs, so the loop is not `in_step`.
-    fn guarded_count_loop_reading_inside() -> Vec<u32> {
+    pub(super) fn guarded_count_loop_reading_inside() -> Vec<u32> {
         let mut after = Vec::new();
         after.extend(store(1, 0));
         looped(
@@ -823,7 +823,7 @@ mod lane_mask_tests {
     /// A group of two console waves (128 threads) whose loop count is one
     /// value per console wave: the waves run different numbers of passes, so
     /// no group barrier can meet in the loop.
-    fn per_wave_count_loop_reading_inside() -> Vec<u32> {
+    pub(super) fn per_wave_count_loop_reading_inside() -> Vec<u32> {
         let mut after = Vec::new();
         after.extend(store(1, 0));
         looped(
@@ -835,7 +835,7 @@ mod lane_mask_tests {
 
     /// The same per-wave-count loop, but the mask is read only after it: every
     /// lane runs the block the read starts in once, so the ballot goes there.
-    fn per_wave_count_loop_reading_after() -> Vec<u32> {
+    pub(super) fn per_wave_count_loop_reading_after() -> Vec<u32> {
         let mut after = vec![S_BCNT1_S12_VCC, V_MOV_V1_S12];
         after.extend(store(1, 0));
         looped(
@@ -859,7 +859,7 @@ mod lane_mask_tests {
     ///
     /// The region block is a per-lane branch's (`in_step` is false there), so
     /// the ballot cannot be taken there; the join every lane reaches is.
-    fn region_mask_read_after_the_join() -> Vec<u32> {
+    pub(super) fn region_mask_read_after_the_join() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -877,7 +877,7 @@ mod lane_mask_tests {
     }
 
     /// `s_bcnt1_i32_b64 s12, exec`: a full console wave's live mask, 64.
-    fn live_mask_read() -> Vec<u32> {
+    pub(super) fn live_mask_read() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -891,7 +891,7 @@ mod lane_mask_tests {
 
     /// A literal lane mask kept in `other` (used as a `v_cndmask` predicate)
     /// and read as data: 0xFFFF_FFFF_FFFF_FFFC has 62 bits set.
-    fn literal_mask_read() -> Vec<u32> {
+    pub(super) fn literal_mask_read() -> Vec<u32> {
         let mut w = PROLOGUE.to_vec();
         w.extend([
             V_LSHLREV_V16_5_V0,
@@ -1618,6 +1618,20 @@ mod cross_half_tests {
         lds_bytes: u32,
         narrow_waves: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_flags(words, threads, lds_bytes, narrow_waves, true)
+    }
+
+    /// [`lower_with`] with both host-width options given: `host_wave32` (the
+    /// host refuses `WaveSize(64)`, so a wave64 program runs in halves) and
+    /// `narrow_waves` (the host runs a wave64 program in 32-lane waves whatever
+    /// `WaveSize` it declares).
+    fn lower_flags(
+        words: &[u32],
+        threads: u32,
+        lds_bytes: u32,
+        narrow_waves: bool,
+        host_wave32: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
         let mut n = native(words, threads);
         if let StageIo::Cs(cs) = &mut n.io {
             cs.rsrc2 |= lds_bytes.div_ceil(512) << 15;
@@ -1642,7 +1656,7 @@ mod cross_half_tests {
             atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves,
-            host_wave32: true,
+            host_wave32,
             bvh_no_hit: false,
         })
     }
@@ -1801,11 +1815,25 @@ mod cross_half_tests {
                     1,
                     None,
                 ),
-                // Without D3DMetal's narrow host waves, LDS a one-wave group
-                // shares is refused as before.
+                // Without D3DMetal's narrow host waves but on a host whose
+                // waves are 32 lanes (halves), the same barrier is placed:
+                // the split, not the switch, is what needs it.
+                row("straight, no narrow waves", lds_straight(), 64, 512, false, None, 1, None),
+                // Where no barrier can go (LDS in a per-lane region), the
+                // group still refuses with that reason, switch or not.
                 row(
-                    "straight, no narrow waves",
-                    lds_straight(),
+                    "accesses in a lane region, no narrow waves",
+                    lds_accesses_in_a_lane_region(),
+                    64,
+                    512,
+                    false,
+                    Some(LDS_WHY),
+                    0,
+                    None,
+                ),
+                row(
+                    "loop on a per-lane count, no narrow waves",
+                    lds_loop_guarded_by_lane_mask(),
                     64,
                     512,
                     false,
@@ -1963,5 +1991,498 @@ mod cross_half_tests {
             ],
             Some(32),
         );
+    }
+
+    /// The re-census of the historical 111 compute rejects on a synthetic
+    /// corpus (`wave_audit`, "Census of the title run"). The title shaders and
+    /// the diagnostic log are not in the repository, so the corpus here is
+    /// synthetic: the shapes each bucket is made of, as the fixtures in this
+    /// file and `lane_mask_tests` encode them. Every count this test prints is
+    /// a count of these programs, never of the title's.
+    ///
+    /// Each program is lowered twice, for the two option sets a 32-lane host
+    /// can be translated with: `wine` (`narrow_waves`, D3DMetal's switch) and
+    /// `wave32` (the host refuses `WaveSize(64)`, so the program runs in
+    /// halves; no D3DMetal switch). A program both sets translate must come
+    /// out as the same DXIL: the halves' LDS barriers are the same barriers.
+    mod wave_corpus_tests {
+        use super::super::lane_mask_tests::{
+            PROLOGUE, S_BCNT1_S12_VCC, S_ENDPGM, V_LSHLREV_V16_5_V0, V_MOV_V1_S12, cmp_below,
+            guarded_count_loop_reading_inside, live_mask_read, literal_mask_read,
+            per_wave_count_loop_reading_after, per_wave_count_loop_reading_inside,
+            region_mask_read_after_the_join, store, uniform_count_loop_reading_inside,
+        };
+        use super::{
+            V_ADD_U32, V_MOV_V3_V0, V_OR_B32,
+            exclusive_prefix, first_lane_alike,
+            first_lane_in_a_lane_region, first_lane_in_a_per_wave_loop,
+            first_lane_of_the_thread_id, lane_read_constant, lane_read_in_a_lane_region,
+            lane_read_per_lane_index, lane_read_uniform_source, lane_region,
+            lds_accesses_in_a_lane_region, lds_loop, lds_loop_guarded_by_alike_scalar,
+            lds_loop_guarded_by_lane_mask, lds_region_read_after_a_step_write, lds_straight,
+            lds_write_in_a_lane_region_read_after, lower_flags, lower_with, reduction,
+            reduction_entry, reduction_in_a_guarded_uniform_loop,
+            reduction_in_a_lane_region, reduction_in_a_per_wave_loop, reduction_section,
+        };
+        use std::collections::BTreeMap;
+
+        /// `s_mov_b64 s[20:21], vcc`: a mask's value kept in a scalar pair.
+        const SAVE_VCC_S20: u32 = 0xBE94_036A;
+        /// `s_bcnt1_i32_b64 s12, s[20:21]`: that pair's number.
+        const BCNT_S12_S20: u32 = 0xBE8C_1014;
+
+        /// One corpus program: its historical bucket, what it is, its words,
+        /// its group and its LDS bytes.
+        struct Program {
+            bucket: &'static str,
+            name: &'static str,
+            words: Vec<u32>,
+            threads: u32,
+            lds: u32,
+        }
+
+        fn p(
+            bucket: &'static str,
+            name: &'static str,
+            words: Vec<u32>,
+            threads: u32,
+            lds: u32,
+        ) -> Program {
+            Program {
+                bucket,
+                name,
+                words,
+                threads,
+                lds,
+            }
+        }
+
+        /// A mask computed and read in the entry block: the console's ballot
+        /// at its most common place.
+        fn ballot_at_entry() -> Vec<u32> {
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0, cmp_below(40), S_BCNT1_S12_VCC, V_MOV_V1_S12]);
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// The same mask kept in `s[20:21]` at the entry, read inside a lane
+        /// region: the ballot can still go where the mask is written.
+        fn ballot_at_entry_read_in_a_lane_region() -> Vec<u32> {
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0, cmp_below(40), SAVE_VCC_S20]);
+            w.extend(lane_region(32, &[BCNT_S12_S20, V_MOV_V1_S12]));
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// A mask computed and read inside the same lane region: the two host
+        /// halves do not meet there, so it keeps refusing.
+        fn ballot_in_a_lane_region_read_there() -> Vec<u32> {
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0]);
+            w.extend(lane_region(32, &[cmp_below(16), S_BCNT1_S12_VCC, V_MOV_V1_S12]));
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// A mask written at the entry, read inside a loop counted to two: a
+        /// block every lane runs the same number of times.
+        fn ballot_at_entry_read_in_a_counted_loop() -> Vec<u32> {
+            const S_MOV_S22_0: u32 = 0xBE96_0380; // s_mov_b32 s22, 0
+            const S_ADD_S22_1: u32 = 0x8016_8116; // s_add_u32 s22, s22, 1
+            const S_CMP_LT_S22_2: u32 = 0xBF0A_8216; // s_cmp_lt_u32 s22, 2
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0, cmp_below(40), SAVE_VCC_S20, S_MOV_S22_0]);
+            let body = [BCNT_S12_S20, V_MOV_V1_S12];
+            let back = -(body.len() as i32 + 3);
+            w.extend(body);
+            w.extend([S_ADD_S22_1, S_CMP_LT_S22_2, 0xBF85_0000 | (back as u32 & 0xFFFF)]);
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// A literal mask read inside a lane region: its number does not
+        /// depend on the lanes, so no ballot and no exchange is needed there.
+        fn literal_mask_in_a_lane_region() -> Vec<u32> {
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0]);
+            w.extend([0xBE94_04C4]); // s_mov_b64 s[20:21], -4
+            w.extend(lane_region(32, &[BCNT_S12_S20, V_MOV_V1_S12]));
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// A sum in a loop counted to two: a count every host wave computes
+        /// alike, the plain form of the guarded loop.
+        fn reduction_in_a_counted_loop() -> Vec<u32> {
+            const S_MOV_S22_0: u32 = 0xBE96_0380;
+            const S_ADD_S22_1: u32 = 0x8016_8116;
+            const S_CMP_LT_S22_2: u32 = 0xBF0A_8216;
+            let section = reduction_section(V_ADD_U32, 0x80, V_MOV_V3_V0);
+            let mut w = PROLOGUE.to_vec();
+            w.extend([V_LSHLREV_V16_5_V0, S_MOV_S22_0]);
+            let back = -(section.len() as i32 + 3);
+            w.extend(section);
+            w.extend([S_ADD_S22_1, S_CMP_LT_S22_2, 0xBF85_0000 | (back as u32 & 0xFFFF)]);
+            w.extend(store(1, 0));
+            w.push(S_ENDPGM);
+            w
+        }
+
+        /// The corpus: the shapes the historical buckets are made of (54 lane
+        /// masks, 30 LDS, 12 reductions, 8 first lanes, 3 lane reads, 2 masks
+        /// outside the wave64 parenthetical) with the adversarial shapes each
+        /// change must still refuse. The title run's two non-wave rejects
+        /// (buckets 7-8) are not programs this crate lowers: one is a
+        /// `victory-gpu` diagnostic switch, the other a descriptor shape.
+        fn corpus() -> Vec<Program> {
+            vec![
+                p("mask", "ballot at entry", ballot_at_entry(), 64, 0),
+                p(
+                    "mask",
+                    "region mask read after the join",
+                    region_mask_read_after_the_join(),
+                    64,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "uniform count loop read inside",
+                    uniform_count_loop_reading_inside(),
+                    64,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "per-wave count loop read after",
+                    per_wave_count_loop_reading_after(),
+                    128,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "per-wave count loop read inside",
+                    per_wave_count_loop_reading_inside(),
+                    128,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "guarded first-lane count loop",
+                    guarded_count_loop_reading_inside(),
+                    64,
+                    0,
+                ),
+                p("mask", "full wave live mask", live_mask_read(), 64, 0),
+                p("mask", "literal mask register", literal_mask_read(), 64, 0),
+                p(
+                    "mask",
+                    "entry ballot read in a lane region",
+                    ballot_at_entry_read_in_a_lane_region(),
+                    64,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "ballot in a lane region read there",
+                    ballot_in_a_lane_region_read_there(),
+                    64,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "entry ballot read in a counted loop",
+                    ballot_at_entry_read_in_a_counted_loop(),
+                    64,
+                    0,
+                ),
+                p("lds", "straight", lds_straight(), 64, 512),
+                p("lds", "loop", lds_loop(), 64, 512),
+                p(
+                    "lds",
+                    "loop on a guarded uniform count",
+                    lds_loop_guarded_by_alike_scalar(),
+                    64,
+                    512,
+                ),
+                p(
+                    "lds",
+                    "loop on a per-lane count",
+                    lds_loop_guarded_by_lane_mask(),
+                    64,
+                    512,
+                ),
+                p(
+                    "lds",
+                    "accesses in a lane region",
+                    lds_accesses_in_a_lane_region(),
+                    64,
+                    512,
+                ),
+                p(
+                    "lds",
+                    "read in a region after a step write",
+                    lds_region_read_after_a_step_write(),
+                    64,
+                    512,
+                ),
+                p(
+                    "lds",
+                    "write in a region, read after",
+                    lds_write_in_a_lane_region_read_after(),
+                    64,
+                    512,
+                ),
+                p("reduction", "sum", reduction_entry(), 64, 0),
+                p("reduction", "prefix", exclusive_prefix(), 64, 0),
+                p("reduction", "or", reduction(V_OR_B32, 0x80, V_MOV_V3_V0), 64, 0),
+                p(
+                    "reduction",
+                    "sum in a lane region",
+                    reduction_in_a_lane_region(),
+                    64,
+                    0,
+                ),
+                p(
+                    "reduction",
+                    "sum in a per-wave loop",
+                    reduction_in_a_per_wave_loop(),
+                    128,
+                    0,
+                ),
+                p(
+                    "reduction",
+                    "sum in a guarded uniform loop",
+                    reduction_in_a_guarded_uniform_loop(),
+                    64,
+                    0,
+                ),
+                p(
+                    "reduction",
+                    "sum in a counted loop",
+                    reduction_in_a_counted_loop(),
+                    64,
+                    0,
+                ),
+                p(
+                    "first lane",
+                    "per-lane value",
+                    first_lane_of_the_thread_id(),
+                    64,
+                    0,
+                ),
+                p("first lane", "alike value", first_lane_alike(), 128, 0),
+                p(
+                    "first lane",
+                    "in a lane region",
+                    first_lane_in_a_lane_region(),
+                    64,
+                    0,
+                ),
+                p(
+                    "first lane",
+                    "in a per-wave loop",
+                    first_lane_in_a_per_wave_loop(),
+                    64,
+                    0,
+                ),
+                p("lane read", "constant lane", lane_read_constant(), 64, 0),
+                p(
+                    "lane read",
+                    "alike source",
+                    lane_read_uniform_source(),
+                    64,
+                    0,
+                ),
+                p(
+                    "lane read",
+                    "per-lane index",
+                    lane_read_per_lane_index(),
+                    64,
+                    0,
+                ),
+                p(
+                    "lane read",
+                    "in a lane region",
+                    lane_read_in_a_lane_region(),
+                    64,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "partial wave live mask",
+                    live_mask_read(),
+                    40,
+                    0,
+                ),
+                p(
+                    "mask",
+                    "literal mask read in a lane region",
+                    literal_mask_in_a_lane_region(),
+                    64,
+                    0,
+                ),
+            ]
+        }
+
+        fn outcome(program: &Program, narrow: bool, host_wave32: bool) -> String {
+            match lower_flags(
+                &program.words,
+                program.threads,
+                program.lds,
+                narrow,
+                host_wave32,
+            ) {
+                Ok(_) => "translated".to_string(),
+                Err(e) => e.to_string(),
+            }
+        }
+
+        /// The reason string without its `GFX10 code at 0x..:` prefix and
+        /// `is not supported` suffix, the form the historical census counted.
+        fn reason_of(outcome: &str) -> String {
+            let start = outcome.find(": ").map_or(0, |i| i + 2);
+            let text = outcome[start..].trim();
+            text.strip_suffix(" is not supported")
+                .unwrap_or(text)
+                .to_string()
+        }
+
+        /// Per bucket, the refusals by reason, and the totals.
+        fn census(
+            programs: &[Program],
+            narrow: bool,
+            host_wave32: bool,
+        ) -> (BTreeMap<String, usize>, BTreeMap<&'static str, usize>, usize) {
+            let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+            let mut buckets: BTreeMap<&'static str, usize> = BTreeMap::new();
+            let mut refused = 0;
+            for program in programs {
+                let got = outcome(program, narrow, host_wave32);
+                if got != "translated" {
+                    refused += 1;
+                    *reasons.entry(reason_of(&got)).or_default() += 1;
+                    *buckets.entry(program.bucket).or_default() += 1;
+                }
+            }
+            (reasons, buckets, refused)
+        }
+
+        #[test]
+        fn wave64_corpus_census() {
+            let programs = corpus();
+            let buckets = programs.len();
+            for (label, narrow, host_wave32) in [
+                ("d3dmetal, halves off", true, false),
+                ("wine, halves on", true, true),
+                ("wave32 host, no switch", false, true),
+            ] {
+                let (reasons, by_bucket, refused) = census(&programs, narrow, host_wave32);
+                eprintln!(
+                    "census {label}: {buckets} programs, {refused} refused, {} translated",
+                    buckets - refused
+                );
+                for (bucket, count) in &by_bucket {
+                    eprintln!("census {label}:   {count:2} refused in {bucket}");
+                }
+                for (reason, count) in &reasons {
+                    eprintln!("census {label}:   {count:2} {reason}");
+                }
+                for program in &programs {
+                    let got = outcome(program, narrow, host_wave32);
+                    let shown = reason_of(&got);
+                    eprintln!(
+                        "census {label}: {:<10} {:<40} {}",
+                        program.bucket, program.name, shown
+                    );
+                }
+            }
+            // Pinned: the corpus' own counts, so a shape that starts or stops
+            // refusing is noticed. 35 programs: 13 lane masks, 7 LDS, 7
+            // reductions, 4 first lanes and 4 lane reads; the historical
+            // census' other shapes and its two non-wave rejects are described
+            // in `wave_audit`, not lowered here.
+            let (wine_reasons, wine_buckets, wine_refused) =
+                census(&programs, true, true);
+            assert_eq!((programs.len(), wine_refused), (35, 11), "wine config");
+            assert_eq!(
+                wine_buckets,
+                BTreeMap::from([
+                    ("first lane", 2),
+                    ("lane read", 2),
+                    ("lds", 2),
+                    ("mask", 3),
+                    ("reduction", 2),
+                ]),
+                "wine config: refusals by bucket"
+            );
+            assert_eq!(
+                wine_reasons,
+                BTreeMap::from([
+                    (
+                        "a first-lane read of a value that may differ between 32-lane halves \
+                         (wave64 on a 32-lane host)"
+                            .to_string(),
+                        2
+                    ),
+                    (
+                        "a lane mask read as data (wave64 on a 32-lane host)".to_string(),
+                        3
+                    ),
+                    (
+                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)"
+                            .to_string(),
+                        2
+                    ),
+                    (
+                        "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)"
+                            .to_string(),
+                        2
+                    ),
+                    (
+                        "LDS one console wave64 shares without barriers, on a host of 32-lane \
+                         waves"
+                            .to_string(),
+                        2
+                    ),
+                ]),
+                "wine config: refusals by reason"
+            );
+            // A host that refuses WaveSize(64) needs the same LDS lowering as
+            // D3DMetal's narrow waves: before the barriers were keyed to the
+            // split rather than to the switch, all seven LDS programs here
+            // refused on it (16 refused) and only the divergent two do now.
+            let (_, wave32_buckets, wave32_refused) = census(&programs, false, true);
+            assert_eq!(wave32_refused, wine_refused, "wave32 config");
+            assert_eq!(wave32_buckets, wine_buckets, "wave32 config: by bucket");
+            // The LDS barriers are the same in both option sets: a program the
+            // wave32 host config admits emits the DXIL the D3DMetal config
+            // emits, which is the one the GPU fixtures ran.
+            for program in &programs {
+                if program.lds == 0 {
+                    continue;
+                }
+                if let (Ok(a), Ok(b)) = (
+                    lower_with(&program.words, program.threads, program.lds, true),
+                    lower_with(&program.words, program.threads, program.lds, false),
+                ) {
+                    assert_eq!(a.dxil, b.dxil, "{}: both configs' DXIL", program.name);
+                }
+            }
+            // With the halves lowering off (`host_wave32` false) nearly every
+            // program translates: the ballots take only a 32-lane host wave's
+            // bits and the high dword is 0. That configuration asserts, through
+            // `narrow_waves`, that the host runs 32-lane waves and then lowers
+            // as if it ran 64: it must not be a production combination. Pinned
+            // so a change here is seen.
+            let (_, _, halves_off) = census(&programs, true, false);
+            assert_eq!(halves_off, 1, "halves off translates 34 of 35");
+        }
     }
 }

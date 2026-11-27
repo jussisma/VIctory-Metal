@@ -40,7 +40,10 @@
 //! * a first-lane or lane read of a console value goes through
 //!   `Lower::first_lane_across` / `read_lane_across` in such a block;
 //! * a one-wave group of 33-64 threads gets its LDS barriers from
-//!   `barriers::split_wave_barriers` in those same blocks.
+//!   `barriers::split_wave_barriers` in those same blocks, whenever the host's
+//!   waves are narrower than the console's: `host_wave32` (the host refuses
+//!   `WaveSize(64)`, so the group is two host waves) or `narrow_waves`
+//!   (D3DMetal runs a wave64 program in 32-lane waves whatever it declares).
 //!
 //! `barriers::in_step_one_wave` extends the `step` proof for a group that is
 //! one console wave: a first-lane read of a value `halves::lane_uniform`
@@ -173,3 +176,71 @@
 //! (`lower/halves.rs`, `cross_half_tests`) and the Metal proof
 //! (`victory-metal/tests/wave_lower_gpu.rs`, the LDS, reduction and
 //! first-lane tests) cover each shape above, admitted and refused.
+//!
+//! # Re-census on a synthetic corpus
+//!
+//! The `105/111` in `.swarm/reports/architect-sync-04.md` cannot be
+//! reproduced from this tree: it is not a count any test or report here
+//! derives, and the two wave64 tasks merged before it (`f71b0b3d`,
+//! `d42b7694`) explicitly declined to re-count (their reports say the census
+//! "cannot be re-attributed" without the title's bytes). The title's shaders
+//! and the log are still not in the repository, so the title census cannot be
+//! re-counted either. It is re-counted on a synthetic corpus of the shapes
+//! each bucket is made of
+//! (`lower::halves::cross_half_tests::wave_corpus_tests`): 35 programs, of
+//! which 13 are lane masks, 7 LDS, 7 reductions, 4 first lanes and 4 lane
+//! reads. These are counts of that corpus, **not** of the 111 title shaders.
+//!
+//! | configuration | refused | by bucket |
+//! |---|---|---|
+//! | `narrow_waves` + `host_wave32` (a Wine/D3DMetal run whose device query says 32) | 11/35 | masks 3, LDS 2, reductions 2, first lanes 2, lane reads 2 |
+//! | `host_wave32` only (NVIDIA, Intel: the host refuses `WaveSize(64)`) | 11/35 | the same 11 |
+//! | `narrow_waves` only (halves off) | 1/35 | the lowering translates 34, with no halves |
+//!
+//! So on the configuration the historical refusals came from, the shapes that
+//! close the census buckets admit; the 11 that keep refusing are the divergent
+//! ones listed above. The census reason strings themselves prove the halves
+//! lowering ran in the title's run: `MASK_ACROSS`, `FIRST_ACROSS` and the lane
+//! read's reason are only raised in halves.
+//!
+//! ## The wiring defect: the LDS barriers were keyed to a switch
+//!
+//! `Lower::new` (`lower.rs`) asked for `split_wave_barriers` only under
+//! `narrow_waves`, and computed `fits` the same way. `narrow_waves` is the
+//! D3DMetal workaround ("the host runs a wave64 program in 32-lane waves
+//! whatever `WaveSize` says"); `host_wave32` is the device fact ("the host
+//! refuses `WaveSize(64)`"). On a genuinely 32-lane host (NVIDIA, Intel) the
+//! barrier pass was therefore never run, and every one-wave 33-64 group with
+//! LDS was refused with bucket 2's reason although the same barriers are
+//! sound and needed there: 7 of the corpus' 35 programs, the shape of the
+//! 30 title shaders in that bucket. Keying the pass to
+//! `native.wave64 && (narrow_waves || host_wave32)` admits them: the corpus'
+//! wave32 configuration drops from 16 to 11 refusals and emits, for every LDS
+//! program it now admits, byte-identical DXIL to the configuration the GPU
+//! fixtures ran (`wave_corpus_tests` asserts that identity).
+//!
+//! ## The flag that is still allowed to disagree
+//!
+//! `narrow_waves` alone (`host_wave32` false) translates 34 of the 35 corpus
+//! programs, ballots and lane reads included, taking only a 32-lane host
+//! wave's mask bits (the high dword is 0) while asserting the host runs 32-lane
+//! waves: that configuration lowers as if the host ran 64. It is reachable in
+//! production because `victory-gpu`'s `host_wave32()` returns false when
+//! `CheckFeatureSupport` fails (`host.rs` logs "host wave lanes not known" and
+//! answers false) while `narrow_waves()` still answers true under Wine. Making
+//! `narrow_waves` imply halves is the sound fix, but it changes every
+//! D3DMetal-translated wave64 shader from "declare 64" to "declare 32 with
+//! exchanges" and the `halves_tests` three-way table, so it is left as a
+//! decision for the orchestrator/architect, not a side effect of this task.
+//!
+//! ## What still refuses, and why it must
+//!
+//! | # | shape | why no barrier can go |
+//! |---|-------|-----------------------|
+//! | 1 | a mask read, reduction, first-lane or lane read in a per-lane region or a loop on a per-lane/per-console-wave count | the two host halves need not run it, or run it a different number of times, so a group barrier there would hang or read the wrong pass's values |
+//! | 2 | a lane mask written and read in the same per-lane region | the ballot covers both halves' bits, so it needs a block every lane reaches |
+//! | 3 | a lane read with a per-lane lane index | the 2-dword exchange holds one value per half; N lanes asking for N different console lanes need a full 64-lane permutation, which one dword per half cannot carry |
+//!
+//! Each of these has a negative test in `lower/halves.rs`
+//! (`cross_half_tests::wave_corpus_tests` for both option sets, and the two
+//! admit/refuse tables) asserting the exact reason string it keeps.
