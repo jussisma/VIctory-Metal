@@ -16,7 +16,10 @@
 //! [`NativeQueue`] owns an ordered outbound queue of encoded v3 submissions.
 //! It never merges submissions ([`enqueue`](NativeQueue::enqueue) encodes each
 //! one with the canonical [`encode_submission_v3`] codec and appends it), and
-//! it refuses an empty batch with [`NativeQueueError::Empty`].
+//! it refuses an empty batch with [`NativeQueueError::Empty`]. It is also the
+//! single place a submission sequence is assigned: a frame that carries
+//! commands gets the next session-wide sequence exactly once, here, so an
+//! empty or dropped stream never leaves a hole in the host's ledger.
 //! [`NativeQueue::submit`] sends every queued frame exactly once, in order,
 //! and returns the host's reply status; a replayed list's
 //! [`ReplyStatus::AlreadyExecuted`] is surfaced, never re-sent.
@@ -47,7 +50,7 @@ use crate::native_metal::present::{
     InFlightFrame, NativeSwapchain, PresentError, PresentedSurface, SurfacePresenter,
     present_surface,
 };
-use crate::native_metal::producer::ProducerError;
+use crate::native_metal::producer::{self, ProducerError};
 
 /// `E_FAIL`: the refusal code for everything that is not an unsupported
 /// operation or an invalid argument.
@@ -125,7 +128,7 @@ impl NativeQueueError {
 /// One encoded submission waiting for the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundFrame {
-    /// Sequence the submission carried.
+    /// Session sequence assigned when the frame was enqueued.
     pub sequence: u32,
     /// The list that produced it, when the submission names one.
     pub list: Option<ListIdentity>,
@@ -226,6 +229,7 @@ pub struct NativeQueue<S: V3Sink> {
     sink: S,
     outbound: VecDeque<OutboundFrame>,
     sent: u64,
+    highest_sequence: u32,
 }
 
 impl<S: V3Sink> NativeQueue<S> {
@@ -235,6 +239,7 @@ impl<S: V3Sink> NativeQueue<S> {
             sink,
             outbound: VecDeque::new(),
             sent: 0,
+            highest_sequence: 0,
         }
     }
 
@@ -263,12 +268,28 @@ impl<S: V3Sink> NativeQueue<S> {
         self.sent
     }
 
-    /// Encodes `submissions` and appends them in recorded order.
+    /// The highest sequence assigned to a frame of this session.
     ///
-    /// Nothing is coalesced: one [`SubmissionV3`] becomes one outbound frame,
-    /// encoded with the canonical v3 codec. An empty batch is refused with
-    /// [`NativeQueueError::Empty`]. Nothing is queued if any frame fails to
-    /// encode, so a refused batch never leaves a partial prefix behind.
+    /// Sequences are handed out in enqueue order and never reused, so after a
+    /// successful [`flush`](Self::flush) this is the sequence of the last
+    /// frame handed to the host; the fence path records it.
+    pub fn highest_sequence(&self) -> u32 {
+        self.highest_sequence
+    }
+
+    /// Assigns a sequence and encodes `submissions`, in recorded order.
+    ///
+    /// This is the transport choke point and the only place a frame takes a
+    /// session sequence: a submission that carries no commands is skipped (it
+    /// is never handed to the host and consumes nothing), and every other one
+    /// gets the next sequence exactly once, through
+    /// [`producer::ensure_sequence`]. A submission that already carries a
+    /// sequence (a frame built by a caller, or a retried one) keeps it, so a
+    /// retry never renumbers. Nothing is coalesced: one [`SubmissionV3`]
+    /// becomes one outbound frame, encoded with the canonical v3 codec. An
+    /// empty batch is refused with [`NativeQueueError::Empty`]. Nothing is
+    /// queued if any frame fails to encode, so a refused batch never leaves a
+    /// partial prefix behind.
     pub fn enqueue(&mut self, submissions: &[SubmissionV3]) -> Result<usize, NativeQueueError> {
         if submissions.is_empty() {
             return Err(NativeQueueError::Empty(
@@ -277,7 +298,25 @@ impl<S: V3Sink> NativeQueue<S> {
         }
         let mut encoded = Vec::with_capacity(submissions.len());
         for submission in submissions {
+            if submission.commands.is_empty() {
+                // An empty stream is not a frame: it is never handed to the
+                // host and must not consume a sequence the host will never
+                // see, or every later frame is a protocol violation.
+                continue;
+            }
+            // A submitted stream leaves the producer unassigned; assign it
+            // here, exactly once, in recorded order. A frame that already
+            // carries a sequence keeps it.
+            let assigned = if submission.sequence == producer::UNASSIGNED_SEQUENCE {
+                let mut copy = submission.clone();
+                producer::ensure_sequence(&mut copy)?;
+                Some(copy)
+            } else {
+                None
+            };
+            let submission = assigned.as_ref().unwrap_or(submission);
             let bytes = encode_submission_v3(submission).map_err(NativeQueueError::Encode)?;
+            self.highest_sequence = self.highest_sequence.max(submission.sequence);
             encoded.push(OutboundFrame {
                 sequence: submission.sequence,
                 list: submission.list,
@@ -910,12 +949,15 @@ pub fn submit_recorded_batch(
 
     let mut queue = native_queue();
     let outcome = dispatch_measured(GpuBackend::Metal, &mut queue, submissions);
+    // The sequences were assigned at enqueue, so the callers' submissions may
+    // still be unassigned here; the queue knows the last one it handed out.
+    let highest_sequence = queue.highest_sequence();
     drop(queue);
 
     match outcome {
         Ok((dispatch, timing)) => {
-            if let Some(last) = submissions.iter().map(|submission| submission.sequence).max() {
-                LAST_SEQUENCE.fetch_max(u64::from(last), Ordering::AcqRel);
+            if highest_sequence != 0 {
+                LAST_SEQUENCE.fetch_max(u64::from(highest_sequence), Ordering::AcqRel);
             }
             if let Some(timing) = timing {
                 // `gpu_us` is 0: the kind 5 reply carries a status only. The
@@ -1283,6 +1325,7 @@ mod tests {
 
     use crate::object::S_OK;
     use crate::native_metal::client::{ENVELOPE_LEN, KIND_ACK, KIND_AUTH, KIND_SUBMISSION_V3};
+    use crate::native_metal::producer::{MetalList, UNASSIGNED_SEQUENCE, reset_sequences};
     use crate::native_metal::telemetry;
 
     const SECRET: [u8; 32] = [0x5a; 32];
@@ -1988,5 +2031,148 @@ mod tests {
         native_queue_reset();
         drop(handle);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --------------------------------------------------- dense sequences
+
+    /// The Boot #2 failure, reproduced: a hundred `Close` calls on an empty
+    /// list must consume no sequence, so the first real frame is sequence 1
+    /// instead of 586 and the host's ledger stays dense.
+    #[test]
+    fn a_hundred_empty_closes_do_not_consume_a_sequence() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        let mut list = MetalList::new(101).expect("list");
+
+        for _ in 0..100 {
+            list.close().expect("an empty close is not a submission");
+            assert!(list.take().is_empty(), "an empty stream is never queued");
+        }
+        assert!(queue.is_empty(), "nothing reached the transport");
+
+        list.producer_mut().present(1, 0).expect("present");
+        list.close().expect("the first real frame closes");
+        let batch = list.take();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].sequence, UNASSIGNED_SEQUENCE,
+            "the list closes before the transport assigns the sequence"
+        );
+
+        assert_eq!(queue.submit(&batch), Ok(ReplyStatus::Ok));
+        assert_eq!(queue.sink().frames.len(), 1, "one frame, not 101");
+        let carried = decode_submission_v3(&queue.sink().frames[0]).expect("canonical v3");
+        assert_eq!(carried.sequence, 1, "the first real frame is sequence 1");
+        assert_eq!(carried.list.map(|list| list.list_id), Some(101));
+    }
+
+    /// Two lists closed, one empty and one with a frame: the empty one yields
+    /// nothing, so exactly one outbound frame goes out, at sequence 1.
+    #[test]
+    fn an_empty_list_beside_a_real_list_yields_one_frame() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut empty = MetalList::new(201).expect("empty list");
+        empty.close().expect("close");
+        let mut real = MetalList::new(202).expect("real list");
+        real.producer_mut().present(1, 0).expect("present");
+        real.close().expect("close");
+
+        let mut batch = empty.take();
+        assert!(batch.is_empty(), "the empty close carried no submission");
+        batch.extend(real.take());
+        assert_eq!(batch.len(), 1);
+
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        assert_eq!(queue.submit(&batch), Ok(ReplyStatus::Ok));
+        assert_eq!(queue.sink().frames.len(), 1);
+        let carried = decode_submission_v3(&queue.sink().frames[0]).expect("canonical v3");
+        assert_eq!(carried.sequence, 1);
+        assert_eq!(carried.list.map(|list| list.list_id), Some(202));
+    }
+
+    /// A list reset before execution drops an unassigned submission, so the
+    /// frames it would have preceded still take sequences 1, 2, ... in order.
+    #[test]
+    fn a_list_reset_before_execution_keeps_the_ledger_dense() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        let mut list = MetalList::new(301).expect("list");
+
+        list.producer_mut().present(1, 0).expect("present");
+        list.close().expect("close");
+        // The title resets the list before `ExecuteCommandLists` takes it:
+        // `reset` drops the pending submission, which never held a sequence
+        // (its debug assertion checks that ordering).
+        list.reset().expect("reset drops the pending frame");
+        assert!(list.take().is_empty());
+
+        for _ in 0..2 {
+            list.producer_mut().present(1, 0).expect("present");
+            list.close().expect("close");
+            assert_eq!(queue.submit(&list.take()), Ok(ReplyStatus::Ok));
+        }
+
+        assert_eq!(queue.sink().frames.len(), 2);
+        let sequences: Vec<u32> = queue
+            .sink()
+            .frames
+            .iter()
+            .map(|bytes| decode_submission_v3(bytes).expect("canonical v3").sequence)
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![1, 2],
+            "the dropped frame took no sequence from the ledger"
+        );
+    }
+
+    /// A refused send leaves the frames queued with the sequences they were
+    /// assigned at enqueue; the retry sends those same sequences once, in
+    /// order, and never renumbers them.
+    #[test]
+    fn a_refused_send_retries_the_same_sequences_without_renumbering() {
+        let _serial = serialized();
+        reset_sequences(1);
+        let mut queue = NativeQueue::new(FlakySink {
+            failures: 1,
+            frames: Vec::new(),
+        });
+        let batch = [submission(0, 401, 1), submission(0, 402, 2)];
+
+        assert!(matches!(
+            queue.submit(&batch),
+            Err(NativeQueueError::Transport(_))
+        ));
+        assert_eq!(queue.pending(), 2, "the refused frames stay queued");
+        assert_eq!(queue.sent(), 0);
+        assert!(queue.sink().frames.is_empty());
+
+        assert_eq!(queue.flush(), Ok(vec![ReplyStatus::Ok, ReplyStatus::Ok]));
+        assert_eq!(queue.sent(), 2);
+        let decoded: Vec<SubmissionV3> = queue
+            .sink()
+            .frames
+            .iter()
+            .map(|bytes| decode_submission_v3(bytes).expect("canonical v3"))
+            .collect();
+        assert_eq!(
+            decoded.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the retry keeps the sequences assigned at enqueue"
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|frame| frame.list.map(|list| list.list_id))
+                .collect::<Vec<_>>(),
+            vec![Some(401), Some(402)],
+            "the retry keeps the recorded order"
+        );
+
+        assert_eq!(queue.flush(), Ok(Vec::new()), "nothing is sent twice");
+        assert_eq!(queue.sink().frames.len(), 2);
     }
 }
