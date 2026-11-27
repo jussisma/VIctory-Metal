@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use victory_metal::fence_page::FencePageMapping;
+#[cfg(target_os = "macos")]
 use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost, PipelineStageLibrary};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::PixelFormat;
