@@ -709,6 +709,13 @@ pub enum WireError {
         /// Name of the zero extent or stride field.
         field: &'static str,
     },
+    /// A blend-state command carried no render-target entries.
+    ZeroBlendAttachments,
+    /// A blend-state command carried more than `MAX_BLEND_ATTACHMENTS_V3` (8)
+    /// entries.
+    TooManyBlendAttachments(usize),
+    /// A depth/stencil clear selected neither the depth nor the stencil plane.
+    EmptyClear,
 }
 
 impl fmt::Display for WireError {
@@ -804,6 +811,13 @@ impl fmt::Display for WireError {
                 write!(f, "{count} descriptor bindings exceeds version 3 limit 32")
             }
             Self::ZeroExtent { field } => write!(f, "{field} must be nonzero"),
+            Self::ZeroBlendAttachments => {
+                write!(f, "blend state must have at least one render-target entry")
+            }
+            Self::TooManyBlendAttachments(count) => {
+                write!(f, "{count} blend entries exceeds limit 8")
+            }
+            Self::EmptyClear => write!(f, "clear must select the depth and/or stencil plane"),
         }
     }
 }

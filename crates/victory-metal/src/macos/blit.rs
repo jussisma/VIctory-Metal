@@ -262,6 +262,131 @@ pub(crate) fn copy_texture_region(
     Ok(())
 }
 
+/// One pitched upload-heap to private-texture copy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BufferTextureCopy {
+    /// Registry-held source `MTLBuffer`.
+    pub(crate) buffer: objc::Id,
+    /// Byte offset of the first source texel.
+    pub(crate) source_offset: usize,
+    /// Source row pitch in bytes.
+    pub(crate) bytes_per_row: usize,
+    /// Source slice pitch in bytes; zero for a single-slice copy.
+    pub(crate) bytes_per_image: usize,
+    /// Destination subresource.
+    pub(crate) destination: TextureSubresourceRef,
+    /// Destination box origin in texels.
+    pub(crate) destination_origin: [usize; 3],
+    /// Box size in texels; every component nonzero.
+    pub(crate) size: [usize; 3],
+}
+
+impl BufferTextureCopy {
+    /// Validates the copy against the live destination texture geometry.
+    pub(crate) fn validate(&self) -> Result<(), MetalError> {
+        if self.buffer.is_null() {
+            return Err(MetalError::InvalidArg("copy source buffer is nil"));
+        }
+        if self.bytes_per_row == 0 {
+            return Err(MetalError::InvalidArg(
+                "copy source row pitch must be nonzero",
+            ));
+        }
+        if self.size.contains(&0) {
+            return Err(MetalError::InvalidArg(
+                "copy width, height and depth must be nonzero",
+            ));
+        }
+        let rows = self.size[1];
+        let row_bytes = self
+            .bytes_per_row
+            .checked_mul(rows)
+            .ok_or(MetalError::InvalidArg("copy source row pitch overflows"))?;
+        if self.size[2] > 1 {
+            if self.bytes_per_image == 0 {
+                return Err(MetalError::InvalidArg(
+                    "copy source image pitch must be nonzero for a volume copy",
+                ));
+            }
+            if self.bytes_per_image < row_bytes {
+                return Err(MetalError::InvalidArg(
+                    "copy source image pitch is smaller than one image",
+                ));
+            }
+        } else if self.bytes_per_image != 0 && self.bytes_per_image < row_bytes {
+            return Err(MetalError::InvalidArg(
+                "copy source image pitch is smaller than one image",
+            ));
+        }
+        validate_box(
+            "destination",
+            self.destination,
+            self.destination_origin,
+            self.size,
+        )
+    }
+}
+
+/// Copies one pitched buffer image into a texture subresource.
+///
+/// The row pitch is supplied by the caller and validated against the live
+/// destination extent by [`BufferTextureCopy::validate`], so a stride mismatch
+/// is an explicit error before any encoder call.
+pub(crate) fn copy_buffer_to_texture(
+    enc: objc::Id,
+    copy: &BufferTextureCopy,
+) -> Result<(), MetalError> {
+    if enc.is_null() {
+        return Err(MetalError::InternalError(
+            "blit encoder is nil".to_string(),
+        ));
+    }
+    copy.validate()?;
+    let origin = MTLOrigin {
+        x: copy.destination_origin[0],
+        y: copy.destination_origin[1],
+        z: copy.destination_origin[2],
+    };
+    let size = MTLSize {
+        width: copy.size[0],
+        height: copy.size[1],
+        depth: copy.size[2],
+    };
+    // SAFETY: `enc` is a live blit encoder, the buffer is registry-held for the
+    // synchronous submission, the texture is registry-held, and every
+    // level/slice/origin/size/pitch was checked before the selector is sent.
+    unsafe {
+        type Fn = unsafe extern "C" fn(
+            objc::Id,
+            objc::Sel,
+            objc::Id,
+            usize,
+            usize,
+            usize,
+            MTLSize,
+            objc::Id,
+            usize,
+            usize,
+            MTLOrigin,
+        );
+        let send: Fn = std::mem::transmute(objc::msg_send_entry());
+        send(
+            enc,
+            objc::sel(c"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
+            copy.buffer,
+            copy.source_offset,
+            copy.bytes_per_row,
+            copy.bytes_per_image,
+            size,
+            copy.destination.texture,
+            copy.destination.slice,
+            copy.destination.level,
+            origin,
+        );
+    }
+    Ok(())
+}
+
 /// Validates a multisample resolve against both live textures.
 pub(crate) fn validate_resolve(
     source: TextureSubresourceRef,
