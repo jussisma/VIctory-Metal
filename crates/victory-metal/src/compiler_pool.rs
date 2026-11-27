@@ -23,13 +23,18 @@
 //!
 //! # Worker protocol
 //!
-//! Each worker is a child process started as `victory-irconverter --stdio`
-//! (see [`pool_stdio_enabled`]) and driven over stdin/stdout with
-//! length-prefixed frames. When `VICTORY_METAL_IRCONVERTER` or `D3DMETAL_RES`
-//! names a converter library, the pool also passes `--converter <path>`; a
-//! worker that rejects `--stdio` exits before answering and is reported as
-//! [`PoolError::WorkerExited`] on the affected job, never silently replaced by
-//! the one-shot path. The protocol version is implicit in the header tokens.
+//! Each worker is a child process started as
+//! `victory-irconverter --stdio --converter <libmetalirconverter.dylib>` (see
+//! [`pool_stdio_enabled`]) and driven over stdin/stdout with length-prefixed
+//! frames. The converter is resolved once, when the pool is built, from
+//! `VICTORY_METAL_IRCONVERTER` and then `D3DMETAL_RES`; every child is started
+//! with that explicit path, because `--stdio` without `--converter` is a usage
+//! error and the child would exit before reading a job. A pool built by
+//! [`CompilerPool::from_env`] (the host) refuses a job with a named
+//! "no converter library" error instead of spawning such a worker; a worker
+//! that really dies is reported as [`PoolError::WorkerExited`] with its bounded
+//! stderr captured for the diagnostic, never silently replaced by the one-shot
+//! path. The protocol version is implicit in the header tokens.
 //!
 //! Request, pool -> worker stdin:
 //!
@@ -91,7 +96,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -133,6 +138,33 @@ pub const MAX_REFLECTION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// asked for reflection is a different key and can never be served to
 /// [`CompilerPool::compile_with_reflection`] as if it carried a layout.
 pub const POOL_REFLECTION_PRODUCER_VERSION: &str = "reflection-json-1";
+
+/// Largest worker stderr text kept for a diagnostic.
+///
+/// A worker's usage text or converter error fits comfortably; the bound keeps
+/// one host log line and one error message finite. The tail is kept (the
+/// reason a worker died is the end of its stderr), not the first bytes.
+pub const MAX_WORKER_STDERR_BYTES: usize = 4096;
+
+/// Longest worker stderr text that may enter telemetry.
+///
+/// Longer text stays behind [`CompilerPool::last_worker_stderr`] and the host
+/// log; [`CompilerPool::worker_stderr_for_telemetry`] is `None` for it so a
+/// telemetry document never carries an unbounded or path-bearing line.
+pub const MAX_WORKER_STDERR_TELEMETRY_CHARS: usize = 200;
+
+/// Stable identity of the refusal returned when no converter library resolves.
+///
+/// It is carried as the source of [`PoolError::Spawn`] so the pool's variant
+/// set, and therefore every existing consumer of [`PoolError`], stays
+/// unchanged. A pool in this state never spawns a worker: `--stdio` without
+/// `--converter` is a usage error, and that child would exit before reading a
+/// single job.
+pub const NO_CONVERTER_LIBRARY: &str =
+    "no converter library (set VICTORY_METAL_IRCONVERTER or D3DMETAL_RES)";
+
+/// Placeholder that replaces an absolute path in reported worker stderr.
+const REDACTED_PATH: &str = "<path>";
 
 /// Version mixed into the pool's cache key.
 pub const POOL_CONVERTER_VERSION: &str = concat!(
@@ -176,9 +208,16 @@ pub const fn pool_stdio_enabled() -> bool {
     true
 }
 
-/// Converter library passed to a `--stdio` worker, taken from the same
-/// environment the renderer uses. `None` lets the worker report the missing
-/// converter itself, which surfaces as [`PoolError::WorkerExited`].
+/// Converter library passed to every `--stdio` worker.
+///
+/// Resolved the same way the launcher does, in this order: the
+/// `VICTORY_METAL_IRCONVERTER` file itself, then
+/// `D3DMETAL_RES/libmetalirconverter.dylib`. The pool resolves it once, at
+/// construction, so every child of this pool is started with the same
+/// explicit `--converter` and a later environment change cannot split the
+/// worker set. `None` means nothing resolves; a pool that requires a
+/// converter refuses the job instead of spawning a worker that can only exit
+/// on a usage error.
 fn converter_from_env() -> Option<PathBuf> {
     std::env::var_os("VICTORY_METAL_IRCONVERTER")
         .map(PathBuf::from)
@@ -436,6 +475,22 @@ pub enum PoolError {
     Closed,
 }
 
+impl PoolError {
+    /// Whether this error is the pool's "no converter library" refusal.
+    ///
+    /// The refusal is a [`PoolError::Spawn`] whose source is
+    /// [`NO_CONVERTER_LIBRARY`], so the error message names the missing input
+    /// while the variant set every existing consumer matches stays unchanged.
+    pub fn is_no_converter_library(&self) -> bool {
+        matches!(
+            self,
+            PoolError::Spawn { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+                    && source.to_string().contains(NO_CONVERTER_LIBRARY)
+        )
+    }
+}
+
 /// One answer from a worker: the metallib and, for protocol version 2, the
 /// reflection JSON.
 struct WorkerReply {
@@ -476,12 +531,17 @@ struct AtomicStats {
 pub struct CompilerPool {
     config: PoolConfig,
     program: Option<PathBuf>,
+    /// Converter library every child of this pool is started with, resolved
+    /// once from the environment.
+    converter: Option<PathBuf>,
     cache: Option<cache_bridge::Slot>,
     slots: Vec<Arc<WorkerSlot>>,
     senders: Vec<SyncSender<JobFrame>>,
     handles: Vec<JoinHandle<()>>,
     gate: Gate,
     stats: Arc<AtomicStats>,
+    /// Bounded stderr of the last worker that failed a job.
+    last_stderr: Arc<Mutex<Option<String>>>,
     next_worker: AtomicUsize,
     next_seq: AtomicU64,
 }
@@ -491,9 +551,20 @@ impl CompilerPool {
     /// documented frame protocol (normally the `victory-irconverter` binary);
     /// `None` leaves the pool cache-only.
     pub fn new(config: PoolConfig, worker_program: Option<PathBuf>) -> Self {
+        Self::build(config, worker_program, converter_from_env(), false)
+    }
+
+    /// Builds the pool, resolving the converter once and passing it on.
+    fn build(
+        config: PoolConfig,
+        worker_program: Option<PathBuf>,
+        converter: Option<PathBuf>,
+        require_converter: bool,
+    ) -> Self {
         let workers = config.workers.clamp(1, MAX_WORKERS);
         let queue_depth = config.queue_depth.max(1);
         let stats = Arc::new(AtomicStats::default());
+        let last_stderr = Arc::new(Mutex::new(None));
         let cache = config
             .cache_dir
             .as_deref()
@@ -509,9 +580,19 @@ impl CompilerPool {
                 Some(program) => {
                     let thread_stats = stats.clone();
                     let thread_slot = Arc::clone(&slot);
+                    let thread_converter = converter.clone();
+                    let thread_stderr = Arc::clone(&last_stderr);
                     let name = format!("victory-shader-pool-{index}");
                     match thread::Builder::new().name(name).spawn(move || {
-                        worker_loop(program, thread_slot, rx, thread_stats);
+                        worker_loop(
+                            program,
+                            thread_converter,
+                            require_converter,
+                            thread_slot,
+                            rx,
+                            thread_stats,
+                            thread_stderr,
+                        );
                     }) {
                         Ok(handle) => {
                             slots.push(slot);
@@ -540,12 +621,14 @@ impl CompilerPool {
                 ..config
             },
             program: worker_program,
+            converter,
             cache,
             slots,
             senders,
             handles,
             gate: Gate::new(queue_depth),
             stats,
+            last_stderr,
             next_worker: AtomicUsize::new(0),
             next_seq: AtomicU64::new(0),
         }
@@ -561,9 +644,36 @@ impl CompilerPool {
         self.program.as_deref()
     }
 
+    /// Converter library every child of this pool is started with, when one
+    /// resolved at construction.
+    pub fn converter(&self) -> Option<&Path> {
+        self.converter.as_deref()
+    }
+
+    /// The bounded, escaped stderr of the last worker that failed a job.
+    ///
+    /// The text is at most [`MAX_WORKER_STDERR_BYTES`], has control characters
+    /// replaced, and has absolute paths redacted to `<path>`: it is safe to put
+    /// on one diagnostic line. A worker that exited before answering leaves its
+    /// own reason here even though [`PoolError::WorkerExited`] cannot carry an
+    /// extra field without breaking every existing matcher.
+    pub fn last_worker_stderr(&self) -> Option<String> {
+        self.last_stderr.lock().ok().and_then(|text| text.clone())
+    }
+
+    /// [`CompilerPool::last_worker_stderr`] only when it is short enough for
+    /// telemetry (at most [`MAX_WORKER_STDERR_TELEMETRY_CHARS`] characters).
+    pub fn worker_stderr_for_telemetry(&self) -> Option<String> {
+        telemetry_stderr(self.last_worker_stderr().as_deref())
+    }
+
     /// Builds a pool from [`PoolConfig::from_env`], resolving the worker from
     /// `VICTORY_IRCONVERTER_WORKER` or the `victory-irconverter` sibling of
     /// the current executable. A pool with neither is cache-only.
+    ///
+    /// This is the host's pool: it requires the converter library, because
+    /// every `--stdio` job needs one and a child spawned without it exits on a
+    /// usage error before reading the job.
     pub fn from_env() -> Self {
         let program = std::env::var_os("VICTORY_IRCONVERTER_WORKER")
             .map(PathBuf::from)
@@ -573,7 +683,7 @@ impl CompilerPool {
                 let sibling = exe.parent()?.join("victory-irconverter");
                 sibling.is_file().then_some(sibling)
             });
-        Self::new(PoolConfig::from_env(), program)
+        Self::build(PoolConfig::from_env(), program, converter_from_env(), true)
     }
 
     /// Cache directory actually in use, when caching is enabled and openable.
@@ -901,12 +1011,204 @@ fn kill_worker(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Reads a worker's stderr into a bounded tail ring and sends the escaped
+/// text back when the pipe closes.
+///
+/// The reader never blocks the worker: it drains the pipe for the whole child
+/// lifetime and only keeps the last [`MAX_WORKER_STDERR_BYTES`] bytes, because
+/// the reason a worker died is at the end of its stderr. The receiver carries
+/// the text once, at EOF; a caller that already reaped the child gets it
+/// immediately.
+fn spawn_stderr_reader(mut pipe: ChildStderr) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("victory-shader-stderr".to_string())
+        .spawn(move || {
+            let mut ring: Vec<u8> = Vec::new();
+            let mut truncated = false;
+            let mut chunk = [0u8; 1024];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        ring.extend_from_slice(&chunk[..read]);
+                        if ring.len() > MAX_WORKER_STDERR_BYTES {
+                            let overflow = ring.len() - MAX_WORKER_STDERR_BYTES;
+                            ring.drain(..overflow);
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(escape_worker_stderr(&ring, truncated));
+        });
+    if let Err(err) = spawned {
+        // Without a reader the job still fails explicitly; it just has no
+        // captured reason. Dropping the closure also disconnects `rx`.
+        tracing::warn!(error = %err, "shader pool could not start a worker stderr reader");
+    }
+    rx
+}
+
+/// Escapes a bounded worker-stderr tail into one line of diagnostics.
+///
+/// Newlines and tabs become spaces, other control characters `?`, runs of
+/// spaces collapse, and absolute paths are replaced with [`REDACTED_PATH`], so
+/// the text can be recorded without a host path breaking a `key=value` line or
+/// leaking into telemetry.
+fn escape_worker_stderr(raw: &[u8], truncated: bool) -> String {
+    let lossy = String::from_utf8_lossy(raw);
+    let mut cleaned = String::with_capacity(lossy.len());
+    let mut last_space = false;
+    for ch in lossy.chars() {
+        let mapped = match ch {
+            '\n' | '\r' | '\t' => ' ',
+            ch if ch.is_control() => '?',
+            ch => ch,
+        };
+        if mapped == ' ' {
+            if !last_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+            }
+            last_space = true;
+        } else {
+            cleaned.push(mapped);
+            last_space = false;
+        }
+    }
+    let escaped = redact_absolute_paths(cleaned.trim_end());
+    let suffix = if truncated { " [truncated]" } else { "" };
+    let room = MAX_WORKER_STDERR_BYTES.saturating_sub(suffix.len());
+    let mut out = truncate_chars(&escaped, room);
+    if truncated || out.len() < escaped.len() {
+        out.push_str(suffix);
+    }
+    out
+}
+
+/// Replaces every absolute path token with [`REDACTED_PATH`].
+fn redact_absolute_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, token) in text.split(' ').enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&redact_token(token));
+    }
+    out
+}
+
+/// Redacts an absolute path at the start of a token or after a `key=` prefix.
+fn redact_token(token: &str) -> String {
+    let (prefix, value) = match token.split_once('=') {
+        Some((prefix, value)) if !prefix.is_empty() => (Some(prefix), value),
+        _ => (None, token),
+    };
+    let core = value.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '\'' | '"' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '<' | '>' | '.'
+        )
+    });
+    if is_absolute_path(core) {
+        match prefix {
+            Some(prefix) => format!("{prefix}={REDACTED_PATH}"),
+            None => REDACTED_PATH.to_string(),
+        }
+    } else {
+        token.to_string()
+    }
+}
+
+/// Whether `token` names an absolute POSIX or Windows path.
+fn is_absolute_path(token: &str) -> bool {
+    if token.starts_with('/') || token.starts_with("~/") {
+        return true;
+    }
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// Truncates `text` to at most `max` bytes without splitting a character.
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.len() + ch.len_utf8() > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// [`MAX_WORKER_STDERR_TELEMETRY_CHARS`]-bounded view of captured stderr.
+fn telemetry_stderr(text: Option<&str>) -> Option<String> {
+    text.filter(|text| {
+        !text.is_empty() && text.chars().count() <= MAX_WORKER_STDERR_TELEMETRY_CHARS
+    })
+    .map(str::to_string)
+}
+
+/// Records the most recent worker stderr for [`CompilerPool::last_worker_stderr`].
+fn record_worker_stderr(sink: &Mutex<Option<String>>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Ok(mut slot) = sink.lock() {
+        *slot = Some(text.to_string());
+    }
+}
+
+/// Appends captured stderr to a worker-reported failure, when it fits.
+///
+/// A status-failure payload is already a diagnostic; the stderr tail is added
+/// only when the payload is short, so one error message stays bounded.
+fn attach_stderr(error: PoolError, stderr: String) -> PoolError {
+    match error {
+        PoolError::WorkerFailed {
+            job_id,
+            status,
+            message,
+        } if message.len() <= MAX_WORKER_STDERR_BYTES => {
+            let message = if message.is_empty() {
+                stderr
+            } else {
+                format!("{message}; worker stderr: {stderr}")
+            };
+            PoolError::WorkerFailed {
+                job_id,
+                status,
+                message,
+            }
+        }
+        other => other,
+    }
+}
+
 struct ChildIo {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Escaped stderr, delivered once when the worker's pipe closes.
+    stderr: Option<Receiver<String>>,
 }
 
 impl ChildIo {
+    /// Waits briefly for the stderr reader to reach EOF.
+    ///
+    /// A worker that exited has already closed the pipe, so this returns at
+    /// once; the timeout only covers a descendant that escaped the
+    /// process-group kill and kept the pipe open.
+    fn take_stderr(&mut self) -> Option<String> {
+        let reader = self.stderr.take()?;
+        match reader.recv_timeout(Duration::from_millis(250)) {
+            Ok(text) if !text.is_empty() => Some(text),
+            _ => None,
+        }
+    }
+
     fn run(&mut self, job: &JobFrame) -> Result<WorkerReply, PoolError> {
         let header = format!(
             "{PROTOCOL_MAGIC_JOB} {} {} {} {} {}\n",
@@ -1078,21 +1380,94 @@ impl ChildIo {
     }
 }
 
-fn spawn_child(program: &Path, slot: &WorkerSlot) -> Result<ChildIo, PoolError> {
+/// Builds the exact command one worker child is started with.
+///
+/// The pool always asks for the persistent `--stdio` transport and names the
+/// converter explicitly: `--stdio` without `--converter` is a usage error, and
+/// such a child exits before reading a frame. `--converter` is omitted only for
+/// a program the pool was built to drive without one (the protocol fixtures).
+fn worker_command(program: &Path, converter: Option<&Path>) -> Command {
     let mut command = Command::new(program);
     if pool_stdio_enabled() {
         command.arg(STDIO_ARG);
     }
-    if let Some(converter) = converter_from_env() {
+    if let Some(converter) = converter {
         command.arg(CONVERTER_ARG).arg(converter);
     }
     // Ask for the reflection frame; a worker that predates it ignores the
     // variable and answers `VMRES`, which `compile` still accepts.
     command.env(REFLECTION_FRAMES_ENV, "1");
     command
+}
+
+/// The named refusal for a pool that cannot give its worker a converter.
+fn no_converter_library(program: &Path, converter: Option<&Path>) -> PoolError {
+    let detail = match converter {
+        Some(path) => format!(
+            "{NO_CONVERTER_LIBRARY}: {} is not a regular file",
+            path.display()
+        ),
+        None => NO_CONVERTER_LIBRARY.to_string(),
+    };
+    PoolError::Spawn {
+        program: program.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, detail),
+    }
+}
+
+/// Cheap startup self-check: the worker program must be a runnable file.
+///
+/// This is a filesystem check only. It sends no probe frame and starts no GPU
+/// work, so a broken installation is a named [`PoolError::Spawn`] before the
+/// pool pays for a child process.
+fn validate_worker_program(program: &Path) -> Result<(), PoolError> {
+    let metadata = std::fs::metadata(program).map_err(|source| PoolError::Spawn {
+        program: program.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(PoolError::Spawn {
+            program: program.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "worker program is not a regular file",
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(PoolError::Spawn {
+                program: program.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "worker program is not executable",
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn spawn_child(
+    program: &Path,
+    converter: Option<&Path>,
+    require_converter: bool,
+    slot: &WorkerSlot,
+) -> Result<ChildIo, PoolError> {
+    validate_worker_program(program)?;
+    let converter = match converter {
+        Some(path) if path.is_file() => Some(path),
+        Some(path) => return Err(no_converter_library(program, Some(path))),
+        None if require_converter => return Err(no_converter_library(program, None)),
+        None => None,
+    };
+    let mut command = worker_command(program, converter);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|source| PoolError::Spawn {
@@ -1101,6 +1476,7 @@ fn spawn_child(program: &Path, slot: &WorkerSlot) -> Result<ChildIo, PoolError> 
     })?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
+    let stderr = child.stderr.take().map(spawn_stderr_reader);
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
         let _ = child.kill();
         let _ = child.wait();
@@ -1115,14 +1491,18 @@ fn spawn_child(program: &Path, slot: &WorkerSlot) -> Result<ChildIo, PoolError> 
     Ok(ChildIo {
         stdin,
         stdout: BufReader::new(stdout),
+        stderr,
     })
 }
 
 fn worker_loop(
     program: PathBuf,
+    converter: Option<PathBuf>,
+    require_converter: bool,
     slot: Arc<WorkerSlot>,
     jobs: Receiver<JobFrame>,
     stats: Arc<AtomicStats>,
+    last_stderr: Arc<Mutex<Option<String>>>,
 ) {
     let mut io: Option<ChildIo> = None;
     while let Ok(job) = jobs.recv() {
@@ -1142,7 +1522,7 @@ fn worker_loop(
         // warm-up; later jobs reuse the same `--stdio` child.
         let started = Instant::now();
         if io.is_none() {
-            match spawn_child(&program, &slot) {
+            match spawn_child(&program, converter.as_deref(), require_converter, &slot) {
                 Ok(child) => {
                     stats.worker_starts.fetch_add(1, Ordering::Relaxed);
                     io = Some(child);
@@ -1175,11 +1555,29 @@ fn worker_loop(
                 let _ = job.reply.send(Ok(reply));
             }
             Err(err) => {
+                // The worker's own last words are the only evidence for why
+                // it died. The read is bounded: a worker that exited has
+                // already closed stderr, so this returns at once; only a
+                // descendant that escaped the process-group kill can make it
+                // wait out the short timeout.
+                let stderr = child.take_stderr();
                 // Any IO or protocol failure leaves the pipeline unusable:
                 // reap the child and respawn on the next job.
                 io = None;
                 slot.reap();
                 stats.worker_restarts.fetch_add(1, Ordering::Relaxed);
+                let err = match stderr {
+                    Some(text) => {
+                        record_worker_stderr(&last_stderr, &text);
+                        tracing::warn!(
+                            job_id = job.id,
+                            worker_stderr = %text,
+                            "shader worker failed a job and wrote to stderr"
+                        );
+                        attach_stderr(err, text)
+                    }
+                    None => err,
+                };
                 let _ = job.reply.send(Err(err));
             }
         }
@@ -1518,5 +1916,195 @@ mod tests {
             assert!(matches!(err, PoolError::InvalidJob(_)));
         }
         assert_eq!(pool.stats().jobs, 0, "rejected jobs are not counted");
+    }
+
+    /// The exact command a worker child is started with.
+    #[test]
+    fn worker_command_names_the_stdio_transport_and_the_converter() {
+        let command = worker_command(
+            Path::new("/opt/victory/victory-irconverter"),
+            Some(Path::new("/share/libmetalirconverter.dylib")),
+        );
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/victory/victory-irconverter")
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["--stdio", "--converter", "/share/libmetalirconverter.dylib"],
+            "every job needs an explicit converter; --stdio alone is a usage error"
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == REFLECTION_FRAMES_ENV),
+            Some((
+                std::ffi::OsStr::new(REFLECTION_FRAMES_ENV),
+                Some(std::ffi::OsStr::new("1"))
+            ))
+        );
+
+        let command = worker_command(Path::new("/opt/victory/pool-fixture.sh"), None);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--stdio"]);
+    }
+
+    /// A pool that must convert never spawns a worker without a converter.
+    #[test]
+    fn a_pool_without_a_converter_refuses_the_job_without_spawning() {
+        let program = std::env::current_exe().expect("the test executable exists");
+        let pool = CompilerPool::build(
+            PoolConfig {
+                workers: 1,
+                queue_depth: 1,
+                cache_dir: None,
+                ..PoolConfig::default()
+            },
+            Some(program),
+            None,
+            true,
+        );
+        let err = pool
+            .compile(&CompileJob {
+                id: 9,
+                stage: 1,
+                entry: "main",
+                dxil: b"dxil",
+            })
+            .expect_err("a pool with no converter library must refuse");
+        assert!(err.is_no_converter_library(), "unexpected error: {err:?}");
+        assert!(
+            err.to_string().contains(NO_CONVERTER_LIBRARY),
+            "the refusal must name the missing library: {err}"
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.worker_starts, 0, "no worker may be started");
+        assert_eq!(stats.worker_jobs, 0, "no job may reach a worker");
+        assert_eq!(stats.errors, 1);
+        assert!(pool.last_worker_stderr().is_none());
+    }
+
+    /// A worker that exits before answering leaves its own reason behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_that_exits_before_answering_reports_its_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "victory-pool-stderr-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let program = dir.join("immediate-exit.sh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             printf 'victory-irconverter: --converter /Users/someone/lib/libmetalirconverter.dylib is not a regular file\\n' >&2\n\
+             exit 2\n",
+        )
+        .expect("write the failing worker");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("stat the failing worker")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions).expect("chmod the failing worker");
+
+        let pool = CompilerPool::build(
+            PoolConfig {
+                workers: 1,
+                queue_depth: 1,
+                cache_dir: None,
+                ..PoolConfig::default()
+            },
+            Some(program),
+            None,
+            false,
+        );
+        let err = pool
+            .compile(&CompileJob {
+                id: 1,
+                stage: 8,
+                entry: "main",
+                dxil: b"dxil",
+            })
+            .expect_err("a worker that exits before answering must fail the job");
+        assert!(
+            matches!(err, PoolError::WorkerExited { job_id: 1 }),
+            "unexpected error: {err:?}"
+        );
+        let stderr = pool
+            .last_worker_stderr()
+            .expect("the exited worker's stderr must be captured");
+        assert!(
+            stderr.contains("--converter <path> is not a regular file"),
+            "the captured stderr must keep the reason: {stderr}"
+        );
+        assert!(
+            !stderr.contains("/Users"),
+            "an absolute path must be redacted: {stderr}"
+        );
+        assert!(stderr.len() <= MAX_WORKER_STDERR_BYTES);
+        let telemetry = pool.worker_stderr_for_telemetry();
+        if stderr.chars().count() <= MAX_WORKER_STDERR_TELEMETRY_CHARS {
+            assert_eq!(telemetry.as_deref(), Some(stderr.as_str()));
+        } else {
+            assert!(
+                telemetry.is_none(),
+                "long worker stderr must stay out of telemetry"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_stderr_is_escaped_and_paths_are_redacted() {
+        let text = escape_worker_stderr(
+            b"victory-irconverter: --converter /Users/x/lib.dylib\nis not\ta file\0",
+            false,
+        );
+        assert_eq!(
+            text,
+            "victory-irconverter: --converter <path> is not a file?"
+        );
+        assert_eq!(
+            escape_worker_stderr(b"converter=C:\\tools\\lib.dylib failed", false),
+            "converter=<path> failed"
+        );
+        assert_eq!(escape_worker_stderr(b"", false), "");
+    }
+
+    #[test]
+    fn worker_stderr_is_bounded_and_marks_the_tail() {
+        let raw = vec![b'a'; MAX_WORKER_STDERR_BYTES + 512];
+        let text = escape_worker_stderr(&raw, true);
+        assert!(
+            text.len() <= MAX_WORKER_STDERR_BYTES,
+            "{} bytes",
+            text.len()
+        );
+        assert!(text.ends_with(" [truncated]"), "{text}");
+    }
+
+    #[test]
+    fn worker_stderr_reaches_telemetry_only_when_short() {
+        assert_eq!(telemetry_stderr(None), None);
+        assert_eq!(telemetry_stderr(Some("")), None);
+        assert_eq!(
+            telemetry_stderr(Some("converter worker exited")),
+            Some("converter worker exited".to_string())
+        );
+        let long = "x".repeat(MAX_WORKER_STDERR_TELEMETRY_CHARS + 1);
+        assert_eq!(telemetry_stderr(Some(&long)), None);
     }
 }

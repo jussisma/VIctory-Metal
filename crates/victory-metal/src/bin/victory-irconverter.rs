@@ -120,6 +120,15 @@ mod cli {
     /// as unrecoverable framing.
     const MAX_STDIO_PAYLOAD_BYTES: usize = MAX_DXIL_INPUT_BYTES + MAX_ENTRY_POINT_BYTES;
 
+    /// Where the caller is expected to name the converter library.
+    ///
+    /// The pool resolves `--converter` from the same two variables and passes
+    /// it explicitly, so a missing flag is an installation error rather than a
+    /// worker default. The sentence is part of the worker's stderr, which the
+    /// pool captures and redacts.
+    const CONVERTER_HINT: &str =
+        "set VICTORY_METAL_IRCONVERTER or D3DMETAL_RES to libmetalirconverter.dylib";
+
     const USAGE: &str = "\
 usage: victory-irconverter --converter <libmetalirconverter.dylib> \\
            --entry <entry-point> [options] <input.dxil> <output.metallib>
@@ -297,8 +306,9 @@ root signature <= 1048576 bytes.
                         .to_string(),
                 );
             }
-            let converter =
-                converter.ok_or_else(|| "--converter is required with --stdio".to_string())?;
+            let converter = converter.ok_or_else(|| {
+                format!("--converter is required with --stdio ({CONVERTER_HINT})")
+            })?;
             return Ok(Some(Args {
                 converter,
                 entry: String::new(),
@@ -325,7 +335,8 @@ root signature <= 1048576 bytes.
         }
         let output = PathBuf::from(positional.pop().unwrap());
         let input = PathBuf::from(positional.pop().unwrap());
-        let converter = converter.ok_or_else(|| "--converter is required".to_string())?;
+        let converter =
+            converter.ok_or_else(|| format!("--converter is required ({CONVERTER_HINT})"))?;
         let entry = entry.ok_or_else(|| "--entry is required".to_string())?;
         Ok(Some(Args {
             converter,
@@ -454,6 +465,15 @@ root signature <= 1048576 bytes.
         }
         let reflection_frames = env::var_os(REFLECTION_FRAMES_ENV)
             .is_some_and(|value| !value.is_empty() && value != "0");
+        // One line on stderr names the converter this child was actually given
+        // and the frame it will answer. The pool keeps a bounded tail of
+        // stderr, so a later exit can be explained instead of reported as a
+        // silent `WorkerExited`.
+        eprintln!(
+            "victory-irconverter: serving --stdio with converter {} (frame {})",
+            args.converter.display(),
+            if reflection_frames { "VMRES2" } else { "VMRES" }
+        );
         if let Some(dir) = &args.reflection_dir {
             if let Err(err) = fs::create_dir_all(dir) {
                 eprintln!(

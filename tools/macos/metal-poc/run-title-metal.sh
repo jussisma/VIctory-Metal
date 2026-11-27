@@ -40,11 +40,14 @@
 # a usage error before anything is created. The rest of the connection variables
 # (port, secret, share dir, fence page) are owned by this launcher.
 #
-# ADR-038 keeps the converter worker and its dylib host-only: the launcher lets
-# `victory_metal_host` inherit VICTORY_IRCONVERTER_WORKER and
-# VICTORY_METAL_IRCONVERTER, then unsets both before the Wine guest starts. The
-# guest must not build a pool around a macOS binary; it reaches the VP3
-# host-translation path instead (see `crates/victory-gpu/src/native_metal/pso.rs`).
+# ADR-038 keeps the converter worker and its dylib host-only: the launcher
+# resolves them (VICTORY_METAL_IRCONVERTER, then D3DMETAL_RES, then the D3DMetal
+# install), builds the x86_64 worker if needed, and exports both for
+# `victory_metal_host` immediately before the daemon starts, so its pool always
+# has an explicit `--converter`. It then unsets both before the Wine guest
+# starts. The guest must not build a pool around a macOS binary; it reaches the
+# VP3 host-translation path instead (see
+# `crates/victory-gpu/src/native_metal/pso.rs`).
 #
 # With VICTORY_BACKEND=d3d12 the native daemon is not started (it can only serve
 # a metal guest) and the D3DMetal DLL override is exported so the guest reaches
@@ -421,7 +424,16 @@ DXIL_DIR="$WORK/dxil"
 ABI_DIR="$WORK/abi"
 SHARE_PIPE="$SHARE/pipelines"
 IRCONV="$TARGET_DIR/x86_64-apple-darwin/debug/victory-irconverter"
-CONV="${VICTORY_METAL_IRCONVERTER:-$HOME/Library/Caches/victory-macos/target/wine-cx/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib}"
+# The converter library, resolved in the same order the pool uses:
+# VICTORY_METAL_IRCONVERTER names the dylib itself, D3DMETAL_RES names the
+# resource directory that holds it, and the D3DMetal install is the fallback.
+if [ -n "${VICTORY_METAL_IRCONVERTER:-}" ]; then
+    CONV="$VICTORY_METAL_IRCONVERTER"
+elif [ -n "${D3DMETAL_RES:-}" ]; then
+    CONV="$D3DMETAL_RES/libmetalirconverter.dylib"
+else
+    CONV="$HOME/Library/Caches/victory-macos/target/wine-cx/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib"
+fi
 
 find_tool() {
     # $1 = relative path under a candidate root
@@ -778,6 +790,39 @@ elif [ "$GATE_MODE" = 1 ]; then
     echo "run-title-metal.sh: VICTORY_BACKEND=d3d12: skipping the native metallib/ABI pool"
 fi
 
+# --- Converter worker availability (ADR-038) -------------------------------
+# `victory_metal_host` runs the ADR-038 translation pool: it spawns
+# `victory-irconverter --stdio --converter <libmetalirconverter.dylib>` for
+# every stage. The pool resolves both paths from its own environment once, at
+# startup, so this launcher resolves and exports them here, before `start_host`
+# backgrounds the daemon. It never overrides a value the caller already
+# exported, and it builds the x86_64 worker when the gate's pool stage did not
+# (a title run does not compile HLSL first). The Win64 guest must not inherit
+# any of them: `unset` after `start_host` keeps its pool cache-only so the VP3
+# host-translation path is selected (ADR-038).
+prepare_converter_env() {
+    if [ ! -x "$IRCONV" ]; then
+        echo "run-title-metal.sh: building the x86_64 victory-irconverter worker (missing $IRCONV)..."
+        if ! victory_hygiene_run cargo build --locked -p victory-metal \
+            --target x86_64-apple-darwin --bin victory-irconverter; then
+            echo "run-title-metal.sh: WARN: the x86_64 converter worker did not build; host translation will be refused" >&2
+        fi
+    fi
+    if [ -z "${VICTORY_IRCONVERTER_WORKER:-}" ] && [ -x "$IRCONV" ]; then
+        VICTORY_IRCONVERTER_WORKER="$IRCONV"
+    fi
+    if [ -n "${VICTORY_IRCONVERTER_WORKER:-}" ] && [ -x "${VICTORY_IRCONVERTER_WORKER}" ]; then
+        export VICTORY_IRCONVERTER_WORKER
+    fi
+    if [ -z "${VICTORY_METAL_IRCONVERTER:-}" ] && [ -f "$CONV" ]; then
+        VICTORY_METAL_IRCONVERTER="$CONV"
+    fi
+    if [ -n "${VICTORY_METAL_IRCONVERTER:-}" ] && [ -f "${VICTORY_METAL_IRCONVERTER}" ]; then
+        export VICTORY_METAL_IRCONVERTER
+    fi
+    echo "CONVERTER_ENV worker=${VICTORY_IRCONVERTER_WORKER:-none} converter=${VICTORY_METAL_IRCONVERTER:-none}"
+}
+
 # --- Start the ARM64 daemon ------------------------------------------------
 start_host() {
     set -- --secret-file "$SECRET" --port 0 --once --share-dir "$SHARE" \
@@ -799,6 +844,7 @@ start_host() {
 
 if [ "$BACKEND" = metal ]; then
     echo "run-title-metal.sh: starting the ARM64 victory-metal-host daemon..."
+    prepare_converter_env
     start_host
 
     ready=0
@@ -835,14 +881,14 @@ graphics_id="$(sed -n 's/^id=\([0-9][0-9]*\)$/\1/p' "$SHARE/victory-metal-host.g
 # --- Host-only converter environment (ADR-038) -----------------------------
 # `VICTORY_IRCONVERTER_WORKER` and `VICTORY_METAL_IRCONVERTER` name macOS
 # builds that only `victory_metal_host` can run: the host reads them when it
-# creates the ADR-038 translation pool it sandboxes behind Rosetta. They were
-# inherited by this script so `start_host` could pass them on. The Win64 guest
-# must not inherit them: a guest that sees a macOS worker path builds a pool
-# whose child dies at once, and the refusal is reported as `Translation`
-# instead of the `ConverterUnavailable` that selects the VP3 host-translation
-# path. `CONV` (the dylib the gate's own pool stage used above) is already
-# resolved and stays a shell variable only. The share dir, fence page, endpoint
-# and secret below stay in the guest environment.
+# creates the ADR-038 translation pool it sandboxes behind Rosetta.
+# `prepare_converter_env` exported them before `start_host`, so the daemon (and
+# only the daemon) inherited them. The Win64 guest must not: a guest that sees
+# a macOS worker path builds a pool whose child dies at once, and the refusal is
+# reported as `Translation` instead of the `ConverterUnavailable` that selects
+# the VP3 host-translation path. `CONV` (the dylib the gate's own pool stage
+# used above) is already resolved and stays a shell variable only. The share
+# dir, fence page, endpoint and secret below stay in the guest environment.
 unset VICTORY_IRCONVERTER_WORKER VICTORY_METAL_IRCONVERTER
 
 # --- Guest environment -----------------------------------------------------
