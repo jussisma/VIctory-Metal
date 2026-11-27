@@ -440,7 +440,13 @@ const PAGE: usize = 64 << 10;
 
 struct Section {
     handle: HANDLE,
+    /// The allocation's real size: what the guest may map and resolve. A
+    /// share file is rounded up to whole pages, so this can be smaller than
+    /// [`Section::map_size`]; the difference is padding the guest never sees.
     size: usize,
+    /// The length the section maps, always a non-zero multiple of 64 KiB
+    /// pages for a share-backed section. Equal to `size` otherwise.
+    map_size: usize,
     /// Optional shared CPU/GPU backing. The file still supplies Wine's
     /// placeholder-view metadata.
     #[cfg(feature = "diagnostics")]
@@ -477,26 +483,37 @@ impl Section {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let at = *self.whole.get_or_init(|| {
             // SAFETY: our section; the view is ours until the section drops.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.size) }.Value as usize
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.map_size) }.Value
+                as usize
         });
         (at != 0).then_some(at)
     }
 }
 
-/// A section of `size` bytes for an allocation of physical pages: the
-/// pagefile in production, a file the opt-in share provider names when
-/// `VICTORY_METAL_SHARE_DIR` is set, or in tests a file a synthetic caller
-/// provides.
+/// A section of `size` bytes for an allocation of physical pages: a file the
+/// opt-in share provider names when `VICTORY_METAL_SHARE_DIR` is set (in
+/// every build, diagnostics included), the pagefile when the provider is
+/// unconfigured or genuinely fails, or in tests a file a synthetic caller
+/// provides. A failure is logged with its category and still falls back
+/// explicitly: it is never reported as a shared section.
 fn new_section(size: usize) -> Option<Arc<Section>> {
     #[cfg(test)]
     if let Some(section) = tests::file_section(size) {
         return Some(section);
     }
-    // Diagnostic heaps alias the section's pages onto a GPU heap, so they
-    // keep the pagefile and never claim a share file.
-    #[cfg(not(feature = "diagnostics"))]
+    // `VICTORY_PHYSICAL_TILES` is an independent GPU-heap opt-in: a section
+    // takes the share path whether or not that switch is on, and a share
+    // section has no GPU host heap of its own.
     match share::section(size) {
-        Ok(section) => return Some(section),
+        Ok(section) => {
+            tracing::debug!(
+                size,
+                map_size = section.map_size,
+                live = share::live(),
+                "host-visible XMem section"
+            );
+            return Some(section);
+        }
         Err(share::Failure::Unconfigured) => {}
         Err(error) => tracing::warn!(
             size,
@@ -504,23 +521,31 @@ fn new_section(size: usize) -> Option<Arc<Section>> {
             "host-visible XMem backing failed; keeping the pagefile section"
         ),
     }
-    #[cfg(feature = "diagnostics")]
-    if std::env::var_os(share::DIRECTORY).is_some_and(|value| !value.is_empty()) {
-        tracing::debug!(
-            "VICTORY_METAL_SHARE_DIR is set, but diagnostic heaps keep the pagefile path"
-        );
-    }
     pagefile_section(size)
 }
 
 /// A section over `file`: its pages are the file's pages. `share` records a
 /// provider backing the file, if any. The file must outlive every view of
 /// the section (callers keep it, or a `share::Backing`, alive).
+#[cfg(test)]
 fn file_section(
     file: &std::fs::File,
     size: usize,
     share: Option<Arc<share::Backing>>,
 ) -> Option<Arc<Section>> {
+    file_section_sized(file, size, size, share)
+}
+
+/// A section over `file` reporting `size` to the guest but mapping
+/// `map_size`: the provider rounds an allocation up to whole pages, and the
+/// extra tail must stay padding the guest cannot resolve.
+fn file_section_sized(
+    file: &std::fs::File,
+    size: usize,
+    map_size: usize,
+    share: Option<Arc<share::Backing>>,
+) -> Option<Arc<Section>> {
+    debug_assert!(map_size >= size && map_size.is_multiple_of(PAGE));
     use std::os::windows::io::AsRawHandle;
     // SAFETY: plain file-backed section creation; the caller keeps the file
     // open while the section and its views live.
@@ -529,8 +554,8 @@ fn file_section(
             file.as_raw_handle() as HANDLE,
             std::ptr::null(),
             PAGE_READWRITE,
-            (size as u64 >> 32) as u32,
-            size as u32,
+            (map_size as u64 >> 32) as u32,
+            map_size as u32,
             std::ptr::null(),
         )
     };
@@ -540,6 +565,7 @@ fn file_section(
     Some(Arc::new(Section {
         handle,
         size,
+        map_size,
         // The file is the backing, not the GPU's host heap.
         #[cfg(feature = "diagnostics")]
         shared: None,
@@ -572,6 +598,7 @@ fn pagefile_section(size: usize) -> Option<Arc<Section>> {
     Some(Arc::new(Section {
         handle,
         size,
+        map_size: size,
         #[cfg(feature = "diagnostics")]
         shared: victory_gpu::physical_heap(size),
         share: None,
