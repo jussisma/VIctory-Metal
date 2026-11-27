@@ -18,5 +18,6 @@ pub mod present;
 pub mod producer;
 pub mod pso;
 pub mod queue;
+pub mod sampler;
 pub mod state;
 pub mod telemetry;

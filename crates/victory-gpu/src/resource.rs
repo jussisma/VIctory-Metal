@@ -2009,9 +2009,10 @@ pub(crate) fn owned(this: This) -> Option<Owned> {
 /// The host registration of one texture, when the native path needs it.
 ///
 /// Only textures the GPU writes (render targets, depth targets, UAVs) and a
-/// present surface are host-owned; a sampled texture stays in guest memory
-/// and is reached through the binding tables. `None` means "no host object":
-/// a buffer, or a texture the native path never names directly.
+/// present surface are host-owned at creation; a sampled texture stays in
+/// guest memory until a descriptor table names it, at which point
+/// [`texture_table_registration`] supplies the same codes. `None` means "no
+/// host object": a buffer, or a texture the native path never names directly.
 #[cfg(windows)]
 fn native_texture_registration(
     desc: &ResourceDesc,
@@ -2019,12 +2020,97 @@ fn native_texture_registration(
     if desc.dimension == BUFFER || desc.flags & (0x4 | 0x8 | 0x10) == 0 {
         return None;
     }
+    let usage = if desc.flags & 0x10 != 0 {
+        2
+    } else if desc.flags & 0x8 != 0 {
+        3
+    } else {
+        1
+    };
+    Some(texture_registration_codes(desc, usage))
+}
+
+/// Parameters for registering a texture at its first table bind.
+#[cfg(windows)]
+pub(crate) struct TextureTableRegistration {
+    /// Guest memory base, the kind 8 handle.
+    pub handle: u64,
+    /// Kind 8 dimension code.
+    pub dimension: u8,
+    /// Kind 8 format code.
+    pub format: u8,
+    /// Kind 8 usage code (`0` sampled, `3` storage).
+    pub usage: u8,
+    /// Sample count.
+    pub sample_count: u8,
+    /// Top-level width.
+    pub width: u32,
+    /// Top-level height.
+    pub height: u32,
+    /// Depth for a 3D texture, otherwise 1.
+    pub depth: u32,
+    /// Mip levels.
+    pub mip_levels: u16,
+    /// Array layers (1 for a 3D texture).
+    pub array_layers: u16,
+}
+
+/// The registration a texture table entry needs, when it is not registered yet.
+///
+/// A texture that is only sampled has no creation-time registration
+/// (`desc.flags` names no GPU-write usage), so the first table entry that names
+/// it registers it here with `usage` (`0` sampled for an SRV, `3` storage for a
+/// UAV). The dimension and format codes are the same stable subset kind 8 uses;
+/// an unsupported dimension or format is an explicit error. `None` means the
+/// descriptor names a buffer, not a texture.
+#[cfg(windows)]
+pub(crate) fn texture_table_registration(
+    this: This,
+    usage: u8,
+) -> Option<Result<TextureTableRegistration, &'static str>> {
+    let (base, desc) = texture_memory(this)?;
+    let handle = base as u64;
+    if handle == 0 {
+        return Some(Err("a texture descriptor names no guest memory"));
+    }
+    let (dimension, format, usage) = match texture_registration_codes(&desc, usage) {
+        Ok(codes) => codes,
+        Err(why) => return Some(Err(why)),
+    };
+    Some(Ok(TextureTableRegistration {
+        handle,
+        dimension,
+        format,
+        usage,
+        sample_count: desc.sample_count.max(1).try_into().unwrap_or(1),
+        width: u32::try_from(desc.width).unwrap_or(u32::MAX),
+        height: desc.height,
+        depth: if desc.dimension == TEXTURE_3D {
+            u32::from(desc.depth_or_array_size)
+        } else {
+            1
+        },
+        mip_levels: desc.mip_levels.max(1),
+        array_layers: if desc.dimension == TEXTURE_3D {
+            1
+        } else {
+            desc.depth_or_array_size.max(1)
+        },
+    }))
+}
+
+/// Maps a texture description to the kind 8 `(dimension, format, usage)` codes.
+#[cfg(windows)]
+fn texture_registration_codes(
+    desc: &ResourceDesc,
+    usage: u8,
+) -> Result<(u8, u8, u8), &'static str> {
     let dimension = match desc.dimension {
-        2 => 0,                                     // D1
-        3 if desc.depth_or_array_size > 1 => 2,    // D2Array
-        3 => 1,                                     // D2
-        4 => 5,                                     // D3
-        _ => return Some(Err("texture registration: unknown dimension")),
+        2 => 0,                                  // D1
+        3 if desc.depth_or_array_size > 1 => 2, // D2Array
+        3 => 1,                                  // D2
+        4 => 5,                                  // D3
+        _ => return Err("texture registration: unknown dimension"),
     };
     let format = match desc.format {
         28 => 0,
@@ -2036,16 +2122,9 @@ fn native_texture_registration(
         24 => 6,
         40 => 7,
         20 => 8,
-        _ => return Some(Err("texture registration: format has no host code")),
+        _ => return Err("texture registration: format has no host code"),
     };
-    let usage = if desc.flags & 0x10 != 0 {
-        2
-    } else if desc.flags & 0x8 != 0 {
-        3
-    } else {
-        1
-    };
-    Some(Ok((dimension, format, usage)))
+    Ok((dimension, format, usage))
 }
 
 /// The host registration of one buffer, made at creation (kind 2).

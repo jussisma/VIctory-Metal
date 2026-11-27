@@ -49,7 +49,7 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub mod native_metal;
 #[cfg(all(windows, test))]
 mod list_bench;

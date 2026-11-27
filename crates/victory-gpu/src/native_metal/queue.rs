@@ -446,7 +446,7 @@ struct PendingSignal {
 }
 
 /// Fence signals whose host submission has not completed yet.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn pending_signals() -> std::sync::MutexGuard<'static, Vec<PendingSignal>> {
     static PENDING: std::sync::Mutex<Vec<PendingSignal>> = std::sync::Mutex::new(Vec::new());
     PENDING.lock().unwrap_or_else(|error| error.into_inner())
@@ -460,7 +460,7 @@ fn pending_signals() -> std::sync::MutexGuard<'static, Vec<PendingSignal>> {
 /// With a page the value moves only once `completed_fence` has reached the
 /// sequence submitted before the signal: this is the zero-IPC path ADR-019
 /// asks for, and `GetCompletedValue` never waits.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn signal_native(fence: crate::object::This, value: u64) {
     let sequence = LAST_SEQUENCE.load(Ordering::Acquire);
     pending_signals().push(PendingSignal {
@@ -476,7 +476,7 @@ pub fn signal_native(fence: crate::object::This, value: u64) {
 /// One atomic load of the shared page per call; no blocking wait and no IPC.
 /// Without a registered page every pending signal is completed immediately
 /// because the transport reply already followed host execution.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn poll_native_fence() {
     let completion = {
         let queue = native_queue();
@@ -503,7 +503,7 @@ pub fn poll_native_fence() {
 }
 
 /// The session's native queue. It starts disconnected and connects lazily.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<NativeSink>> {
     static QUEUE: std::sync::Mutex<NativeQueue<NativeSink>> =
         std::sync::Mutex::new(NativeQueue::new(NativeSink::Disconnected(DisconnectedSink)));
@@ -511,7 +511,7 @@ fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<NativeSink>> {
 }
 
 /// Whether the session queue holds a live Wire v3 host session.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_is_live() -> bool {
     native_queue().sink().is_live()
 }
@@ -520,13 +520,13 @@ pub fn native_queue_is_live() -> bool {
 ///
 /// Replaces whatever the queue held (the lazy connect and the daemon task both
 /// use it); frames already queued keep their order and go out over `client`.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_install_client(client: WireV3Client) {
     *native_queue().sink_mut() = NativeSink::Live(client);
 }
 
 /// Drops the session queue's sink and every unsent frame (teardown, tests).
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_reset() {
     native_queue().reset(NativeSink::Disconnected(DisconnectedSink));
 }
@@ -536,7 +536,7 @@ pub fn native_queue_reset() {
 /// Returns whether the queue is live. A configuration that does not parse is
 /// logged without the secret and leaves the queue disconnected, so submissions
 /// keep failing explicitly instead of silently succeeding.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_connect_from_env() -> bool {
     match ensure_live(LiveConfig::from_env) {
         Ok(live) => live,
@@ -555,7 +555,7 @@ pub fn native_queue_connect_from_env() -> bool {
 /// The codes are the stable kinds documented in `ipc_host::register_texture`
 /// (dimension, format, usage). A configured endpoint connects on first use; a
 /// refusal is an explicit error, never a fallback.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub fn register_texture(
     id: u64,
@@ -601,7 +601,7 @@ pub fn register_texture(
 }
 
 /// Registers a texture handle as a present surface with the host.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn register_surface(surface_id: u64, texture_id: u64) -> Result<bool, NativeQueueError> {
     ensure_live(LiveConfig::from_env)
         .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
@@ -612,6 +612,62 @@ pub fn register_surface(surface_id: u64, texture_id: u64) -> Result<bool, Native
     client.register_surface(surface_id, texture_id)
 }
 
+/// Registers one sampler content with the host and returns its stable handle.
+///
+/// The handle is derived from the descriptor content
+/// ([`crate::native_metal::sampler::sampler_handle`]), so the same descriptor
+/// returns the same handle on every frame and after a reconnect; only the first
+/// registration sends a frame. A content map that is full is an explicit error,
+/// never an eviction. Registration failures are explicit: there is no default
+/// sampler fallback.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_sampler_state(
+    desc: &crate::native_metal::sampler::SamplerStateDesc,
+) -> Result<u64, NativeQueueError> {
+    let handle = crate::native_metal::sampler::sampler_handle(desc)
+        .map_err(|error| NativeQueueError::Refused(error.to_string()))?;
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    if client.sampler_registered(handle) {
+        return Ok(handle);
+    }
+    if client.register_sampler(handle, desc)? {
+        Ok(handle)
+    } else {
+        Err(NativeQueueError::Refused(format!(
+            "the host refused sampler handle 0x{handle:016x}"
+        )))
+    }
+}
+
+/// Whether a live session registered this sampler handle.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn sampler_registered(handle: u64) -> bool {
+    match LiveConfig::from_env() {
+        Some(Ok(_)) => native_queue()
+            .sink()
+            .client()
+            .is_some_and(|client| client.sampler_registered(handle)),
+        _ => false,
+    }
+}
+
+/// Whether a live session registered this texture handle.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn texture_registered(handle: u64) -> bool {
+    match LiveConfig::from_env() {
+        Some(Ok(_)) => native_queue()
+            .sink()
+            .client()
+            .is_some_and(|client| client.texture_registered(handle)),
+        _ => false,
+    }
+}
+
 /// Registers one guest host-visible allocation with the host (kind 2).
 ///
 /// `byte_len` is the whole share file the allocation id names (the guest reads
@@ -620,7 +676,7 @@ pub fn register_surface(surface_id: u64, texture_id: u64) -> Result<bool, Native
 /// already registered is `Ok(true)` without a frame (aliases and placed
 /// resources share the first descriptor), and a refused registration is an
 /// explicit error the caller turns into a structured HRESULT.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn register_buffer(allocation_id: u64, byte_len: u64) -> Result<bool, NativeQueueError> {
     ensure_live(LiveConfig::from_env)
         .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
@@ -635,7 +691,7 @@ pub fn register_buffer(allocation_id: u64, byte_len: u64) -> Result<bool, Native
 ///
 /// `false` means the range may not be named in a submission yet: the host
 /// validates every binding against its kind 2 registry. No session is `false`.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn allocation_registered(allocation_id: u64) -> bool {
     match LiveConfig::from_env() {
         Some(Ok(_)) => native_queue()
@@ -654,7 +710,7 @@ pub fn allocation_registered(allocation_id: u64) -> bool {
 /// exist at or below the requested id are registered first, ascending, because
 /// the host refuses (and closes the session on) a kind 2 id that does not
 /// increase.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn ensure_allocation(allocation_id: u64) -> Result<bool, NativeQueueError> {
     if allocation_id == 0 {
         return Err(NativeQueueError::Refused(
@@ -686,7 +742,7 @@ pub fn ensure_allocation(allocation_id: u64) -> Result<bool, NativeQueueError> {
 /// reads a resource directory or guesses a ticket: the ticket is the live
 /// session's own next one, and the write path is the launcher's share
 /// directory.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn register_pipeline(metallib: &[u8], entry: &str) -> Result<u64, NativeQueueError> {
     if metallib.is_empty() {
         return Err(NativeQueueError::Refused(
@@ -712,7 +768,7 @@ pub fn register_pipeline(metallib: &[u8], entry: &str) -> Result<u64, NativeQueu
 }
 
 /// One pre-translated stage of a version 2 pipeline registration.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineStageLibrary<'a> {
     /// Wire stage code (`client::PIPELINE_STAGE_*`).
@@ -730,7 +786,7 @@ pub struct PipelineStageLibrary<'a> {
 /// the encoded ABI and the raw root-signature bytes. Nothing is written until
 /// the whole request is validated by the caller, and a host rejection leaves
 /// the session open.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn register_pipeline_v2(
     kind: u8,
     stages: &[PipelineStageLibrary<'_>],
@@ -786,7 +842,7 @@ pub fn register_pipeline_v2(
 /// later in the run: a configured endpoint that refused the session is an
 /// explicit error the device creation surfaces, and no endpoint leaves the
 /// queue disconnected with an explicit transport failure on first submission.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn connect_once_from_env() -> Result<bool, NativeQueueError> {
     static ONCE: std::sync::Mutex<Option<Result<bool, NativeQueueError>>> =
         std::sync::Mutex::new(None);
@@ -801,7 +857,7 @@ pub fn connect_once_from_env() -> Result<bool, NativeQueueError> {
 
 /// [`native_queue_connect_from_env`] without collapsing a configuration
 /// failure to `false`.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn native_queue_connect_from_env_try() -> Result<bool, NativeQueueError> {
     ensure_live(LiveConfig::from_env)
 }
@@ -811,7 +867,7 @@ fn native_queue_connect_from_env_try() -> Result<bool, NativeQueueError> {
 /// `Ok(true)` means a live sink is installed, `Ok(false)` that no endpoint is
 /// configured (the queue stays disconnected and fails explicitly), and `Err`
 /// that a configured endpoint refused the session.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn ensure_live<F>(config: F) -> Result<bool, NativeQueueError>
 where
     F: FnOnce() -> Option<Result<LiveConfig, crate::native_metal::client::TransportError>>,
@@ -841,7 +897,7 @@ where
 /// The Metal path records one frame sample, including a frame the producer
 /// refused for an unsupported opcode (that is what the histogram counts). A
 /// transport failure records nothing: no frame reached the host.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn submit_recorded_batch(
     submissions: &[SubmissionV3],
     record_us: u64,
@@ -1173,7 +1229,7 @@ impl SurfacePresenter for WirePresenter {
 /// `VICTORY_METAL_SURFACE_WIDTH`/`_HEIGHT` (default 3840x2160). With no
 /// surface named nothing is installed, and `Present` fails explicitly with
 /// `NoSwapchain` instead of using the D3D12 swapchain.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn install_present_from_env() -> Result<bool, NativeQueueError> {
     fn number(name: &str) -> Option<u64> {
         std::env::var(name)
@@ -1194,7 +1250,7 @@ pub fn install_present_from_env() -> Result<bool, NativeQueueError> {
 
 /// Installs a [`WirePresenter`] over a headless swapchain (tests and the
 /// launcher path).
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 pub fn install_wire_present(
     surface_id: u64,
     texture_id: u64,
