@@ -7,9 +7,10 @@
 //! its `addCompletedHandler` block and drains them afterwards.
 //!
 //! This module deliberately holds no Metal type: it is plain, testable host
-//! bookkeeping. The transport owns one [`RetireQueue`] per in-flight frame and
-//! calls [`RetireQueue::drain_upto`] with the completed fence value before it
-//! releases a frame slot.
+//! bookkeeping. The transport owns one [`RetireQueue`], pushes every resource a
+//! submission pins against that submission's fence value, and calls
+//! [`RetireQueue::drain_upto`] with the contiguous completed fence value, both
+//! from its `addCompletedHandler:` block and from every frame-boundary drain.
 //!
 //! # Ordering contract
 //!

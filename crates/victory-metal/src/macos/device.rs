@@ -6,9 +6,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
+use crate::fence_page::FencePage;
 use crate::macos::bindings::{
     ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind,
     ReflectedStage, RootParameterKind, RootSignatureLayout,
@@ -29,6 +31,7 @@ use crate::macos::render::{
     new_less_depth_state, plan_encoder_segments, texture_info,
 };
 use crate::macos::residency::ResidencySet;
+use crate::macos::retire::RetireQueue;
 use crate::macos::texture::VmTextureId;
 use crate::macos::{blit, indirect};
 use crate::transport::{MetalError, MetalTransport};
@@ -467,12 +470,410 @@ unsafe extern "C" {
     fn objc_msgSend();
 }
 
+/// Default number of command buffers kept in flight (ADR-017).
+const DEFAULT_FRAMES_IN_FLIGHT: usize = 3;
+/// Hard upper bound the environment override is clamped to.
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
+/// Environment override for the in-flight cap, clamped to `1..=3`.
+const FRAMES_IN_FLIGHT_ENV: &str = "VICTORY_METAL_FRAMES_IN_FLIGHT";
+/// Bounded spin on the published completion fence before a frame-boundary
+/// submission escalates to `waitUntilCompleted` on the oldest buffer only.
+const BACKPRESSURE_SPIN: Duration = Duration::from_micros(250);
+
+// `_NSConcreteStackBlock` class object exported by libclosure.
+//
+// Only the symbol address matters: a stack block literal stores it as `isa`
+// and `addCompletedHandler:` copies the literal to the heap before use.
+unsafe extern "C" {
+    static _NSConcreteStackBlock: *const c_void;
+}
+
+/// Layout prefix every Objective-C block literal starts with.
+///
+/// The captured fields follow the prefix verbatim; `Block_copy` moves exactly
+/// `descriptor.size` bytes, so a literal with no Objective-C object captures
+/// needs no `copy`/`dispose` helper and no signature.
+#[repr(C)]
+struct CompletionBlock {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut CompletionBlock, objc::Id),
+    descriptor: *const CompletionBlockDescriptor,
+    /// Transport-owned async state; valid until the transport is dropped.
+    state: *const Mutex<AsyncSubmitState>,
+    /// Fence value this command buffer was committed with.
+    fence: u64,
+}
+
+/// Trailing descriptor of a block literal: two reserved words then the size.
+#[repr(C)]
+struct CompletionBlockDescriptor {
+    reserved: usize,
+    size: usize,
+}
+
+/// Static descriptor shared by every completion block literal.
+///
+/// A static is required: `Block_copy` keeps the descriptor pointer, so it must
+/// not point into a returning stack frame.
+static COMPLETION_BLOCK_DESCRIPTOR: CompletionBlockDescriptor = CompletionBlockDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<CompletionBlock>(),
+};
+
+/// `MTLCommandBuffer.addCompletedHandler:` body (ADR-017).
+///
+/// Runs on Metal's completion thread after the command buffer finishes. It
+/// publishes the submission's fence value into the shared [`FencePage`] and
+/// releases retired staging work, so no submitter has to wait.
+///
+/// # Safety
+///
+/// `block` must be a live [`CompletionBlock`] copied by Metal whose `state`
+/// pointer still names the transport-owned [`AsyncSubmitState`]; `command_buffer`
+/// must be the committed `MTLCommandBuffer` the handler was attached to.
+unsafe extern "C" fn completion_block_invoke(block: *mut CompletionBlock, command_buffer: objc::Id) {
+    // SAFETY: the caller is libdispatch invoking a block literal built by
+    // `DirectMetalTransport::commit_async`; `state` outlives every committed
+    // buffer because `Drop` waits for the pipeline to drain.
+    let (state, fence) = unsafe { (&*(*block).state, (*block).fence) };
+    // SAFETY: `command_buffer` is a live `MTLCommandBuffer` at completion time.
+    let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
+    publish_completion(state, fence, status == MTL_COMMAND_BUFFER_STATUS_COMPLETED);
+}
+
+/// Records one observed completion and publishes the contiguous watermark.
+///
+/// A poisoned lock means a panic aborted a previous holder; the publication is
+/// dropped rather than resumed with possibly inconsistent state.
+fn publish_completion(state: &Mutex<AsyncSubmitState>, fence: u64, succeeded: bool) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    state.note_completion(fence, succeeded);
+}
+
+/// Contiguous completion watermark over committed fence values.
+///
+/// Fence values are committed in strictly increasing order, but completion
+/// handlers may be delivered out of order. Only a contiguous prefix may be
+/// published: publishing across a gap would release staging memory a still
+/// running command buffer reads.
+#[derive(Debug, Default)]
+struct CompletionWatermark {
+    /// `(fence, done)` in commit order.
+    pending: VecDeque<(u64, bool)>,
+    completed: u64,
+}
+
+impl CompletionWatermark {
+    const fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            completed: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True when no committed buffer is outstanding.
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Oldest fence still in flight.
+    fn front(&self) -> Option<u64> {
+        self.pending.front().map(|entry| entry.0)
+    }
+
+    /// Newest committed fence.
+    fn back(&self) -> Option<u64> {
+        self.pending.back().map(|entry| entry.0)
+    }
+
+    fn completed(&self) -> u64 {
+        self.completed
+    }
+
+    /// True when `fence` is committed and not yet marked done.
+    fn is_pending(&self, fence: u64) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.0 == fence && !entry.1)
+    }
+
+    fn push(&mut self, fence: u64) {
+        self.pending.push_back((fence, false));
+    }
+
+    /// Marks `fence` complete.
+    ///
+    /// Returns `false` when the fence is not pending: a completion for a
+    /// command buffer this transport never committed (a dropped, duplicated or
+    /// forged handler) must publish and release nothing.
+    fn mark_done(&mut self, fence: u64) -> bool {
+        let Some(entry) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.0 == fence && !entry.1)
+        else {
+            return false;
+        };
+        entry.1 = true;
+        true
+    }
+
+    /// Pops the contiguous completed prefix and returns the new watermark.
+    ///
+    /// `None` means no completed entry is contiguous yet, so nothing may be
+    /// published or released.
+    fn advance(&mut self) -> Option<u64> {
+        let mut advanced = None;
+        while let Some((fence, done)) = self.pending.front().copied() {
+            if !done {
+                break;
+            }
+            self.pending.pop_front();
+            self.completed = fence;
+            advanced = Some(fence);
+        }
+        advanced
+    }
+}
+
+/// Counters behind [`DirectMetalTransport::async_submit_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AsyncCounters {
+    submitted: u64,
+    completed: u64,
+    failed: u64,
+    rejected: u64,
+    ignored_completions: u64,
+    in_flight_peak: u64,
+    backpressure_waits: u64,
+    retire_wait_micros_max: u64,
+}
+
+/// Host bookkeeping of the asynchronous submit pipeline (ADR-017).
+///
+/// The state is shared between the submitting thread(s) and Metal's completion
+/// callbacks, so every field is behind the transport's own mutex. It owns no
+/// Metal type except the tracked command buffers, which is what keeps a
+/// completion handler from observing a deallocated buffer.
+struct AsyncSubmitState {
+    fence_page: Arc<FencePage>,
+    cap: usize,
+    next_fence: u64,
+    watermark: CompletionWatermark,
+    /// Retained committed command buffers, keyed by fence, until they complete.
+    held: HashMap<u64, ObjcObject>,
+    retire: RetireQueue,
+    /// Staged Metal objects pinned by token until their fence completes.
+    staged: HashMap<u64, Vec<ObjcObject>>,
+    /// Caller pins: token -> caller id, reported by `drain_retired`.
+    pins: HashMap<u64, u64>,
+    /// Caller ids released since the last `drain_retired`.
+    released: Vec<u64>,
+    next_token: u64,
+    counters: AsyncCounters,
+}
+
+impl AsyncSubmitState {
+    fn new(fence_page: Arc<FencePage>, cap: usize) -> Self {
+        Self {
+            fence_page,
+            cap,
+            next_fence: 0,
+            watermark: CompletionWatermark::new(),
+            held: HashMap::new(),
+            retire: RetireQueue::new(),
+            staged: HashMap::new(),
+            pins: HashMap::new(),
+            released: Vec::new(),
+            next_token: 1,
+            counters: AsyncCounters::default(),
+        }
+    }
+
+    /// Reserves the next monotonic fence value for a committed submission.
+    ///
+    /// The value is `max(sequence, previous + 1)`, so the published completion
+    /// fence is monotonic even for a caller that replays an old sequence.
+    fn reserve_fence(&mut self, sequence: u32) -> u64 {
+        let fence = u64::from(sequence).max(self.next_fence + 1);
+        self.next_fence = fence;
+        fence
+    }
+
+    fn alloc_token(&mut self) -> u64 {
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+        token
+    }
+
+    /// Tracks one freshly committed command buffer.
+    fn note_commit(&mut self, fence: u64, command_buffer: ObjcObject) {
+        self.watermark.push(fence);
+        self.held.insert(fence, command_buffer);
+        self.counters.submitted += 1;
+        self.counters.in_flight_peak = self
+            .counters
+            .in_flight_peak
+            .max(self.watermark.len() as u64);
+    }
+
+    /// Pins prepared staging objects behind `fence`.
+    fn pin_staged(&mut self, fence: u64, staged: Vec<ObjcObject>) {
+        if staged.is_empty() {
+            return;
+        }
+        let token = self.alloc_token();
+        self.staged.insert(token, staged);
+        self.retire.push(fence, token);
+    }
+
+    /// Pins a caller-visible resource id behind `fence`.
+    fn pin_caller(&mut self, fence: u64, caller_id: u64) -> u64 {
+        let token = self.alloc_token();
+        self.pins.insert(token, caller_id);
+        self.retire.push(fence, token);
+        token
+    }
+
+    /// Marks `fence` complete and advances the contiguous watermark.
+    ///
+    /// A completion for a fence this transport never committed is ignored: a
+    /// dropped, duplicated or forged handler must not publish a value, because
+    /// that would release staging work the GPU may still read.
+    ///
+    /// A buffer that finished with a GPU error still advances the watermark — it
+    /// is no longer reading anything — and is counted in `failed` instead; the
+    /// reply cannot report it because it was returned before `commit`.
+    fn note_completion(&mut self, fence: u64, succeeded: bool) {
+        if !self.watermark.mark_done(fence) {
+            self.counters.ignored_completions += 1;
+            return;
+        }
+        if succeeded {
+            self.counters.completed += 1;
+        } else {
+            self.counters.failed += 1;
+        }
+        if let Some(advanced) = self.watermark.advance() {
+            self.fence_page.publish(advanced);
+            self.held.retain(|&fence, _| fence > advanced);
+        }
+        self.drain();
+    }
+
+    /// Releases every retired token at or below the observed watermark.
+    fn drain(&mut self) -> usize {
+        let completed = self.watermark.completed();
+        let released = self.retire.drain_upto(completed);
+        let count = released.len();
+        for token in released {
+            drop(self.staged.remove(&token));
+            if let Some(caller_id) = self.pins.remove(&token) {
+                self.released.push(caller_id);
+            }
+        }
+        count
+    }
+
+    fn stats(&self) -> AsyncSubmitStats {
+        AsyncSubmitStats {
+            submitted: self.counters.submitted,
+            completed: self.counters.completed,
+            failed: self.counters.failed,
+            rejected: self.counters.rejected,
+            ignored_completions: self.counters.ignored_completions,
+            in_flight: self.watermark.len() as u64,
+            in_flight_peak: self.counters.in_flight_peak,
+            frames_in_flight_cap: self.cap as u64,
+            retire_depth: self.retire.len(),
+            retire_max_wait_micros: self.counters.retire_wait_micros_max,
+            backpressure_waits: self.counters.backpressure_waits,
+            completed_fence: self.watermark.completed(),
+        }
+    }
+}
+
+/// Counters for the asynchronous submit pipeline (ADR-017).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsyncSubmitStats {
+    /// Command buffers committed by this transport.
+    pub submitted: u64,
+    /// Committed buffers whose completion handler reported success.
+    pub completed: u64,
+    /// Committed buffers whose completion handler reported a GPU failure.
+    pub failed: u64,
+    /// Pre-commit refusals (unknown handle, replay, encoder error).
+    pub rejected: u64,
+    /// Completions ignored because their fence was not in flight.
+    pub ignored_completions: u64,
+    /// Command buffers in flight at the moment of the call.
+    pub in_flight: u64,
+    /// Highest observed in-flight depth.
+    pub in_flight_peak: u64,
+    /// Configured cap (`VICTORY_METAL_FRAMES_IN_FLIGHT`, 1..=3).
+    pub frames_in_flight_cap: u64,
+    /// Resources still pinned in the retire queue.
+    pub retire_depth: usize,
+    /// Longest single frame-boundary wait on the oldest command buffer, in
+    /// microseconds. This is the only place a submit can block (ADR-017).
+    pub retire_max_wait_micros: u64,
+    /// Number of frame-boundary waits on the oldest command buffer.
+    pub backpressure_waits: u64,
+    /// Contiguous completed fence value published in the shared page.
+    pub completed_fence: u64,
+}
+
+/// A command buffer encoded for one submission but not yet committed.
+struct EncodedSubmission {
+    command_buffer: ObjcObject,
+    /// Staging Metal objects that must stay alive until the fence completes.
+    staged: Vec<ObjcObject>,
+}
+
+/// Retains one more reference to a committed command buffer.
+///
+/// The extra reference lets a caller wait on the buffer outside the state lock
+/// without racing a completion handler that pops and releases the slot.
+fn retain_command_buffer(raw: objc::Id) -> Option<ObjcObject> {
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `raw` is a live retained `MTLCommandBuffer` owned by the async
+    // state; `retain` returns it with one extra reference.
+    ObjcObject::from_retained(unsafe { objc::msg_send_id_0(raw, objc::sel(c"retain")) })
+}
+
+/// Clamps an environment value to the supported in-flight window `1..=3`.
+///
+/// A missing or unparsable value falls back to [`DEFAULT_FRAMES_IN_FLIGHT`], so
+/// a typo can never remove backpressure entirely.
+fn clamp_frames_in_flight(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, MAX_FRAMES_IN_FLIGHT))
+        .unwrap_or(DEFAULT_FRAMES_IN_FLIGHT)
+}
+
+/// Reads the in-flight cap from the environment, clamped to `1..=3`.
+fn resolve_frames_in_flight() -> usize {
+    let raw = std::env::var(FRAMES_IN_FLIGHT_ENV).ok();
+    clamp_frames_in_flight(raw.as_deref())
+}
+
 /// Native Apple Metal backend implementing [`MetalTransport`].
 pub struct DirectMetalTransport {
     device: ObjcObject,
     queue: ObjcObject,
     info: VmDeviceInfo,
     state: Mutex<DeviceState>,
+    async_submit: Arc<Mutex<AsyncSubmitState>>,
 }
 
 impl DirectMetalTransport {
@@ -489,6 +890,11 @@ impl DirectMetalTransport {
         })?;
 
         let info = query_device_info(&device);
+
+        let async_submit = Arc::new(Mutex::new(AsyncSubmitState::new(
+            Arc::new(FencePage::new()),
+            resolve_frames_in_flight(),
+        )));
 
         Ok(Self {
             device,
@@ -513,6 +919,7 @@ impl DirectMetalTransport {
                 executed_lists: HashSet::new(),
                 executed_list_order: VecDeque::new(),
             }),
+            async_submit,
         })
     }
 
@@ -531,12 +938,245 @@ impl DirectMetalTransport {
 
     /// Locks the allocation registry.
     ///
-    /// Callers must hold the guard until any GPU work that references registry
-    /// objects has completed, exactly like the existing batch and legacy paths.
+    /// A submission plans, validates and encodes while holding this guard, so a
+    /// concurrent registration cannot change the tables mid-frame. Since ADR-017
+    /// the guard is **not** held until the GPU finishes: a submission returns
+    /// after `commit` and only its staging objects are pinned in the retire
+    /// queue. A caller that unregisters a buffer which in-flight work can still
+    /// reference must therefore drain the pipeline first
+    /// ([`DirectMetalTransport::wait_for_gpu`]).
     pub(crate) fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, DeviceState>, MetalError> {
         self.state
             .lock()
             .map_err(|_| MetalError::InternalError("Metal state mutex poisoned".to_string()))
+    }
+
+    fn lock_async(&self) -> Result<std::sync::MutexGuard<'_, AsyncSubmitState>, MetalError> {
+        self.async_submit
+            .lock()
+            .map_err(|_| MetalError::InternalError("submit pipeline mutex poisoned".to_string()))
+    }
+
+    /// Borrows the completion page this transport publishes into.
+    ///
+    /// The default page is a process-local allocation; a native host that
+    /// shares a mapped page installs it with [`Self::set_fence_page`] before the
+    /// first submission.
+    pub fn fence_page(&self) -> Arc<FencePage> {
+        match self.async_submit.lock() {
+            Ok(state) => Arc::clone(&state.fence_page),
+            Err(_) => Arc::new(FencePage::new()),
+        }
+    }
+
+    /// Replaces the completion page later submissions publish into.
+    ///
+    /// Command buffers already in flight keep publishing into the page that was
+    /// current when they were committed, so install a page before submitting.
+    pub fn set_fence_page(&self, page: Arc<FencePage>) -> Result<(), MetalError> {
+        let mut state = self.lock_async()?;
+        state.fence_page = page;
+        Ok(())
+    }
+
+    /// Returns the asynchronous submit counters (ADR-017).
+    pub fn async_submit_stats(&self) -> AsyncSubmitStats {
+        match self.async_submit.lock() {
+            Ok(state) => state.stats(),
+            Err(_) => AsyncSubmitStats::default(),
+        }
+    }
+
+    /// Drains every retire entry whose fence value has completed and returns
+    /// the caller ids released since the previous call.
+    ///
+    /// This is the transport-level drain: it runs at the start of every submit
+    /// and at a `Present` frame boundary, and is safe to call from any thread.
+    pub fn drain_retired(&self) -> Vec<u64> {
+        match self.async_submit.lock() {
+            Ok(mut state) => {
+                state.drain();
+                std::mem::take(&mut state.released)
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Pins `caller_id` behind the newest committed submission.
+    ///
+    /// The id is reported by [`Self::drain_retired`] only after the GPU fence of
+    /// the newest committed command buffer is observed complete, which is what
+    /// lets a caller recycle staging memory without a use-after-free. Returns
+    /// the fence value it is pinned behind, or `None` when nothing is in flight
+    /// (nothing can still read the resource).
+    pub fn pin_until_complete(&self, caller_id: u64) -> Result<Option<u64>, MetalError> {
+        let mut state = self.lock_async()?;
+        let Some(fence) = state.watermark.back() else {
+            return Ok(None);
+        };
+        state.pin_caller(fence, caller_id);
+        Ok(Some(fence))
+    }
+
+    /// Waits until every committed command buffer has completed.
+    ///
+    /// This is a frame-boundary/teardown barrier, never part of a normal submit:
+    /// it waits on the oldest in-flight buffer first, so the GPU pipeline drains
+    /// in commit order without a per-command-list wait.
+    pub fn wait_for_gpu(&self) -> Result<(), MetalError> {
+        loop {
+            let next = {
+                let mut state = self.lock_async()?;
+                if state.watermark.is_idle() {
+                    state.drain();
+                    return Ok(());
+                }
+                let fence = state.watermark.front().expect("non-empty watermark");
+                let retained = state
+                    .held
+                    .get(&fence)
+                    .and_then(|buffer| retain_command_buffer(buffer.as_raw()));
+                (fence, retained)
+            };
+            let (fence, retained) = next;
+            let Some(retained) = retained else {
+                return Err(MetalError::InternalError(
+                    "in-flight command buffer is null".to_string(),
+                ));
+            };
+            self.wait_on_buffer(fence, &retained);
+        }
+    }
+
+    /// Waits on one committed buffer and records its completion.
+    ///
+    /// `waitUntilCompleted` calls the completion handler before it returns; the
+    /// state machine also records the observation itself so a handler that is
+    /// never delivered cannot stall the pipeline.
+    fn wait_on_buffer(&self, fence: u64, command_buffer: &ObjcObject) {
+        let started = Instant::now();
+        // SAFETY: `command_buffer` is a live retained committed
+        // `MTLCommandBuffer`; `waitUntilCompleted` blocks until it is done.
+        unsafe {
+            objc::msg_send_void_0(command_buffer.as_raw(), objc::sel(c"waitUntilCompleted"))
+        };
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // SAFETY: `command_buffer` completed above, so `status` is final.
+        let status = unsafe {
+            objc::msg_send_usize_0(command_buffer.as_raw(), objc::sel(c"status"))
+        };
+        if let Ok(mut state) = self.async_submit.lock() {
+            state.counters.backpressure_waits += 1;
+            state.counters.retire_wait_micros_max =
+                state.counters.retire_wait_micros_max.max(micros);
+            // The completion handler normally recorded this observation
+            // already; only an undelivered handler needs the fallback, and the
+            // check and the mark share the state lock so it is race-free.
+            if state.watermark.is_pending(fence) {
+                state.note_completion(fence, status == MTL_COMMAND_BUFFER_STATUS_COMPLETED);
+            }
+        }
+    }
+
+    /// Blocks until the in-flight cap admits one more command buffer.
+    ///
+    /// A short bounded spin on the published completion value covers the common
+    /// case where a frame finishes while the next one is being prepared; only
+    /// then does the oldest — never the current — command buffer get an explicit
+    /// `waitUntilCompleted`.
+    fn await_slot(&self) -> Result<(), MetalError> {
+        loop {
+            let pending = {
+                let state = self.lock_async()?;
+                if state.watermark.len() < state.cap {
+                    return Ok(());
+                }
+                let fence = state.watermark.front().expect("cap is at least one");
+                (
+                    fence,
+                    state
+                        .held
+                        .get(&fence)
+                        .and_then(|buffer| retain_command_buffer(buffer.as_raw())),
+                    Arc::clone(&state.fence_page),
+                )
+            };
+            let (fence, retained, page) = pending;
+            let deadline = Instant::now() + BACKPRESSURE_SPIN;
+            while Instant::now() < deadline {
+                if page.completed() >= fence {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            // The page may have been advanced by another publisher; only the
+            // state machine decides whether this slot is really free.
+            let still_capped = {
+                let state = self.lock_async()?;
+                state.watermark.len() >= state.cap
+                    && state.watermark.front() == Some(fence)
+            };
+            if !still_capped {
+                continue;
+            }
+            let Some(retained) = retained else {
+                return Err(MetalError::InternalError(
+                    "in-flight command buffer is null".to_string(),
+                ));
+            };
+            self.wait_on_buffer(fence, &retained);
+        }
+    }
+
+    /// Commits an encoded submission and registers its completion handler.
+    ///
+    /// The handler is attached before `commit`, so Metal cannot finish the
+    /// buffer before the publication path exists. The reply status is decided by
+    /// pre-GPU validation only; GPU status is reported through the shared page
+    /// and [`Self::async_submit_stats`].
+    fn commit_async(&self, encoded: EncodedSubmission, sequence: u32) -> Result<(), MetalError> {
+        self.await_slot()?;
+        let state_ptr = Arc::as_ptr(&self.async_submit);
+        let (fence, command_buffer_raw) = {
+            let mut state = self.lock_async()?;
+            let fence = state.reserve_fence(sequence);
+            let raw = encoded.command_buffer.as_raw();
+            state.note_commit(fence, encoded.command_buffer);
+            state.pin_staged(fence, encoded.staged);
+            (fence, raw)
+        };
+        let block = CompletionBlock {
+            // SAFETY: `_NSConcreteStackBlock` is the libclosure class object; its
+            // address is the `isa` every stack block literal carries.
+            isa: std::ptr::addr_of!(_NSConcreteStackBlock) as *const c_void,
+            // No copy/dispose helper and no signature: the literal captures only
+            // plain pointers, so `Block_copy` can memmove it.
+            flags: 0,
+            reserved: 0,
+            invoke: completion_block_invoke,
+            descriptor: &COMPLETION_BLOCK_DESCRIPTOR,
+            state: state_ptr,
+            fence,
+        };
+        // SAFETY: `command_buffer_raw` is a live retained committed-to-be
+        // `MTLCommandBuffer`; the stack literal is valid for this call because
+        // `addCompletedHandler:` copies it; `commit` starts execution.
+        unsafe {
+            objc::msg_send_void_1(
+                command_buffer_raw,
+                objc::sel(c"addCompletedHandler:"),
+                std::ptr::addr_of!(block).cast_mut().cast(),
+            );
+            objc::msg_send_void_0(command_buffer_raw, objc::sel(c"commit"));
+        }
+        Ok(())
+    }
+
+    /// Records one submission that returned before any commit.
+    fn note_refusal(&self) {
+        if let Ok(mut state) = self.async_submit.lock() {
+            state.counters.rejected += 1;
+        }
     }
 
     fn create_compute_pipeline(
@@ -4516,6 +5156,22 @@ impl DirectMetalTransport {
     ///   from that registered pipeline; the wire only carries group counts.
     ///   A mesh dispatch outside a pass, without a mesh pipeline, or naming an
     ///   unknown handle fails before any command buffer exists.
+    ///
+    /// # Asynchronous execution (ADR-017)
+    ///
+    /// An accepted submission is validated and encoded on the calling thread and
+    /// then **committed without waiting**: `ReplyStatus::Ok` means the command
+    /// buffer was accepted by the GPU, not that it finished. Every encoder or
+    /// validation failure still returns its explicit error *before* `commit`, so
+    /// a refusal never publishes a fence value. Completion is published into
+    /// [`Self::fence_page`] by an `addCompletedHandler:` block, which also
+    /// releases the staging objects pinned for the submission through the
+    /// per-transport retire queue. At most
+    /// `VICTORY_METAL_FRAMES_IN_FLIGHT` (1..=3, default 3) buffers are in
+    /// flight; a full pipeline waits on the *oldest* command buffer only.
+    ///
+    /// A `Present` command is a frame boundary: it drains completed retire
+    /// entries, but never waits for its own command buffer.
     pub fn submit_v3_with_stats(
         &self,
         submission: &SubmissionV3,
@@ -4542,21 +5198,31 @@ impl DirectMetalTransport {
             sequence: submission.sequence,
             status,
         };
-        let plan = plan_encoder_segments(&submission.commands)?;
+        let plan = match plan_encoder_segments(&submission.commands) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.note_refusal();
+                return Err(error);
+            }
+        };
         let _pool = AutoreleasePool::new();
         let mut state = self.lock_state()?;
+        // Frame boundary: release staging work the GPU already finished with.
+        let _ = self.drain_retired();
         let list_key = submission
             .list
             .map(|list| (list.list_id, list.list_generation));
         if let Some((list_id, generation)) = list_key
             && state.list_was_executed(list_id, generation)
         {
+            self.note_refusal();
             return Ok((reply(ReplyStatus::AlreadyExecuted), EncoderStats::default()));
         }
         for command in &submission.commands {
             if let CommandV3::Present(present) = command
                 && !state.surfaces.contains_key(&present.surface_id)
             {
+                self.note_refusal();
                 return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
             }
         }
@@ -4564,9 +5230,13 @@ impl DirectMetalTransport {
         let prepared = match prepare_v3(&state, self, allocations, &submission.commands, &plan) {
             Ok(prepared) => prepared,
             Err(PrepareAbort::UnknownHandle) => {
+                self.note_refusal();
                 return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
             }
-            Err(PrepareAbort::Error(error)) => return Err(error),
+            Err(PrepareAbort::Error(error)) => {
+                self.note_refusal();
+                return Err(error);
+            }
         };
 
         let mut stats = EncoderStats::default();
@@ -4574,35 +5244,55 @@ impl DirectMetalTransport {
             if let Some((list_id, generation)) = list_key {
                 state.mark_list_executed(list_id, generation);
             }
+            self.note_refusal();
             return Ok((reply(ReplyStatus::Ok), stats));
         }
 
         // Attach every live buffer and registered texture to the persistent
         // residency set and publish the additions before the queues run.
         self.sync_residency(&mut state)?;
-        let completed = self.encode_v3_segments(&prepared, &mut stats, state.residency.as_ref())?;
+        // Encoding errors (including a null encoder) are reported before any
+        // commit, so nothing is published for a rejected submission.
+        let encoded = match self.encode_v3_segments(
+            prepared,
+            &mut stats,
+            state.residency.as_ref(),
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.note_refusal();
+                return Err(error);
+            }
+        };
+        let has_present = submission
+            .commands
+            .iter()
+            .any(|command| matches!(command, CommandV3::Present(_)));
+        self.commit_async(encoded, submission.sequence)?;
         if let Some((list_id, generation)) = list_key {
             state.mark_list_executed(list_id, generation);
         }
-        Ok((
-            reply(if completed {
-                ReplyStatus::Ok
-            } else {
-                ReplyStatus::ExecutionFailed
-            }),
-            stats,
-        ))
+        if has_present {
+            // Frame boundary: drain what the GPU has already finished with.
+            let _ = self.drain_retired();
+        }
+        Ok((reply(ReplyStatus::Ok), stats))
     }
 
-    /// Encodes prepared segments onto one command buffer and waits for it.
+    /// Encodes prepared segments onto one command buffer and returns it ready to
+    /// commit.
     ///
-    /// Returns whether the command buffer completed successfully.
+    /// Nothing is committed here: the caller attaches the completion handler and
+    /// commits through [`Self::commit_async`], so an encoding error leaves the
+    /// GPU untouched. Every owned staging object (a converted argument buffer)
+    /// is returned with the command buffer so the caller can pin it in the retire
+    /// queue until the fence completes.
     fn encode_v3_segments(
         &self,
-        segments: &[PreparedSegment],
+        segments: Vec<PreparedSegment>,
         stats: &mut EncoderStats,
         residency: Option<&ResidencySet>,
-    ) -> Result<bool, MetalError> {
+    ) -> Result<EncodedSubmission, MetalError> {
         let _pool = AutoreleasePool::new();
         // SAFETY: `queue_raw()` is a valid `MTLCommandQueue`; the command buffer
         // is autoreleased and stays alive for this pool.
@@ -4613,6 +5303,7 @@ impl DirectMetalTransport {
             ));
         }
         stats.command_buffers = 1;
+        let mut staged: Vec<ObjcObject> = Vec::new();
 
         for segment in segments {
             match segment {
@@ -4631,7 +5322,7 @@ impl DirectMetalTransport {
                         // every allocation once per encoder.
                         residency.use_resources(enc);
                     }
-                    for op in ops {
+                    for op in &ops {
                         match op {
                             PreparedComputeOp::Pipeline(pipeline) => unsafe {
                                 objc::msg_send_void_1(
@@ -4669,6 +5360,7 @@ impl DirectMetalTransport {
                                         );
                                     }
                                 }
+                                // Staging: the GPU reads it after `commit`.
                             }
                             PreparedComputeOp::Dispatch(dispatch) => {
                                 // SAFETY: `enc`, the pipeline and every buffer
@@ -4748,6 +5440,12 @@ impl DirectMetalTransport {
                     }
                     // SAFETY: `enc` is a live compute encoder awaiting its end.
                     unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
+                    // Staging: the GPU reads it after `commit` returns.
+                    for op in ops {
+                        if let PreparedComputeOp::ArgumentBuffer(argument_buffer) = op {
+                            staged.push(argument_buffer.buffer);
+                        }
+                    }
                 }
                 PreparedSegment::Render {
                     descriptor,
@@ -4757,24 +5455,23 @@ impl DirectMetalTransport {
                 } => {
                     if ops.iter().any(PreparedRenderOp::is_indirect) {
                         encode_indirect_render_segment(
-                            cb,
-                            *descriptor,
-                            *width,
-                            *height,
-                            ops,
-                            stats,
-                            residency,
+                            cb, descriptor, width, height, &ops, stats, residency,
                         )?;
+                        for op in ops {
+                            if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
+                                staged.push(argument_buffer.buffer);
+                            }
+                        }
                         continue;
                     }
                     let mut encoder =
-                        RenderEncoder::new_with_descriptor(self, cb, *descriptor, *width, *height);
+                        RenderEncoder::new_with_descriptor(self, cb, descriptor, width, height);
                     encoder.ensure_started()?;
                     stats.render_encoders += 1;
                     if let Some(residency) = residency {
                         residency.use_resources(encoder.raw_encoder());
                     }
-                    for op in ops {
+                    for op in &ops {
                         match op {
                             PreparedRenderOp::Pipeline { state, depth_state } => {
                                 encoder.set_pipeline_state(
@@ -4817,6 +5514,7 @@ impl DirectMetalTransport {
                                         );
                                     }
                                 }
+                                // Staging: the GPU reads it after `commit`.
                             }
                             PreparedRenderOp::StageBytes { stage, slot, bytes } => {
                                 encoder.set_stage_bytes(*stage, bytes, *slot)?;
@@ -4895,6 +5593,12 @@ impl DirectMetalTransport {
                         }
                     }
                     encoder.end_encoding();
+                    // Staging: the GPU reads it after `commit` returns.
+                    for op in ops {
+                        if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
+                            staged.push(argument_buffer.buffer);
+                        }
+                    }
                 }
                 PreparedSegment::Blit(ops) => {
                     // SAFETY: `cb` is a live uncommitted command buffer.
@@ -4908,7 +5612,7 @@ impl DirectMetalTransport {
                     if let Some(residency) = residency {
                         residency.use_resources(enc);
                     }
-                    for op in ops {
+                    for op in &ops {
                         match op {
                             PreparedBlitOp::CopyBuffer {
                                 src,
@@ -5003,14 +5707,30 @@ impl DirectMetalTransport {
             }
         }
 
-        // SAFETY: `cb` has every encoder closed.
-        unsafe {
-            objc::msg_send_void_0(cb, objc::sel(c"commit"));
-            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
-        }
-        // SAFETY: `cb` completed via `waitUntilCompleted`.
-        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
-        Ok(status == MTL_COMMAND_BUFFER_STATUS_COMPLETED)
+        // SAFETY: `cb` has every encoder closed and is still uncommitted; the
+        // extra reference keeps it alive past this function's autorelease pool.
+        let command_buffer = ObjcObject::from_retained(unsafe {
+            objc::msg_send_id_0(cb, objc::sel(c"retain"))
+        })
+        .ok_or_else(|| {
+            MetalError::InternalError("command buffer retain returned null".to_string())
+        })?;
+        Ok(EncodedSubmission {
+            command_buffer,
+            staged,
+        })
+    }
+}
+
+impl Drop for DirectMetalTransport {
+    /// Drains every committed command buffer before the transport state dies.
+    ///
+    /// Completion blocks hold a raw pointer to the transport's async state, so
+    /// the state must outlive every committed buffer. `waitUntilCompleted`
+    /// invokes the pending handlers before it returns, so after this barrier no
+    /// handler can still reference freed memory.
+    fn drop(&mut self) {
+        let _ = self.wait_for_gpu();
     }
 }
 
@@ -7046,6 +7766,12 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
             "ADR-006 segmentation must be observable"
         );
 
+        // ADR-017: the submission is committed asynchronously, so host memory
+        // is only valid after the transport observes GPU completion.
+        transport
+            .wait_for_gpu()
+            .expect("the submitted frame should complete");
+
         // Stage one wrote exactly 4096 dwords; the CopyBuffer duplicated them.
         for (index, &value) in data.words().iter().enumerate() {
             assert_eq!(value, index as u32 + 1, "fill mismatch at dword {index}");
@@ -7326,5 +8052,103 @@ fragment float4 vm_host_fragment(VOut in [[stage_in]]) {
             .submit_v3_with_stats(&empty, &HashMap::new())
             .expect("a replay should return a reply");
         assert_eq!(reply.status, ReplyStatus::AlreadyExecuted);
+    }
+}
+
+/// CPU-only tests for the asynchronous submit bookkeeping (ADR-017).
+///
+/// These exercise the fence watermark, the retire ordering and the in-flight cap
+/// without touching Metal, so they run on any host and in the default `--lib`
+/// suite.
+#[cfg(test)]
+mod async_pipeline_tests {
+    use super::*;
+
+    /// A completion for a fence this transport never committed must publish and
+    /// release nothing: a dropped or duplicated handler is not evidence that the
+    /// GPU finished.
+    #[test]
+    fn uncommitted_completion_never_publishes() {
+        let mut watermark = CompletionWatermark::new();
+        watermark.push(1);
+        watermark.push(2);
+
+        assert!(!watermark.mark_done(9), "fence 9 was never committed");
+        assert_eq!(watermark.advance(), None);
+        assert_eq!(watermark.completed(), 0);
+        assert_eq!(watermark.front(), Some(1));
+    }
+
+    #[test]
+    fn out_of_order_completion_keeps_the_watermark_contiguous() {
+        let mut watermark = CompletionWatermark::new();
+        for fence in 1..=3 {
+            watermark.push(fence);
+        }
+
+        // The newest buffer finishing first must not jump the fence.
+        assert!(watermark.mark_done(3));
+        assert_eq!(watermark.advance(), None);
+        assert_eq!(watermark.completed(), 0);
+
+        // Fence 1 completing while 2 is still running publishes exactly 1.
+        assert!(watermark.mark_done(1));
+        assert_eq!(watermark.advance(), Some(1));
+        assert_eq!(watermark.completed(), 1);
+
+        // 2 follows; 3 was already done, so the rest of the prefix drains too.
+        assert!(watermark.mark_done(2));
+        assert_eq!(watermark.advance(), Some(3), "1..=3 are contiguous");
+        assert_eq!(watermark.completed(), 3);
+        assert_eq!(watermark.front(), None);
+    }
+
+    #[test]
+    fn duplicate_completion_is_ignored() {
+        let mut watermark = CompletionWatermark::new();
+        watermark.push(4);
+        assert!(watermark.mark_done(4));
+        assert!(!watermark.mark_done(4));
+        assert_eq!(watermark.advance(), Some(4));
+        assert_eq!(watermark.completed(), 4);
+    }
+
+    #[test]
+    fn retired_pins_release_only_after_the_watermark_advances() {
+        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3);
+        let fence = state.reserve_fence(7);
+        state.watermark.push(fence);
+        state.pin_caller(fence, 77);
+
+        // Nothing is observed complete yet: the pin must stay.
+        assert_eq!(state.drain(), 0);
+        assert!(state.released.is_empty(), "released before completion");
+        assert_eq!(state.retire.len(), 1);
+
+        assert!(state.watermark.mark_done(fence));
+        assert_eq!(state.drain(), 0, "advance has not run yet");
+        assert!(state.watermark.advance().is_some());
+        assert_eq!(state.drain(), 1);
+        assert_eq!(state.released, vec![77]);
+        assert!(state.retire.is_empty());
+    }
+
+    #[test]
+    fn reserve_fence_is_monotonic_across_a_replayed_sequence() {
+        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3);
+        assert_eq!(state.reserve_fence(1), 1);
+        assert_eq!(state.reserve_fence(2), 2);
+        // A replay of an older sequence must not move the fence backwards.
+        assert_eq!(state.reserve_fence(1), 3);
+    }
+
+    #[test]
+    fn frames_in_flight_cap_is_clamped_to_the_supported_window() {
+        assert_eq!(clamp_frames_in_flight(None), 3);
+        assert_eq!(clamp_frames_in_flight(Some("2")), 2);
+        assert_eq!(clamp_frames_in_flight(Some("0")), 1);
+        assert_eq!(clamp_frames_in_flight(Some("64")), 3);
+        assert_eq!(clamp_frames_in_flight(Some("nonsense")), 3);
+        assert_eq!(clamp_frames_in_flight(Some(" 1 ")), 1);
     }
 }
