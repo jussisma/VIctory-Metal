@@ -190,28 +190,46 @@ extern "system" fn create_queue(
         return E_INVALIDARG;
     };
     let name = text(desc.name).unwrap_or_default();
+    let Some(scheduler) = scheduler() else {
+        return E_OUTOFMEMORY;
+    };
+    let id = scheduler.lock().open(desc, &name);
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
-        name,
+        name = name.as_str(),
         unknown = desc.unknown,
         iid = iid_text(iid),
+        lane = id,
         "dstorage: queue"
     );
-    let Some(scheduler) = scheduler() else {
-        return E_OUTOFMEMORY;
-    };
-    let mut lanes = scheduler.lock();
-    let id = lanes.next_id;
-    lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
-    lanes.lanes.insert(id, lane);
-    drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue::new(id)),
     )
+}
+
+/// What makes a queue's lane: queues that agree on every field share one.
+type Description = (u64, u16, i8, String, u64);
+
+/// Most distinct descriptions kept for reuse. Past this, a queue always gets
+/// a lane of its own: the map stays bounded.
+const DEDUP_LIMIT: usize = 64;
+
+/// Lanes made, queue creations that reused one, descriptions tracked (at
+/// most `DEDUP_LIMIT`), and creations past that limit, each a new lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaneStats {
+    pub created: u64,
+    pub reused: u64,
+    pub distinct: usize,
+    pub overflow: u64,
+}
+
+/// The scheduler's lane counters; `None` before the first queue.
+pub fn lane_stats() -> Option<LaneStats> {
+    scheduler().map(|scheduler| scheduler.lock().stats())
 }
 
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
@@ -295,14 +313,28 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler. Queues created with an
+/// identical description share the lane; `closed` makes `close` and `drop`
+/// give up the object's share once.
 struct Queue {
     id: u64,
+    closed: AtomicBool,
+}
+
+impl Queue {
+    fn new(id: u64) -> Queue {
+        Queue {
+            id,
+            closed: AtomicBool::new(false),
+        }
+    }
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        close_lane(self.id);
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            close_lane(self.id);
+        }
     }
 }
 
@@ -325,7 +357,14 @@ const STAGING: u64 = 32 << 20;
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
+    /// Lane by description, for queues that can share one.
+    dedup: HashMap<Description, u64>,
     next_id: u64,
+    /// Lanes made, queue creations that reused one, and creations past
+    /// `DEDUP_LIMIT`.
+    created: u64,
+    reused: u64,
+    overflow: u64,
     /// Submission order over all queues.
     next_seq: u64,
     /// Bytes of staging held by running requests, and the limit.
@@ -352,6 +391,8 @@ struct Lanes {
 
 /// A queue's requests in the scheduler.
 struct Lane {
+    /// Queue objects running on this lane: it goes with the last one.
+    queues: usize,
     class: usize,
     capacity: usize,
     /// Bytes started, for round robin among the lanes of a class.
@@ -396,7 +437,11 @@ fn scheduler() -> Option<&'static Scheduler> {
             Some(Scheduler {
                 lanes: Mutex::new(Lanes {
                     lanes: HashMap::new(),
+                    dedup: HashMap::new(),
                     next_id: 0,
+                    created: 0,
+                    reused: 0,
+                    overflow: 0,
                     next_seq: 0,
                     staged: 0,
                     staging: STAGING,
@@ -439,6 +484,53 @@ fn scheduler() -> Option<&'static Scheduler> {
 impl Scheduler {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Lanes {
+    /// The lane a queue runs on: the one an identical description already
+    /// made, or a new one. Past `DEDUP_LIMIT` descriptions every queue gets
+    /// a lane of its own, so the map stays bounded.
+    fn open(&mut self, desc: &QueueDesc, name: &str) -> u64 {
+        let key = (
+            desc.source_type,
+            desc.capacity,
+            desc.priority,
+            name.to_owned(),
+            desc.unknown,
+        );
+        if self.dedup.len() < DEDUP_LIMIT
+            && let Some(&id) = self.dedup.get(&key)
+        {
+            if let Some(lane) = self.lanes.get_mut(&id) {
+                lane.queues += 1;
+                self.reused += 1;
+                tracing::debug!(lane = id, "dstorage: queue shares a lane");
+                return id;
+            }
+            // Its last queue closed since; the id is not reused.
+            self.dedup.remove(&key);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.lanes
+            .insert(id, Lane::new(desc.priority, desc.capacity));
+        self.created += 1;
+        if self.dedup.len() < DEDUP_LIMIT {
+            self.dedup.insert(key, id);
+        } else {
+            self.overflow += 1;
+        }
+        id
+    }
+
+    fn stats(&self) -> LaneStats {
+        LaneStats {
+            created: self.created,
+            reused: self.reused,
+            distinct: self.dedup.len(),
+            overflow: self.overflow,
+        }
     }
 }
 
@@ -610,6 +702,7 @@ impl Lanes {
 impl Lane {
     fn new(priority: i8, capacity: u16) -> Lane {
         Lane {
+            queues: 1,
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
             clock: 0,
@@ -669,8 +762,9 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
-/// Ends a queue: what was not started is dropped, and this waits for the
-/// reads already running (they write title memory).
+/// Ends a queue object's share of its lane; the lane goes with the last
+/// object sharing it: what was not started is dropped, and this waits for
+/// the reads already running (they write title memory).
 fn close_lane(id: u64) {
     let Some(scheduler) = scheduler() else {
         return;
@@ -679,6 +773,10 @@ fn close_lane(id: u64) {
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
+    if lane.queues > 1 {
+        lane.queues -= 1;
+        return;
+    }
     lane.closed = true;
     lane.unsubmitted.clear();
     lane.held.clear();
@@ -691,6 +789,8 @@ fn close_lane(id: u64) {
             .unwrap_or_else(|e| e.into_inner());
     }
     lanes.lanes.remove(&id);
+    // A later queue with the same description makes a lane of its own.
+    lanes.dedup.retain(|_, lane| *lane != id);
     scheduler.finished.notify_all();
 }
 
@@ -779,11 +879,18 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 /// submits on its own once half of it is enqueued, as the console does.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let state = &unsafe { &*this }.state;
+    if state.closed.load(Ordering::Acquire) {
+        return; // closed: dropped (a status releases its array)
+    }
+    let id = state.id;
     let Some(scheduler) = scheduler() else {
         return;
     };
     let mut lanes = scheduler.lock();
+    if state.closed.load(Ordering::Acquire) {
+        return; // closed before we got the lock: dropped
+    }
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
             return; // closed: dropped (a status releases its array)
@@ -830,23 +937,34 @@ fn queue(this: QueueRef, command: Command) {
 
 extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
-    let id = unsafe { &*this }.state.id;
+    let state = &unsafe { &*this }.state;
+    if state.closed.load(Ordering::Acquire) {
+        return;
+    }
+    let id = state.id;
     let Some(scheduler) = scheduler() else {
         return;
     };
     let mut lanes = scheduler.lock();
+    if state.closed.load(Ordering::Acquire) {
+        return;
+    }
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
 }
 
-/// Ends the queue whatever its reference count: what was not started never
-/// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// Ends this queue object's use of its lane (and the lane with its last
+/// object): what was not started never completes, and this returns once the
+/// reads already running have finished. Grand Theft Auto VI calls this, not
+/// `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
-    close_lane(unsafe { &*this }.state.id);
+    let state = &unsafe { &*this }.state;
+    if !state.closed.swap(true, Ordering::AcqRel) {
+        close_lane(state.id);
+    }
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1183,18 +1301,41 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
+        // A name per call: tests do not share lanes through the dedup map.
+        let name = std::ffi::CString::new(format!(
+            "test-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+        .unwrap();
         let desc = QueueDesc {
             source_type,
             capacity: 0x80,
             priority: 0,
-            name: c"test".as_ptr(),
+            name: name.as_ptr(),
             unknown: 1,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
         queue
+    }
+
+    /// A queue with an explicit description (identical descriptions share a
+    /// lane).
+    fn queue_with(desc: &QueueDesc) -> *mut c_void {
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), desc, std::ptr::null(), &mut queue), S_OK);
+        queue
+    }
+
+    /// The lane a queue object runs on.
+    fn lane_of(queue: *mut c_void) -> u64 {
+        // SAFETY: a queue we created.
+        unsafe { (&*queue.cast::<Instance<Queue>>()).state.id }
     }
 
     fn request(
@@ -1385,7 +1526,11 @@ mod tests {
     fn lanes(staging: u64) -> Lanes {
         Lanes {
             lanes: HashMap::new(),
+            dedup: HashMap::new(),
             next_id: 0,
+            created: 0,
+            reused: 0,
+            overflow: 0,
             next_seq: 0,
             staged: 0,
             staging,
@@ -1829,5 +1974,115 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn identical_descriptions_share_one_lane() {
+        let desc = QueueDesc {
+            source_type: 0x0c09_0001,
+            capacity: 64,
+            priority: 1,
+            name: c"shared startup".as_ptr(),
+            unknown: 1,
+        };
+        let before = lane_stats().expect("a scheduler");
+        let queues: Vec<*mut c_void> = (0..11).map(|_| queue_with(&desc)).collect();
+        let after = lane_stats().expect("a scheduler");
+        assert_eq!(after.created - before.created, 1, "one lane for eleven queues");
+        assert_eq!(after.reused - before.reused, 10);
+        let lane = lane_of(queues[0]);
+        assert!(queues.iter().all(|&queue| lane_of(queue) == lane));
+
+        // One status entry per object: a lane is shared, arrays are not.
+        let arrays: Vec<*mut c_void> = (0..11).map(|_| status_array(1)).collect();
+        for (&queue, &array) in queues.iter().zip(&arrays) {
+            enqueue_status(queue, array, 0);
+        }
+        void(queues[0], 0x30);
+        for &array in &arrays {
+            assert_eq!(wait(array, 0), S_OK);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for &array in &arrays {
+            assert!(seen.insert(array as usize), "status arrays are per queue");
+        }
+        for &queue in &queues {
+            void(queue, 0x40);
+        }
+        assert_eq!(
+            lane_stats().expect("a scheduler").distinct,
+            before.distinct,
+            "the lane's description is forgotten with the lane"
+        );
+    }
+
+    #[test]
+    fn descriptions_past_the_cap_get_their_own_lane() {
+        let mut l = lanes(STAGING);
+        let name = c"cap";
+        let desc = |source_type: u64| QueueDesc {
+            source_type,
+            capacity: 8,
+            priority: 0,
+            name: name.as_ptr(),
+            unknown: 1,
+        };
+        // The first queue still gets lane 0; an identical one shares it.
+        let first = l.open(&desc(0), "cap");
+        assert_eq!(first, 0, "the first queue still gets lane 0");
+        assert_eq!(l.open(&desc(0), "cap"), first, "identical descriptions share");
+        assert_eq!(l.stats().reused, 1);
+
+        let mut ids = vec![first];
+        for source_type in 1..DEDUP_LIMIT as u64 {
+            ids.push(l.open(&desc(source_type), "cap"));
+        }
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            DEDUP_LIMIT,
+            "distinct descriptions get distinct lanes"
+        );
+        assert_eq!(l.stats().created, DEDUP_LIMIT as u64);
+        assert_eq!(l.stats().reused, 1);
+        assert_eq!(l.stats().distinct, DEDUP_LIMIT);
+
+        // At the cap: a new lane, and the counter says why.
+        let overflow = l.open(&desc(DEDUP_LIMIT as u64), "cap");
+        assert!(!ids.contains(&overflow));
+        assert_eq!(l.stats().created, DEDUP_LIMIT as u64 + 1);
+        assert_eq!(l.stats().overflow, 1);
+        assert_eq!(l.stats().distinct, DEDUP_LIMIT, "the map stays bounded");
+    }
+
+    #[test]
+    fn queues_sharing_a_lane_submit_together() {
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let desc = QueueDesc {
+            source_type: 0x0c09_0002,
+            capacity: 64,
+            priority: 1,
+            name: c"shared submits".as_ptr(),
+            unknown: 1,
+        };
+        let (first, second) = (queue_with(&desc), queue_with(&desc));
+        assert_eq!(lane_of(first), lane_of(second));
+        let (a, b) = (status_array(1), status_array(1));
+        let (mut out_a, mut out_b) = ([0u8; 16], [0u8; 16]);
+        enqueue(first, &request(0, out_a.as_mut_ptr().cast(), 16, file, 0, 16));
+        enqueue_status(first, a, 0);
+        enqueue(second, &request(0, out_b.as_mut_ptr().cast(), 16, file, 8, 16));
+        enqueue_status(second, b, 0);
+        assert_eq!(result(a, 0), E_PENDING);
+        assert_eq!(result(b, 0), E_PENDING);
+        // One Submit, from one of the two objects, starts both queues'
+        // requests: they run on the same lane.
+        void(first, 0x30);
+        assert_eq!(wait(a, 0), S_OK);
+        assert_eq!(wait(b, 0), S_OK);
+        assert_eq!(out_a, contents[..16]);
+        assert_eq!(out_b, contents[8..24]);
+        void(first, 0x40);
+        void(second, 0x40);
     }
 }
