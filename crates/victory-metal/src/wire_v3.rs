@@ -474,6 +474,20 @@ pub const OP_EXECUTE_INDIRECT_DISPATCH: u16 = 43;
 pub const OP_COPY_TEXTURE_REGION: u16 = 44;
 pub const OP_RESOLVE_SUBRESOURCE: u16 = 45;
 
+// ADR-026a core render-state band (46+): blend, depth-stencil, rasterizer,
+// stencil reference, blend factor, explicit clears and pitched upload.
+pub const OP_SET_BLEND_STATE: u16 = 46;
+pub const OP_SET_DEPTH_STENCIL_STATE: u16 = 47;
+pub const OP_SET_RASTERIZER_STATE: u16 = 48;
+pub const OP_SET_STENCIL_REF: u16 = 49;
+pub const OP_SET_BLEND_FACTOR: u16 = 50;
+pub const OP_CLEAR_RENDER_TARGET_VIEW: u16 = 51;
+pub const OP_CLEAR_DEPTH_STENCIL_VIEW: u16 = 52;
+pub const OP_COPY_BUFFER_TO_TEXTURE: u16 = 53;
+
+/// Maximum per-render-target blend entries in one `SetBlendState`.
+pub const MAX_BLEND_ATTACHMENTS_V3: usize = 8;
+
 /// Maximum number of indirect commands one v3 command may execute.
 ///
 /// Without a count buffer D3D12 executes exactly `MaxCommandCount` commands;
@@ -555,6 +569,22 @@ pub enum CommandV3 {
     CopyTextureRegion(CopyTextureRegion),
     /// Multisample resolve into a single-sample subresource.
     ResolveSubresource(ResolveSubresource),
+    /// Per-render-target blend state (ADR-026a).
+    SetBlendState(BlendState),
+    /// Depth/stencil comparison, write and stencil-face state (ADR-026a).
+    SetDepthStencilState(DepthStencilState),
+    /// Rasterizer fill, cull, winding, bias and depth-clip state (ADR-026a).
+    SetRasterizerState(RasterizerState),
+    /// Stencil reference value (`OMSetStencilRef`).
+    SetStencilRef(StencilRef),
+    /// Blend factor constant (`OMSetBlendFactor`).
+    SetBlendFactor(BlendFactorValue),
+    /// Clears one colour attachment of the open render pass.
+    ClearRenderTargetView(ClearRenderTargetView),
+    /// Clears the depth and/or stencil plane of the open render pass.
+    ClearDepthStencilView(ClearDepthStencilView),
+    /// Pitched buffer-to-texture upload (`CopyTextureRegion` from an upload heap).
+    CopyBufferToTexture(CopyBufferToTexture),
     /// Presents a swapchain surface.
     Present(Present),
 }
@@ -1001,6 +1031,466 @@ pub struct ResolveSubresource {
     pub dst: TextureSubresource,
 }
 
+/// D3D12 blend factor, encoded with its D3D12 enum value.
+///
+/// Codes 12 and 13 are unused by D3D12 and are refused. The host maps each
+/// variant onto the `MTLBlendFactor` that has the same arithmetic meaning; the
+/// mapping lives in `macos::state` so the wire stays Metal-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlendFactor {
+    /// `D3D12_BLEND_ZERO`.
+    Zero = 1,
+    /// `D3D12_BLEND_ONE`.
+    One = 2,
+    /// `D3D12_BLEND_SRC_COLOR`.
+    SrcColor = 3,
+    /// `D3D12_BLEND_INV_SRC_COLOR`.
+    InvSrcColor = 4,
+    /// `D3D12_BLEND_SRC_ALPHA`.
+    SrcAlpha = 5,
+    /// `D3D12_BLEND_INV_SRC_ALPHA`.
+    InvSrcAlpha = 6,
+    /// `D3D12_BLEND_DEST_ALPHA`.
+    DestAlpha = 7,
+    /// `D3D12_BLEND_INV_DEST_ALPHA`.
+    InvDestAlpha = 8,
+    /// `D3D12_BLEND_DEST_COLOR`.
+    DestColor = 9,
+    /// `D3D12_BLEND_INV_DEST_COLOR`.
+    InvDestColor = 10,
+    /// `D3D12_BLEND_SRC_ALPHA_SAT`.
+    SrcAlphaSat = 11,
+    /// `D3D12_BLEND_BLEND_FACTOR`.
+    BlendFactor = 14,
+    /// `D3D12_BLEND_INV_BLEND_FACTOR`.
+    InvBlendFactor = 15,
+    /// `D3D12_BLEND_SRC1_COLOR`.
+    Src1Color = 16,
+    /// `D3D12_BLEND_INV_SRC1_COLOR`.
+    InvSrc1Color = 17,
+    /// `D3D12_BLEND_SRC1_ALPHA`.
+    Src1Alpha = 18,
+    /// `D3D12_BLEND_INV_SRC1_ALPHA`.
+    InvSrc1Alpha = 19,
+}
+
+impl BlendFactor {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 blend-factor code, refusing the two unused codes.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            1 => Self::Zero,
+            2 => Self::One,
+            3 => Self::SrcColor,
+            4 => Self::InvSrcColor,
+            5 => Self::SrcAlpha,
+            6 => Self::InvSrcAlpha,
+            7 => Self::DestAlpha,
+            8 => Self::InvDestAlpha,
+            9 => Self::DestColor,
+            10 => Self::InvDestColor,
+            11 => Self::SrcAlphaSat,
+            14 => Self::BlendFactor,
+            15 => Self::InvBlendFactor,
+            16 => Self::Src1Color,
+            17 => Self::InvSrc1Color,
+            18 => Self::Src1Alpha,
+            19 => Self::InvSrc1Alpha,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "blend factor",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// D3D12 blend operation, encoded with its D3D12 enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlendOperation {
+    /// `D3D12_BLEND_OP_ADD`.
+    Add = 1,
+    /// `D3D12_BLEND_OP_SUBTRACT`.
+    Subtract = 2,
+    /// `D3D12_BLEND_OP_REV_SUBTRACT`.
+    RevSubtract = 3,
+    /// `D3D12_BLEND_OP_MIN`.
+    Min = 4,
+    /// `D3D12_BLEND_OP_MAX`.
+    Max = 5,
+}
+
+impl BlendOperation {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 blend-operation code.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            1 => Self::Add,
+            2 => Self::Subtract,
+            3 => Self::RevSubtract,
+            4 => Self::Min,
+            5 => Self::Max,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "blend operation",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// D3D12 comparison function, encoded with its D3D12 enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompareFunction {
+    /// `D3D12_COMPARISON_FUNC_NEVER`.
+    Never = 1,
+    /// `D3D12_COMPARISON_FUNC_LESS`.
+    Less = 2,
+    /// `D3D12_COMPARISON_FUNC_EQUAL`.
+    Equal = 3,
+    /// `D3D12_COMPARISON_FUNC_LESS_EQUAL`.
+    LessEqual = 4,
+    /// `D3D12_COMPARISON_FUNC_GREATER`.
+    Greater = 5,
+    /// `D3D12_COMPARISON_FUNC_NOT_EQUAL`.
+    NotEqual = 6,
+    /// `D3D12_COMPARISON_FUNC_GREATER_EQUAL`.
+    GreaterEqual = 7,
+    /// `D3D12_COMPARISON_FUNC_ALWAYS`.
+    Always = 8,
+}
+
+impl CompareFunction {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 comparison-function code.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            1 => Self::Never,
+            2 => Self::Less,
+            3 => Self::Equal,
+            4 => Self::LessEqual,
+            5 => Self::Greater,
+            6 => Self::NotEqual,
+            7 => Self::GreaterEqual,
+            8 => Self::Always,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "comparison function",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// D3D12 stencil operation, encoded with its D3D12 enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StencilOperation {
+    /// `D3D12_STENCIL_OP_KEEP`.
+    Keep = 1,
+    /// `D3D12_STENCIL_OP_ZERO`.
+    Zero = 2,
+    /// `D3D12_STENCIL_OP_REPLACE`.
+    Replace = 3,
+    /// `D3D12_STENCIL_OP_INCR_SAT`.
+    IncrSat = 4,
+    /// `D3D12_STENCIL_OP_DECR_SAT`.
+    DecrSat = 5,
+    /// `D3D12_STENCIL_OP_INVERT`.
+    Invert = 6,
+    /// `D3D12_STENCIL_OP_INCR`.
+    Incr = 7,
+    /// `D3D12_STENCIL_OP_DECR`.
+    Decr = 8,
+}
+
+impl StencilOperation {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 stencil-operation code.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            1 => Self::Keep,
+            2 => Self::Zero,
+            3 => Self::Replace,
+            4 => Self::IncrSat,
+            5 => Self::DecrSat,
+            6 => Self::Invert,
+            7 => Self::Incr,
+            8 => Self::Decr,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "stencil operation",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// D3D12 fill mode, encoded with its D3D12 enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FillMode {
+    /// `D3D12_FILL_MODE_WIREFRAME`.
+    Wireframe = 2,
+    /// `D3D12_FILL_MODE_SOLID`.
+    Solid = 3,
+}
+
+impl FillMode {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 fill-mode code.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            2 => Self::Wireframe,
+            3 => Self::Solid,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "fill mode",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// D3D12 cull mode, encoded with its D3D12 enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CullMode {
+    /// `D3D12_CULL_MODE_NONE`.
+    None = 1,
+    /// `D3D12_CULL_MODE_FRONT`.
+    Front = 2,
+    /// `D3D12_CULL_MODE_BACK`.
+    Back = 3,
+}
+
+impl CullMode {
+    /// D3D12 enum value carried on the wire.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes a D3D12 cull-mode code.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            1 => Self::None,
+            2 => Self::Front,
+            3 => Self::Back,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "cull mode",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// Which triangle winding is front-facing.
+///
+/// D3D12 carries this as the `FrontCounterClockwise` boolean; the wire keeps
+/// the boolean meaning in a two-valued enum so an undefined code is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrontFaceWinding {
+    /// Clockwise triangles are front-facing (`FrontCounterClockwise = FALSE`).
+    Clockwise = 0,
+    /// Counter-clockwise triangles are front-facing (`TRUE`).
+    CounterClockwise = 1,
+}
+
+impl FrontFaceWinding {
+    /// Boolean wire code.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Decodes the `FrontCounterClockwise` boolean.
+    pub fn from_code(code: u16) -> Result<Self, WireError> {
+        Ok(match code {
+            0 => Self::Clockwise,
+            1 => Self::CounterClockwise,
+            other => {
+                return Err(WireError::InvalidEnumCode {
+                    field: "front-face winding",
+                    code: other,
+                });
+            }
+        })
+    }
+}
+
+/// One render target's blend state (`D3D12_RENDER_TARGET_BLEND_DESC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlendAttachment {
+    /// Whether blending is enabled for this target.
+    pub enable: bool,
+    /// Source colour factor.
+    pub src_color: BlendFactor,
+    /// Destination colour factor.
+    pub dst_color: BlendFactor,
+    /// Colour blend operation.
+    pub color_op: BlendOperation,
+    /// Source alpha factor.
+    pub src_alpha: BlendFactor,
+    /// Destination alpha factor.
+    pub dst_alpha: BlendFactor,
+    /// Alpha blend operation.
+    pub alpha_op: BlendOperation,
+    /// Colour write mask bits (`R=1, G=2, B=4, A=8`).
+    pub write_mask: u8,
+}
+
+/// Per-render-target blend state (`D3D12_BLEND_DESC`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlendState {
+    /// `IndependentBlendEnable`: every target uses its own entry, otherwise
+    /// entry 0 applies to all targets.
+    pub independent_blend: bool,
+    /// `AlphaToCoverageEnable`.
+    pub alpha_to_coverage: bool,
+    /// One entry per target (1..=`MAX_BLEND_ATTACHMENTS_V3`).
+    pub attachments: Vec<BlendAttachment>,
+}
+
+/// One stencil face (`D3D12_DEPTH_STENCILOP_DESC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StencilFaceState {
+    /// Operation on stencil test failure.
+    pub fail: StencilOperation,
+    /// Operation on depth test failure.
+    pub depth_fail: StencilOperation,
+    /// Operation on both tests passing.
+    pub pass: StencilOperation,
+    /// Stencil comparison function.
+    pub func: CompareFunction,
+    /// Stencil read mask.
+    pub read_mask: u8,
+    /// Stencil write mask.
+    pub write_mask: u8,
+}
+
+/// Depth/stencil state (`D3D12_DEPTH_STENCIL_DESC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DepthStencilState {
+    /// Depth testing enabled.
+    pub depth_enable: bool,
+    /// Depth writes enabled.
+    pub depth_write: bool,
+    /// Depth comparison function.
+    pub depth_func: CompareFunction,
+    /// Stencil testing enabled.
+    pub stencil_enable: bool,
+    /// Front-face stencil operations.
+    pub front: StencilFaceState,
+    /// Back-face stencil operations.
+    pub back: StencilFaceState,
+}
+
+/// Rasterizer state (`D3D12_RASTERIZER_DESC`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RasterizerState {
+    /// Fill mode.
+    pub fill: FillMode,
+    /// Cull mode.
+    pub cull: CullMode,
+    /// Front-face winding.
+    pub front_face: FrontFaceWinding,
+    /// Constant depth bias (`DepthBias`, an `INT`).
+    pub depth_bias: i32,
+    /// Slope-scaled depth bias (`SlopeScaledDepthBias`).
+    pub slope_scaled_depth_bias: f32,
+    /// Maximum clamped depth bias (`DepthBiasClamp`).
+    pub depth_bias_clamp: f32,
+    /// `DepthClipEnable`.
+    pub depth_clip: bool,
+}
+
+/// Stencil reference value (`OMSetStencilRef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilRef {
+    /// Reference value written by `REPLACE` and compared by the stencil func.
+    pub value: u8,
+}
+
+/// Blend factor constant (`OMSetBlendFactor`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlendFactorValue {
+    /// RGBA blend factors.
+    pub value: [f32; 4],
+}
+
+/// Clears one colour attachment of the open render pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClearRenderTargetView {
+    /// Colour attachment slot in the open pass (0 ..= 7).
+    pub slot: u16,
+    /// Optional scissor-style rectangle; `None` clears the whole attachment.
+    pub rect: Option<ScissorRect>,
+    /// Clear colour.
+    pub color: [f32; 4],
+}
+
+/// Clears the depth and/or stencil plane of the open render pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClearDepthStencilView {
+    /// Depth clear value, when the depth plane is cleared.
+    pub depth: Option<f32>,
+    /// Stencil clear value, when the stencil plane is cleared.
+    pub stencil: Option<u32>,
+    /// Optional rectangle; `None` clears the whole attachment.
+    pub rect: Option<ScissorRect>,
+}
+
+/// Pitched upload-heap to private-texture copy.
+///
+/// Mirrors `D3D12_BOX` plus `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` for one mip,
+/// slice and origin. `bytes_per_image` covers one array slice of a 3D/array
+/// copy; it is zero for a single-slice copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyBufferToTexture {
+    /// Source buffer allocation ID; never zero.
+    pub allocation_id: u64,
+    /// Source generation; never zero.
+    pub generation: u32,
+    /// Byte offset of the first texel; 4-byte aligned.
+    pub offset: u64,
+    /// Source row pitch in bytes; nonzero.
+    pub bytes_per_row: u32,
+    /// Source slice pitch in bytes; zero or at least one full image.
+    pub bytes_per_image: u32,
+    /// Copy box size in texels; every component nonzero.
+    pub extent: [u32; 3],
+    /// Destination mip level.
+    pub mip_level: u16,
+    /// Destination array slice.
+    pub slice: u16,
+    /// Destination box origin in texels.
+    pub origin: [u32; 3],
+}
+
+
 /// Convenience accessor: the frozen opcode of a command.
 impl CommandV3 {
     /// Returns the wire opcode for this command.
@@ -1036,6 +1526,14 @@ impl CommandV3 {
             Self::ExecuteIndirectDispatch(_) => OP_EXECUTE_INDIRECT_DISPATCH,
             Self::CopyTextureRegion(_) => OP_COPY_TEXTURE_REGION,
             Self::ResolveSubresource(_) => OP_RESOLVE_SUBRESOURCE,
+            Self::SetBlendState(_) => OP_SET_BLEND_STATE,
+            Self::SetDepthStencilState(_) => OP_SET_DEPTH_STENCIL_STATE,
+            Self::SetRasterizerState(_) => OP_SET_RASTERIZER_STATE,
+            Self::SetStencilRef(_) => OP_SET_STENCIL_REF,
+            Self::SetBlendFactor(_) => OP_SET_BLEND_FACTOR,
+            Self::ClearRenderTargetView(_) => OP_CLEAR_RENDER_TARGET_VIEW,
+            Self::ClearDepthStencilView(_) => OP_CLEAR_DEPTH_STENCIL_VIEW,
+            Self::CopyBufferToTexture(_) => OP_COPY_BUFFER_TO_TEXTURE,
             Self::Present(_) => OP_PRESENT,
         }
     }
@@ -1081,6 +1579,15 @@ const EXECUTE_INDIRECT_DISPATCH_MESH_LEN: usize = 4 + 8 + INDIRECT_ARGUMENTS_LEN
 const EXECUTE_INDIRECT_DISPATCH_LEN: usize = 4 + 8 + INDIRECT_ARGUMENTS_LEN + 16;
 const COPY_TEXTURE_REGION_LEN: usize = 4 + 72;
 const RESOLVE_SUBRESOURCE_LEN: usize = 4 + 32;
+const SET_BLEND_STATE_HEADER_LEN: usize = 12;
+const BLEND_ATTACHMENT_LEN: usize = 8;
+const SET_DEPTH_STENCIL_STATE_LEN: usize = 24;
+const SET_RASTERIZER_STATE_LEN: usize = 24;
+const SET_STENCIL_REF_LEN: usize = 8;
+const SET_BLEND_FACTOR_LEN: usize = 24;
+const CLEAR_RENDER_TARGET_VIEW_LEN: usize = 40;
+const CLEAR_DEPTH_STENCIL_VIEW_LEN: usize = 32;
+const COPY_BUFFER_TO_TEXTURE_LEN: usize = 64;
 const PRESENT_LEN: usize = 20;
 
 /// Checked little-endian cursor over a version 3 frame or payload.
@@ -1508,6 +2015,51 @@ fn empty_command(opcode: u16) -> Result<CommandV3, WireError> {
             src: empty_subresource(),
             dst: empty_subresource(),
         }),
+        OP_SET_BLEND_STATE => CommandV3::SetBlendState(BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: Vec::new(),
+        }),
+        OP_SET_DEPTH_STENCIL_STATE => CommandV3::SetDepthStencilState(DepthStencilState {
+            depth_enable: false,
+            depth_write: false,
+            depth_func: CompareFunction::Always,
+            stencil_enable: false,
+            front: empty_stencil_face(),
+            back: empty_stencil_face(),
+        }),
+        OP_SET_RASTERIZER_STATE => CommandV3::SetRasterizerState(RasterizerState {
+            fill: FillMode::Solid,
+            cull: CullMode::None,
+            front_face: FrontFaceWinding::Clockwise,
+            depth_bias: 0,
+            slope_scaled_depth_bias: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_clip: true,
+        }),
+        OP_SET_STENCIL_REF => CommandV3::SetStencilRef(StencilRef { value: 0 }),
+        OP_SET_BLEND_FACTOR => CommandV3::SetBlendFactor(BlendFactorValue { value: [0.0; 4] }),
+        OP_CLEAR_RENDER_TARGET_VIEW => CommandV3::ClearRenderTargetView(ClearRenderTargetView {
+            slot: 0,
+            rect: None,
+            color: [0.0; 4],
+        }),
+        OP_CLEAR_DEPTH_STENCIL_VIEW => CommandV3::ClearDepthStencilView(ClearDepthStencilView {
+            depth: None,
+            stencil: None,
+            rect: None,
+        }),
+        OP_COPY_BUFFER_TO_TEXTURE => CommandV3::CopyBufferToTexture(CopyBufferToTexture {
+            allocation_id: 0,
+            generation: 0,
+            offset: 0,
+            bytes_per_row: 0,
+            bytes_per_image: 0,
+            extent: [0; 3],
+            mip_level: 0,
+            slice: 0,
+            origin: [0; 3],
+        }),
         other => return Err(WireError::UnknownOpcode(other)),
     })
 }
@@ -1528,6 +2080,17 @@ fn empty_subresource() -> TextureSubresource {
         generation: 0,
         mip_level: 0,
         slice: 0,
+    }
+}
+
+fn empty_stencil_face() -> StencilFaceState {
+    StencilFaceState {
+        fail: StencilOperation::Keep,
+        depth_fail: StencilOperation::Keep,
+        pass: StencilOperation::Keep,
+        func: CompareFunction::Always,
+        read_mask: 0,
+        write_mask: 0,
     }
 }
 
@@ -1572,6 +2135,31 @@ fn read_command_payload(
         }
         CommandV3::CopyTextureRegion(copy) => read_copy_texture_region(reader, copy),
         CommandV3::ResolveSubresource(resolve) => read_resolve_subresource(reader, resolve),
+        CommandV3::SetBlendState(state) => read_blend_state(reader, state),
+        CommandV3::SetDepthStencilState(state) => read_depth_stencil_state(reader, state),
+        CommandV3::SetRasterizerState(state) => read_rasterizer_state(reader, state),
+        CommandV3::SetStencilRef(reference) => {
+            let value = reader.u16()?;
+            reader.reserved_u16()?;
+            if value > u16::from(u8::MAX) {
+                return Err(WireError::InvalidEnumCode {
+                    field: "stencil reference",
+                    code: value,
+                });
+            }
+            reference.value = value as u8;
+            Ok(())
+        }
+        CommandV3::SetBlendFactor(factor) => {
+            for component in &mut factor.value {
+                *component = reader.f32()?;
+            }
+            reader.reserved_u32()?;
+            Ok(())
+        }
+        CommandV3::ClearRenderTargetView(clear) => read_clear_render_target_view(reader, clear),
+        CommandV3::ClearDepthStencilView(clear) => read_clear_depth_stencil_view(reader, clear),
+        CommandV3::CopyBufferToTexture(copy) => read_copy_buffer_to_texture(reader, copy),
         CommandV3::Present(present) => read_present(reader, present),
     }
 }
@@ -2201,6 +2789,281 @@ fn read_subresource(reader: &mut ReaderV3<'_>) -> Result<TextureSubresource, Wir
     })
 }
 
+/// Reads the fixed flags word that carries two independent booleans.
+fn read_state_flag(code: u16, field: &'static str) -> Result<bool, WireError> {
+    match code {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(WireError::InvalidEnumCode {
+            field,
+            code: other,
+        }),
+    }
+}
+
+fn read_blend_factor_code(reader: &mut ReaderV3<'_>) -> Result<BlendFactor, WireError> {
+    BlendFactor::from_code(u16::from(reader.u8()?))
+}
+
+fn read_blend_operation_code(reader: &mut ReaderV3<'_>) -> Result<BlendOperation, WireError> {
+    BlendOperation::from_code(u16::from(reader.u8()?))
+}
+
+fn read_stencil_operation_code(reader: &mut ReaderV3<'_>) -> Result<StencilOperation, WireError> {
+    StencilOperation::from_code(u16::from(reader.u8()?))
+}
+
+fn read_compare_function_code(reader: &mut ReaderV3<'_>) -> Result<CompareFunction, WireError> {
+    CompareFunction::from_code(u16::from(reader.u8()?))
+}
+
+fn read_stencil_face(reader: &mut ReaderV3<'_>) -> Result<StencilFaceState, WireError> {
+    let fail = read_stencil_operation_code(reader)?;
+    let depth_fail = read_stencil_operation_code(reader)?;
+    let pass = read_stencil_operation_code(reader)?;
+    let func = read_compare_function_code(reader)?;
+    let read_mask = reader.u8()?;
+    let write_mask = reader.u8()?;
+    Ok(StencilFaceState {
+        fail,
+        depth_fail,
+        pass,
+        func,
+        read_mask,
+        write_mask,
+    })
+}
+
+fn read_blend_attachment(reader: &mut ReaderV3<'_>) -> Result<BlendAttachment, WireError> {
+    let enable = read_state_flag(u16::from(reader.u8()?), "blend enable")?;
+    let src_color = read_blend_factor_code(reader)?;
+    let dst_color = read_blend_factor_code(reader)?;
+    let color_op = read_blend_operation_code(reader)?;
+    let src_alpha = read_blend_factor_code(reader)?;
+    let dst_alpha = read_blend_factor_code(reader)?;
+    let alpha_op = read_blend_operation_code(reader)?;
+    let write_mask = reader.u8()?;
+    Ok(BlendAttachment {
+        enable,
+        src_color,
+        dst_color,
+        color_op,
+        src_alpha,
+        dst_alpha,
+        alpha_op,
+        write_mask,
+    })
+}
+
+fn read_blend_state(reader: &mut ReaderV3<'_>, state: &mut BlendState) -> Result<(), WireError> {
+    let count = usize::from(reader.u16()?);
+    let independent_blend = read_state_flag(reader.u16()?, "independent blend")?;
+    let alpha_to_coverage = read_state_flag(reader.u16()?, "alpha to coverage")?;
+    reader.reserved_u16()?;
+    if count == 0 {
+        return Err(WireError::ZeroBlendAttachments);
+    }
+    if count > MAX_BLEND_ATTACHMENTS_V3 {
+        return Err(WireError::TooManyBlendAttachments(count));
+    }
+    state.attachments.clear();
+    for _ in 0..count {
+        state.attachments.push(read_blend_attachment(reader)?);
+    }
+    state.independent_blend = independent_blend;
+    state.alpha_to_coverage = alpha_to_coverage;
+    Ok(())
+}
+
+fn read_depth_stencil_state(
+    reader: &mut ReaderV3<'_>,
+    state: &mut DepthStencilState,
+) -> Result<(), WireError> {
+    let depth_enable = read_state_flag(u16::from(reader.u8()?), "depth enable")?;
+    let depth_write = read_state_flag(u16::from(reader.u8()?), "depth write")?;
+    let depth_func = read_compare_function_code(reader)?;
+    let stencil_enable = read_state_flag(u16::from(reader.u8()?), "stencil enable")?;
+    let front = read_stencil_face(reader)?;
+    let back = read_stencil_face(reader)?;
+    reader.reserved_u32()?;
+    state.depth_enable = depth_enable;
+    state.depth_write = depth_write;
+    state.depth_func = depth_func;
+    state.stencil_enable = stencil_enable;
+    state.front = front;
+    state.back = back;
+    Ok(())
+}
+
+fn read_rasterizer_state(
+    reader: &mut ReaderV3<'_>,
+    state: &mut RasterizerState,
+) -> Result<(), WireError> {
+    let fill = FillMode::from_code(u16::from(reader.u8()?))?;
+    let cull = CullMode::from_code(u16::from(reader.u8()?))?;
+    let front_face = FrontFaceWinding::from_code(u16::from(reader.u8()?))?;
+    let depth_clip = read_state_flag(u16::from(reader.u8()?), "depth clip enable")?;
+    let depth_bias = reader.i32()?;
+    let slope_scaled_depth_bias = reader.f32()?;
+    let depth_bias_clamp = reader.f32()?;
+    reader.reserved_u32()?;
+    state.fill = fill;
+    state.cull = cull;
+    state.front_face = front_face;
+    state.depth_bias = depth_bias;
+    state.slope_scaled_depth_bias = slope_scaled_depth_bias;
+    state.depth_bias_clamp = depth_bias_clamp;
+    state.depth_clip = depth_clip;
+    Ok(())
+}
+
+fn read_clear_rect(
+    reader: &mut ReaderV3<'_>,
+    has_rect: bool,
+) -> Result<Option<ScissorRect>, WireError> {
+    let x = reader.u32()?;
+    let y = reader.u32()?;
+    let width = reader.u32()?;
+    let height = reader.u32()?;
+    if !has_rect {
+        if x != 0 || y != 0 || width != 0 || height != 0 {
+            return Err(WireError::NonZeroReserved);
+        }
+        return Ok(None);
+    }
+    validate_extent("clear rect width", width)?;
+    validate_extent("clear rect height", height)?;
+    Ok(Some(ScissorRect {
+        x,
+        y,
+        width,
+        height,
+    }))
+}
+
+fn read_clear_render_target_view(
+    reader: &mut ReaderV3<'_>,
+    clear: &mut ClearRenderTargetView,
+) -> Result<(), WireError> {
+    let slot = reader.u16()?;
+    let flags = reader.u16()?;
+    if flags & !1 != 0 {
+        return Err(WireError::UnsupportedFlags(flags));
+    }
+    if usize::from(slot) >= MAX_COLOR_ATTACHMENTS {
+        return Err(WireError::TooManyColorAttachments(usize::from(slot) + 1));
+    }
+    let color = [reader.f32()?, reader.f32()?, reader.f32()?, reader.f32()?];
+    let rect = read_clear_rect(reader, flags & 1 != 0)?;
+    clear.slot = slot;
+    clear.rect = rect;
+    clear.color = color;
+    Ok(())
+}
+
+fn read_clear_depth_stencil_view(
+    reader: &mut ReaderV3<'_>,
+    clear: &mut ClearDepthStencilView,
+) -> Result<(), WireError> {
+    let flags = reader.u16()?;
+    if flags & !7 != 0 {
+        return Err(WireError::UnsupportedFlags(flags));
+    }
+    reader.reserved_u16()?;
+    let clear_depth = flags & 1 != 0;
+    let clear_stencil = flags & 2 != 0;
+    if !clear_depth && !clear_stencil {
+        return Err(WireError::EmptyClear);
+    }
+    let depth_bits = reader.f32()?;
+    let stencil = reader.u32()?;
+    let rect = read_clear_rect(reader, flags & 4 != 0)?;
+    clear.depth = clear_depth.then_some(depth_bits);
+    clear.stencil = clear_stencil.then_some(stencil);
+    if clear.stencil.is_none() && stencil != 0 {
+        return Err(WireError::NonZeroReserved);
+    }
+    clear.rect = rect;
+    Ok(())
+}
+
+fn read_copy_buffer_to_texture(
+    reader: &mut ReaderV3<'_>,
+    copy: &mut CopyBufferToTexture,
+) -> Result<(), WireError> {
+    let allocation_id = reader.u64()?;
+    let generation = reader.u32()?;
+    validate_handle(allocation_id, generation)?;
+    let offset = reader.u64()?;
+    validate_alignment(offset, "copy source offset alignment")?;
+    let bytes_per_row = reader.u32()?;
+    let bytes_per_image = reader.u32()?;
+    let extent = [reader.u32()?, reader.u32()?, reader.u32()?];
+    let mip_level = reader.u16()?;
+    let slice = reader.u16()?;
+    let origin = [reader.u32()?, reader.u32()?, reader.u32()?];
+    reader.reserved_u32()?;
+    validate_pitched_copy(
+        offset,
+        bytes_per_row,
+        bytes_per_image,
+        extent,
+        origin,
+    )?;
+    copy.allocation_id = allocation_id;
+    copy.generation = generation;
+    copy.offset = offset;
+    copy.bytes_per_row = bytes_per_row;
+    copy.bytes_per_image = bytes_per_image;
+    copy.extent = extent;
+    copy.mip_level = mip_level;
+    copy.slice = slice;
+    copy.origin = origin;
+    Ok(())
+}
+
+/// Validates the pitched-copy fields the wire can check without the texture.
+fn validate_pitched_copy(
+    offset: u64,
+    bytes_per_row: u32,
+    bytes_per_image: u32,
+    extent: [u32; 3],
+    origin: [u32; 3],
+) -> Result<(), WireError> {
+    if bytes_per_row == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "copy source row pitch",
+        });
+    }
+    validate_box("copy buffer to texture", origin, extent)?;
+    let row_bytes = u64::from(bytes_per_row)
+        .checked_mul(u64::from(extent[1]))
+        .ok_or(WireError::OffsetOverflow)?;
+    let image_bytes = u64::from(bytes_per_image);
+    if extent[2] > 1 {
+        if image_bytes == 0 {
+            return Err(WireError::ZeroExtent {
+                field: "copy source image pitch",
+            });
+        }
+        if image_bytes < row_bytes {
+            return Err(WireError::OffsetOverflow);
+        }
+    } else if image_bytes != 0 && image_bytes < row_bytes {
+        return Err(WireError::OffsetOverflow);
+    }
+    let total = if image_bytes == 0 {
+        row_bytes
+    } else {
+        image_bytes
+            .checked_mul(u64::from(extent[2]))
+            .ok_or(WireError::OffsetOverflow)?
+    };
+    offset.checked_add(total).ok_or(WireError::OffsetOverflow)?;
+    Ok(())
+}
+
+
 fn read_bindings_into(
     reader: &mut ReaderV3<'_>,
     bindings: &mut Vec<BufferBinding>,
@@ -2272,6 +3135,14 @@ fn command_encoded_len(command: &CommandV3) -> Result<usize, WireError> {
         }
         CommandV3::CopyTextureRegion(copy) => copy_texture_region_encoded_len(copy),
         CommandV3::ResolveSubresource(resolve) => resolve_subresource_encoded_len(resolve),
+        CommandV3::SetBlendState(state) => blend_state_encoded_len(state),
+        CommandV3::SetDepthStencilState(_) => Ok(SET_DEPTH_STENCIL_STATE_LEN),
+        CommandV3::SetRasterizerState(_) => Ok(SET_RASTERIZER_STATE_LEN),
+        CommandV3::SetStencilRef(_) => Ok(SET_STENCIL_REF_LEN),
+        CommandV3::SetBlendFactor(_) => Ok(SET_BLEND_FACTOR_LEN),
+        CommandV3::ClearRenderTargetView(clear) => clear_render_target_view_encoded_len(clear),
+        CommandV3::ClearDepthStencilView(clear) => clear_depth_stencil_view_encoded_len(clear),
+        CommandV3::CopyBufferToTexture(copy) => copy_buffer_to_texture_encoded_len(copy),
         CommandV3::Present(present) => present_encoded_len(present),
     }
 }
@@ -2570,6 +3441,61 @@ fn resolve_subresource_encoded_len(resolve: &ResolveSubresource) -> Result<usize
     validate_subresource(&resolve.dst)?;
     Ok(RESOLVE_SUBRESOURCE_LEN)
 }
+
+fn blend_state_encoded_len(state: &BlendState) -> Result<usize, WireError> {
+    if state.attachments.is_empty() {
+        return Err(WireError::ZeroBlendAttachments);
+    }
+    if state.attachments.len() > MAX_BLEND_ATTACHMENTS_V3 {
+        return Err(WireError::TooManyBlendAttachments(state.attachments.len()));
+    }
+    state
+        .attachments
+        .len()
+        .checked_mul(BLEND_ATTACHMENT_LEN)
+        .and_then(|entries| entries.checked_add(SET_BLEND_STATE_HEADER_LEN))
+        .ok_or(WireError::FrameTooLarge)
+}
+
+fn clear_render_target_view_encoded_len(
+    clear: &ClearRenderTargetView,
+) -> Result<usize, WireError> {
+    if usize::from(clear.slot) >= MAX_COLOR_ATTACHMENTS {
+        return Err(WireError::TooManyColorAttachments(usize::from(clear.slot) + 1));
+    }
+    if let Some(rect) = clear.rect {
+        validate_extent("clear rect width", rect.width)?;
+        validate_extent("clear rect height", rect.height)?;
+    }
+    Ok(CLEAR_RENDER_TARGET_VIEW_LEN)
+}
+
+fn clear_depth_stencil_view_encoded_len(
+    clear: &ClearDepthStencilView,
+) -> Result<usize, WireError> {
+    if clear.depth.is_none() && clear.stencil.is_none() {
+        return Err(WireError::EmptyClear);
+    }
+    if let Some(rect) = clear.rect {
+        validate_extent("clear rect width", rect.width)?;
+        validate_extent("clear rect height", rect.height)?;
+    }
+    Ok(CLEAR_DEPTH_STENCIL_VIEW_LEN)
+}
+
+fn copy_buffer_to_texture_encoded_len(copy: &CopyBufferToTexture) -> Result<usize, WireError> {
+    validate_handle(copy.allocation_id, copy.generation)?;
+    validate_alignment(copy.offset, "copy source offset alignment")?;
+    validate_pitched_copy(
+        copy.offset,
+        copy.bytes_per_row,
+        copy.bytes_per_image,
+        copy.extent,
+        copy.origin,
+    )?;
+    Ok(COPY_BUFFER_TO_TEXTURE_LEN)
+}
+
 
 fn validate_subresource(subresource: &TextureSubresource) -> Result<(), WireError> {
     validate_handle(subresource.allocation_id, subresource.generation)
@@ -2879,6 +3805,118 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
         CommandV3::ResolveSubresource(resolve) => {
             write_subresource(out, &resolve.src);
             write_subresource(out, &resolve.dst);
+        }
+        CommandV3::SetBlendState(state) => {
+            write_u16(out, state.attachments.len() as u16);
+            write_u16(out, u16::from(state.independent_blend));
+            write_u16(out, u16::from(state.alpha_to_coverage));
+            write_u16(out, 0);
+            for attachment in &state.attachments {
+                out.push(u8::from(attachment.enable));
+                out.push(attachment.src_color.code() as u8);
+                out.push(attachment.dst_color.code() as u8);
+                out.push(attachment.color_op.code() as u8);
+                out.push(attachment.src_alpha.code() as u8);
+                out.push(attachment.dst_alpha.code() as u8);
+                out.push(attachment.alpha_op.code() as u8);
+                out.push(attachment.write_mask);
+            }
+        }
+        CommandV3::SetDepthStencilState(state) => {
+            out.push(u8::from(state.depth_enable));
+            out.push(u8::from(state.depth_write));
+            out.push(state.depth_func.code() as u8);
+            out.push(u8::from(state.stencil_enable));
+            write_stencil_face(out, &state.front);
+            write_stencil_face(out, &state.back);
+            write_u32(out, 0);
+        }
+        CommandV3::SetRasterizerState(state) => {
+            out.push(state.fill.code() as u8);
+            out.push(state.cull.code() as u8);
+            out.push(state.front_face.code() as u8);
+            out.push(u8::from(state.depth_clip));
+            write_i32(out, state.depth_bias);
+            write_f32(out, state.slope_scaled_depth_bias);
+            write_f32(out, state.depth_bias_clamp);
+            write_u32(out, 0);
+        }
+        CommandV3::SetStencilRef(reference) => {
+            write_u16(out, u16::from(reference.value));
+            write_u16(out, 0);
+        }
+        CommandV3::SetBlendFactor(factor) => {
+            for component in factor.value {
+                write_f32(out, component);
+            }
+            write_u32(out, 0);
+        }
+        CommandV3::ClearRenderTargetView(clear) => {
+            write_u16(out, clear.slot);
+            write_u16(out, u16::from(clear.rect.is_some()));
+            for component in clear.color {
+                write_f32(out, component);
+            }
+            write_clear_rect(out, clear.rect.as_ref());
+        }
+        CommandV3::ClearDepthStencilView(clear) => {
+            let mut flags = 0u16;
+            if clear.depth.is_some() {
+                flags |= 1;
+            }
+            if clear.stencil.is_some() {
+                flags |= 2;
+            }
+            if clear.rect.is_some() {
+                flags |= 4;
+            }
+            write_u16(out, flags);
+            write_u16(out, 0);
+            write_f32(out, clear.depth.unwrap_or(0.0));
+            write_u32(out, clear.stencil.unwrap_or(0));
+            write_clear_rect(out, clear.rect.as_ref());
+        }
+        CommandV3::CopyBufferToTexture(copy) => {
+            write_u64(out, copy.allocation_id);
+            write_u32(out, copy.generation);
+            write_u64(out, copy.offset);
+            write_u32(out, copy.bytes_per_row);
+            write_u32(out, copy.bytes_per_image);
+            for value in copy.extent {
+                write_u32(out, value);
+            }
+            write_u16(out, copy.mip_level);
+            write_u16(out, copy.slice);
+            for value in copy.origin {
+                write_u32(out, value);
+            }
+            write_u32(out, 0);
+        }
+    }
+}
+
+fn write_stencil_face(out: &mut Vec<u8>, face: &StencilFaceState) {
+    out.push(face.fail.code() as u8);
+    out.push(face.depth_fail.code() as u8);
+    out.push(face.pass.code() as u8);
+    out.push(face.func.code() as u8);
+    out.push(face.read_mask);
+    out.push(face.write_mask);
+}
+
+fn write_clear_rect(out: &mut Vec<u8>, rect: Option<&ScissorRect>) {
+    match rect {
+        Some(rect) => {
+            write_u32(out, rect.x);
+            write_u32(out, rect.y);
+            write_u32(out, rect.width);
+            write_u32(out, rect.height);
+        }
+        None => {
+            write_u32(out, 0);
+            write_u32(out, 0);
+            write_u32(out, 0);
+            write_u32(out, 0);
         }
     }
 }
@@ -3449,6 +4487,93 @@ mod tests {
                 src: subresource(11, 0, 0),
                 dst: subresource(12, 0, 0),
             }),
+            CommandV3::SetBlendState(BlendState {
+                independent_blend: true,
+                alpha_to_coverage: false,
+                attachments: vec![
+                    BlendAttachment {
+                        enable: true,
+                        src_color: BlendFactor::SrcAlpha,
+                        dst_color: BlendFactor::InvSrcAlpha,
+                        color_op: BlendOperation::Add,
+                        src_alpha: BlendFactor::One,
+                        dst_alpha: BlendFactor::InvSrcAlpha,
+                        alpha_op: BlendOperation::Max,
+                        write_mask: 0xf,
+                    },
+                    BlendAttachment {
+                        enable: false,
+                        src_color: BlendFactor::One,
+                        dst_color: BlendFactor::Zero,
+                        color_op: BlendOperation::RevSubtract,
+                        src_alpha: BlendFactor::DestColor,
+                        dst_alpha: BlendFactor::SrcAlphaSat,
+                        alpha_op: BlendOperation::Min,
+                        write_mask: 0b0101,
+                    },
+                ],
+            }),
+            CommandV3::SetDepthStencilState(DepthStencilState {
+                depth_enable: true,
+                depth_write: true,
+                depth_func: CompareFunction::LessEqual,
+                stencil_enable: true,
+                front: StencilFaceState {
+                    fail: StencilOperation::Keep,
+                    depth_fail: StencilOperation::IncrSat,
+                    pass: StencilOperation::Replace,
+                    func: CompareFunction::Equal,
+                    read_mask: 0xff,
+                    write_mask: 0x0f,
+                },
+                back: StencilFaceState {
+                    fail: StencilOperation::Decr,
+                    depth_fail: StencilOperation::Invert,
+                    pass: StencilOperation::Zero,
+                    func: CompareFunction::Always,
+                    read_mask: 0x7f,
+                    write_mask: 0xf0,
+                },
+            }),
+            CommandV3::SetRasterizerState(RasterizerState {
+                fill: FillMode::Wireframe,
+                cull: CullMode::Back,
+                front_face: FrontFaceWinding::CounterClockwise,
+                depth_bias: -16,
+                slope_scaled_depth_bias: 1.5,
+                depth_bias_clamp: 0.25,
+                depth_clip: false,
+            }),
+            CommandV3::SetStencilRef(StencilRef { value: 7 }),
+            CommandV3::SetBlendFactor(BlendFactorValue {
+                value: [0.25, 0.5, 0.75, 1.0],
+            }),
+            CommandV3::ClearRenderTargetView(ClearRenderTargetView {
+                slot: 1,
+                rect: Some(ScissorRect {
+                    x: 4,
+                    y: 8,
+                    width: 16,
+                    height: 32,
+                }),
+                color: [0.0, 0.25, 0.5, 1.0],
+            }),
+            CommandV3::ClearDepthStencilView(ClearDepthStencilView {
+                depth: Some(0.5),
+                stencil: Some(3),
+                rect: None,
+            }),
+            CommandV3::CopyBufferToTexture(CopyBufferToTexture {
+                allocation_id: 13,
+                generation: 2,
+                offset: 1024,
+                bytes_per_row: 256,
+                bytes_per_image: 0,
+                extent: [4, 4, 1],
+                mip_level: 1,
+                slice: 2,
+                origin: [1, 2, 0],
+            }),
             CommandV3::Present(Present {
                 surface_id: 1,
                 sync_interval: 1,
@@ -3506,7 +4631,7 @@ mod tests {
         let submission = rich_submission();
         let decoded = decode_submission_v3(&encoded_rich()).expect("rich frame decodes");
         assert_eq!(decoded, submission);
-        assert_eq!(decoded.commands.len(), 32);
+        assert_eq!(decoded.commands.len(), 40);
 
         let opcodes: std::collections::BTreeSet<u16> =
             decoded.commands.iter().map(CommandV3::opcode).collect();
@@ -3541,6 +4666,14 @@ mod tests {
             OP_EXECUTE_INDIRECT_DISPATCH,
             OP_COPY_TEXTURE_REGION,
             OP_RESOLVE_SUBRESOURCE,
+            OP_SET_BLEND_STATE,
+            OP_SET_DEPTH_STENCIL_STATE,
+            OP_SET_RASTERIZER_STATE,
+            OP_SET_STENCIL_REF,
+            OP_SET_BLEND_FACTOR,
+            OP_CLEAR_RENDER_TARGET_VIEW,
+            OP_CLEAR_DEPTH_STENCIL_VIEW,
+            OP_COPY_BUFFER_TO_TEXTURE,
             OP_PRESENT,
         ] {
             assert!(opcodes.contains(&opcode), "opcode {opcode} missing");
@@ -4453,5 +5586,356 @@ mod tests {
         assert_roundtrip(&empty);
         let frame = encode_submission_v3(&empty).expect("empty frame encodes");
         assert_eq!(frame.len(), FRAME_HEADER_LEN + LIST_BLOCK_LEN);
+    }
+
+    fn blend_attachment(enable: bool) -> BlendAttachment {
+        BlendAttachment {
+            enable,
+            src_color: BlendFactor::SrcAlpha,
+            dst_color: BlendFactor::InvSrcAlpha,
+            color_op: BlendOperation::Add,
+            src_alpha: BlendFactor::One,
+            dst_alpha: BlendFactor::Zero,
+            alpha_op: BlendOperation::Add,
+            write_mask: 0xf,
+        }
+    }
+
+    fn blend_state(count: usize) -> BlendState {
+        BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: (0..count).map(|_| blend_attachment(true)).collect(),
+        }
+    }
+
+    fn depth_stencil_state() -> DepthStencilState {
+        DepthStencilState {
+            depth_enable: true,
+            depth_write: true,
+            depth_func: CompareFunction::Less,
+            stencil_enable: false,
+            front: empty_stencil_face(),
+            back: empty_stencil_face(),
+        }
+    }
+
+    fn rasterizer_state() -> RasterizerState {
+        RasterizerState {
+            fill: FillMode::Solid,
+            cull: CullMode::Back,
+            front_face: FrontFaceWinding::CounterClockwise,
+            depth_bias: 0,
+            slope_scaled_depth_bias: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_clip: true,
+        }
+    }
+
+    fn clear_rtv() -> ClearRenderTargetView {
+        ClearRenderTargetView {
+            slot: 0,
+            rect: None,
+            color: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    fn clear_dsv() -> ClearDepthStencilView {
+        ClearDepthStencilView {
+            depth: Some(1.0),
+            stencil: None,
+            rect: None,
+        }
+    }
+
+    fn pitched_copy() -> CopyBufferToTexture {
+        CopyBufferToTexture {
+            allocation_id: 21,
+            generation: 3,
+            offset: 0,
+            bytes_per_row: 256,
+            bytes_per_image: 0,
+            extent: [4, 4, 1],
+            mip_level: 0,
+            slice: 0,
+            origin: [0, 0, 0],
+        }
+    }
+
+    fn new_state_commands() -> Vec<CommandV3> {
+        vec![
+            CommandV3::SetBlendState(blend_state(2)),
+            CommandV3::SetDepthStencilState(depth_stencil_state()),
+            CommandV3::SetRasterizerState(rasterizer_state()),
+            CommandV3::SetStencilRef(StencilRef { value: 9 }),
+            CommandV3::SetBlendFactor(BlendFactorValue {
+                value: [0.5, 0.25, 0.125, 1.0],
+            }),
+            CommandV3::ClearRenderTargetView(clear_rtv()),
+            CommandV3::ClearDepthStencilView(clear_dsv()),
+            CommandV3::CopyBufferToTexture(pitched_copy()),
+        ]
+    }
+
+    #[test]
+    fn wire_v3_render_state_commands_roundtrip_and_reject_bad_fields() {
+        for command in new_state_commands() {
+            assert_roundtrip(&submission_with(vec![command]));
+        }
+
+        assert_encode_error(
+            CommandV3::SetBlendState(blend_state(0)),
+            WireError::ZeroBlendAttachments,
+        );
+        assert_encode_error(
+            CommandV3::SetBlendState(blend_state(9)),
+            WireError::TooManyBlendAttachments(9),
+        );
+        // 8 entries are the maximum and must round-trip.
+        assert_roundtrip(&submission_with(vec![CommandV3::SetBlendState(blend_state(
+            8,
+        ))]));
+
+        let blend = single_frame(CommandV3::SetBlendState(blend_state(1)));
+        assert_decode_error(
+            &blend,
+            COMMAND_START + 13,
+            &12u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "blend factor",
+                code: 12,
+            },
+        );
+        assert_decode_error(
+            &blend,
+            COMMAND_START + 15,
+            &9u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "blend operation",
+                code: 9,
+            },
+        );
+        assert_decode_error(
+            &blend,
+            COMMAND_START + 12,
+            &2u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "blend enable",
+                code: 2,
+            },
+        );
+        assert_decode_error(
+            &blend,
+            COMMAND_START + 6,
+            &2u16.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "independent blend",
+                code: 2,
+            },
+        );
+        assert_decode_error(&blend, COMMAND_START + 10, &[1, 0], WireError::NonZeroReserved);
+
+        let depth = single_frame(CommandV3::SetDepthStencilState(depth_stencil_state()));
+        assert_decode_error(
+            &depth,
+            COMMAND_START + 6,
+            &9u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "comparison function",
+                code: 9,
+            },
+        );
+        assert_decode_error(
+            &depth,
+            COMMAND_START + 8,
+            &9u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "stencil operation",
+                code: 9,
+            },
+        );
+        assert_decode_error(
+            &depth,
+            COMMAND_START + 4,
+            &2u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "depth enable",
+                code: 2,
+            },
+        );
+
+        let raster = single_frame(CommandV3::SetRasterizerState(rasterizer_state()));
+        assert_decode_error(
+            &raster,
+            COMMAND_START + 4,
+            &1u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "fill mode",
+                code: 1,
+            },
+        );
+        assert_decode_error(
+            &raster,
+            COMMAND_START + 5,
+            &4u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "cull mode",
+                code: 4,
+            },
+        );
+        assert_decode_error(
+            &raster,
+            COMMAND_START + 6,
+            &2u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "front-face winding",
+                code: 2,
+            },
+        );
+        assert_decode_error(
+            &raster,
+            COMMAND_START + 7,
+            &2u8.to_le_bytes(),
+            WireError::InvalidEnumCode {
+                field: "depth clip enable",
+                code: 2,
+            },
+        );
+
+        let clear = single_frame(CommandV3::ClearRenderTargetView(clear_rtv()));
+        assert_decode_error(
+            &clear,
+            COMMAND_START + 6,
+            &2u16.to_le_bytes(),
+            WireError::UnsupportedFlags(2),
+        );
+        assert_encode_error(
+            CommandV3::ClearRenderTargetView(ClearRenderTargetView {
+                slot: 8,
+                ..clear_rtv()
+            }),
+            WireError::TooManyColorAttachments(9),
+        );
+        let mut rect_clear = clear_rtv();
+        rect_clear.rect = Some(ScissorRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        });
+        assert_encode_error(
+            CommandV3::ClearRenderTargetView(rect_clear),
+            WireError::ZeroExtent {
+                field: "clear rect width",
+            },
+        );
+        assert_decode_error(
+            &clear,
+            COMMAND_START + 24,
+            &4u32.to_le_bytes(),
+            WireError::NonZeroReserved,
+        );
+
+        let dsv = single_frame(CommandV3::ClearDepthStencilView(clear_dsv()));
+        assert_encode_error(
+            CommandV3::ClearDepthStencilView(ClearDepthStencilView {
+                depth: None,
+                stencil: None,
+                rect: None,
+            }),
+            WireError::EmptyClear,
+        );
+        assert_decode_error(
+            &dsv,
+            COMMAND_START + 4,
+            &8u16.to_le_bytes(),
+            WireError::UnsupportedFlags(8),
+        );
+        // A stencil value without the stencil plane flag is a reserved word.
+        assert_decode_error(
+            &dsv,
+            COMMAND_START + 12,
+            &5u32.to_le_bytes(),
+            WireError::NonZeroReserved,
+        );
+
+        let copy = single_frame(CommandV3::CopyBufferToTexture(pitched_copy()));
+        let mut zero_row = pitched_copy();
+        zero_row.bytes_per_row = 0;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(zero_row),
+            WireError::ZeroExtent {
+                field: "copy source row pitch",
+            },
+        );
+        let mut misaligned = pitched_copy();
+        misaligned.offset = 2;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(misaligned),
+            WireError::InvalidEnumCode {
+                field: "copy source offset alignment",
+                code: 2,
+            },
+        );
+        let mut volume = pitched_copy();
+        volume.extent = [4, 4, 2];
+        volume.bytes_per_image = 0;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(volume),
+            WireError::ZeroExtent {
+                field: "copy source image pitch",
+            },
+        );
+        volume.bytes_per_image = 512;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(volume),
+            WireError::OffsetOverflow,
+        );
+        volume.bytes_per_image = 1024;
+        assert_roundtrip(&submission_with(vec![CommandV3::CopyBufferToTexture(
+            volume,
+        )]));
+        let mut zero_alloc = pitched_copy();
+        zero_alloc.allocation_id = 0;
+        assert_encode_error(
+            CommandV3::CopyBufferToTexture(zero_alloc),
+            WireError::ZeroAllocationId,
+        );
+        assert_decode_error(
+            &copy,
+            COMMAND_START + 4,
+            &[0; 8],
+            WireError::ZeroAllocationId,
+        );
+        assert_decode_error(
+            &copy,
+            COMMAND_START + 24,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "copy source row pitch",
+            },
+        );
+        assert_decode_error(
+            &copy,
+            COMMAND_START + 32,
+            &0u32.to_le_bytes(),
+            WireError::ZeroExtent {
+                field: "copy region width",
+            },
+        );
+    }
+
+    #[test]
+    fn wire_v3_render_state_opcodes_reject_every_truncated_prefix() {
+        for command in new_state_commands() {
+            let frame = single_frame(command);
+            for length in 0..frame.len() {
+                assert!(
+                    decode_submission_v3(&frame[..length]).is_err(),
+                    "prefix {length} of a render-state opcode must not decode"
+                );
+            }
+            assert!(decode_submission_v3(&frame).is_ok());
+        }
     }
 }

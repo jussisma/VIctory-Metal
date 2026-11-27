@@ -31,7 +31,9 @@ use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::texture::VmTextureId;
 use crate::transport::MetalError;
-use crate::wire_v3::{CommandV3, MAX_COLOR_ATTACHMENTS};
+use crate::wire_v3::{
+    BlendState, CommandV3, DepthStencilState, MAX_COLOR_ATTACHMENTS,
+};
 
 /// `MTLPixelFormatRGBA8Unorm`.
 const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
@@ -624,6 +626,10 @@ pub struct GraphicsPipeline {
     color_formats: Vec<PixelFormat>,
     depth_format: Option<PixelFormat>,
     depth_state: Option<ObjcObject>,
+    /// Blend state baked into the pipeline state (ADR-026a).
+    blend: Option<BlendState>,
+    /// Depth/stencil parameters the pipeline's depth state was built from.
+    depth_params: Option<DepthStencilState>,
 }
 
 impl GraphicsPipeline {
@@ -665,6 +671,38 @@ impl GraphicsPipeline {
         color_formats: &[PixelFormat],
         depth_format: Option<PixelFormat>,
     ) -> Result<Self, MetalError> {
+        Self::compile_mrt_with_state(
+            transport,
+            source,
+            vertex_entry,
+            fragment_entry,
+            color_formats,
+            depth_format,
+            None,
+            None,
+        )
+    }
+
+    /// Compiles a pipeline with the recorded blend and depth-stencil state.
+    ///
+    /// Metal bakes per-attachment blending into `MTLRenderPipelineState`, so a
+    /// blend state can only take effect when the pipeline is created from the
+    /// same recorded state. A caller that passes `None` keeps the previous
+    /// behaviour: no blending and, with a depth format, `Less` plus depth
+    /// writes. The wire `SetBlendState` command is still validated against the
+    /// baked state so a mismatch is an explicit error rather than a silent
+    /// default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_mrt_with_state(
+        transport: &DirectMetalTransport,
+        source: &str,
+        vertex_entry: &str,
+        fragment_entry: &str,
+        color_formats: &[PixelFormat],
+        depth_format: Option<PixelFormat>,
+        blend: Option<&BlendState>,
+        depth_params: Option<&DepthStencilState>,
+    ) -> Result<Self, MetalError> {
         if source.is_empty() || vertex_entry.is_empty() || fragment_entry.is_empty() {
             return Err(MetalError::InvalidArg(
                 "MSL source and both entry point names must be non-empty",
@@ -685,6 +723,23 @@ impl GraphicsPipeline {
         {
             return Err(MetalError::InvalidArg(
                 "render pipeline depth format must be Depth32Float or Depth32Float_Stencil8",
+            ));
+        }
+        if let Some(blend) = blend {
+            if blend.attachments.is_empty() {
+                return Err(MetalError::InvalidArg(
+                    "blend state must have at least one render-target entry",
+                ));
+            }
+            if blend.independent_blend && blend.attachments.len() != color_formats.len() {
+                return Err(MetalError::InvalidArg(
+                    "independent blend state must have one entry per colour attachment",
+                ));
+            }
+        }
+        if depth_params.is_some() && depth_format.is_none() {
+            return Err(MetalError::InvalidArg(
+                "depth-stencil state requires a depth attachment format",
             ));
         }
 
@@ -761,6 +816,28 @@ impl GraphicsPipeline {
                     objc::sel(c"setPixelFormat:"),
                     format.mtl_pixel_format(),
                 );
+                if let Some(blend) = blend {
+                    // Independent blending uses each target's own entry; the
+                    // shared mode replicates entry 0 onto every target, exactly
+                    // like D3D12.
+                    let entry = if blend.independent_blend {
+                        blend.attachments.get(index)
+                    } else {
+                        blend.attachments.first()
+                    };
+                    if let Some(entry) = entry {
+                        crate::macos::state::apply_blend_attachment(attachment, entry)?;
+                    }
+                }
+            }
+            if let Some(blend) = blend
+                && blend.alpha_to_coverage
+            {
+                objc::msg_send_void_u8(
+                    descriptor.as_raw(),
+                    objc::sel(c"setAlphaToCoverageEnabled:"),
+                    1,
+                );
             }
             if let Some(format) = depth_format {
                 msg_send_void_usize(
@@ -779,7 +856,12 @@ impl GraphicsPipeline {
         }
 
         let depth_state = match depth_format {
-            Some(_) => Some(new_less_depth_state(transport)?),
+            Some(_) => match depth_params {
+                Some(params) => Some(crate::macos::state::new_depth_stencil_state(
+                    transport, params,
+                )?),
+                None => Some(new_less_depth_state(transport)?),
+            },
             None => None,
         };
 
@@ -805,6 +887,8 @@ impl GraphicsPipeline {
             color_formats: color_formats.to_vec(),
             depth_format,
             depth_state,
+            blend: blend.cloned(),
+            depth_params: depth_params.copied(),
         })
     }
 
@@ -826,6 +910,16 @@ impl GraphicsPipeline {
     /// Raw `MTLDepthStencilState` handle, when the pipeline tests depth.
     pub(crate) fn depth_state_raw(&self) -> Option<objc::Id> {
         self.depth_state.as_ref().map(ObjcObject::as_raw)
+    }
+
+    /// Blend state baked into this pipeline, when it was compiled with one.
+    pub(crate) fn blend_state(&self) -> Option<&BlendState> {
+        self.blend.as_ref()
+    }
+
+    /// Depth/stencil parameters this pipeline's depth state was built from.
+    pub(crate) fn depth_params(&self) -> Option<&DepthStencilState> {
+        self.depth_params.as_ref()
     }
 }
 
@@ -1013,6 +1107,15 @@ impl<'a> RenderEncoder<'a> {
         Ok(())
     }
 
+    /// Binds a raw `MTLDepthStencilState` on the live encoder.
+    pub(crate) fn set_depth_stencil_state(&mut self, state: objc::Id) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is live and `state` is a live cached
+        // `MTLDepthStencilState` owned by the device.
+        unsafe { objc::msg_send_void_1(self.enc, objc::sel(c"setDepthStencilState:"), state) };
+        Ok(())
+    }
+
     /// Emits an explicit `memoryBarrierWithScope:` on the active encoder.
     pub(crate) fn memory_barrier(&mut self, scope: usize) -> Result<(), MetalError> {
         self.ensure_encoder()?;
@@ -1064,6 +1167,33 @@ impl<'a> RenderEncoder<'a> {
         // `MTLScissorRect` argument layout.
         unsafe { msg_send_void_scissor(self.enc, objc::sel(c"setScissorRect:"), rect) };
         Ok(())
+    }
+
+    /// Applies cull, winding, fill and depth bias from a wire rasterizer state.
+    pub(crate) fn apply_rasterizer_state(
+        &mut self,
+        state: &crate::wire_v3::RasterizerState,
+    ) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder created by
+        // `ensure_encoder`.
+        unsafe { crate::macos::state::apply_rasterizer(self.enc, state) }
+    }
+
+    /// Applies the wire stencil reference value.
+    pub(crate) fn apply_stencil_ref(&mut self, value: u8) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder created by
+        // `ensure_encoder`.
+        unsafe { crate::macos::state::apply_stencil_ref(self.enc, value) }
+    }
+
+    /// Applies the wire blend colour constant.
+    pub(crate) fn apply_blend_color(&mut self, color: [f32; 4]) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder created by
+        // `ensure_encoder`.
+        unsafe { crate::macos::state::apply_blend_color(self.enc, color) }
     }
 
     /// Binds an `MTLBuffer` for the vertex stage at `index`.
@@ -2373,6 +2503,31 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                 cursor = index + 1;
                 pending_work_state = 0;
             }
+            CommandV3::CopyBufferToTexture(copy) => {
+                if pass_open.is_some() {
+                    return Err(plan_error("buffer-to-texture copy inside an open render pass"));
+                }
+                if copy.extent.contains(&0) {
+                    return Err(plan_error(
+                        "texture copy width, height and depth must be nonzero",
+                    ));
+                }
+                match current {
+                    Some((WorkKind::Blit, segment_index)) => {
+                        if let SegmentKind::Blit(range) = &mut segments[segment_index].kind {
+                            range.end = index + 1;
+                        }
+                    }
+                    _ => {
+                        segments.push(Segment {
+                            kind: SegmentKind::Blit(cursor..index + 1),
+                        });
+                        current = Some((WorkKind::Blit, segments.len() - 1));
+                    }
+                }
+                cursor = index + 1;
+                pending_work_state = 0;
+            }
             CommandV3::ResolveSubresource(_) => {
                 if pass_open.is_some() {
                     return Err(plan_error("texture resolve inside an open render pass"));
@@ -2574,13 +2729,25 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             | CommandV3::SetIndexBuffer(_)
             | CommandV3::SetRootConstants(_)
             | CommandV3::SetDescriptorTable(_)
-            | CommandV3::SetRootBufferView(_) => {
+            | CommandV3::SetRootBufferView(_)
+            | CommandV3::SetBlendState(_)
+            | CommandV3::SetDepthStencilState(_)
+            | CommandV3::SetRasterizerState(_)
+            | CommandV3::SetStencilRef(_)
+            | CommandV3::SetBlendFactor(_) => {
                 if pass_open.is_some() {
                     // Inside a pass the contiguous range already covers this
                     // command up to `EndRenderPass`.
                     continue;
                 }
                 pending_work_state += 1;
+            }
+            CommandV3::ClearRenderTargetView(_) | CommandV3::ClearDepthStencilView(_) => {
+                if pass_open.is_none() {
+                    return Err(plan_error(
+                        "clear requires an open render pass; use the pass load action outside one",
+                    ));
+                }
             }
         }
     }

@@ -32,13 +32,14 @@ use crate::macos::render::{
 };
 use crate::macos::residency::ResidencySet;
 use crate::macos::retire::RetireQueue;
+use crate::macos::state::{self, DepthStencilCache};
 use crate::macos::texture::VmTextureId;
 use crate::macos::{blit, indirect};
 use crate::transport::{MetalError, MetalTransport};
 use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
 use crate::wire_v3::{
-    BeginRenderPass, CommandV3, DescriptorKind, IndexFormat, LoadOp, PrimitiveTopology, StoreOp,
-    SubmissionV3,
+    BeginRenderPass, CommandV3, DescriptorKind, IndexFormat, LoadOp, PrimitiveTopology,
+    RasterizerState, StoreOp, SubmissionV3,
 };
 
 /// How many executed list identities the v3 entry point remembers.
@@ -137,6 +138,8 @@ pub(crate) struct DeviceState {
     /// v3 list identities already executed or executing.
     executed_lists: HashSet<(u64, u32)>,
     executed_list_order: VecDeque<(u64, u32)>,
+    /// `MTLDepthStencilState` objects built from wire depth/stencil commands.
+    depth_states: DepthStencilCache,
 }
 
 impl DeviceState {
@@ -981,6 +984,7 @@ impl DirectMetalTransport {
                 residency: None,
                 executed_lists: HashSet::new(),
                 executed_list_order: VecDeque::new(),
+                depth_states: DepthStencilCache::new(),
             }),
             async_submit,
         })
@@ -2694,8 +2698,17 @@ enum PreparedRenderOp {
         state: objc::Id,
         depth_state: Option<DepthState>,
     },
+    /// Binds a depth/stencil state built from a wire `SetDepthStencilState`.
+    /// The id is owned by the device's [`DepthStencilCache`].
+    DepthStencil(objc::Id),
     Viewport(RenderViewport),
     Scissor(RenderScissorRect),
+    /// Encoder-level rasterizer state (cull, winding, fill, depth bias).
+    Rasterizer(RasterizerState),
+    /// Stencil reference value (`OMSetStencilRef`).
+    StencilRef(u8),
+    /// Blend colour constant (`OMSetBlendFactor`).
+    BlendColor([f32; 4]),
     VertexBuffers(Vec<BoundVertex>),
     VertexBytes {
         slot: usize,
@@ -2790,6 +2803,8 @@ enum PreparedBlitOp {
     },
     /// Explicit texel-box copy with independent origins.
     CopyTextureRegion(blit::TextureRegion),
+    /// Pitched upload-buffer to texture copy.
+    CopyBufferToTexture(blit::BufferTextureCopy),
     /// Multisample resolve into a single-sample subresource.
     ResolveSubresource {
         src: blit::TextureSubresourceRef,
@@ -2804,12 +2819,22 @@ enum PreparedBlitOp {
 enum PreparedSegment {
     Compute(Vec<PreparedComputeOp>),
     Render {
-        descriptor: objc::Id,
+        /// One render pass per sub-pass; an explicit clear inside a pass splits
+        /// the pass so the clear becomes the next sub-pass's load action.
+        passes: Vec<PreparedRenderPass>,
         width: u32,
         height: u32,
-        ops: Vec<PreparedRenderOp>,
     },
     Blit(Vec<PreparedBlitOp>),
+}
+
+/// One `MTLRenderCommandEncoder` sub-pass of a v3 render pass.
+struct PreparedRenderPass {
+    /// Descriptor owned by the submission's autorelease pool.
+    descriptor: objc::Id,
+    /// Replayed commands, including the state prefix when the sub-pass follows
+    /// an explicit clear.
+    ops: Vec<PreparedRenderOp>,
 }
 
 fn to_usize(value: u64) -> Result<usize, MetalError> {
@@ -3857,14 +3882,38 @@ fn prepare_compute_segment(
 }
 
 /// Validates and prepares one render segment, including its pass descriptor.
+/// One explicit clear recorded inside a render pass.
+#[derive(Clone, Copy)]
+enum ClearSpec {
+    Color {
+        slot: usize,
+        color: [f64; 4],
+    },
+    Depth {
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    },
+}
+
+/// Prepares one v3 render pass, splitting it at explicit clears.
+///
+/// A Metal render encoder has no clear command. An explicit
+/// `ClearRenderTargetView`/`ClearDepthStencilView` recorded inside the pass is
+/// therefore encoded by closing the current encoder and opening a continuation
+/// pass whose load action is `Clear` for the named plane and `Load` for every
+/// other attachment. The continuation replays the pass's state (pipeline,
+/// viewport, bindings) but not its earlier draws, so draw order is preserved.
+/// This is the "fold into the next pass load action" rule; a clear is never
+/// silently dropped. Partial-rectangle clears cannot be expressed as a load
+/// action and are refused explicitly.
 fn prepare_render_segment(
-    state: &DeviceState,
+    state: &mut DeviceState,
     transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     range: Range<usize>,
     pass: &BeginRenderPass,
-) -> Result<(objc::Id, u32, u32, Vec<PreparedRenderOp>), PrepareAbort> {
+) -> Result<(Vec<PreparedRenderPass>, u32, u32), PrepareAbort> {
     let device = transport.device_raw();
     let mut colors = Vec::with_capacity(pass.colors.len());
     let mut color_formats = Vec::with_capacity(pass.colors.len());
@@ -3952,8 +4001,265 @@ fn prepare_render_segment(
         None => None,
     };
 
-    let descriptor = build_mrt_render_pass_descriptor(&colors, depth.as_ref())?;
+    // Group clears that are adjacent in the command stream, so two clears of
+    // two attachments share one continuation pass.
+    let mut groups: Vec<(usize, Vec<ClearSpec>)> = Vec::new();
+    for index in range.clone() {
+        match &commands[index] {
+            CommandV3::ClearRenderTargetView(clear) => {
+                if clear.rect.is_some() {
+                    return Err(MetalError::InvalidArg(
+                        "partial-rect clears are not supported; clear the whole attachment",
+                    )
+                    .into());
+                }
+                if usize::from(clear.slot) >= colors.len() {
+                    return Err(MetalError::InvalidArg(
+                        "clear slot names an attachment the pass does not have",
+                    )
+                    .into());
+                }
+                let spec = ClearSpec::Color {
+                    slot: usize::from(clear.slot),
+                    color: [
+                        f64::from(clear.color[0]),
+                        f64::from(clear.color[1]),
+                        f64::from(clear.color[2]),
+                        f64::from(clear.color[3]),
+                    ],
+                };
+                push_clear_group(&mut groups, index, spec);
+            }
+            CommandV3::ClearDepthStencilView(clear) => {
+                if clear.rect.is_some() {
+                    return Err(MetalError::InvalidArg(
+                        "partial-rect clears are not supported; clear the whole attachment",
+                    )
+                    .into());
+                }
+                let raw_depth = depth.as_ref().ok_or(MetalError::InvalidArg(
+                    "depth/stencil clear requires a depth attachment in the pass",
+                ))?;
+                if clear.stencil.is_some() && !raw_depth.has_stencil {
+                    return Err(MetalError::InvalidArg(
+                        "stencil clear requires a depth-stencil attachment format",
+                    )
+                    .into());
+                }
+                let spec = ClearSpec::Depth {
+                    depth: clear.depth,
+                    stencil: clear.stencil,
+                };
+                push_clear_group(&mut groups, index, spec);
+            }
+            _ => {}
+        }
+    }
+    // A group is only a boundary if the clear is the first command of the
+    // group after a run of non-clear commands; adjacent groups are merged by
+    // `push_clear_group`.
+    let groups = merge_clear_groups(commands, range.clone(), groups);
 
+    let mut passes = Vec::with_capacity(groups.len() + 1);
+    let mut cursor = range.start;
+    let mut previous_clears: &[ClearSpec] = &[];
+    let mut first = true;
+    for (clear_at, clears) in &groups {
+        let ops = build_render_ops(
+            device,
+            state,
+            transport,
+            allocations,
+            commands,
+            range.start,
+            cursor..*clear_at,
+            &color_formats,
+            depth_format,
+            width,
+            height,
+        )?;
+        let (descriptor_colors, descriptor_depth) = if first {
+            (colors.clone(), depth)
+        } else {
+            (
+                continuation_colors(&colors, previous_clears, false),
+                continuation_depth(depth.as_ref(), previous_clears, false),
+            )
+        };
+        let descriptor = build_mrt_render_pass_descriptor(
+            &descriptor_colors,
+            descriptor_depth.as_ref(),
+        )?;
+        passes.push(PreparedRenderPass { descriptor, ops });
+        cursor = *clear_at;
+        previous_clears = clears;
+        first = false;
+    }
+    let final_ops = build_render_ops(
+        device,
+        state,
+        transport,
+        allocations,
+        commands,
+        range.start,
+        cursor..range.end,
+        &color_formats,
+        depth_format,
+        width,
+        height,
+    )?;
+    let (final_colors, final_depth) = if first {
+        (colors, depth)
+    } else {
+        (
+            continuation_colors(&colors, previous_clears, true),
+            continuation_depth(depth.as_ref(), previous_clears, true),
+        )
+    };
+    let final_descriptor =
+        build_mrt_render_pass_descriptor(&final_colors, final_depth.as_ref())?;
+    passes.push(PreparedRenderPass {
+        descriptor: final_descriptor,
+        ops: final_ops,
+    });
+    Ok((passes, width, height))
+}
+
+/// Records one clear at its command index, merging adjacent clears.
+fn push_clear_group(groups: &mut Vec<(usize, Vec<ClearSpec>)>, index: usize, spec: ClearSpec) {
+    match groups.last_mut() {
+        Some((last_index, specs)) if *last_index == index => specs.push(spec),
+        _ => groups.push((index, vec![spec])),
+    }
+}
+
+/// Merges clear groups that have no non-clear command between them.
+fn merge_clear_groups(
+    commands: &[CommandV3],
+    range: Range<usize>,
+    groups: Vec<(usize, Vec<ClearSpec>)>,
+) -> Vec<(usize, Vec<ClearSpec>)> {
+    let mut merged: Vec<(usize, Vec<ClearSpec>)> = Vec::new();
+    for (index, specs) in groups {
+        let adjacent = merged.last().is_some_and(|(previous, _)| {
+            (*previous..index).all(|position| {
+                position < range.start
+                    || position >= range.end
+                    || matches!(
+                        commands[position],
+                        CommandV3::ClearRenderTargetView(_)
+                            | CommandV3::ClearDepthStencilView(_)
+                    )
+            })
+        });
+        if adjacent {
+            if let Some((_, previous_specs)) = merged.last_mut() {
+                previous_specs.extend(specs);
+            }
+        } else {
+            merged.push((index, specs));
+        }
+    }
+    merged
+}
+
+/// Builds the colour attachment list of one sub-pass.
+///
+/// Sub-pass 0 keeps the pass's recorded load/store actions; a continuation
+/// loads every attachment, applies the clears that start it, and stores so the
+/// next sub-pass can load it (the final sub-pass keeps the recorded store
+/// actions).
+fn continuation_colors(
+    colors: &[RawColorAttachment],
+    clears: &[ClearSpec],
+    final_pass: bool,
+) -> Vec<RawColorAttachment> {
+    let mut out = colors.to_vec();
+    for clear in clears {
+        if let ClearSpec::Color { slot, color } = clear {
+            if let Some(attachment) = out.get_mut(*slot) {
+                attachment.load = LoadAction::Clear;
+                attachment.clear_color = *color;
+            }
+        }
+    }
+    if !final_pass {
+        for attachment in &mut out {
+            if attachment.load != LoadAction::Clear {
+                attachment.load = LoadAction::Load;
+            }
+            attachment.store = StoreAction::Store;
+        }
+    } else {
+        for attachment in &mut out {
+            if attachment.load != LoadAction::Clear {
+                attachment.load = LoadAction::Load;
+            }
+        }
+    }
+    out
+}
+
+/// Builds the optional depth attachment of one sub-pass.
+fn continuation_depth(
+    depth: Option<&RawDepthAttachment>,
+    clears: &[ClearSpec],
+    final_pass: bool,
+) -> Option<RawDepthAttachment> {
+    let mut out = *depth?;
+    for clear in clears {
+        if let ClearSpec::Depth { depth, stencil } = clear {
+            if let Some(value) = depth {
+                out.depth_load = LoadAction::Clear;
+                out.clear_depth = f64::from(*value);
+            }
+            if let Some(value) = stencil {
+                out.stencil_load = LoadAction::Clear;
+                out.clear_stencil = *value;
+            }
+        }
+    }
+    if !final_pass {
+        if out.depth_load != LoadAction::Clear {
+            out.depth_load = LoadAction::Load;
+        }
+        if out.stencil_load != LoadAction::Clear {
+            out.stencil_load = LoadAction::Load;
+        }
+        out.depth_store = StoreAction::Store;
+        out.stencil_store = StoreAction::Store;
+    } else {
+        if out.depth_load != LoadAction::Clear {
+            out.depth_load = LoadAction::Load;
+        }
+        if out.stencil_load != LoadAction::Clear {
+            out.stencil_load = LoadAction::Load;
+        }
+    }
+    Some(out)
+}
+
+/// Builds the replayed ops of one render sub-pass.
+///
+/// `state_from` is the first command of the pass; commands in
+/// `state_from..emit.start` are replayed as state only (draws and barriers are
+/// skipped) so a sub-pass that follows an explicit clear starts from the same
+/// pipeline, viewport, buffers and bindings as the pass did. Clear commands are
+/// never replayed: each one is the load action of the sub-pass it starts.
+#[allow(clippy::too_many_arguments)]
+fn build_render_ops(
+    device: objc::Id,
+    state: &mut DeviceState,
+    transport: &DirectMetalTransport,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: &[CommandV3],
+    state_from: usize,
+    emit: Range<usize>,
+    color_formats: &[PixelFormat],
+    depth_format: Option<PixelFormat>,
+    width: u32,
+    height: u32,
+) -> Result<Vec<PreparedRenderOp>, PrepareAbort> {
     let mut ops = Vec::new();
     let mut mesh_pipeline: Option<u64> = None;
     let mut current_pipeline = false;
@@ -3962,14 +4268,31 @@ fn prepare_render_segment(
     // Root-signature state of the selected pipeline and its collected bindings.
     let mut abi: Option<PipelineAbi> = None;
     let mut pending = AbiPending::default();
-    for index in range {
+    // Last-applied encoder state, so a repeated Set command emits no redundant
+    // Metal call inside one sub-pass.
+    let mut last_rasterizer: Option<RasterizerState> = None;
+    let mut last_stencil_ref: Option<u8> = None;
+    let mut last_blend_color: Option<[f32; 4]> = None;
+    let mut last_depth_state: Option<objc::Id> = None;
+    // D3D12 depth/stencil state is independent of the PSO. Once a wire state is
+    // set, pipeline selection must not overwrite it with the pipeline default.
+    let mut depth_overridden = false;
+    // Blend is baked into the pipeline state; a wire blend state is checked
+    // against the selected pipeline so a mismatch is an explicit error.
+    let mut current_blend: Option<crate::wire_v3::BlendState> = None;
+    let mut selected_blend: Option<Option<crate::wire_v3::BlendState>> = None;
+    for index in state_from..emit.end {
+        if index < emit.start && is_work_command(&commands[index]) {
+            continue;
+        }
         match &commands[index] {
             CommandV3::BeginRenderPass(_) | CommandV3::EndRenderPass => continue,
+            CommandV3::ClearRenderTargetView(_) | CommandV3::ClearDepthStencilView(_) => continue,
             CommandV3::SetGraphicsPipeline(pipeline) => {
                 let mut depth_state = None;
                 let state_raw;
                 if let Some(graphics) = state.render_pipelines.get(&pipeline.pipeline_id) {
-                    if graphics.color_formats() != color_formats.as_slice() {
+                    if graphics.color_formats() != color_formats {
                         return Err(MetalError::InvalidArg(
                             "graphics pipeline colour formats do not match the render pass",
                         )
@@ -3981,16 +4304,25 @@ fn prepare_render_segment(
                         )
                         .into());
                     }
+                    check_blend_state(
+                        current_blend.as_ref(),
+                        PipelineBlend::Legacy(graphics.blend_state()),
+                    )?;
+                    selected_blend = Some(graphics.blend_state().cloned());
                     state_raw = graphics.state_raw();
-                    depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                    if !depth_overridden {
+                        depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                    }
                 } else {
                     // Content-hashed registry pipeline: the attachment state is
                     // part of the content key and must match this pass exactly.
                     let entry =
                         resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Graphics)?;
-                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    check_pipeline_attachments(entry, color_formats, depth_format)?;
+                    check_blend_state(current_blend.as_ref(), PipelineBlend::ContentHashed)?;
+                    selected_blend = Some(None);
                     state_raw = entry.raw();
-                    if entry.state().depth_format.is_some() {
+                    if !depth_overridden && entry.state().depth_format.is_some() {
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
@@ -4007,7 +4339,7 @@ fn prepare_render_segment(
                 let mut depth_state = None;
                 let state_raw;
                 if let Some(graphics) = state.render_pipelines.get(&pipeline.pipeline_id) {
-                    if graphics.color_formats() != color_formats.as_slice() {
+                    if graphics.color_formats() != color_formats {
                         return Err(MetalError::InvalidArg(
                             "graphics pipeline colour formats do not match the render pass",
                         )
@@ -4019,16 +4351,25 @@ fn prepare_render_segment(
                         )
                         .into());
                     }
+                    check_blend_state(
+                        current_blend.as_ref(),
+                        PipelineBlend::Legacy(graphics.blend_state()),
+                    )?;
+                    selected_blend = Some(graphics.blend_state().cloned());
                     state_raw = graphics.state_raw();
-                    depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                    if !depth_overridden {
+                        depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                    }
                 } else {
                     // Content-hashed registry pipeline: the attachment state is
                     // part of the content key and must match this pass exactly.
                     let entry =
                         resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Graphics)?;
-                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    check_pipeline_attachments(entry, color_formats, depth_format)?;
+                    check_blend_state(current_blend.as_ref(), PipelineBlend::ContentHashed)?;
+                    selected_blend = Some(None);
                     state_raw = entry.raw();
-                    if entry.state().depth_format.is_some() {
+                    if !depth_overridden && entry.state().depth_format.is_some() {
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
@@ -4045,7 +4386,7 @@ fn prepare_render_segment(
                 let mut depth_state = None;
                 let state_raw;
                 if let Some(mesh) = state.mesh_pipelines.get(&pipeline.pipeline_id) {
-                    if mesh.color_formats() != color_formats.as_slice() {
+                    if mesh.color_formats() != color_formats {
                         return Err(MetalError::InvalidArg(
                             "mesh pipeline colour formats do not match the render pass",
                         )
@@ -4057,14 +4398,20 @@ fn prepare_render_segment(
                         )
                         .into());
                     }
+                    check_blend_state(current_blend.as_ref(), PipelineBlend::ContentHashed)?;
+                    selected_blend = Some(None);
                     state_raw = mesh.state_raw();
-                    depth_state = mesh.depth_state_raw().map(DepthState::Borrowed);
+                    if !depth_overridden {
+                        depth_state = mesh.depth_state_raw().map(DepthState::Borrowed);
+                    }
                 } else {
                     let entry =
                         resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Mesh)?;
-                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    check_pipeline_attachments(entry, color_formats, depth_format)?;
+                    check_blend_state(current_blend.as_ref(), PipelineBlend::ContentHashed)?;
+                    selected_blend = Some(None);
                     state_raw = entry.raw();
-                    if entry.state().depth_format.is_some() {
+                    if !depth_overridden && entry.state().depth_format.is_some() {
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
@@ -4076,6 +4423,45 @@ fn prepare_render_segment(
                 });
                 current_pipeline = true;
                 mesh_pipeline = Some(pipeline.pipeline_id);
+            }
+            CommandV3::SetBlendState(blend) => {
+                current_blend = Some(blend.clone());
+                // The pipeline is validated when it is selected; if one is
+                // already bound, check the new state against it now.
+                if selected_blend.is_some() {
+                    check_blend_state(
+                        Some(blend),
+                        selected_blend_to_pipeline(selected_blend.as_ref()),
+                    )?;
+                }
+            }
+            CommandV3::SetDepthStencilState(depth) => {
+                let raw = state
+                    .depth_states
+                    .get_or_create(transport, depth)?;
+                depth_overridden = true;
+                if last_depth_state != Some(raw) {
+                    last_depth_state = Some(raw);
+                    ops.push(PreparedRenderOp::DepthStencil(raw));
+                }
+            }
+            CommandV3::SetRasterizerState(raster) => {
+                if last_rasterizer.as_ref() != Some(raster) {
+                    last_rasterizer = Some(*raster);
+                    ops.push(PreparedRenderOp::Rasterizer(*raster));
+                }
+            }
+            CommandV3::SetStencilRef(reference) => {
+                if last_stencil_ref != Some(reference.value) {
+                    last_stencil_ref = Some(reference.value);
+                    ops.push(PreparedRenderOp::StencilRef(reference.value));
+                }
+            }
+            CommandV3::SetBlendFactor(factor) => {
+                if last_blend_color != Some(factor.value) {
+                    last_blend_color = Some(factor.value);
+                    ops.push(PreparedRenderOp::BlendColor(factor.value));
+                }
             }
             CommandV3::SetViewport(viewport) => {
                 ops.push(PreparedRenderOp::Viewport(validate_viewport(
@@ -4501,7 +4887,94 @@ fn prepare_render_segment(
             }
         }
     }
-    Ok((descriptor, width, height, ops))
+    // A sub-pass can end on state that no draw consumed (for example right
+    // before an explicit clear). Emit those bindings so the encoder is in the
+    // same state the pass had reached.
+    flush_render_abi(
+        device,
+        abi.as_ref(),
+        mesh_pipeline.is_some(),
+        &mut pending,
+        &mut ops,
+    )?;
+    Ok(ops)
+}
+
+/// Whether a command does GPU work rather than only set state.
+///
+/// A sub-pass that follows an explicit clear replays the pass's state but must
+/// not repeat earlier draws, mesh dispatches or barriers.
+fn is_work_command(command: &CommandV3) -> bool {
+    matches!(
+        command,
+        CommandV3::Draw(_)
+            | CommandV3::DrawIndexed(_)
+            | CommandV3::DrawInstanced(_)
+            | CommandV3::DrawIndexedInstanced(_)
+            | CommandV3::ExecuteIndirectDraw(_)
+            | CommandV3::ExecuteIndirectDrawIndexed(_)
+            | CommandV3::ExecuteIndirectDispatchMesh(_)
+            | CommandV3::DispatchMesh(_)
+            | CommandV3::ResourceBarrier(_)
+    )
+}
+
+/// What a selected pipeline can say about its baked blend state.
+#[derive(Clone, Copy)]
+enum PipelineBlend<'a> {
+    /// A legacy `GraphicsPipeline`, which records the blend state it was
+    /// compiled with (`None` when it was compiled without one).
+    Legacy(Option<&'a crate::wire_v3::BlendState>),
+    /// A content-hashed registry pipeline; the registry always compiles
+    /// without blending, so an enabled wire blend state cannot be represented.
+    ContentHashed,
+}
+
+/// Reconstructs the pipeline-blend view of a selection recorded as the owned
+/// state a legacy pipeline declared (`Some(None)` for content-hashed).
+fn selected_blend_to_pipeline(
+    selected: Option<&Option<crate::wire_v3::BlendState>>,
+) -> PipelineBlend<'_> {
+    match selected {
+        Some(Some(blend)) => PipelineBlend::Legacy(Some(blend)),
+        Some(None) => PipelineBlend::ContentHashed,
+        None => PipelineBlend::ContentHashed,
+    }
+}
+
+/// Refuses a wire blend state the selected pipeline cannot represent.
+///
+/// Metal bakes per-attachment blending into the pipeline, so a blend state that
+/// differs from the one the pipeline was compiled with cannot be applied at
+/// draw time. An all-disabled state matches every pipeline (the default) and is
+/// always accepted.
+fn check_blend_state(
+    current: Option<&crate::wire_v3::BlendState>,
+    pipeline: PipelineBlend<'_>,
+) -> Result<(), MetalError> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if !current.alpha_to_coverage && current.attachments.iter().all(|entry| !entry.enable) {
+        return Ok(());
+    }
+    match pipeline {
+        PipelineBlend::Legacy(Some(baked)) => {
+            if *baked == *current {
+                Ok(())
+            } else {
+                Err(MetalError::InvalidArg(
+                    "wire blend state does not match the pipeline's compiled blend state",
+                ))
+            }
+        }
+        PipelineBlend::Legacy(None) => Err(MetalError::InvalidArg(
+            "wire blend state needs a pipeline compiled with the same blend state",
+        )),
+        PipelineBlend::ContentHashed => Err(MetalError::InvalidArg(
+            "content-hashed pipelines cannot represent blend state; compile the pipeline with it",
+        )),
+    }
 }
 
 /// Resolves the index window of an indexed draw against the bound index buffer.
@@ -4695,6 +5168,87 @@ fn prepare_blit_segment(
                 region.validate()?;
                 ops.push(PreparedBlitOp::CopyTextureRegion(region));
             }
+            CommandV3::CopyBufferToTexture(copy) => {
+                let mip = u32::from(copy.mip_level);
+                let slice = u32::from(copy.slice);
+                let (texture, info) = resolve_texture(
+                    state,
+                    allocations,
+                    copy.allocation_id,
+                    copy.generation,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                if mip >= info.mip_levels || slice >= info.slices {
+                    return Err(MetalError::InvalidArg(
+                        "buffer-to-texture copy mip level or slice is out of range",
+                    )
+                    .into());
+                }
+                if copy.extent[2] != 1 {
+                    return Err(MetalError::InvalidArg(
+                        "buffer-to-texture copy supports one depth slice per call",
+                    )
+                    .into());
+                }
+                let level_width = info.width >> mip.min(31);
+                let level_height = info.height >> mip.min(31);
+                if copy.origin[0]
+                    .checked_add(copy.extent[0])
+                    .is_none_or(|end| end > level_width)
+                    || copy.origin[1]
+                        .checked_add(copy.extent[1])
+                        .is_none_or(|end| end > level_height)
+                {
+                    return Err(MetalError::InvalidArg(
+                        "buffer-to-texture copy exceeds the destination extent",
+                    )
+                    .into());
+                }
+                let bpp = u64::from(info.format.bytes_per_texel());
+                let row_bytes = u64::from(copy.bytes_per_row);
+                if row_bytes < u64::from(copy.extent[0]) * bpp {
+                    return Err(MetalError::InvalidArg(
+                        "copy source row pitch is smaller than one destination row",
+                    )
+                    .into());
+                }
+                let rows = u64::from(copy.extent[1]);
+                let needed = row_bytes
+                    .checked_mul(rows)
+                    .ok_or(MetalError::InvalidArg("copy source range overflows"))?;
+                let (buffer, offset, _) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    copy.allocation_id,
+                    copy.generation,
+                    copy.offset,
+                    needed,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                ops.push(PreparedBlitOp::CopyBufferToTexture(
+                    blit::BufferTextureCopy {
+                        buffer,
+                        source_offset: offset,
+                        bytes_per_row: copy.bytes_per_row as usize,
+                        bytes_per_image: copy.bytes_per_image as usize,
+                        destination: blit::TextureSubresourceRef {
+                            texture,
+                            slice: slice as usize,
+                            level: mip as usize,
+                        },
+                        destination_origin: [
+                            copy.origin[0] as usize,
+                            copy.origin[1] as usize,
+                            copy.origin[2] as usize,
+                        ],
+                        size: [
+                            copy.extent[0] as usize,
+                            copy.extent[1] as usize,
+                            copy.extent[2] as usize,
+                        ],
+                    },
+                ));
+            }
             CommandV3::ResolveSubresource(resolve) => {
                 let (src, _) = resolve_texture(
                     state,
@@ -4836,7 +5390,7 @@ fn registry_error(error: RegistryError) -> MetalError {
 
 /// Validates every handle and bound and builds the executable segment plan.
 fn prepare_v3(
-    state: &DeviceState,
+    state: &mut DeviceState,
     transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
@@ -4859,7 +5413,7 @@ fn prepare_v3(
                 let pass = passes.get(*pass_index).ok_or(MetalError::InternalError(
                     "render segment names a missing BeginRenderPass".to_string(),
                 ))?;
-                let (descriptor, width, height, ops) = prepare_render_segment(
+                let (passes, width, height) = prepare_render_segment(
                     state,
                     transport,
                     allocations,
@@ -4868,10 +5422,9 @@ fn prepare_v3(
                     pass,
                 )?;
                 prepared.push(PreparedSegment::Render {
-                    descriptor,
+                    passes,
                     width,
                     height,
-                    ops,
                 });
             }
             SegmentKind::Blit(range) => prepared.push(PreparedSegment::Blit(prepare_blit_segment(
@@ -5525,7 +6078,7 @@ impl DirectMetalTransport {
             }
         }
 
-        let prepared = match prepare_v3(&state, self, allocations, &submission.commands, &plan) {
+        let prepared = match prepare_v3(&mut state, self, allocations, &submission.commands, &plan) {
             Ok(prepared) => prepared,
             Err(PrepareAbort::UnknownHandle) => {
                 self.note_refusal();
@@ -5753,41 +6306,65 @@ impl DirectMetalTransport {
                     }
                 }
                 PreparedSegment::Render {
-                    descriptor,
+                    passes,
                     width,
                     height,
-                    ops,
                 } => {
-                    if ops.iter().any(PreparedRenderOp::is_indirect) {
-                        encode_indirect_render_segment(
-                            cb, descriptor, width, height, &ops, stats, residency,
-                        )?;
-                        for op in ops {
-                            if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
-                                staged.push(argument_buffer.buffer);
-                                staged.extend(argument_buffer.tables);
+                    for pass in passes {
+                        let PreparedRenderPass { descriptor, ops } = pass;
+                        if ops.iter().any(PreparedRenderOp::is_indirect) {
+                            encode_indirect_render_segment(
+                                cb,
+                                descriptor,
+                                width,
+                                height,
+                                &ops,
+                                stats,
+                                residency,
+                            )?;
+                            for op in ops {
+                                if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
+                                    staged.push(argument_buffer.buffer);
+                                    staged.extend(argument_buffer.tables);
+                                }
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    let mut encoder =
-                        RenderEncoder::new_with_descriptor(self, cb, descriptor, width, height);
-                    encoder.ensure_started()?;
-                    stats.render_encoders += 1;
-                    if let Some(residency) = residency {
-                        residency.use_resources(encoder.raw_encoder());
-                    }
-                    for op in &ops {
-                        match op {
-                            PreparedRenderOp::Pipeline { state, depth_state } => {
-                                encoder.set_pipeline_state(
-                                    *state,
-                                    depth_state.as_ref().map(DepthState::raw),
-                                )?;
-                            }
-                            PreparedRenderOp::Viewport(viewport) => {
-                                encoder.set_viewport(*viewport)?;
-                            }
+                        let mut encoder = RenderEncoder::new_with_descriptor(
+                            self,
+                            cb,
+                            descriptor,
+                            width,
+                            height,
+                        );
+                        encoder.ensure_started()?;
+                        stats.render_encoders += 1;
+                        if let Some(residency) = residency {
+                            residency.use_resources(encoder.raw_encoder());
+                        }
+                        for op in &ops {
+                            match op {
+                                PreparedRenderOp::Pipeline { state, depth_state } => {
+                                        encoder.set_pipeline_state(
+                                        *state,
+                                        depth_state.as_ref().map(DepthState::raw),
+                                    )?;
+                                }
+                                PreparedRenderOp::DepthStencil(raw) => {
+                                    encoder.set_depth_stencil_state(*raw)?;
+                                }
+                                PreparedRenderOp::Rasterizer(raster) => {
+                                    encoder.apply_rasterizer_state(raster)?;
+                                }
+                                PreparedRenderOp::StencilRef(value) => {
+                                    encoder.apply_stencil_ref(*value)?;
+                                }
+                                PreparedRenderOp::BlendColor(color) => {
+                                    encoder.apply_blend_color(*color)?;
+                                }
+                                PreparedRenderOp::Viewport(viewport) => {
+                                    encoder.set_viewport(*viewport)?;
+                                }
                             PreparedRenderOp::Scissor(scissor) => {
                                 encoder.set_scissor_rect(*scissor)?;
                             }
@@ -5906,6 +6483,7 @@ impl DirectMetalTransport {
                             staged.extend(argument_buffer.tables);
                         }
                     }
+                    }
                 }
                 PreparedSegment::Blit(ops) => {
                     // SAFETY: `cb` is a live uncommitted command buffer.
@@ -5975,6 +6553,9 @@ impl DirectMetalTransport {
                             }
                             PreparedBlitOp::CopyTextureRegion(region) => {
                                 blit::copy_texture_region(enc, region)?;
+                            }
+                            PreparedBlitOp::CopyBufferToTexture(copy) => {
+                                blit::copy_buffer_to_texture(enc, copy)?;
                             }
                             PreparedBlitOp::ResolveSubresource { src, dst } => {
                                 // A resolve is a render-pass store action, so
@@ -6140,6 +6721,24 @@ fn encode_indirect_render_segment(
                         );
                     }
                 }
+            }
+            PreparedRenderOp::DepthStencil(raw) => {
+                // SAFETY: `raw` is a live cached `MTLDepthStencilState`.
+                unsafe {
+                    objc::msg_send_void_1(enc, objc::sel(c"setDepthStencilState:"), *raw);
+                }
+            }
+            PreparedRenderOp::Rasterizer(raster) => {
+                // SAFETY: `enc` is a live render encoder.
+                unsafe { state::apply_rasterizer(enc, raster)? };
+            }
+            PreparedRenderOp::StencilRef(value) => {
+                // SAFETY: `enc` is a live render encoder.
+                unsafe { state::apply_stencil_ref(enc, *value)? };
+            }
+            PreparedRenderOp::BlendColor(color) => {
+                // SAFETY: `enc` is a live render encoder.
+                unsafe { state::apply_blend_color(enc, *color)? };
             }
             PreparedRenderOp::Viewport(viewport) => {
                 // SAFETY: `enc` is live and the viewport was validated against
