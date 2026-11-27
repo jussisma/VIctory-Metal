@@ -83,6 +83,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::native_metal::bindings::{
+    RootArgument, RootArgumentError, RootArgumentKind, MAX_ROOT_ARGUMENTS,
+};
 use victory_metal::wire::{
     BufferBinding, Dispatch3d, DispatchMesh, ListIdentity, Reply, ReplyStatus, ResourceBarrier,
     WireError, MAX_BINDINGS_PER_DISPATCH,
@@ -90,8 +93,8 @@ use victory_metal::wire::{
 pub use victory_metal::wire::BarrierEntry;
 use victory_metal::wire_v3::{
     BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyBufferToTexture, CopyTexture,
-    CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorTableEntryV3,
-    DescriptorTableV3,
+    CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorKind,
+    DescriptorTableEntryV3, DescriptorTableV3,
     DrawIndexedInstanced, DrawInstanced, ExecuteIndirectDispatch, ExecuteIndirectDispatchMesh,
     ExecuteIndirectDraw, ExecuteIndirectDrawIndexed, IndirectArguments,
     IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
@@ -270,6 +273,54 @@ pub mod hint_census {
                 topology_undefined = undefined,
                 "draw-list hint census"
             );
+        }
+        count
+    }
+
+    /// The counters, in [`NAMES`] order.
+    pub fn counts() -> [u64; NAMES.len()] {
+        std::array::from_fn(|i| COUNTS[i].load(Relaxed))
+    }
+}
+
+/// Root arguments the producer cannot express, counted under bounded names.
+///
+/// A root argument that names a space, a sampler table or a constants write the
+/// translated root signature cannot address is a refusal, never a silent drop.
+/// The counters are logged at powers of two, so a title that repeats one every
+/// frame does not fill the log.
+pub mod root_argument_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The argument names a register space past
+    /// [`bindings::MAX_ROOT_SPACE`](crate::native_metal::bindings::MAX_ROOT_SPACE).
+    pub const UNKNOWN_SPACE: usize = 0;
+    /// A sampler table is not in the sampler space.
+    pub const SAMPLER_NON_SAMPLER_SPACE: usize = 1;
+    /// A constants write reaches past the block the translated pipeline declared.
+    pub const CONSTANTS_BEYOND_BLOCK: usize = 2;
+    /// A root-argument plan is already at its bounded capacity.
+    pub const PLAN_FULL: usize = 3;
+    /// A root-argument record is otherwise malformed.
+    pub const MALFORMED: usize = 4;
+
+    /// The static counter names, in the order of the constants above.
+    pub const NAMES: [&str; 5] = [
+        "root_argument_unknown_space",
+        "root_argument_sampler_non_sampler_space",
+        "root_argument_constants_beyond_block",
+        "root_argument_plan_full",
+        "root_argument_malformed",
+    ];
+
+    static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
+
+    /// Counts one refusal and logs the whole census at powers of two.
+    pub(crate) fn note(outcome: usize) -> u64 {
+        let count = COUNTS[outcome].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            let counts = counts();
+            tracing::warn!(?counts, "root-argument refusal census");
         }
         count
     }
@@ -629,12 +680,28 @@ impl std::error::Error for ProducerError {}
 pub trait WireV3Sink {
     /// Carries one submission to its execution host.
     fn submit(&mut self, submission: &SubmissionV3) -> Result<Reply, ProducerError>;
+
+    /// Carries a submission together with the versioned root-argument plan.
+    ///
+    /// The default keeps a sink that predates the plan working unchanged: it
+    /// forwards the submission and ignores the plan, exactly as an older host
+    /// keeps decoding the version 3 frame it already knows. A transport that
+    /// does carry the plan encodes it with
+    /// [`bindings::encode_root_arguments`](crate::native_metal::bindings::encode_root_arguments).
+    fn submit_with_root_arguments(
+        &mut self,
+        submission: &SubmissionV3,
+        _root_arguments: &[RootArgument],
+    ) -> Result<Reply, ProducerError> {
+        self.submit(submission)
+    }
 }
 
 /// Sink that keeps every submission, for tests and diagnostics.
 #[derive(Debug, Default)]
 pub struct RecordingSink {
     submissions: Vec<SubmissionV3>,
+    root_arguments: Vec<Vec<RootArgument>>,
     status: Option<ReplyStatus>,
 }
 
@@ -648,6 +715,7 @@ impl RecordingSink {
     pub fn with_status(status: ReplyStatus) -> Self {
         Self {
             submissions: Vec::new(),
+            root_arguments: Vec::new(),
             status: Some(status),
         }
     }
@@ -655,6 +723,12 @@ impl RecordingSink {
     /// The submissions received so far.
     pub fn submissions(&self) -> &[SubmissionV3] {
         &self.submissions
+    }
+
+    /// The root-argument plan that arrived with submission `index`, if the
+    /// sink was handed one.
+    pub fn root_arguments(&self, index: usize) -> Option<&[RootArgument]> {
+        self.root_arguments.get(index).map(Vec::as_slice)
     }
 
     /// Takes the submissions received so far.
@@ -666,6 +740,20 @@ impl RecordingSink {
 impl WireV3Sink for RecordingSink {
     fn submit(&mut self, submission: &SubmissionV3) -> Result<Reply, ProducerError> {
         self.submissions.push(submission.clone());
+        self.root_arguments.push(Vec::new());
+        Ok(Reply {
+            sequence: submission.sequence,
+            status: self.status.take().unwrap_or(ReplyStatus::Ok),
+        })
+    }
+
+    fn submit_with_root_arguments(
+        &mut self,
+        submission: &SubmissionV3,
+        root_arguments: &[RootArgument],
+    ) -> Result<Reply, ProducerError> {
+        self.submissions.push(submission.clone());
+        self.root_arguments.push(root_arguments.to_vec());
         Ok(Reply {
             sequence: submission.sequence,
             status: self.status.take().unwrap_or(ReplyStatus::Ok),
@@ -793,6 +881,14 @@ pub struct MetalProducer {
     emitted_compute_pipeline: Option<u64>,
     emitted_mesh_pipeline: Option<u64>,
     commands: Vec<CommandV3>,
+    /// Every root argument recorded so far, with the register space the
+    /// translated root signature binds it in. This is the versioned binding
+    /// plan the submission seam carries; the wire's own root commands keep
+    /// their existing slot/register shape byte-for-byte.
+    root_arguments: Vec<crate::native_metal::bindings::RootArgument>,
+    /// Declared roots-constant blocks, per stage: `(graphics, root parameter,
+    /// space)` to the translated block's dword count.
+    root_constant_blocks: BTreeMap<(bool, u16, u16), u32>,
 }
 
 impl MetalProducer {
@@ -816,6 +912,8 @@ impl MetalProducer {
             emitted_compute_pipeline: None,
             emitted_mesh_pipeline: None,
             commands: Vec::new(),
+            root_arguments: Vec::new(),
+            root_constant_blocks: BTreeMap::new(),
         })
     }
 
@@ -827,6 +925,79 @@ impl MetalProducer {
     /// Commands recorded and not yet flushed.
     pub fn commands(&self) -> &[CommandV3] {
         &self.commands
+    }
+
+    /// Every root argument recorded so far, in the order the title set it.
+    ///
+    /// The records carry the register space each argument is bound in, which
+    /// the wire's root commands cannot express on their own. Same-slot
+    /// arguments in different spaces stay distinct entries.
+    pub fn root_arguments(&self) -> &[RootArgument] {
+        &self.root_arguments
+    }
+
+    /// Encodes [`root_arguments`](Self::root_arguments) as the versioned
+    /// `(root_parameter, space, kind, register/offset, size)` plan.
+    pub fn encode_root_arguments(&self) -> Result<Vec<u8>, RootArgumentError> {
+        crate::native_metal::bindings::encode_root_arguments(&self.root_arguments)
+    }
+
+    /// Declares the translated root-constants block a pipeline gives
+    /// `(root_parameter, space)` on a stage.
+    ///
+    /// A later `Set*Root32BitConstants` that reaches past it is refused by
+    /// name instead of updating bytes the translated shader never reads.
+    pub fn declare_root_constant_block(
+        &mut self,
+        stage: RootSignatureStage,
+        root_parameter: u16,
+        space: u16,
+        dwords: u32,
+    ) {
+        self.root_constant_blocks.insert(
+            (stage == RootSignatureStage::Graphics, root_parameter, space),
+            dwords,
+        );
+    }
+
+    fn record_root_argument(&mut self, argument: RootArgument) -> Result<(), ProducerError> {
+        if self.root_arguments.len() >= MAX_ROOT_ARGUMENTS {
+            root_argument_census::note(root_argument_census::PLAN_FULL);
+            return Err(ProducerError::unsupported(
+                "a root-argument plan is already at its capacity",
+            ));
+        }
+        if let Err(error) = argument.validate() {
+            return Err(refuse_root_argument(error));
+        }
+        self.root_arguments.push(argument);
+        Ok(())
+    }
+
+    fn check_declared_block(
+        &self,
+        stage: RootSignatureStage,
+        root_parameter: u16,
+        space: u16,
+        offset: u32,
+        words: usize,
+    ) -> Result<(), ProducerError> {
+        let key = (
+            stage == RootSignatureStage::Graphics,
+            root_parameter,
+            space,
+        );
+        let Some(&dwords) = self.root_constant_blocks.get(&key) else {
+            return Ok(());
+        };
+        crate::native_metal::bindings::check_constant_block(
+            root_parameter,
+            space,
+            offset,
+            words,
+            dwords,
+        )
+        .map_err(refuse_root_argument)
     }
 
     /// Whether a render pass is open (commands are inside it).
@@ -846,6 +1017,7 @@ impl MetalProducer {
         self.pending_clears.clear();
         self.emitted_compute_pipeline = None;
         self.emitted_mesh_pipeline = None;
+        self.root_arguments.clear();
     }
 
     fn ensure_room(&self, extra: usize) -> Result<(), ProducerError> {
@@ -1368,16 +1540,56 @@ impl MetalProducer {
     }
 
     /// `SetGraphicsRoot32BitConstants`: merges the words into the slot.
+    ///
+    /// The translated graphics root signature puts per-stage user data in
+    /// [`USER_DATA_SPACE`](victory_shader::emit::USER_DATA_SPACE); the call
+    /// keeps its existing slot behaviour and records that space with it.
     pub fn set_graphics_root_constants(
         &mut self,
         slot: u32,
         values: &[u32],
         offset: u32,
     ) -> Result<(), ProducerError> {
+        self.set_graphics_root_constants_at(
+            slot,
+            victory_shader::emit::USER_DATA_SPACE as u16,
+            values,
+            offset,
+        )
+    }
+
+    /// `SetGraphicsRoot32BitConstants` in an explicit register space.
+    ///
+    /// The space is the one the translated root signature binds the block in.
+    /// It is recorded with the argument and checked against any block a
+    /// pipeline declared; the wire command itself keeps the title's slot
+    /// exactly as before.
+    pub fn set_graphics_root_constants_at(
+        &mut self,
+        slot: u32,
+        space: u16,
+        values: &[u32],
+        offset: u32,
+    ) -> Result<(), ProducerError> {
+        let slot_u16 = u16::try_from(slot).map_err(|_| {
+            ProducerError::unsupported_opcode(
+                "SetGraphicsRoot32BitConstants: slot out of range",
+                OP_ROOT_CONSTANTS,
+            )
+        })?;
+        self.check_declared_block(
+            RootSignatureStage::Graphics,
+            slot_u16,
+            space,
+            offset,
+            values.len(),
+        )?;
         let merge = merge_constants(&self.graphics.constants, slot, values, offset)?;
-        self.graphics.constants.insert(slot as u16, merge);
-        self.dirty.constants.insert(slot as u16);
-        Ok(())
+        self.graphics.constants.insert(slot_u16, merge);
+        self.dirty.constants.insert(slot_u16);
+        let argument = RootArgument::constants(slot_u16, space, offset, values.len())
+            .map_err(refuse_root_argument)?;
+        self.record_root_argument(argument)
     }
 
     /// `SetComputeRoot32BitConstants`: merges the words into the slot.
@@ -1390,9 +1602,40 @@ impl MetalProducer {
         values: &[u32],
         offset: u32,
     ) -> Result<(), ProducerError> {
+        self.set_compute_root_constants_at(
+            slot,
+            victory_shader::emit::USER_DATA_SPACE as u16,
+            values,
+            offset,
+        )
+    }
+
+    /// `SetComputeRoot32BitConstants` in an explicit register space.
+    pub fn set_compute_root_constants_at(
+        &mut self,
+        slot: u32,
+        space: u16,
+        values: &[u32],
+        offset: u32,
+    ) -> Result<(), ProducerError> {
+        let slot_u16 = u16::try_from(slot).map_err(|_| {
+            ProducerError::unsupported_opcode(
+                "SetComputeRoot32BitConstants: slot out of range",
+                OP_ROOT_CONSTANTS,
+            )
+        })?;
+        self.check_declared_block(
+            RootSignatureStage::Compute,
+            slot_u16,
+            space,
+            offset,
+            values.len(),
+        )?;
         let merge = merge_constants(&self.compute_constants, slot, values, offset)?;
-        self.compute_constants.insert(slot as u16, merge);
-        Ok(())
+        self.compute_constants.insert(slot_u16, merge);
+        let argument = RootArgument::constants(slot_u16, space, offset, values.len())
+            .map_err(refuse_root_argument)?;
+        self.record_root_argument(argument)
     }
 
     /// A compute root CBV/SRV/UAV (already resolved to an allocation).
@@ -1406,6 +1649,18 @@ impl MetalProducer {
         &mut self,
         view: RootBufferView,
     ) -> Result<(), ProducerError> {
+        self.set_compute_root_buffer_view_at(
+            view,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+        )
+    }
+
+    /// A compute root view in an explicit register space.
+    pub fn set_compute_root_buffer_view_at(
+        &mut self,
+        view: RootBufferView,
+        space: u16,
+    ) -> Result<(), ProducerError> {
         ResourceId::new(view.allocation_id, view.generation)?;
         if view.length == 0 {
             return Err(ProducerError::unsupported_opcode(
@@ -1414,13 +1669,27 @@ impl MetalProducer {
             ));
         }
         self.compute_views.insert(view.slot, view);
-        Ok(())
+        self.record_root_argument(RootArgument::root_view(view.slot, space, view.length as u32))
     }
 
     /// A compute descriptor table (already resolved to buffer ranges).
     pub fn set_compute_descriptor_table(
         &mut self,
         table: DescriptorTableV3,
+    ) -> Result<(), ProducerError> {
+        let space = if table.kind == DescriptorKind::Sampler {
+            victory_shader::emit::SAMPLER_SPACE as u16
+        } else {
+            victory_shader::emit::ROOT_CBV_SPACE as u16
+        };
+        self.set_compute_descriptor_table_at(table, space)
+    }
+
+    /// A compute descriptor table in an explicit register space.
+    pub fn set_compute_descriptor_table_at(
+        &mut self,
+        table: DescriptorTableV3,
+        space: u16,
     ) -> Result<(), ProducerError> {
         if table.bindings.is_empty() {
             return Err(ProducerError::unsupported_opcode(
@@ -1450,6 +1719,20 @@ impl MetalProducer {
                 }
             }
         }
+        let kind = if table.kind == DescriptorKind::Sampler {
+            RootArgumentKind::SamplerTable
+        } else {
+            RootArgumentKind::DescriptorTable
+        };
+        let entries = u32::try_from(table.bindings.len()).unwrap_or(u32::MAX);
+        let argument = RootArgument::descriptor_table(
+            table.set,
+            space,
+            table.base_register,
+            kind,
+            entries,
+        );
+        self.record_root_argument(argument)?;
         self.compute_tables
             .insert((table.set, table.base_register), table);
         Ok(())
@@ -1460,6 +1743,18 @@ impl MetalProducer {
         &mut self,
         view: RootBufferView,
     ) -> Result<(), ProducerError> {
+        self.set_graphics_root_buffer_view_at(
+            view,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+        )
+    }
+
+    /// A graphics root view in an explicit register space.
+    pub fn set_graphics_root_buffer_view_at(
+        &mut self,
+        view: RootBufferView,
+        space: u16,
+    ) -> Result<(), ProducerError> {
         ResourceId::new(view.allocation_id, view.generation)?;
         if view.length == 0 {
             return Err(ProducerError::unsupported_opcode(
@@ -1467,15 +1762,30 @@ impl MetalProducer {
                 OP_SET_ROOT_BUFFER_VIEW,
             ));
         }
+        let length = u32::try_from(view.length).unwrap_or(u32::MAX);
         self.graphics.views.insert(view.slot, view);
         self.dirty.views.insert(view.slot);
-        Ok(())
+        self.record_root_argument(RootArgument::root_view(view.slot, space, length))
     }
 
     /// A graphics descriptor table (already resolved to buffer ranges).
     pub fn set_graphics_descriptor_table(
         &mut self,
         table: DescriptorTableV3,
+    ) -> Result<(), ProducerError> {
+        let space = if table.kind == DescriptorKind::Sampler {
+            victory_shader::emit::SAMPLER_SPACE as u16
+        } else {
+            victory_shader::emit::ROOT_CBV_SPACE as u16
+        };
+        self.set_graphics_descriptor_table_at(table, space)
+    }
+
+    /// A graphics descriptor table in an explicit register space.
+    pub fn set_graphics_descriptor_table_at(
+        &mut self,
+        table: DescriptorTableV3,
+        space: u16,
     ) -> Result<(), ProducerError> {
         if table.bindings.is_empty() {
             return Err(ProducerError::unsupported_opcode(
@@ -1505,6 +1815,20 @@ impl MetalProducer {
                 }
             }
         }
+        let kind = if table.kind == DescriptorKind::Sampler {
+            RootArgumentKind::SamplerTable
+        } else {
+            RootArgumentKind::DescriptorTable
+        };
+        let entries = u32::try_from(table.bindings.len()).unwrap_or(u32::MAX);
+        let argument = RootArgument::descriptor_table(
+            table.set,
+            space,
+            table.base_register,
+            kind,
+            entries,
+        );
+        self.record_root_argument(argument)?;
         let key = (table.set, table.base_register);
         self.graphics.tables.insert(key, table);
         self.dirty.tables.insert(key);
@@ -2155,7 +2479,7 @@ impl MetalProducer {
     pub fn submit<S: WireV3Sink + ?Sized>(&mut self, sink: &mut S) -> Result<Reply, ProducerError> {
         let mut submission = self.flush()?;
         ensure_sequence(&mut submission)?;
-        let reply = sink.submit(&submission)?;
+        let reply = sink.submit_with_root_arguments(&submission, &self.root_arguments)?;
         if reply.sequence != submission.sequence {
             return Err(ProducerError::ReplySequenceMismatch {
                 expected: submission.sequence,
@@ -2631,6 +2955,45 @@ fn same_attachments(
         _ => false,
     };
     same_color && same_depth
+}
+
+/// Turns a root-argument refusal into a named producer error and counts it.
+///
+/// Every case is a call the translated root signature cannot address; the
+/// title sees `E_NOTIMPL` with the argument's own operation name instead of a
+/// binding that silently reaches the wrong parameter.
+fn refuse_root_argument(error: RootArgumentError) -> ProducerError {
+    match error {
+        RootArgumentError::UnknownSpace { .. } => {
+            root_argument_census::note(root_argument_census::UNKNOWN_SPACE);
+            ProducerError::unsupported_opcode(
+                "Set*Root*: the root argument names an unknown register space",
+                OP_ROOT_CONSTANTS,
+            )
+        }
+        RootArgumentError::SamplerNonSamplerSpace { .. } => {
+            root_argument_census::note(root_argument_census::SAMPLER_NON_SAMPLER_SPACE);
+            ProducerError::unsupported_opcode(
+                "Set*RootDescriptorTable: a sampler table is outside the sampler space",
+                OP_DESCRIPTOR_TABLE,
+            )
+        }
+        RootArgumentError::ConstantsBeyondBlock { .. } => {
+            root_argument_census::note(root_argument_census::CONSTANTS_BEYOND_BLOCK);
+            ProducerError::unsupported_opcode(
+                "Set*Root32BitConstants: the write is past the declared root-constant block",
+                OP_ROOT_CONSTANTS,
+            )
+        }
+        RootArgumentError::TooMany(_) => {
+            root_argument_census::note(root_argument_census::PLAN_FULL);
+            ProducerError::unsupported("Set*Root*: the root-argument plan is full")
+        }
+        _ => {
+            root_argument_census::note(root_argument_census::MALFORMED);
+            ProducerError::unsupported("Set*Root*: the root argument is malformed")
+        }
+    }
 }
 
 fn merge_constants(
@@ -5161,5 +5524,85 @@ mod tests {
         producer
             .draw_indexed(3, 1, 0, 0, 0)
             .expect("an index buffer now exists");
+    }
+
+    /// Two root constants with the same title slot but different translated
+    /// spaces stay two records in the encoded plan, in set order.
+    #[test]
+    fn root_constants_with_the_same_slot_but_different_spaces_survive_encoding() {
+        let mut producer = MetalProducer::new(51, 1).expect("producer");
+        producer
+            .set_graphics_root_constants_at(0, 0, &[0x11], 0)
+            .expect("space 0 constants");
+        producer
+            .set_graphics_root_constants_at(0, 1, &[0x22], 0)
+            .expect("space 1 constants");
+
+        let plan = producer.root_arguments();
+        assert_eq!(plan.len(), 2, "neither argument is collapsed");
+        assert_eq!((plan[0].root_parameter, plan[0].space), (0, 0));
+        assert_eq!((plan[1].root_parameter, plan[1].space), (0, 1));
+
+        let encoded = producer.encode_root_arguments().expect("the plan encodes");
+        assert_eq!(
+            crate::native_metal::bindings::decode_root_arguments(&encoded)
+                .expect("the plan decodes"),
+            plan,
+            "the plan round-trips with both spaces"
+        );
+
+        // The wire frame itself is untouched: the canonical codec still
+        // round-trips the submission the producer flushes.
+        let submission = flush_for_wire(&mut producer);
+        let frame = MetalProducer::encode(&submission).expect("the frame encodes");
+        let decoded = decode_submission_v3(&frame).expect("the frame decodes");
+        assert_eq!(decoded, submission);
+    }
+
+    /// A constants write past the block a translated pipeline declared is a
+    /// named refusal, counted under its own class.
+    #[test]
+    fn a_constants_write_past_the_declared_block_is_refused_by_name() {
+        let mut producer = MetalProducer::new(52, 1).expect("producer");
+        producer.declare_root_constant_block(RootSignatureStage::Graphics, 0, 0, 2);
+        producer
+            .set_graphics_root_constants(0, &[1, 2], 0)
+            .expect("two dwords fit the declared block");
+        let before = root_argument_census::counts()[root_argument_census::CONSTANTS_BEYOND_BLOCK];
+        let error = producer
+            .set_graphics_root_constants(0, &[1, 2, 3], 0)
+            .expect_err("a third dword is past the block");
+        assert_eq!(
+            error.operation(),
+            Some("Set*Root32BitConstants: the write is past the declared root-constant block")
+        );
+        assert_eq!(
+            root_argument_census::counts()[root_argument_census::CONSTANTS_BEYOND_BLOCK],
+            before + 1
+        );
+    }
+
+    /// The submission seam hands a sink the plan beside the unchanged frame.
+    #[test]
+    fn a_submission_carries_the_root_argument_plan_to_its_sink() {
+        let mut producer = MetalProducer::new(53, 1).expect("producer");
+        producer
+            .set_graphics_root_constants_at(4, 0, &[7], 0)
+            .expect("space 0 constants");
+        producer
+            .set_graphics_root_constants_at(4, 1, &[9], 0)
+            .expect("space 1 constants");
+
+        let mut sink = RecordingSink::new();
+        producer.submit(&mut sink).expect("submit");
+        let plan = sink.root_arguments(0).expect("the sink kept the plan");
+        assert_eq!(plan.len(), 2);
+        assert_eq!((plan[0].root_parameter, plan[0].space), (4, 0));
+        assert_eq!((plan[1].root_parameter, plan[1].space), (4, 1));
+        assert_eq!(
+            sink.submissions().len(),
+            1,
+            "the frame is still carried exactly once"
+        );
     }
 }
