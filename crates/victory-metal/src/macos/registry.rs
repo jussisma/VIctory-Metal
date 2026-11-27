@@ -75,22 +75,29 @@ use crate::wire_v3::{
     StencilOperation,
 };
 
+// The canonical `MTLTextureType` values, exactly as Metal.framework declares
+// them (ADR-042). They are NOT sequential from 2: `Cube` is 5, `CubeArray` 6,
+// `3D` 7 and `2DMultisampleArray` 8. Before ADR-042 this table shifted every
+// cube/3D constant up by one, so a 3D texture was created as a multisample
+// array and the 33x33x33 FP16 volume asserted on the host.
 /// `MTLTextureType1D`.
 const MTL_TEXTURE_TYPE_1D: usize = 0;
+/// `MTLTextureType1DArray`.
+const MTL_TEXTURE_TYPE_1D_ARRAY: usize = 1;
 /// `MTLTextureType2D`.
 const MTL_TEXTURE_TYPE_2D: usize = 2;
 /// `MTLTextureType2DArray`.
 const MTL_TEXTURE_TYPE_2D_ARRAY: usize = 3;
 /// `MTLTextureType2DMultisample`.
 const MTL_TEXTURE_TYPE_2D_MULTISAMPLE: usize = 4;
-/// `MTLTextureType2DMultisampleArray`.
-const MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY: usize = 5;
 /// `MTLTextureTypeCube`.
-const MTL_TEXTURE_TYPE_CUBE: usize = 6;
+const MTL_TEXTURE_TYPE_CUBE: usize = 5;
 /// `MTLTextureTypeCubeArray`.
-const MTL_TEXTURE_TYPE_CUBE_ARRAY: usize = 7;
+const MTL_TEXTURE_TYPE_CUBE_ARRAY: usize = 6;
 /// `MTLTextureType3D`.
-const MTL_TEXTURE_TYPE_3D: usize = 8;
+const MTL_TEXTURE_TYPE_3D: usize = 7;
+/// `MTLTextureType2DMultisampleArray`.
+const MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY: usize = 8;
 
 /// `MTLStorageModePrivate`.
 const MTL_STORAGE_MODE_PRIVATE: usize = 2;
@@ -215,6 +222,44 @@ pub enum TextureDimension {
     CubeArray,
     /// `MTLTextureType3D`.
     D3,
+}
+
+/// The canonical `MTLTextureType` for a dimension, sample count and layer
+/// count (ADR-042).
+///
+/// This is the one table both a resource descriptor and a typed view plan go
+/// through, so neither can drift from Metal's enum again. `array_layers` is
+/// the descriptor's array length for a resource and the view's slice count for
+/// a view; a single layer of an arrayable dimension is a plain 2D (or 2D
+/// multisample) texture, exactly as `newTextureViewWithPixelFormat:` expects.
+/// `D1` with more than one layer is the 1D array Metal also declares.
+pub(crate) const fn canonical_texture_type(
+    dimension: TextureDimension,
+    sample_count: u32,
+    array_layers: u32,
+) -> usize {
+    use TextureDimension::{Cube, CubeArray, D1, D2, D2Array, D3};
+    match dimension {
+        D1 if array_layers > 1 => MTL_TEXTURE_TYPE_1D_ARRAY,
+        D1 => MTL_TEXTURE_TYPE_1D,
+        D2 if sample_count > 1 => MTL_TEXTURE_TYPE_2D_MULTISAMPLE,
+        D2 => MTL_TEXTURE_TYPE_2D,
+        D2Array if sample_count > 1 && array_layers > 1 => MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY,
+        D2Array if sample_count > 1 => MTL_TEXTURE_TYPE_2D_MULTISAMPLE,
+        D2Array if array_layers > 1 => MTL_TEXTURE_TYPE_2D_ARRAY,
+        D2Array => MTL_TEXTURE_TYPE_2D,
+        // A cube array with exactly one cube (six layers) is the `Cube` type;
+        // only more than one cube selects `CubeArray`. `validate` refuses
+        // non-multiple-of-six layer counts before Metal sees them.
+        Cube | CubeArray if array_layers == 6 => MTL_TEXTURE_TYPE_CUBE,
+        // A single face of a cube texture is a plain 2D view.
+        Cube if array_layers == 1 => MTL_TEXTURE_TYPE_2D,
+        Cube | CubeArray if array_layers % 6 == 0 && array_layers > 6 => {
+            MTL_TEXTURE_TYPE_CUBE_ARRAY
+        }
+        Cube | CubeArray => MTL_TEXTURE_TYPE_CUBE,
+        D3 => MTL_TEXTURE_TYPE_3D,
+    }
 }
 
 /// Host texture formats mirrored from D3D12/DXGI.
@@ -1183,18 +1228,7 @@ impl TextureDesc {
     }
 
     const fn mtl_texture_type(&self) -> usize {
-        match self.dimension {
-            TextureDimension::D1 => MTL_TEXTURE_TYPE_1D,
-            TextureDimension::D2 if self.sample_count > 1 => MTL_TEXTURE_TYPE_2D_MULTISAMPLE,
-            TextureDimension::D2 => MTL_TEXTURE_TYPE_2D,
-            TextureDimension::D2Array if self.sample_count > 1 => {
-                MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY
-            }
-            TextureDimension::D2Array => MTL_TEXTURE_TYPE_2D_ARRAY,
-            TextureDimension::Cube => MTL_TEXTURE_TYPE_CUBE,
-            TextureDimension::CubeArray => MTL_TEXTURE_TYPE_CUBE_ARRAY,
-            TextureDimension::D3 => MTL_TEXTURE_TYPE_3D,
-        }
+        canonical_texture_type(self.dimension, self.sample_count, self.array_layers)
     }
 }
 
@@ -1352,37 +1386,31 @@ impl ViewPlan {
                         "render/depth views require a 2D, array or cube texture",
                     ));
                 }
-                MTL_TEXTURE_TYPE_2D
+                // One attachment layer: 2D, or 2D multisample when the source
+                // texture is multisampled.
+                canonical_texture_type(D2Array, desc.sample_count, 1)
             }
             TextureViewKind::Srv => match desc.dimension {
-                D1 => MTL_TEXTURE_TYPE_1D,
-                D2 => MTL_TEXTURE_TYPE_2D,
+                D1 => canonical_texture_type(D1, desc.sample_count, sub.array_layer_count),
+                D2 => canonical_texture_type(D2, desc.sample_count, sub.array_layer_count),
                 D2Array => {
-                    if sub.array_layer_count == 1 {
-                        MTL_TEXTURE_TYPE_2D
-                    } else {
-                        MTL_TEXTURE_TYPE_2D_ARRAY
-                    }
+                    canonical_texture_type(D2Array, desc.sample_count, sub.array_layer_count)
                 }
                 Cube => {
-                    if sub.array_layer_count == 6 {
-                        MTL_TEXTURE_TYPE_CUBE
-                    } else if sub.array_layer_count == 1 {
-                        MTL_TEXTURE_TYPE_2D
-                    } else {
+                    if !matches!(sub.array_layer_count, 1 | 6) {
                         return Err(RegistryError::InvalidSubresource(
                             "cube SRV views need 1 face or all 6 faces",
                         ));
                     }
+                    canonical_texture_type(Cube, desc.sample_count, sub.array_layer_count)
                 }
                 CubeArray => {
-                    if sub.array_layer_count.is_multiple_of(6) {
-                        MTL_TEXTURE_TYPE_CUBE_ARRAY
-                    } else {
+                    if !sub.array_layer_count.is_multiple_of(6) {
                         return Err(RegistryError::InvalidSubresource(
                             "cube array SRV views need a multiple of 6 layers",
                         ));
                     }
+                    canonical_texture_type(CubeArray, desc.sample_count, sub.array_layer_count)
                 }
                 D3 => MTL_TEXTURE_TYPE_3D,
             },
@@ -1393,13 +1421,9 @@ impl ViewPlan {
                     ));
                 }
                 match desc.dimension {
-                    D2 => MTL_TEXTURE_TYPE_2D,
+                    D2 => canonical_texture_type(D2, desc.sample_count, sub.array_layer_count),
                     D2Array => {
-                        if sub.array_layer_count == 1 {
-                            MTL_TEXTURE_TYPE_2D
-                        } else {
-                            MTL_TEXTURE_TYPE_2D_ARRAY
-                        }
+                        canonical_texture_type(D2Array, desc.sample_count, sub.array_layer_count)
                     }
                     D3 => MTL_TEXTURE_TYPE_3D,
                     D1 | Cube | CubeArray => {
@@ -3821,6 +3845,92 @@ mod tests {
         ));
     }
 
+    /// ADR-042: every canonical `MTLTextureType` value is what Metal.framework
+    /// declares, and the one table distinguishes all nine cases. The old
+    /// table was shifted from `Cube` on (`Cube` 6, `CubeArray` 7, `3D` 8), so
+    /// a 3D resource became a multisample array.
+    #[test]
+    fn mtl_texture_type_matches_the_canonical_metal_enum() {
+        use TextureDimension::{Cube, CubeArray, D1, D2, D2Array, D3};
+
+        assert_eq!(MTL_TEXTURE_TYPE_1D, 0);
+        assert_eq!(MTL_TEXTURE_TYPE_1D_ARRAY, 1);
+        assert_eq!(MTL_TEXTURE_TYPE_2D, 2);
+        assert_eq!(MTL_TEXTURE_TYPE_2D_ARRAY, 3);
+        assert_eq!(MTL_TEXTURE_TYPE_2D_MULTISAMPLE, 4);
+        assert_eq!(MTL_TEXTURE_TYPE_CUBE, 5);
+        assert_eq!(MTL_TEXTURE_TYPE_CUBE_ARRAY, 6);
+        assert_eq!(MTL_TEXTURE_TYPE_3D, 7);
+        assert_eq!(MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY, 8);
+
+        // D1, D1Array, D2, D2Array, D2 multisample, 2D multisample array,
+        // Cube, CubeArray and D3, in that order.
+        assert_eq!(canonical_texture_type(D1, 1, 1), 0);
+        assert_eq!(canonical_texture_type(D1, 1, 2), 1);
+        assert_eq!(canonical_texture_type(D2, 1, 1), 2);
+        assert_eq!(canonical_texture_type(D2Array, 1, 4), 3);
+        assert_eq!(canonical_texture_type(D2, 4, 1), 4);
+        assert_eq!(canonical_texture_type(D2Array, 4, 4), 8);
+        assert_eq!(canonical_texture_type(Cube, 1, 6), 5);
+        assert_eq!(canonical_texture_type(CubeArray, 1, 12), 6);
+        assert_eq!(canonical_texture_type(D3, 1, 1), 7);
+
+        // A single layer of an arrayable dimension is the plain 2D type, and a
+        // six-layer cube array is one cube, never the shifted 3D value.
+        assert_eq!(canonical_texture_type(D2Array, 1, 1), 2);
+        assert_eq!(canonical_texture_type(CubeArray, 1, 6), 5);
+        assert_eq!(canonical_texture_type(D2Array, 4, 1), 4);
+    }
+
+    /// Boot #11/#12's 33x33x33 `R16G16B16A16_FLOAT` unordered-access volume
+    /// (ADR-042): one mip, one array layer, depth 33, and `MTLTextureType3D`
+    /// (7). The old table sent 8 (`MTLTextureType2DMultisampleArray`), which
+    /// the host refused/asserted on. No GPU is touched here.
+    #[test]
+    fn a_33x33x33_fp16_uav_volume_is_a_3d_texture() {
+        let mut volume = desc();
+        volume.width = 33;
+        volume.height = 33;
+        volume.depth = 33;
+        volume.mip_levels = 1;
+        volume.array_layers = 1;
+        volume.dimension = TextureDimension::D3;
+        volume.format = TextureFormat::Rgba16Float;
+        volume.usage = TextureUsage {
+            shader_read: true,
+            shader_write: true,
+            render_target: false,
+            depth_stencil: false,
+        };
+
+        assert!(volume.validate().is_ok());
+        assert_eq!(volume.mtl_texture_type(), MTL_TEXTURE_TYPE_3D);
+        assert_eq!(volume.mtl_texture_type(), 7);
+        assert_eq!(volume.depth, 33);
+        assert_eq!(volume.array_layers, 1);
+        let uav = ViewPlan::resolve(
+            &volume,
+            TextureViewKind::Uav,
+            TextureSubresource::single(0, 0),
+        )
+        .expect("a 33x33x33 FP16 UAV volume must resolve");
+        assert_eq!(uav.texture_type, 7);
+        assert_eq!(
+            uav.levels,
+            NSRange {
+                location: 0,
+                length: 1
+            }
+        );
+        assert_eq!(
+            uav.slices,
+            NSRange {
+                location: 0,
+                length: 1
+            }
+        );
+    }
+
     /// The Boot #2b compute-storage target (1280x720 R32_UINT) is both a
     /// colour attachment (RTV, Metal 53) and a shader-written storage target
     /// (UAV); R32_SINT is its signed sibling (Metal 54). No GPU is touched.
@@ -4940,6 +5050,29 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
             if support.depth24_stencil8 { 255 } else { 260 },
             "D24S8 effective Metal format"
         );
+
+        // ADR-042 / Boot #11/#12: the 33x33x33 FP16 unordered-access volume
+        // must create as a real `MTLTextureType3D` (7) and take a UAV view.
+        // Before the canonical enum fix this descriptor was built as a
+        // multisample array and the host asserted.
+        let mut volume = colour(TextureFormat::Rgba16Float, true, false);
+        volume.width = 33;
+        volume.height = 33;
+        volume.depth = 33;
+        volume.dimension = TextureDimension::D3;
+        assert_eq!(volume.mtl_texture_type(), MTL_TEXTURE_TYPE_3D);
+        registry
+            .register(9, volume)
+            .expect("33x33x33 FP16 UAV 3D creation");
+        let created = registry.get(9).expect("33x33x33 volume registered");
+        assert_eq!(created.desc().dimension, TextureDimension::D3);
+        assert_eq!(created.desc().depth, 33);
+        assert_eq!(created.desc().array_layers, 1);
+        assert_eq!(created.desc().mtl_texture_type(), 7);
+        registry
+            .create_view(9, TextureViewKind::Uav, TextureSubresource::single(0, 0))
+            .expect("33x33x33 FP16 UAV 3D view");
+        println!("gpu proof: 33x33x33 FP16 UAV volume created as MTLTextureType3D and viewed");
         println!("gpu proof: every creation and view succeeded ({} textures)", registry.len());
     }
 
