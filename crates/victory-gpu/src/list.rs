@@ -614,6 +614,12 @@ fn bind_index_buffer(this: This, address: u64, len: u64, format: u32) {
 /// that holds no live view is [`DescriptorSlot::Empty`], while a live view this
 /// backend cannot put in a table entry is [`DescriptorSlot::Unresolvable`] so
 /// the enumeration can stop there instead of mis-reading the next slot.
+///
+/// The entry shape follows the resource the descriptor names, never the root
+/// parameter alone: a buffer SRV/UAV becomes a buffer range, a texture SRV/UAV
+/// names the texture's registered handle (registering it as a sampled texture
+/// when the session has not seen it), and a sampler names the sampler handle
+/// the guest content registry derived.
 #[cfg(windows)]
 fn descriptor_slot(handle: u64) -> crate::native_metal::bindings::DescriptorSlot {
     use crate::descriptor::View;
@@ -638,20 +644,105 @@ fn descriptor_slot(handle: u64) -> crate::native_metal::bindings::DescriptorSlot
         }
         View::Shader(resource, _) => match buffer_entry(*resource, DescriptorKind::Srv) {
             Ok((kind, binding)) => DescriptorSlot::Live(kind, binding),
-            Err(why) => DescriptorSlot::Unresolvable(why),
+            Err(_) => match texture_entry(*resource, 0) {
+                Ok(handle) => DescriptorSlot::Texture(DescriptorKind::Srv, handle),
+                Err(why) => DescriptorSlot::Unresolvable(why),
+            },
         },
         View::Unordered(resource, _, _) => match buffer_entry(*resource, DescriptorKind::Uav) {
             Ok((kind, binding)) => DescriptorSlot::Live(kind, binding),
+            Err(_) => match texture_entry(*resource, 3) {
+                Ok(handle) => DescriptorSlot::Texture(DescriptorKind::Uav, handle),
+                Err(why) => DescriptorSlot::Unresolvable(why),
+            },
+        },
+        View::Sampler(words) => match sampler_entry(words) {
+            Ok(handle) => DescriptorSlot::Sampler(handle),
             Err(why) => DescriptorSlot::Unresolvable(why),
         },
-        // A sampler has no guest range: only the host's `MTLSamplerState`
-        // registry can name it, and the guest has no IPC route to register one
-        // yet. Multi-entry sampler tables are therefore refused explicitly.
-        View::Sampler(_) | View::ConsoleSampler(_) => DescriptorSlot::Unresolvable(
-            "sampler descriptor tables have no guest registration route to the host",
+        View::ConsoleSampler(_) => DescriptorSlot::Unresolvable(
+            "a console sampler descriptor has no D3D12-to-Metal mapping",
         ),
         View::Placed(..) => {
             DescriptorSlot::Unresolvable("a placed view is not a buffer descriptor")
+        }
+    }
+}
+
+/// A texture resource's host registration handle for a table entry.
+///
+/// The handle is the resource's guest memory base, the same identity kind 8
+/// uses. A texture the session has not registered is registered as a sampled
+/// texture here (idempotent), so an SRV table never binds a blank or guessed
+/// handle. A session without a live host connection is an explicit error.
+#[cfg(windows)]
+fn texture_entry(resource: usize, usage: u8) -> Result<u64, &'static str> {
+    use crate::native_metal::queue;
+
+    let this = resource as This;
+    let Some(registration) = crate::resource::texture_table_registration(this, usage) else {
+        return Err("a descriptor names neither a buffer nor a texture");
+    };
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(why) => {
+            tracing::warn!(why, "texture SRV table");
+            return Err("a sampled texture has no host registration code");
+        }
+    };
+    let handle = registration.handle;
+    if queue::texture_registered(handle) {
+        return Ok(handle);
+    }
+    match queue::register_texture(
+        handle,
+        1,
+        registration.dimension,
+        registration.format,
+        registration.usage,
+        registration.sample_count,
+        registration.width,
+        registration.height,
+        registration.depth,
+        registration.mip_levels,
+        registration.array_layers,
+    ) {
+        Ok(true) => Ok(handle),
+        Ok(false) => {
+            tracing::warn!(
+                handle = format_args!("{handle:#x}"),
+                "the host refused a sampled texture registration"
+            );
+            Err("the host refused a sampled texture registration")
+        }
+        Err(error) => {
+            tracing::warn!(
+                handle = format_args!("{handle:#x}"),
+                %error,
+                "a sampled texture could not be registered"
+            );
+            Err("a sampled texture could not be registered with the host")
+        }
+    }
+}
+
+/// A D3D12 sampler descriptor's registered handle for a table entry.
+#[cfg(windows)]
+fn sampler_entry(words: &[u32; 13]) -> Result<u64, &'static str> {
+    use crate::native_metal::{queue, sampler::SamplerStateDesc};
+
+    let desc = match SamplerStateDesc::from_d3d12(words) {
+        Ok(desc) => desc,
+        Err(error) => {
+            tracing::warn!(%error, "a D3D12 sampler has no host equivalent");
+            return Err("a sampler descriptor has no host equivalent");
+        }
+    };
+    match queue::register_sampler_state(&desc) {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            tracing::warn!(%error, "a sampler could not be registered with the host");
+            Err("a sampler could not be registered with the host")
         }
     }
 }
@@ -697,8 +788,9 @@ fn buffer_entry(
 /// stops at the first empty, unresolvable or different-kind slot; a different
 /// kind is the boundary of the next root parameter's table in the same heap, so
 /// a genuinely mixed range must be split into separate root parameters (wire
-/// v3 carries one kind per table). Sampler tables are refused because the
-/// guest has no sampler-registration route to the host.
+/// v3 carries one kind per table). Each slot's entry shape follows the resource
+/// it names: a buffer range, a registered texture handle or a registered
+/// sampler handle.
 #[cfg(windows)]
 fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     use crate::native_metal::bindings;
@@ -726,20 +818,18 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match bindings::enumerate_descriptor_table(handle, descriptor_slot) {
+    let run = match bindings::enumerate_descriptor_table_typed(
+        handle,
+        descriptor_slot,
+    ) {
         Ok(run) => run,
         Err(error) => {
             refuse_binding(this, "a descriptor table could not be enumerated", error);
             return;
         }
     };
-    let resolved = match bindings::descriptor_table(
-        &*resolver,
-        handle,
-        slot,
-        slot,
-        run.kind,
-        &run.entries,
+    let resolved = match bindings::descriptor_table_typed(
+        &*resolver, handle, slot, slot, run.kind, &run.entries,
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -748,6 +838,19 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         }
     };
     let (table, tokens) = resolved.into_parts();
+    if let Err(error) = bindings::require_registered_handles(
+        &table,
+        crate::native_metal::queue::texture_registered,
+        crate::native_metal::queue::sampler_registered,
+    ) {
+        bindings::retire_all(&*resolver, &tokens);
+        refuse_binding(
+            this,
+            "a descriptor table names a handle this session did not register",
+            error,
+        );
+        return;
+    }
     for entry in &table.bindings {
         let Some(binding) = entry.as_buffer() else {
             continue;
@@ -782,10 +885,10 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
 /// same-kind live slots at the kind's guest increment, and the run stops at the
 /// first empty, unresolvable or different-kind slot. A different kind is the
 /// next root parameter's table boundary (a genuinely mixed range must be split
-/// into separate root parameters); sampler tables are refused because the guest
-/// has no sampler-registration route to the host. A table whose first entry is
-/// not expressible increments the opcode histogram with
-/// [`victory_metal::wire_v3::OP_DESCRIPTOR_TABLE`].
+/// into separate root parameters). Each slot's entry shape follows the resource
+/// it names: a buffer range, a registered texture handle or a registered
+/// sampler handle. A table whose first entry is not expressible increments the
+/// opcode histogram with [`victory_metal::wire_v3::OP_DESCRIPTOR_TABLE`].
 #[cfg(windows)]
 fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
     use crate::native_metal::{bindings, queue};
@@ -815,7 +918,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match bindings::enumerate_descriptor_table(handle, descriptor_slot) {
+    let run = match bindings::enumerate_descriptor_table_typed(handle, descriptor_slot) {
         Ok(run) => run,
         Err(error) => {
             tracing::warn!(%error, "a compute descriptor table could not be enumerated");
@@ -828,7 +931,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
             return;
         }
     };
-    let resolved = match bindings::descriptor_table(
+    let resolved = match bindings::descriptor_table_typed(
         &*resolver,
         handle,
         slot,
@@ -843,6 +946,19 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         }
     };
     let (table, tokens) = resolved.into_parts();
+    if let Err(error) = bindings::require_registered_handles(
+        &table,
+        queue::texture_registered,
+        queue::sampler_registered,
+    ) {
+        bindings::retire_all(&*resolver, &tokens);
+        refuse_unregistered(
+            this,
+            "a compute descriptor table names a handle this session did not register",
+            error,
+        );
+        return;
+    }
     for entry in &table.bindings {
         let Some(binding) = entry.as_buffer() else {
             continue;

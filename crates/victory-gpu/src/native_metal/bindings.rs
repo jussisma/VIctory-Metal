@@ -177,11 +177,67 @@ pub fn descriptor_increment(kind: DescriptorKind) -> u64 {
     }
 }
 
+/// One expressible descriptor-table entry before it is resolved or encoded.
+///
+/// A buffer entry still has to resolve and pin its guest range; a texture or
+/// sampler entry already names a handle the host registered (kind 8 or the
+/// sampler-registration frame). Wire v3 encodes one entry shape per table, so a
+/// run may not mix the three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorEntry {
+    /// A guest buffer range, resolved through [`GuestRangeResolver`].
+    Buffer(GuestBinding),
+    /// A registered texture handle (`gpuResourceID` resolved on the host).
+    Texture(u64),
+    /// A registered sampler-state handle.
+    Sampler(u64),
+}
+
+impl DescriptorEntry {
+    /// Whether this entry shape can be carried by a table of `kind`.
+    pub fn is_compatible_with(&self, kind: DescriptorKind) -> bool {
+        match self {
+            Self::Buffer(_) => kind != DescriptorKind::Sampler,
+            Self::Texture(_) => matches!(kind, DescriptorKind::Srv | DescriptorKind::Uav),
+            Self::Sampler(_) => kind == DescriptorKind::Sampler,
+        }
+    }
+
+    /// The guest buffer range, when this is a buffer entry.
+    pub fn as_buffer(&self) -> Option<&GuestBinding> {
+        match self {
+            Self::Buffer(binding) => Some(binding),
+            Self::Texture(_) | Self::Sampler(_) => None,
+        }
+    }
+
+    /// The registered resource handle, when this is a texture or sampler entry.
+    pub fn resource_handle(&self) -> Option<u64> {
+        match self {
+            Self::Texture(handle) | Self::Sampler(handle) => Some(*handle),
+            Self::Buffer(_) => None,
+        }
+    }
+
+    /// A short name for error messages and diagnostics.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Buffer(_) => "buffer",
+            Self::Texture(_) => "texture",
+            Self::Sampler(_) => "sampler",
+        }
+    }
+}
+
 /// One guest descriptor slot as a table run reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorSlot {
-    /// A live, expressible descriptor and the kind its entry declares.
+    /// A live buffer descriptor and the kind its entry declares.
     Live(DescriptorKind, GuestBinding),
+    /// A live texture descriptor and its registered texture handle.
+    Texture(DescriptorKind, u64),
+    /// A live sampler descriptor and its registered sampler handle.
+    Sampler(u64),
     /// No live descriptor names this slot (freed, stale or never written).
     Empty,
     /// A live descriptor this backend cannot put in a table entry.
@@ -252,12 +308,12 @@ pub enum TableRunBoundary {
     },
 }
 
-/// One homogeneous run of consecutive descriptors in register order.
+/// One homogeneous run of consecutive buffer descriptors in register order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DescriptorTableRun {
     /// The kind every entry carries.
     pub kind: DescriptorKind,
-    /// The entries, in register order.
+    /// The buffer entries, in register order.
     pub entries: Vec<GuestBinding>,
     /// Why the run stopped.
     pub boundary: TableRunBoundary,
@@ -283,17 +339,24 @@ impl DescriptorTableRun {
     /// A caller that knows one root parameter is a single mixed range can use
     /// this to refuse instead of binding its first range.
     pub fn require_homogeneous(&self) -> Result<(), TableRunError> {
-        match self.boundary {
-            TableRunBoundary::KindChange { kind } => Err(TableRunError::MixedKind {
-                run_kind: self.kind,
-                next_kind: kind,
+        self.boundary.require_homogeneous(self.kind)
+    }
+}
+
+impl TableRunBoundary {
+    /// Refuses a boundary that is a descriptor-kind change.
+    pub fn require_homogeneous(&self, run_kind: DescriptorKind) -> Result<(), TableRunError> {
+        match self {
+            Self::KindChange { kind } => Err(TableRunError::MixedKind {
+                run_kind,
+                next_kind: *kind,
             }),
             _ => Ok(()),
         }
     }
 }
 
-/// Enumerates the consecutive same-kind descriptors of one table.
+/// Enumerates the consecutive same-kind buffer descriptors of one table.
 ///
 /// `read` returns the slot at a guest descriptor handle. The run starts at
 /// `base_handle`, always includes that slot, and walks forward by the kind's
@@ -302,8 +365,9 @@ impl DescriptorTableRun {
 /// [`MAX_DESCRIPTOR_BINDINGS_V3`]: a 33rd same-kind live entry is
 /// [`TableRunError::OverCap`], never a silent truncation.
 ///
-/// A first slot that is empty, unresolvable, a sampler or zero-handed is an
-/// error: a sampler table has no guest registration route to the host yet.
+/// This buffer-only form is kept for callers that predate registered-resource
+/// entries. A sampler or texture slot is [`TableRunError::Unsupported`];
+/// [`enumerate_descriptor_table_typed`] enumerates every entry shape.
 pub fn enumerate_descriptor_table<F>(
     base_handle: u64,
     mut read: F,
@@ -318,10 +382,113 @@ where
         DescriptorSlot::Live(kind, binding) => (kind, binding),
         DescriptorSlot::Empty => return Err(TableRunError::Empty),
         DescriptorSlot::Unresolvable(why) => return Err(TableRunError::Unsupported(why)),
+        DescriptorSlot::Texture(..) | DescriptorSlot::Sampler(_) => {
+            return Err(TableRunError::Unsupported(
+                "the buffer-only enumerator cannot carry a registered resource entry",
+            ));
+        }
     };
     if kind == DescriptorKind::Sampler {
         return Err(TableRunError::Unsupported(
-            "sampler descriptor tables have no guest registration route to the host",
+            "sampler descriptor tables have no buffer binding",
+        ));
+    }
+    let increment = descriptor_increment(kind);
+    let mut entries = Vec::with_capacity(4);
+    entries.push(first);
+    let mut distance = increment;
+    let boundary = loop {
+        let Some(next_handle) = base_handle.checked_add(distance) else {
+            break TableRunBoundary::Empty;
+        };
+        match read(next_handle) {
+            DescriptorSlot::Empty => break TableRunBoundary::Empty,
+            DescriptorSlot::Unresolvable(why) => break TableRunBoundary::Unresolvable(why),
+            DescriptorSlot::Texture(..) | DescriptorSlot::Sampler(_) => {
+                break TableRunBoundary::Unresolvable(
+                    "the buffer-only enumerator cannot carry a registered resource entry",
+                );
+            }
+            DescriptorSlot::Live(next_kind, binding) => {
+                if next_kind != kind {
+                    break TableRunBoundary::KindChange { kind: next_kind };
+                }
+                if entries.len() >= MAX_DESCRIPTOR_BINDINGS_V3 {
+                    return Err(TableRunError::OverCap {
+                        count: MAX_DESCRIPTOR_BINDINGS_V3 + 1,
+                    });
+                }
+                entries.push(binding);
+                distance += increment;
+            }
+        }
+    };
+    Ok(DescriptorTableRun {
+        kind,
+        entries,
+        boundary,
+    })
+}
+
+/// One homogeneous run of consecutive typed descriptors in register order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedDescriptorTableRun {
+    /// The kind every entry carries.
+    pub kind: DescriptorKind,
+    /// The entries (buffer, texture or sampler), in register order.
+    pub entries: Vec<DescriptorEntry>,
+    /// Why the run stopped.
+    pub boundary: TableRunBoundary,
+}
+
+impl TypedDescriptorTableRun {
+    /// Number of entries enumerated.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the run has no entries (never: a run always has at least one).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Refuses a run that ended on a different descriptor kind.
+    pub fn require_homogeneous(&self) -> Result<(), TableRunError> {
+        self.boundary.require_homogeneous(self.kind)
+    }
+}
+
+/// Enumerates the consecutive same-kind descriptors of one table, keeping each
+/// entry's shape (buffer range, registered texture handle or sampler handle).
+///
+/// Sampler tables advance at the 16-byte sampler increment and view tables at
+/// the 32-byte view increment. A first slot that is empty, unresolvable or
+/// whose entry shape the kind cannot express is an error. A later slot of the
+/// same kind is included even when its entry shape differs, so
+/// [`descriptor_table_typed`] can refuse the mixed table explicitly instead of
+/// silently binding a prefix.
+pub fn enumerate_descriptor_table_typed<F>(
+    base_handle: u64,
+    mut read: F,
+) -> Result<TypedDescriptorTableRun, TableRunError>
+where
+    F: FnMut(u64) -> DescriptorSlot,
+{
+    if base_handle == 0 {
+        return Err(TableRunError::HandleZero);
+    }
+    let (kind, first) = match read(base_handle) {
+        DescriptorSlot::Live(kind, binding) => (kind, DescriptorEntry::Buffer(binding)),
+        DescriptorSlot::Texture(kind, handle) => (kind, DescriptorEntry::Texture(handle)),
+        DescriptorSlot::Sampler(handle) => {
+            (DescriptorKind::Sampler, DescriptorEntry::Sampler(handle))
+        }
+        DescriptorSlot::Empty => return Err(TableRunError::Empty),
+        DescriptorSlot::Unresolvable(why) => return Err(TableRunError::Unsupported(why)),
+    };
+    if !first.is_compatible_with(kind) {
+        return Err(TableRunError::Unsupported(
+            "the descriptor table's first entry shape does not match its kind",
         ));
     }
     let increment = descriptor_increment(kind);
@@ -344,12 +511,38 @@ where
                         count: MAX_DESCRIPTOR_BINDINGS_V3 + 1,
                     });
                 }
-                entries.push(binding);
+                entries.push(DescriptorEntry::Buffer(binding));
+                distance += increment;
+            }
+            DescriptorSlot::Texture(next_kind, handle) => {
+                if next_kind != kind {
+                    break TableRunBoundary::KindChange { kind: next_kind };
+                }
+                if entries.len() >= MAX_DESCRIPTOR_BINDINGS_V3 {
+                    return Err(TableRunError::OverCap {
+                        count: MAX_DESCRIPTOR_BINDINGS_V3 + 1,
+                    });
+                }
+                entries.push(DescriptorEntry::Texture(handle));
+                distance += increment;
+            }
+            DescriptorSlot::Sampler(handle) => {
+                if kind != DescriptorKind::Sampler {
+                    break TableRunBoundary::KindChange {
+                        kind: DescriptorKind::Sampler,
+                    };
+                }
+                if entries.len() >= MAX_DESCRIPTOR_BINDINGS_V3 {
+                    return Err(TableRunError::OverCap {
+                        count: MAX_DESCRIPTOR_BINDINGS_V3 + 1,
+                    });
+                }
+                entries.push(DescriptorEntry::Sampler(handle));
                 distance += increment;
             }
         }
     };
-    Ok(DescriptorTableRun {
+    Ok(TypedDescriptorTableRun {
         kind,
         entries,
         boundary,
@@ -507,14 +700,11 @@ pub fn root_buffer_view_page(
     })
 }
 
-/// Resolves and pins one homogeneous descriptor table.
+/// Resolves and pins one homogeneous descriptor table of buffer ranges.
 ///
-/// `handle` is the D3D12 GPU descriptor handle of the table's first entry; it
-/// is validated (non-zero) but the Wire frame carries the resolved ranges, not
-/// the handle. `descriptors` are the table entries in register order, as the
-/// caller read them from guest descriptor memory. This resolver only expresses
-/// buffer ranges; sampler tables use registered sampler handles and are built
-/// by the caller instead.
+/// This is the buffer-only form kept for callers that already enumerated
+/// [`GuestBinding`]s; [`descriptor_table_typed`] is the full encoder for
+/// buffer, registered-texture and registered-sampler entries.
 pub fn descriptor_table(
     resolver: &dyn GuestRangeResolver,
     handle: u64,
@@ -523,35 +713,101 @@ pub fn descriptor_table(
     kind: DescriptorKind,
     descriptors: &[GuestBinding],
 ) -> Result<Resolved<DescriptorTableV3>, ResolveError> {
+    let entries: Vec<DescriptorEntry> = descriptors
+        .iter()
+        .copied()
+        .map(DescriptorEntry::Buffer)
+        .collect();
+    descriptor_table_typed(resolver, handle, set, base_register, kind, &entries)
+}
+
+/// Resolves and pins one homogeneous descriptor table.
+///
+/// `handle` is the D3D12 GPU descriptor handle of the table's first entry; it
+/// is validated (non-zero) but the Wire frame carries the resolved entries, not
+/// the handle. `entries` are the table entries in register order, as the caller
+/// read them from guest descriptor memory.
+///
+/// Wire v3 encodes one entry tag per table: all buffers (legacy 32-byte
+/// encoding), all registered texture handles, or all registered sampler
+/// handles. A table that mixes entry shapes, or whose entry shape the reflected
+/// range kind cannot express (a texture in a CBV table, a sampler in a view
+/// table, a buffer in a sampler table), is refused instead of being split,
+/// truncated or written with a guessed tag.
+pub fn descriptor_table_typed(
+    resolver: &dyn GuestRangeResolver,
+    handle: u64,
+    set: u16,
+    base_register: u16,
+    kind: DescriptorKind,
+    entries: &[DescriptorEntry],
+) -> Result<Resolved<DescriptorTableV3>, ResolveError> {
     if handle == 0 {
         return Err(ResolveError::Invalid("the descriptor-table handle is zero"));
     }
-    if kind == DescriptorKind::Sampler {
-        return Err(ResolveError::Unsupported(
-            "sampler descriptor tables have no buffer binding",
-        ));
-    }
-    if descriptors.is_empty() {
+    if entries.is_empty() {
         return Err(ResolveError::Invalid("the descriptor table is empty"));
     }
-    if descriptors.len() > MAX_DESCRIPTOR_BINDINGS_V3 {
+    if entries.len() > MAX_DESCRIPTOR_BINDINGS_V3 {
         return Err(ResolveError::Unsupported(
             "the descriptor table has more bindings than a v3 table carries",
         ));
     }
 
-    let mut bindings = Vec::with_capacity(descriptors.len());
-    let mut tokens = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
-        let resolved = match resolve_descriptor(resolver, descriptor) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                retire_all(resolver, &tokens);
-                return Err(error);
+    let mut shape: Option<&'static str> = None;
+    for entry in entries {
+        if !entry.is_compatible_with(kind) {
+            return Err(ResolveError::Unsupported(
+                "the descriptor table entry shape does not match the reflected range kind",
+            ));
+        }
+        let name = entry.kind_name();
+        match shape {
+            Some(existing) if existing != name => {
+                return Err(ResolveError::Unsupported(
+                    "the descriptor table mixes buffer and registered-resource entries, \
+                     which one v3 entry tag cannot carry",
+                ));
+            }
+            _ => shape = Some(name),
+        }
+    }
+
+    let mut bindings = Vec::with_capacity(entries.len());
+    let mut tokens = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let encoded = match entry {
+            DescriptorEntry::Buffer(descriptor) => {
+                let resolved = match resolve_descriptor(resolver, descriptor) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        retire_all(resolver, &tokens);
+                        return Err(error);
+                    }
+                };
+                tokens.push(resolved.1);
+                DescriptorTableEntryV3::Buffer(resolved.0)
+            }
+            DescriptorEntry::Texture(handle) => {
+                if *handle == 0 {
+                    retire_all(resolver, &tokens);
+                    return Err(ResolveError::Invalid(
+                        "a texture table entry's registered handle is zero",
+                    ));
+                }
+                DescriptorTableEntryV3::Texture(*handle)
+            }
+            DescriptorEntry::Sampler(handle) => {
+                if *handle == 0 {
+                    retire_all(resolver, &tokens);
+                    return Err(ResolveError::Invalid(
+                        "a sampler table entry's registered handle is zero",
+                    ));
+                }
+                DescriptorTableEntryV3::Sampler(*handle)
             }
         };
-        bindings.push(DescriptorTableEntryV3::Buffer(resolved.0));
-        tokens.push(resolved.1);
+        bindings.push(encoded);
     }
     Ok(Resolved {
         entry: DescriptorTableV3 {
@@ -562,6 +818,65 @@ pub fn descriptor_table(
         },
         tokens,
     })
+}
+
+/// Why a table names a handle this session did not register.
+///
+/// This is refused before the producer records the table, so an unregistered
+/// handle can never reach a native submission (and never becomes a default
+/// resource or sampler).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HandleError {
+    /// No texture registration accepted this handle in the session.
+    UnregisteredTexture(u64),
+    /// No sampler registration accepted this handle in the session.
+    UnregisteredSampler(u64),
+}
+
+impl std::fmt::Display for HandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnregisteredTexture(handle) => write!(
+                f,
+                "descriptor table names unregistered texture handle 0x{handle:016x}"
+            ),
+            Self::UnregisteredSampler(handle) => write!(
+                f,
+                "descriptor table names unregistered sampler handle 0x{handle:016x}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HandleError {}
+
+/// Checks every registered-resource entry against the session's registrations.
+///
+/// Buffer entries are validated by the host's allocation registry and are not
+/// checked here. The two predicates are the live client's per-session sets, so
+/// a handle from another session (or a hand-built one) is an explicit
+/// [`HandleError`] rather than a silent default.
+pub fn require_registered_handles(
+    table: &DescriptorTableV3,
+    texture_registered: impl Fn(u64) -> bool,
+    sampler_registered: impl Fn(u64) -> bool,
+) -> Result<(), HandleError> {
+    for entry in &table.bindings {
+        match entry {
+            DescriptorTableEntryV3::Buffer(_) => {}
+            DescriptorTableEntryV3::Texture(handle) => {
+                if !texture_registered(*handle) {
+                    return Err(HandleError::UnregisteredTexture(*handle));
+                }
+            }
+            DescriptorTableEntryV3::Sampler(handle) => {
+                if !sampler_registered(*handle) {
+                    return Err(HandleError::UnregisteredSampler(*handle));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves, validates and pins one table entry.
@@ -1090,6 +1405,10 @@ mod tests {
         }
     }
 
+    fn entry_for(index: usize) -> DescriptorEntry {
+        DescriptorEntry::Buffer(binding_for(index))
+    }
+
     /// Enumerates a heap whose first `kinds.len()` slots are `kinds[i]` and
     /// whose following slot is empty unless `unresolvable` names it.
     fn enumerate_heap(
@@ -1234,22 +1553,233 @@ mod tests {
     }
 
     #[test]
-    fn a_sampler_first_slot_is_refused_explicitly() {
-        let error = enumerate_descriptor_table(TABLE_BASE, |_| {
-            DescriptorSlot::Live(
-                DescriptorKind::Sampler,
-                GuestBinding {
-                    address: 0x1_0000,
-                    len: 16,
-                },
-            )
+    fn a_sampler_table_enumerates_registered_sampler_handles() {
+        const HANDLE: u64 = 0x5300_0000_0000_0042;
+        let run = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
+            if handle == TABLE_BASE {
+                DescriptorSlot::Sampler(HANDLE)
+            } else {
+                DescriptorSlot::Empty
+            }
         })
-        .expect_err("sampler tables have no guest route");
-        assert!(matches!(error, TableRunError::Unsupported(_)));
-        assert!(
-            error.to_string().contains("sampler"),
-            "the refusal names samplers: {error}"
+        .expect("a one-entry sampler table");
+        assert_eq!(run.kind, DescriptorKind::Sampler);
+        assert_eq!(run.len(), 1);
+        assert_eq!(run.entries[0], DescriptorEntry::Sampler(HANDLE));
+        assert_eq!(run.boundary, TableRunBoundary::Empty);
+        assert_eq!(
+            descriptor_increment(DescriptorKind::Sampler),
+            SAMPLER_DESCRIPTOR_INCREMENT,
+            "the sampler run advances at the sampler increment"
         );
+        // The buffer-only enumerator still refuses a sampler slot.
+        assert!(matches!(
+            enumerate_descriptor_table(TABLE_BASE, |_| DescriptorSlot::Sampler(HANDLE)),
+            Err(TableRunError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn an_entry_shape_the_kind_cannot_represent_is_refused() {
+        // A buffer entry in a sampler table.
+        assert!(matches!(
+            enumerate_descriptor_table_typed(TABLE_BASE, |_| {
+                DescriptorSlot::Live(DescriptorKind::Sampler, binding_for(0))
+            }),
+            Err(TableRunError::Unsupported(_))
+        ));
+        // A texture entry in a sampler table.
+        assert!(matches!(
+            enumerate_descriptor_table_typed(TABLE_BASE, |_| {
+                DescriptorSlot::Texture(DescriptorKind::Sampler, 0x3000)
+            }),
+            Err(TableRunError::Unsupported(_))
+        ));
+        // A texture entry in a constant-buffer table.
+        assert!(matches!(
+            enumerate_descriptor_table_typed(TABLE_BASE, |_| {
+                DescriptorSlot::Texture(DescriptorKind::Cbv, 0x3000)
+            }),
+            Err(TableRunError::Unsupported(_))
+        ));
+        // A buffer after a texture in one SRV range is kept, so the typed
+        // encoder can refuse the mixed table instead of binding a prefix.
+        let run = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
+            match ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize {
+                0 => DescriptorSlot::Texture(DescriptorKind::Srv, 0x3000),
+                1 => DescriptorSlot::Live(DescriptorKind::Srv, binding_for(1)),
+                _ => DescriptorSlot::Empty,
+            }
+        })
+        .expect("the mixed run enumerates");
+        assert_eq!(run.entries.len(), 2);
+        assert_eq!(run.entries[0], DescriptorEntry::Texture(0x3000));
+        assert_eq!(run.entries[1], entry_for(1));
+    }
+
+    #[test]
+    fn typed_runs_enumerate_two_texture_entries_in_register_order() {
+        let run = enumerate_descriptor_table_typed(TABLE_BASE, |handle| {
+            match ((handle - TABLE_BASE) / VIEW_DESCRIPTOR_INCREMENT) as usize {
+                0 => DescriptorSlot::Texture(DescriptorKind::Srv, 0x3000),
+                1 => DescriptorSlot::Texture(DescriptorKind::Srv, 0x3001),
+                _ => DescriptorSlot::Empty,
+            }
+        })
+        .expect("a two-entry texture range");
+        assert_eq!(run.kind, DescriptorKind::Srv);
+        assert_eq!(
+            run.entries,
+            vec![
+                DescriptorEntry::Texture(0x3000),
+                DescriptorEntry::Texture(0x3001),
+            ]
+        );
+        assert_eq!(run.boundary, TableRunBoundary::Empty);
+    }
+
+    #[test]
+    fn typed_texture_and_sampler_tables_keep_their_entry_shape() {
+        let resolver = FakeResolver::new();
+        let page = resolver.page_address(0);
+
+        let textures = descriptor_table_typed(
+            &resolver,
+            0x100,
+            1,
+            0,
+            DescriptorKind::Srv,
+            &[
+                DescriptorEntry::Texture(0x3000),
+                DescriptorEntry::Texture(0x3001),
+            ],
+        )
+        .expect("a two-entry texture table");
+        let (texture_table, texture_tokens) = textures.into_parts();
+        assert_eq!(texture_table.kind, DescriptorKind::Srv);
+        assert_eq!(
+            texture_table.bindings,
+            vec![
+                DescriptorTableEntryV3::Texture(0x3000),
+                DescriptorTableEntryV3::Texture(0x3001),
+            ]
+        );
+        assert!(
+            texture_table.bindings[0].as_buffer().is_none(),
+            "a texture handle is not a buffer range"
+        );
+        assert_eq!(texture_table.bindings[0].resource_handle(), Some(0x3000));
+        assert!(texture_tokens.is_empty(), "a texture entry pins no range");
+
+        let samplers = descriptor_table_typed(
+            &resolver,
+            0x200,
+            2,
+            1,
+            DescriptorKind::Sampler,
+            &[DescriptorEntry::Sampler(0x5300_0000_0000_0042)],
+        )
+        .expect("a one-entry sampler table");
+        let (sampler_table, sampler_tokens) = samplers.into_parts();
+        assert_eq!(sampler_table.kind, DescriptorKind::Sampler);
+        assert_eq!(
+            sampler_table.bindings,
+            vec![DescriptorTableEntryV3::Sampler(0x5300_0000_0000_0042)]
+        );
+        assert_eq!(
+            sampler_table.bindings[0].resource_handle(),
+            Some(0x5300_0000_0000_0042)
+        );
+        assert!(sampler_tokens.is_empty());
+
+        // A buffer entry in a sampler table and vice versa are refused.
+        let buffer = DescriptorEntry::Buffer(GuestBinding {
+            address: page,
+            len: 16,
+        });
+        assert!(matches!(
+            descriptor_table_typed(
+                &resolver,
+                0x300,
+                0,
+                0,
+                DescriptorKind::Sampler,
+                &[buffer]
+            ),
+            Err(ResolveError::Unsupported(_))
+        ));
+        assert!(matches!(
+            descriptor_table_typed(
+                &resolver,
+                0x301,
+                0,
+                0,
+                DescriptorKind::Cbv,
+                &[DescriptorEntry::Texture(0x3000)]
+            ),
+            Err(ResolveError::Unsupported(_))
+        ));
+        // A mixed buffer/texture table has no single wire entry tag.
+        assert!(matches!(
+            descriptor_table_typed(
+                &resolver,
+                0x302,
+                0,
+                0,
+                DescriptorKind::Srv,
+                &[buffer, DescriptorEntry::Texture(0x3000)]
+            ),
+            Err(ResolveError::Unsupported(_))
+        ));
+        // A zero registered handle is refused before any submission.
+        assert!(matches!(
+            descriptor_table_typed(
+                &resolver,
+                0x303,
+                0,
+                0,
+                DescriptorKind::Srv,
+                &[DescriptorEntry::Texture(0)]
+            ),
+            Err(ResolveError::Invalid(_))
+        ));
+        assert_eq!(resolver.live(), 0, "no refusal pinned a range");
+    }
+
+    #[test]
+    fn unregistered_resource_handles_are_a_typed_error() {
+        let table = DescriptorTableV3 {
+            set: 0,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![
+                DescriptorTableEntryV3::Texture(0x3000),
+                DescriptorTableEntryV3::Texture(0x3001),
+            ],
+        };
+        assert_eq!(
+            require_registered_handles(&table, |_| false, |_| false),
+            Err(HandleError::UnregisteredTexture(0x3000))
+        );
+        assert!(require_registered_handles(&table, |handle| handle == 0x3000, |_| false)
+            .is_err());
+
+        let sampler = DescriptorTableV3 {
+            set: 1,
+            base_register: 0,
+            kind: DescriptorKind::Sampler,
+            bindings: vec![DescriptorTableEntryV3::Sampler(0x5300_0000_0000_0042)],
+        };
+        assert_eq!(
+            require_registered_handles(&sampler, |_| false, |_| false),
+            Err(HandleError::UnregisteredSampler(0x5300_0000_0000_0042))
+        );
+        require_registered_handles(&sampler, |_| false, |handle| {
+            handle == 0x5300_0000_0000_0042
+        })
+        .expect("a registered sampler");
+        let message = HandleError::UnregisteredSampler(1).to_string();
+        assert!(message.contains("sampler"), "{message}");
     }
 
     #[test]

@@ -94,6 +94,7 @@ use victory_metal::wire::{decode_reply, Reply, ReplyStatus, MAGIC};
 use victory_metal::wire_v3::PROTOCOL_VERSION_V3;
 
 use crate::native_metal::fence_page_guest::GuestFencePage;
+use crate::native_metal::sampler::SamplerStateDesc;
 use crate::native_metal::queue::{NativeQueueError, V3Sink};
 
 /// Frame kind of the first, authentication frame (`ipc_host::KIND_AUTH`).
@@ -158,12 +159,16 @@ pub const KIND_FENCE_PAGE: u8 = 6;
 pub const KIND_TEXTURE_REG: u8 = 8;
 /// Frame kind registering a texture as a present surface (`ipc_host`).
 pub const KIND_SURFACE_REG: u8 = 9;
+/// Frame kind registering a reduced `MTLSamplerState` (`ipc_host`).
+pub const KIND_SAMPLER_REG: u8 = 10;
 /// Exact length of a fence page registration payload (`byte_len: u64 LE`).
 pub const FENCE_PAGE_REGISTER_PAYLOAD_LEN: usize = 8;
 /// Exact length of a texture registration payload.
 pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
 /// Exact length of a present-surface registration payload.
 pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
+/// Exact length of a sampler registration payload: handle then five `u32`s.
+pub const SAMPLER_REG_PAYLOAD_LEN: usize = 8 + 5 * 4;
 /// Status byte of an accepted texture or surface registration.
 pub const REGISTRATION_ACCEPTED: u8 = 0;
 /// Magic tag of the version 3 request envelope.
@@ -659,6 +664,8 @@ pub struct WireV3Client {
     fence_page_path: Option<std::path::PathBuf>,
     /// Texture handles registered with the host in this session.
     textures: BTreeSet<u64>,
+    /// Sampler-state handles registered with the host in this session.
+    samplers: BTreeSet<u64>,
     /// Present surfaces registered with the host in this session.
     surfaces: BTreeSet<u64>,
     /// Guest allocations registered with the host through kind 2.
@@ -742,6 +749,7 @@ impl WireV3Client {
             fence_page: None,
             fence_page_path: page,
             textures: BTreeSet::new(),
+            samplers: BTreeSet::new(),
             surfaces: BTreeSet::new(),
             allocations: BTreeSet::new(),
             last_allocation: 0,
@@ -877,6 +885,7 @@ impl WireV3Client {
         // registration belong to the old one and must be made again.
         self.fence_page = None;
         self.textures.clear();
+        self.samplers.clear();
         self.surfaces.clear();
         self.allocations.clear();
         self.last_allocation = 0;
@@ -987,6 +996,59 @@ impl WireV3Client {
     /// Whether a texture handle was accepted by this session.
     pub fn texture_registered(&self, id: u64) -> bool {
         self.textures.contains(&id)
+    }
+
+    /// Registers one reduced `MTLSamplerState` content (transport kind 10).
+    ///
+    /// The payload is `handle: u64 LE` followed by the five `u32` Metal codes
+    /// of [`SamplerStateDesc`]. The caller derives the handle from the content
+    /// (`native_metal::sampler::sampler_handle`), so the same descriptor is
+    /// registered once and a second frame reuses the handle without a frame.
+    /// A rejection is `Ok(false)`; the session stays open.
+    pub fn register_sampler(
+        &mut self,
+        handle: u64,
+        desc: &SamplerStateDesc,
+    ) -> Result<bool, NativeQueueError> {
+        if handle == 0 {
+            return Err(NativeQueueError::Refused(
+                "sampler registration needs a nonzero handle".to_string(),
+            ));
+        }
+        if self.samplers.contains(&handle) {
+            return Ok(true);
+        }
+        let mut payload = [0u8; SAMPLER_REG_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&handle.to_le_bytes());
+        for (index, value) in [
+            desc.min_filter,
+            desc.mag_filter,
+            desc.s_address_mode,
+            desc.t_address_mode,
+            desc.r_address_mode,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 8 + index * 4;
+            payload[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let status = self.registration(KIND_SAMPLER_REG, &payload, "register sampler")?;
+        let accepted = status == REGISTRATION_ACCEPTED;
+        if accepted {
+            self.samplers.insert(handle);
+        }
+        Ok(accepted)
+    }
+
+    /// Whether a sampler handle was accepted by this session.
+    pub fn sampler_registered(&self, handle: u64) -> bool {
+        self.samplers.contains(&handle)
+    }
+
+    /// Sampler registrations this session made.
+    pub fn sampler_registrations(&self) -> usize {
+        self.samplers.len()
     }
 
     /// Whether a present surface was accepted by this session.

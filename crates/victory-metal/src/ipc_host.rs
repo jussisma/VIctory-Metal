@@ -32,8 +32,21 @@
 //! | 7 | guest to host | one version 3 request envelope, no reply frame |
 //! | 8 | guest to host | `texture registration` (below) |
 //! | 9 | guest to host | `surface registration` (below) |
+//! | 10 | guest to host | `sampler registration` (below) |
 //! | 128 | host to guest | one byte: 0 = accepted, 1 = rejected |
 //! | 129 | host to guest | one byte status, then `pipeline_id: u64 LE` on success |
+//!
+//! # Sampler registration
+//!
+//! Kind 10 carries a fixed 28-byte reduced sampler registration: `handle: u64
+//! LE`, then five `u32 LE` Metal codes (`min_filter`, `mag_filter`,
+//! `s_address_mode`, `t_address_mode`, `r_address_mode`). The host creates the
+//! `MTLSamplerState` through
+//! [`DirectMetalTransport::register_sampler`] and remembers its content, so a
+//! repeated handle with the same content is idempotent and a conflicting
+//! content is rejected. A v3 sampler descriptor-table entry must name a handle
+//! registered by kind 10 in this session; an unknown handle is `UnknownHandle`
+//! before any encoder exists.
 //!
 //! # Texture and present-surface registration
 //!
@@ -68,10 +81,10 @@
 //! [`DirectMetalTransport::register_present_surface`]. A duplicate surface id or
 //! an unregistered texture is refused with status 1.
 //!
-//! Unlike kinds 2 and 6, kinds 8 and 9 answer every request with kind 128 and
-//! leave the session open on a rejection, so a guest can correct a descriptor
-//! and retry. No path crosses the wire: the texture is device-created from the
-//! validated descriptor.
+//! Unlike kinds 2 and 6, kinds 8, 9 and 10 answer every request with kind 128
+//! and leave the session open on a rejection, so a guest can correct a
+//! descriptor and retry. No path crosses the wire: the texture or sampler is
+//! device-created from the validated descriptor.
 //!
 //! # Shared completion fence page (ADR-012)
 //!
@@ -214,7 +227,7 @@ use crate::cmdlist::{ListLedger, RingError};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
 use crate::macos::bindings::RootSignatureLayout;
-use crate::macos::device::{DirectMetalTransport, PipelineAbi};
+use crate::macos::device::{DirectMetalTransport, PipelineAbi, SamplerDesc};
 use crate::macos::objc::{self, ObjcObject};
 use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
@@ -264,10 +277,14 @@ pub const KIND_SUBMISSION_ASYNC: u8 = 7;
 pub const KIND_TEXTURE_REG: u8 = 8;
 /// Frame kind for present-surface registration.
 pub const KIND_SURFACE_REG: u8 = 9;
+/// Frame kind for reduced `MTLSamplerState` registration.
+pub const KIND_SAMPLER_REG: u8 = 10;
 /// Exact length of a texture registration payload.
 pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
 /// Exact length of a present-surface registration payload.
 pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
+/// Exact length of a sampler registration payload (`handle` plus five `u32`s).
+pub const SAMPLER_REG_PAYLOAD_LEN: usize = 8 + 5 * 4;
 /// Status byte of an accepted texture or surface registration.
 pub const REGISTRATION_ACCEPTED: u8 = 0;
 /// Status byte of a rejected texture or surface registration.
@@ -607,6 +624,19 @@ pub trait BatchExecutor {
         ))
     }
 
+    /// Creates (or reuses) a reduced `MTLSamplerState` under `id`.
+    ///
+    /// The default deliberately refuses the request. An executor that owns a
+    /// sampler registry implements it through
+    /// [`DirectMetalTransport::register_sampler`]; a second registration for the
+    /// same id and content is idempotent, so a reconverted table cannot churn
+    /// sampler objects.
+    fn register_sampler(&self, _id: u64, _desc: SamplerDesc) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "sampler registration is not enabled by this executor",
+        ))
+    }
+
     /// Attaches the host-mapped completion page this executor must publish into.
     ///
     /// Returns `true` when the executor took ownership of the page and publishes
@@ -735,6 +765,10 @@ impl BatchExecutor for DirectMetalTransport {
 
     fn register_texture(&self, id: u64, desc: TextureDesc) -> Result<(), MetalError> {
         DirectMetalTransport::register_registry_texture(self, id, desc)
+    }
+
+    fn register_sampler(&self, id: u64, desc: SamplerDesc) -> Result<(), MetalError> {
+        DirectMetalTransport::register_sampler(self, id, desc)
     }
 
     fn register_surface(&self, surface_id: u64, texture_id: u64) -> Result<(), MetalError> {
@@ -967,6 +1001,12 @@ pub struct IpcHost<E: BatchExecutor> {
     allocations: BTreeMap<u64, RegisteredAllocation>,
     /// Textures registered by kind 8, keyed by the handle a v3 attachment names.
     textures: BTreeMap<u64, RegisteredTexture>,
+    /// Sampler states registered by kind 10, keyed by their handle.
+    ///
+    /// The descriptor is kept so a re-registration of the same handle is
+    /// idempotent only when the content matches; a conflicting content is an
+    /// explicit rejection rather than a silent replacement.
+    samplers: BTreeMap<u64, SamplerDesc>,
     /// Present surfaces registered by kind 9, mapped to their texture handle.
     surfaces: BTreeMap<u64, u64>,
     last_allocation_id: u64,
@@ -1023,6 +1063,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             executor,
             allocations: BTreeMap::new(),
             textures: BTreeMap::new(),
+            samplers: BTreeMap::new(),
             surfaces: BTreeMap::new(),
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
@@ -1102,6 +1143,10 @@ impl<E: BatchExecutor> IpcHost<E> {
                 KIND_SUBMISSION_ASYNC => self.serve_async_submission(&payload)?,
                 KIND_TEXTURE_REG => {
                     let status = self.register_texture(&payload);
+                    write_frame(&mut stream, KIND_ACK, &[status])?;
+                }
+                KIND_SAMPLER_REG => {
+                    let status = self.register_sampler(&payload);
                     write_frame(&mut stream, KIND_ACK, &[status])?;
                 }
                 KIND_SURFACE_REG => {
@@ -1253,6 +1298,31 @@ impl<E: BatchExecutor> IpcHost<E> {
                 generation: request.generation,
             },
         );
+        REGISTRATION_ACCEPTED
+    }
+
+    /// Registers a reduced `MTLSamplerState` (kind 10).
+    ///
+    /// Returns the kind-128 status byte. A malformed payload or an out-of-range
+    /// filter/address mode is an explicit rejection and leaves the session
+    /// open. Re-registering a handle with the same content is accepted without
+    /// touching the device; a conflicting content is rejected, so a handle can
+    /// never silently change meaning inside one session.
+    fn register_sampler(&mut self, payload: &[u8]) -> u8 {
+        let Some(request) = decode_sampler_request(payload) else {
+            return REGISTRATION_REJECTED;
+        };
+        if let Some(existing) = self.samplers.get(&request.id) {
+            return if *existing == request.desc {
+                REGISTRATION_ACCEPTED
+            } else {
+                REGISTRATION_REJECTED
+            };
+        }
+        if self.executor.register_sampler(request.id, request.desc).is_err() {
+            return REGISTRATION_REJECTED;
+        }
+        self.samplers.insert(request.id, request.desc);
         REGISTRATION_ACCEPTED
     }
 
@@ -1595,11 +1665,9 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// A v3 table entry is either a registered allocation range or a resource
     /// handle the host registered out of band.
     ///
-    /// Texture handles are the kind 8 registrations. Sampler registrations are
-    /// not part of the wire session, so the device's `build_descriptor_table`
-    /// is the authority that refuses an unknown sampler handle before an
-    /// encoder exists; the host accepts it here rather than inventing a second
-    /// sampler registry.
+    /// Texture handles are the kind 8 registrations and sampler handles are the
+    /// kind 10 registrations, so an unknown handle is `UnknownHandle` before any
+    /// encoder exists.
     fn table_bindings_valid(&self, entries: &[DescriptorTableEntryV3]) -> bool {
         entries.iter().all(|entry| match entry {
             DescriptorTableEntryV3::Buffer(binding) => self.range_valid(
@@ -1609,7 +1677,7 @@ impl<E: BatchExecutor> IpcHost<E> {
                 binding.length,
             ),
             DescriptorTableEntryV3::Texture(handle) => self.textures.contains_key(handle),
-            DescriptorTableEntryV3::Sampler(_) => true,
+            DescriptorTableEntryV3::Sampler(handle) => self.samplers.contains_key(handle),
         })
     }
 
@@ -2422,6 +2490,49 @@ fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
             format,
             usage,
             label: None,
+        },
+    })
+}
+
+/// One decoded kind 10 sampler registration.
+struct SamplerRequest {
+    id: u64,
+    desc: SamplerDesc,
+}
+
+fn decode_sampler_request(payload: &[u8]) -> Option<SamplerRequest> {
+    if payload.len() != SAMPLER_REG_PAYLOAD_LEN {
+        return None;
+    }
+    let id = read_u64(payload, 0);
+    if id == 0 {
+        return None;
+    }
+    let min_filter = read_u32(payload, 8);
+    let mag_filter = read_u32(payload, 12);
+    let s_address_mode = read_u32(payload, 16);
+    let t_address_mode = read_u32(payload, 20);
+    let r_address_mode = read_u32(payload, 24);
+    // The host sampler shape is `MTLSamplerMinMagFilter` (0/1) and
+    // `MTLSamplerAddressMode` (0..=4). Anything else is refused before the
+    // device sees a descriptor.
+    if min_filter > 1 || mag_filter > 1 {
+        return None;
+    }
+    if [s_address_mode, t_address_mode, r_address_mode]
+        .into_iter()
+        .any(|mode| mode > 4)
+    {
+        return None;
+    }
+    Some(SamplerRequest {
+        id,
+        desc: SamplerDesc {
+            min_filter: min_filter as usize,
+            mag_filter: mag_filter as usize,
+            s_address_mode: s_address_mode as usize,
+            t_address_mode: t_address_mode as usize,
+            r_address_mode: r_address_mode as usize,
         },
     })
 }
