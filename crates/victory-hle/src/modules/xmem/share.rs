@@ -1156,12 +1156,18 @@ mod tests {
     // their own temporary file, so they run without a game or a Wine
     // launcher.
 
-    /// The submissions the registry tests use. Each test retires what it
-    /// retains, and the numbers are distinct so a test that fails mid-way
-    /// cannot collide with another.
-    const SUB_A: u64 = 0xA;
-    const SUB_B: u64 = 0xB;
-    const SUB_C: u64 = 0xC;
+    /// A submission number no other test has used.
+    ///
+    /// The registry deliberately remembers a retirement for the life of the
+    /// process (a reused number must not resurrect a stale range), and the
+    /// test harness runs these tests in one process in *name* order, which is
+    /// not source order. A number shared between two tests is therefore
+    /// retired by the first and refused by the second, wherever they run:
+    /// the sharing was the defect, not the registry's permanent retirement.
+    fn fresh_submission() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
 
     /// An address no real view occupies; the resolver reads only the page
     /// table, so a range here is never dereferenced.
@@ -1287,8 +1293,9 @@ mod tests {
 
         let lease = resolve_guest_range(at as usize, PAGE).expect("page 0 resolves");
         assert_eq!(lease.range.id, id);
+        let submission = fresh_submission();
         let key = lease
-            .retain(SUB_A)
+            .retain(submission)
             .expect("the submission retains the range");
         drop(lease);
 
@@ -1299,7 +1306,7 @@ mod tests {
             resolve_guest_range(at as usize, PAGE).expect("a live view still resolves");
         assert_eq!(through_view.range.id, id);
         drop(through_view);
-        assert!(retained(SUB_A, id, GENERATION, 0, PAGE as u64).is_ok());
+        assert!(retained(submission, id, GENERATION, 0, PAGE as u64).is_ok());
 
         // Unmap the view: neither page numbers nor views remain, so only the
         // retained range can keep the backing alive now.
@@ -1309,7 +1316,7 @@ mod tests {
             ResolveError::NotMapped,
             "a range with no page numbers or views must not resolve"
         );
-        let held = retained(SUB_A, id, GENERATION, 0, PAGE as u64)
+        let held = retained(submission, id, GENERATION, 0, PAGE as u64)
             .expect("the retained range keeps the backing alive");
         assert_eq!(held.path(), path.as_path());
         assert_eq!(held.file_size(), size as u64);
@@ -1318,7 +1325,7 @@ mod tests {
 
         // A window and an allocation nobody retained are explicit errors.
         assert_eq!(
-            retained(SUB_A, id, GENERATION, PAGE as u64, PAGE as u64).unwrap_err(),
+            retained(submission, id, GENERATION, PAGE as u64, PAGE as u64).unwrap_err(),
             RegistryError::MissingRange {
                 id,
                 offset: PAGE as u64,
@@ -1326,12 +1333,12 @@ mod tests {
             }
         );
         assert_eq!(
-            retained(SUB_A, id + 1, GENERATION, 0, PAGE as u64).unwrap_err(),
+            retained(submission, id + 1, GENERATION, 0, PAGE as u64).unwrap_err(),
             RegistryError::Missing { id: id + 1 }
         );
 
         drop(held);
-        assert_eq!(retire(SUB_A).expect("retire the submission"), 1);
+        assert_eq!(retire(submission).expect("retire the submission"), 1);
         assert!(
             !is_retained(key),
             "the last reference must drop the retained range"
@@ -1344,27 +1351,29 @@ mod tests {
     fn two_submissions_share_a_range_until_the_last_retires() {
         let share = SyntheticShare::new(1);
         let lease = share.lease(0, PAGE);
-        let key = lease.retain(SUB_A).expect("the first submission retains");
+        let first = fresh_submission();
+        let second = fresh_submission();
+        let key = lease.retain(first).expect("the first submission retains");
         assert_eq!(
-            lease.retain(SUB_B).expect("the second submission retains"),
+            lease.retain(second).expect("the second submission retains"),
             key
         );
         assert!(is_retained(key), "the range is registered");
 
         // The first fence retires: the second submission still holds it.
-        assert_eq!(retire(SUB_A).expect("retire the first"), 1);
+        assert_eq!(retire(first).expect("retire the first"), 1);
         assert!(
             is_retained(key),
             "a second submission still references the range"
         );
-        assert!(retained(SUB_B, key.id, GENERATION, key.offset, key.length).is_ok());
+        assert!(retained(second, key.id, GENERATION, key.offset, key.length).is_ok());
 
         // The last fence retires: the registry drops the range and backing.
-        assert_eq!(retire(SUB_B).expect("retire the second"), 1);
+        assert_eq!(retire(second).expect("retire the second"), 1);
         assert!(!is_retained(key), "the last reference must drop the range");
         assert_eq!(
-            retained(SUB_B, key.id, GENERATION, key.offset, key.length).unwrap_err(),
-            RegistryError::Retired(SUB_B),
+            retained(second, key.id, GENERATION, key.offset, key.length).unwrap_err(),
+            RegistryError::Retired(second),
         );
     }
 
@@ -1374,14 +1383,16 @@ mod tests {
     fn release_order_does_not_matter() {
         let share = SyntheticShare::new(1);
         let lease = share.lease(0, PAGE);
-        let key = lease.retain(SUB_A).expect("retain for the earlier fence");
-        lease.retain(SUB_C).expect("retain for the later fence");
+        let earlier = fresh_submission();
+        let later = fresh_submission();
+        let key = lease.retain(earlier).expect("retain for the earlier fence");
+        lease.retain(later).expect("retain for the later fence");
 
-        assert_eq!(retire(SUB_C).expect("retire the later fence"), 1);
+        assert_eq!(retire(later).expect("retire the later fence"), 1);
         assert!(is_retained(key), "the earlier fence still references it");
-        assert!(retained(SUB_A, key.id, GENERATION, key.offset, key.length).is_ok());
+        assert!(retained(earlier, key.id, GENERATION, key.offset, key.length).is_ok());
 
-        assert_eq!(retire(SUB_A).expect("retire the earlier fence"), 1);
+        assert_eq!(retire(earlier).expect("retire the earlier fence"), 1);
         assert!(!is_retained(key), "the last reference is gone");
     }
 
@@ -1391,15 +1402,16 @@ mod tests {
     fn stale_generations_are_explicit_errors() {
         let share = SyntheticShare::new(1);
         let lease = share.lease(0, PAGE);
-        let key = lease.retain(SUB_A).expect("retain");
+        let submission = fresh_submission();
+        let key = lease.retain(submission).expect("retain");
         assert_eq!(
-            retained(SUB_A, key.id, GENERATION + 1, 0, PAGE as u64).unwrap_err(),
+            retained(submission, key.id, GENERATION + 1, 0, PAGE as u64).unwrap_err(),
             RegistryError::StaleGeneration {
                 id: key.id,
                 generation: GENERATION + 1,
             }
         );
-        assert_eq!(retire(SUB_A).expect("retire"), 1);
+        assert_eq!(retire(submission).expect("retire"), 1);
 
         // A backing with a foreign generation or a zero id can only come
         // from a corrupted page table; the resolver refuses it rather than
@@ -1451,28 +1463,61 @@ mod tests {
     fn double_release_is_an_explicit_error() {
         let share = SyntheticShare::new(1);
         let lease = share.lease(0, PAGE);
-        let key = lease.retain(SUB_A).expect("retain");
-        assert_eq!(release(key, SUB_A), Ok(()));
+        let submission = fresh_submission();
+        let key = lease.retain(submission).expect("retain");
+        assert_eq!(release(key, submission), Ok(()));
         assert_eq!(
-            release(key, SUB_A).unwrap_err(),
+            release(key, submission).unwrap_err(),
             RegistryError::NotRetained {
-                submission: SUB_A,
+                submission,
                 key,
             }
         );
         assert!(!is_retained(key), "the released range is gone");
 
         // A submission with no references left may retire, but only once.
-        assert_eq!(retire(SUB_A).expect("retire after release"), 0);
-        assert_eq!(retire(SUB_A).unwrap_err(), RegistryError::Retired(SUB_A));
+        assert_eq!(retire(submission).expect("retire after release"), 0);
         assert_eq!(
-            lease.retain(SUB_A).unwrap_err(),
-            RegistryError::Retired(SUB_A)
+            retire(submission).unwrap_err(),
+            RegistryError::Retired(submission)
         );
         assert_eq!(
-            release(key, SUB_A).unwrap_err(),
-            RegistryError::Retired(SUB_A)
+            lease.retain(submission).unwrap_err(),
+            RegistryError::Retired(submission)
         );
+        assert_eq!(
+            release(key, submission).unwrap_err(),
+            RegistryError::Retired(submission)
+        );
+    }
+
+    /// A retirement is remembered for the life of the process: the retired
+    /// number is refused from then on, and only a fresh one may retain. The
+    /// lease tests once shared fixed numbers and depended on their execution
+    /// order because of this; the numbers are now per test.
+    #[test]
+    fn a_retired_submission_number_never_names_a_new_lease() {
+        let share = SyntheticShare::new(1);
+        let lease = share.lease(0, PAGE);
+        let retired = fresh_submission();
+        let fresh = fresh_submission();
+        assert_ne!(retired, fresh, "the allocator must not repeat a number");
+
+        let key = lease.retain(retired).expect("retain");
+        assert_eq!(retire(retired).expect("retire"), 1);
+        assert!(!is_retained(key), "the retirement drops the range");
+        assert_eq!(
+            lease.retain(retired).unwrap_err(),
+            RegistryError::Retired(retired),
+            "a retired number must not retain again"
+        );
+
+        // A fresh number for the very same range is independent of it.
+        let key = lease.retain(fresh).expect("a fresh submission retains");
+        assert!(is_retained(key), "the fresh reference keeps the range");
+        assert!(retained(fresh, key.id, GENERATION, 0, PAGE as u64).is_ok());
+        assert_eq!(retire(fresh).expect("retire the fresh submission"), 1);
+        assert!(!is_retained(key), "the last reference is gone");
     }
 
     /// The seam over the real share provider: an unaligned guest address
