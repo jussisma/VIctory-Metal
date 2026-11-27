@@ -96,9 +96,13 @@ fn empty_container() -> Vec<u8> {
     out
 }
 
-/// A wave64 compute program writing `per_lane` dwords per thread at `l * 32`
-/// through the root table's UAV, lowered for a host of 32-lane waves.
-fn lowered_dxil(words: &[u32], threads: u32, lds_bytes: u32, narrow_waves: bool) -> Vec<u8> {
+/// Emits the DXIL for `options` (no IRConverter, no GPU work).
+fn emitted_dxil(
+    words: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    options: Options,
+) -> Result<Vec<u8>, victory_shader::ShaderError> {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -138,25 +142,29 @@ fn lowered_dxil(words: &[u32], threads: u32, lds_bytes: u32, narrow_waves: bool)
     let raised = io::raise(&p, &native).expect("io::raise");
     let bytes = empty_container();
     let c = dxbc::Container::parse(&bytes).expect("empty container");
-    let host = emit::emit_with(
-        &c,
-        &native,
-        &p,
-        &st,
-        &raised,
-        &res,
+    let host = emit::emit_with(&c, &native, &p, &st, &raised, &res, options)?;
+    assert!(
+        host.dxil.windows(4).any(|w| w == b"DXIL"),
+        "emitted container has no DXIL part"
+    );
+    Ok(host.dxil)
+}
+
+/// A wave64 compute program writing `per_lane` dwords per thread at `l * 32`
+/// through the root table's UAV, lowered for a host of 32-lane waves
+/// (`host_wave32`, with `narrow_waves` as given).
+fn lowered_dxil(words: &[u32], threads: u32, lds_bytes: u32, narrow_waves: bool) -> Vec<u8> {
+    emitted_dxil(
+        words,
+        threads,
+        lds_bytes,
         Options {
             host_wave32: true,
             narrow_waves,
             ..Options::default()
         },
     )
-    .expect("the wave64 program lowers for a 32-lane host");
-    assert!(
-        host.dxil.windows(4).any(|w| w == b"DXIL"),
-        "emitted container has no DXIL part"
-    );
-    host.dxil
+    .expect("the wave64 program lowers for a 32-lane host")
 }
 
 /// The x86_64 Rosetta converter worker and the x86_64 IRConverter library.
@@ -1119,6 +1127,38 @@ fn lowered_wave_fixtures_emit_dxil() {
     }
 }
 
+/// ADR-025a: `narrow_waves` without `host_wave32` is refused by the emitter
+/// itself, before any DXIL exists (so before any metallib or GPU work), and
+/// the supported pair still emits.
+#[test]
+fn narrow_waves_without_host_wave32_is_refused_before_conversion() {
+    for words in [lanes_below(), live_mask_read()] {
+        let err = emitted_dxil(
+            &words,
+            64,
+            0,
+            Options {
+                host_wave32: false,
+                narrow_waves: true,
+                ..Options::default()
+            },
+        )
+        .expect_err("the unsound pair must not lower");
+        let text = err.to_string();
+        assert!(
+            matches!(err, victory_shader::ShaderError::Options(_)),
+            "expected the options refusal: {text}"
+        );
+        assert!(
+            text.contains("narrow_waves") && text.contains("host_wave32"),
+            "the refusal must name both flags: {text}"
+        );
+    }
+    // The same program with `host_wave32` emits DXIL.
+    let dxil = lowered_dxil(&lanes_below(), 64, 0, true);
+    assert!(dxil.windows(4).any(|w| w == b"DXIL"));
+}
+
 /// Hardware proof: every fixture, converted and run on the Metal GPU, gives
 /// the console's per-lane dwords.
 #[test]
@@ -1226,6 +1266,38 @@ fn lowered_wave_patterns_run_like_the_console_on_metal() {
         &run(&literal_mask_read(), threads, 0, false),
         &want,
         1,
+    );
+}
+
+/// ADR-025a's supported pair, on the hardware: a 64-lane wave64 corpus mask
+/// program is lowered with `host_wave32: true`, declares `WaveSize(32)` and
+/// runs in halves, and every lane of both halves gets the console's dwords —
+/// including the ballot's high dword, the bits 32..63 a 32-lane host would
+/// lose if the pair were lowered as if it were 64 lanes.
+#[test]
+#[ignore = "hardware: run once on an exclusive GPU with --ignored --test-threads=1"]
+fn a_wave64_corpus_mask_runs_on_both_halves_on_metal() {
+    let _ = converter().expect("IRConverter worker and library");
+    let threads = 64;
+
+    // The live mask of the whole console wave: 64 in all 64 lanes. A high
+    // ballot dword read from a 32-lane host would make it 32.
+    let want: Vec<u32> = vec![64; threads as usize];
+    assert_lanes(
+        "live mask, both halves",
+        &run(&live_mask_read(), threads, 0, false),
+        &want,
+        1,
+    );
+
+    // Lanes below 40 as data: the count, the ballot's high dword (bits
+    // 32..39 = 0xff) and each lane's compaction index.
+    let want: Vec<u32> = (0..threads).flat_map(|l| [40, 0xff, l.min(40)]).collect();
+    assert_lanes(
+        "ballot masks, both halves",
+        &run(&lanes_below(), threads, 0, false),
+        &want,
+        3,
     );
 }
 

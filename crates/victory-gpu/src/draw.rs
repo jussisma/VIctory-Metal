@@ -4310,6 +4310,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                 atomic_lock_rounds: false,
                 atomic_umax: false,
                 bias_as_gradients: false,
+                // ADR-025a: `narrow_waves` is only ever set with
+                // `host_wave32`; this fixture is a plain 64-lane-wave host.
                 host_wave32: false,
                 narrow_waves: false,
                 bvh_no_hit: false,

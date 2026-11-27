@@ -4,7 +4,9 @@
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it; a wave64 one on a
 //! host of 32-lane waves declares 32 and runs in halves
-//! ([`Options::host_wave32`]).
+//! ([`Options::host_wave32`]). `narrow_waves` only ever travels with
+//! `host_wave32`: the pair without it would read the upper half of every lane
+//! mask as zero and is refused ([`ShaderError::Options`], ADR-025a).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -463,11 +465,34 @@ pub struct Options {
     /// says (D3DMetal): a compute group that is one console wave of more
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
+    ///
+    /// ADR-025a: this option must be paired with [`Options::host_wave32`].
+    /// Alone it would declare `WaveSize(64)` while the host runs 32-lane
+    /// waves, and the upper half of every lane mask would read as zero;
+    /// [`translate_with`] and [`emit_with`] refuse that pair with
+    /// [`ShaderError::Options`] instead of lowering it.
     pub narrow_waves: bool,
     /// When the acceleration-structure builder does not run (`VICTORY_BVH_NO_HIT=1`),
     /// BVH intersection instructions answer miss immediately without reading
     /// unbuilt title memory.
     pub bvh_no_hit: bool,
+}
+
+/// Why [`Options::narrow_waves`] without [`Options::host_wave32`] is refused
+/// (ADR-025a): the lowering would declare `WaveSize(64)` and take ballot
+/// dword 1 from a host whose waves are 32 lanes, so bits 32..63 of every EXEC
+/// and BALLOT read as zero. Refused, never repaired into halves: that is the
+/// caller's explicit choice.
+pub(crate) const NARROW_WAVES_WITHOUT_HOST_WAVE32: &str =
+    "narrow_waves requires host_wave32 (else the upper half of every lane mask reads as zero)";
+
+impl Options {
+    /// Why no sound translation can be made with these options, if none can
+    /// (ADR-025a).
+    pub(crate) fn refusal(self) -> Option<ShaderError> {
+        (self.narrow_waves && !self.host_wave32)
+            .then_some(ShaderError::Options(NARROW_WAVES_WITHOUT_HOST_WAVE32))
+    }
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -842,6 +867,12 @@ fn emit_pruned(
     options: Options,
     keep: Option<&lower::KeptOutputs>,
 ) -> Result<HostShader, ShaderError> {
+    // ADR-025a: refuse an unsound host-width pair before any work, so no
+    // path (translate, translate_linked, emit) reaches the lowering with it.
+    // `lower_pruned` repeats the check for direct lowering.
+    if let Some(refusal) = options.refusal() {
+        return Err(refusal);
+    }
     let EmitInput {
         c,
         native,

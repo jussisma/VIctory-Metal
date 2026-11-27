@@ -43,7 +43,8 @@
 //!   `barriers::split_wave_barriers` in those same blocks, whenever the host's
 //!   waves are narrower than the console's: `host_wave32` (the host refuses
 //!   `WaveSize(64)`, so the group is two host waves) or `narrow_waves`
-//!   (D3DMetal runs a wave64 program in 32-lane waves whatever it declares).
+//!   (D3DMetal runs a wave64 program in 32-lane waves whatever it declares;
+//!   ADR-025a: only ever set together with `host_wave32`).
 //!
 //! `barriers::in_step_one_wave` extends the `step` proof for a group that is
 //! one console wave: a first-lane read of a value `halves::lane_uniform`
@@ -195,7 +196,7 @@
 //! |---|---|---|
 //! | `narrow_waves` + `host_wave32` (a Wine/D3DMetal run whose device query says 32) | 11/35 | masks 3, LDS 2, reductions 2, first lanes 2, lane reads 2 |
 //! | `host_wave32` only (NVIDIA, Intel: the host refuses `WaveSize(64)`) | 11/35 | the same 11 |
-//! | `narrow_waves` only (halves off) | 1/35 | the lowering translates 34, with no halves |
+//! | `narrow_waves` only (halves off) | 35/35 | one options refusal, `narrow_waves requires host_wave32` (ADR-025a) |
 //!
 //! So on the configuration the historical refusals came from, the shapes that
 //! close the census buckets admit; the 11 that keep refusing are the divergent
@@ -219,19 +220,27 @@
 //! program it now admits, byte-identical DXIL to the configuration the GPU
 //! fixtures ran (`wave_corpus_tests` asserts that identity).
 //!
-//! ## The flag that is still allowed to disagree
+//! ## The defect ADR-025a closes: `narrow_waves` without `host_wave32`
 //!
-//! `narrow_waves` alone (`host_wave32` false) translates 34 of the 35 corpus
-//! programs, ballots and lane reads included, taking only a 32-lane host
-//! wave's mask bits (the high dword is 0) while asserting the host runs 32-lane
-//! waves: that configuration lowers as if the host ran 64. It is reachable in
-//! production because `victory-gpu`'s `host_wave32()` returns false when
-//! `CheckFeatureSupport` fails (`host.rs` logs "host wave lanes not known" and
-//! answers false) while `narrow_waves()` still answers true under Wine. Making
-//! `narrow_waves` imply halves is the sound fix, but it changes every
-//! D3DMetal-translated wave64 shader from "declare 64" to "declare 32 with
-//! exchanges" and the `halves_tests` three-way table, so it is left as a
-//! decision for the orchestrator/architect, not a side effect of this task.
+//! `narrow_waves` alone (`host_wave32` false) used to translate 34 of the 35
+//! corpus programs, ballots and lane reads included, taking only a 32-lane
+//! host wave's mask bits (the high dword is 0) while asserting the host runs
+//! 32-lane waves: that configuration lowered as if the host ran 64. It was
+//! reachable in production because `victory-gpu`'s `host_wave32()` returned
+//! false when `CheckFeatureSupport` failed (`host.rs` logged "host wave lanes
+//! not known" and answered false) while `narrow_waves()` still answered true
+//! under Wine.
+//!
+//! The translator now refuses the pair in `lower::lower_pruned` (and
+//! `emit::emit_pruned` before its own work) with
+//! `ShaderError::Options("narrow_waves requires host_wave32 ...")`, for every
+//! corpus program (`wave_corpus_tests`), before any code is emitted. It is a
+//! refusal, not a repair into halves: halves stay the caller's explicit
+//! `host_wave32` choice. `victory-gpu`'s `shader_cache::host_wave32()` sets
+//! the flag whenever the backend is native Metal (Apple GPUs always have
+//! 32-lane simdgroups), under `narrow_waves`, and on the device query, so no
+//! production path can build the unsound pair, and the cache key keeps
+//! covering it.
 //!
 //! ## What still refuses, and why it must
 //!

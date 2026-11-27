@@ -581,6 +581,11 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         host_wave32: checks.wave32,
+                        // ADR-025a: the D3DMetal switch is a `victory-gpu`
+                        // run-time option, never set by this walk, so the
+                        // pair stays supported (`narrow_waves` would need
+                        // `host_wave32` or be refused).
+                        narrow_waves: false,
                         ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {

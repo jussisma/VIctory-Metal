@@ -40,4 +40,9 @@ pub enum ShaderError {
     /// Valid code the translator cannot handle yet: an opcode name or a construct.
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
+    /// Options no sound translation can be made with: the request is refused
+    /// rather than translated wrong (ADR-025a, `narrow_waves` without
+    /// `host_wave32`).
+    #[error("translation options: {0}")]
+    Options(&'static str),
 }

@@ -1369,9 +1369,23 @@ fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
     lowered(words, lanes, narrow_waves).split_barriers
 }
 
-/// The same program, lowered.
+/// [`split_barriers`] for a one-wave group whose LDS no barrier can sync: in
+/// halves such a program is refused (`halves_lds`), never run unsynced.
+fn assert_refused_in_halves(words: &[u32]) {
+    let why = match try_lowered(words, 64, true, true) {
+        Ok(_) => panic!("one-wave LDS without a barrier must not run in halves"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        why.contains("LDS one console wave64 shares without barriers"),
+        "{why}"
+    );
+}
+
+/// The same program, lowered. `narrow_waves` also declares `host_wave32`
+/// (`narrow_waves` alone is refused: ADR-025a).
 fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
-    try_lowered(words, lanes, narrow_waves, false).expect("lower")
+    try_lowered(words, lanes, narrow_waves, narrow_waves).expect("lower")
 }
 
 /// [`lowered`], with the host declaring 32-lane waves where `halves`, and
@@ -1478,7 +1492,7 @@ fn no_barrier_in_divergent_code() {
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     assert!(barriers_at(&wave64(&w)).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_refused_in_halves(&w);
 }
 
 const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
@@ -1672,7 +1686,7 @@ fn a_lane_dependent_guard_still_refuses_a_wave_constant_lane_count() {
     );
     let p = wave64(&w);
     assert!(barriers_at_unif(&p, &std::collections::HashSet::new()).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_refused_in_halves(&w);
 }
 
 #[test]
@@ -1822,7 +1836,7 @@ fn a_guarded_uniform_first_lane_read_is_not_admitted() {
         .collect();
     assert_eq!(unif.len(), 1);
     assert!(barriers_at_unif(&p, &unif).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_refused_in_halves(&w);
 }
 
 #[test]
@@ -1876,7 +1890,7 @@ fn lds_in_a_loop_on_a_lane_value_gets_no_barrier() {
         S_CMP_LT_S20_S21,
     );
     assert!(barriers_at(&wave64(&w)).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+    assert_refused_in_halves(&w);
     // A loop on a lane's own condition (`s_cbranch_vccnz`) neither.
     let mut w = vec![V_LSHLREV_V1_2_V0];
     w.extend(DS_WRITE_V1_V0);

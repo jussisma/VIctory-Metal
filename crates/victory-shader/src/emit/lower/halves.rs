@@ -2000,11 +2000,14 @@ mod cross_half_tests {
     /// file and `lane_mask_tests` encode them. Every count this test prints is
     /// a count of these programs, never of the title's.
     ///
-    /// Each program is lowered twice, for the two option sets a 32-lane host
-    /// can be translated with: `wine` (`narrow_waves`, D3DMetal's switch) and
-    /// `wave32` (the host refuses `WaveSize(64)`, so the program runs in
-    /// halves; no D3DMetal switch). A program both sets translate must come
-    /// out as the same DXIL: the halves' LDS barriers are the same barriers.
+    /// Each program is lowered for the two option sets a 32-lane host can be
+    /// translated with: `wine` (`narrow_waves` + `host_wave32`, D3DMetal's
+    /// switch on a host whose device says 32 lanes) and `wave32` (the host
+    /// refuses `WaveSize(64)`, so the program runs in halves; no D3DMetal
+    /// switch). A program both sets translate must come out as the same DXIL:
+    /// the halves' LDS barriers are the same barriers. A third set,
+    /// `narrow_waves` without `host_wave32`, is refused for every program
+    /// (ADR-025a, `ShaderError::Options`).
     mod wave_corpus_tests {
         use super::super::lane_mask_tests::{
             PROLOGUE, S_BCNT1_S12_VCC, S_ENDPGM, V_LSHLREV_V16_5_V0, V_MOV_V1_S12, cmp_below,
@@ -2379,7 +2382,7 @@ mod cross_half_tests {
             let programs = corpus();
             let buckets = programs.len();
             for (label, narrow, host_wave32) in [
-                ("d3dmetal, halves off", true, false),
+                ("narrow waves alone (refused)", true, false),
                 ("wine, halves on", true, true),
                 ("wave32 host, no switch", false, true),
             ] {
@@ -2475,14 +2478,79 @@ mod cross_half_tests {
                     assert_eq!(a.dxil, b.dxil, "{}: both configs' DXIL", program.name);
                 }
             }
-            // With the halves lowering off (`host_wave32` false) nearly every
-            // program translates: the ballots take only a 32-lane host wave's
-            // bits and the high dword is 0. That configuration asserts, through
-            // `narrow_waves`, that the host runs 32-lane waves and then lowers
-            // as if it ran 64: it must not be a production combination. Pinned
-            // so a change here is seen.
-            let (_, _, halves_off) = census(&programs, true, false);
-            assert_eq!(halves_off, 1, "halves off translates 34 of 35");
+            // With the halves lowering off (`host_wave32` false) and
+            // `narrow_waves` on, every program is refused (ADR-025a): that
+            // pair asserts the host runs 32-lane waves and then lowers as if
+            // it ran 64, so the ballots' high dword would be read as 0. The
+            // refusal is a single explicit options error before any code is
+            // emitted, not a per-shape reason.
+            let (halves_off_reasons, _, halves_off) = census(&programs, true, false);
+            assert_eq!(
+                halves_off, buckets,
+                "narrow_waves without host_wave32 refuses every program"
+            );
+            assert_eq!(
+                halves_off_reasons,
+                BTreeMap::from([(
+                    crate::emit::NARROW_WAVES_WITHOUT_HOST_WAVE32.to_string(),
+                    buckets
+                )]),
+                "the unsound pair's one reason"
+            );
+        }
+
+        /// ADR-025a, fail closed: `narrow_waves` without `host_wave32` is
+        /// refused for every corpus program with the explicit options error,
+        /// before any code is emitted — never lowered with a zero high dword.
+        #[test]
+        fn narrow_waves_without_host_wave32_refuses_the_whole_corpus() {
+            let programs = corpus();
+            assert_eq!(programs.len(), 35);
+            for program in &programs {
+                match lower_flags(
+                    &program.words,
+                    program.threads,
+                    program.lds,
+                    true,
+                    false,
+                ) {
+                    Ok(_) => panic!(
+                        "{}: lowered `narrow_waves` without `host_wave32`",
+                        program.name
+                    ),
+                    Err(crate::ShaderError::Options(why)) => assert_eq!(
+                        why,
+                        crate::emit::NARROW_WAVES_WITHOUT_HOST_WAVE32,
+                        "{}: reason",
+                        program.name
+                    ),
+                    Err(e) => panic!("{}: expected the options refusal, got {e}", program.name),
+                }
+            }
+        }
+
+        /// The supported pair still lowers: every program that needs the
+        /// console's lanes declares `WaveSize(32)` and takes the halves path
+        /// (the `!31` half-wave mask), and at least one does.
+        #[test]
+        fn narrow_waves_with_host_wave32_lowers_in_halves() {
+            let mut in_halves = 0;
+            for program in &corpus() {
+                let Ok(l) = lower_flags(&program.words, program.threads, program.lds, true, true)
+                else {
+                    continue;
+                };
+                if let Some(wave) = l.wave_size {
+                    assert_eq!(wave, 32, "{}: wave size", program.name);
+                    assert!(
+                        l.has_half_wave_mask,
+                        "{}: the halves' `!31` mask",
+                        program.name
+                    );
+                    in_halves += 1;
+                }
+            }
+            assert_eq!(in_halves, 22, "programs that need the console's lanes");
         }
     }
 }

@@ -986,6 +986,9 @@ fn differences_in(
     narrow_waves: bool,
 ) -> Vec<String> {
     let n = native(words, wave64, threads, lds_bytes);
+    // ADR-025a: `narrow_waves` only ever travels with `host_wave32`; a host
+    // that really runs 64-lane waves is lowered with neither (the form the
+    // halves are compared against).
     let forms = if wave64 {
         vec![
             (
@@ -994,13 +997,13 @@ fn differences_in(
             ),
             (
                 "wave64",
-                shader(lowered_with(&n, false, narrow_waves).expect("one wave64")),
+                shader(lowered_with(&n, false, false).expect("one wave64")),
             ),
         ]
     } else {
         vec![(
             "wave32",
-            shader(lowered_with(&n, false, narrow_waves).expect("one wave32")),
+            shader(lowered_with(&n, false, false).expect("one wave32")),
         )]
     };
     let views = [

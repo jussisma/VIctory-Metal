@@ -69,11 +69,18 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
-/// Whether translations are for a host of 32-lane waves: the host GPU's
-/// (made here if it is not yet: the cache belongs to the GPU it was filled
-/// on, as the pipeline library does); none without one.
+/// Whether translations are for a host of 32-lane waves: the native Metal
+/// backend's (Apple GPUs' simdgroups are 32 lanes; no device query gates it),
+/// the D3DMetal switch's (`narrow_waves` says the host runs a wave64 program
+/// in 32-lane waves, so it is declared 32 at most too: ADR-025a), or the
+/// device's (made here if it is not yet: the cache belongs to the GPU it was
+/// filled on, as the pipeline library does). A `CheckFeatureSupport` that
+/// failed answers false here but must not leave `narrow_waves` without
+/// `host_wave32`: the translator refuses that pair (`ShaderError::Options`).
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::backend::metal_selected()
+        || narrow_waves()
+        || crate::host::host().is_some_and(crate::host::Host::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -232,6 +239,9 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
     // leave the texels untouched (`emit`, "Atomic locks"). On a host of
     // 32-lane waves, wave64 programs run in halves (`build` keys on it).
+    // ADR-025a: `host_wave32` is set on every such host (native Metal, the
+    // `narrow_waves` switch, the device query) and the translator refuses
+    // `narrow_waves` without it, so this pair is always sound.
     victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
@@ -726,5 +736,18 @@ mod tests {
                 ..base
             })
         );
+    }
+
+    /// ADR-025a: no production option set asks for `narrow_waves` without
+    /// `host_wave32` (the translator refuses that pair), and the cache key
+    /// carries the flag the key's wave-width bit is made from.
+    #[test]
+    fn runtime_options_pair_narrow_waves_with_host_wave32() {
+        let options = runtime_options();
+        assert!(
+            !options.narrow_waves || options.host_wave32,
+            "narrow_waves without host_wave32: {options:?}"
+        );
+        assert_eq!(options.host_wave32, host_wave32());
     }
 }

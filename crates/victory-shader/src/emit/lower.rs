@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::UserData;
+use super::{NARROW_WAVES_WITHOUT_HOST_WAVE32, UserData};
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
@@ -154,7 +154,8 @@ pub(crate) struct Parts<'a> {
     pub bias_as_gradients: bool,
     /// The host's waves have at most 32 lanes (`emit::Options::host_wave32`).
     pub host_wave32: bool,
-    /// See [`Options::narrow_waves`](super::Options).
+    /// See [`Options::narrow_waves`](super::Options); refused without
+    /// [`Parts::host_wave32`] ([`NARROW_WAVES_WITHOUT_HOST_WAVE32`]).
     pub narrow_waves: bool,
     /// See [`Options::bvh_no_hit`](super::Options).
     pub bvh_no_hit: bool,
@@ -174,6 +175,17 @@ pub(crate) fn lower_pruned(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
 ) -> Result<Lowered, ShaderError> {
+    // ADR-025a, fail closed: `narrow_waves` alone says the host runs a
+    // console wave64 program in 32-lane waves while the lowering declares
+    // `WaveSize(64)`, and `mask_dword` reads ballot dword 1 from a 32-lane
+    // host (always 0): bits 32..63 of EXEC and BALLOT would vanish silently.
+    // Refuse the pair; never repair it into halves here, which is the
+    // caller's explicit choice (`host_wave32`). Every translation entry
+    // reaches the lowering through here (`emit`'s `emit_pruned` repeats the
+    // check before its own work).
+    if parts.narrow_waves && !parts.host_wave32 {
+        return Err(ShaderError::Options(NARROW_WAVES_WITHOUT_HOST_WAVE32));
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad, keep).run() {
