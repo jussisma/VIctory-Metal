@@ -2093,12 +2093,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// `SetPipelineState` on the native path: the list names the host's own
 /// pipeline id, never the title's pointer.
 ///
-/// A compute PSO is registered on first use (`pipeline::native_pipeline`),
-/// which translates its DXIL through the persistent IRConverter pool and sends
-/// transport kind 4; the id the host answers with (kind 129) is what the
-/// producer records. A graphics or mesh PSO is refused with the fields the
-/// host's kind 4 form is missing: the frame carries one ticket and one entry,
-/// so it can only build the compute pipeline `load_metallib` makes.
+/// Every PSO family is registered on first use (`pipeline::native_pipeline`):
+/// a compute PSO uses the original kind 4 v1 frame, and a graphics or mesh PSO
+/// uses the version 2 frame with one library per stage, the encoded
+/// `PipelineState`, the ABI and the root-signature bytes. The id the host
+/// answers with (kind 129) is what the producer records for
+/// `SetComputePipeline`, `SetPipeline` or `SetMeshPipeline`.
+///
+/// A refusal is an explicit HRESULT naming the stage. The underlying reason
+/// (`vertex`, `pixel`, `mesh` or an unsupported stage) is in the log; nothing
+/// is silently skipped and nothing falls back to D3DMetal.
 #[cfg(windows)]
 fn set_native_pipeline(list: This, pipeline: This) {
     use victory_metal::wire_v3::{
@@ -2134,23 +2138,41 @@ fn set_native_pipeline(list: This, pipeline: This) {
     } else {
         ("graphics", OP_SET_GRAPHICS_PIPELINE)
     };
-    let missing = crate::native_metal::pso::GRAPHICS_MESH_FRAME_FIELDS;
-    tracing::warn!(
-        ?pipeline,
-        stage,
-        "VICTORY_BACKEND=metal: the host kind 4 form registers compute pipelines only; a {stage} \
-         PSO needs {missing}"
-    );
-    crate::native_metal::telemetry::note_registration_failure();
-    with_metal(list, |producer| {
-        producer.refuse(
-            match stage {
-                "mesh" => "SetPipelineState: a mesh PSO cannot be registered over kind 4",
-                _ => "SetPipelineState: a graphics PSO cannot be registered over kind 4",
-            },
-            Some(opcode),
-        )
-    });
+    match crate::pipeline::native_pipeline(pipeline) {
+        Ok(id) => {
+            tracing::info!(?pipeline, stage, id, "native pipeline registered");
+            with_metal(list, |producer| {
+                if stage == "mesh" {
+                    producer.set_mesh_pipeline(id)
+                } else {
+                    producer.set_pipeline(id)
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?pipeline,
+                stage,
+                %error,
+                "VICTORY_BACKEND=metal: the {stage} PSO could not be registered with the host"
+            );
+            crate::native_metal::telemetry::note_registration_failure();
+            // The refusal names the failing stage, not just the family: the
+            // HRESULT the title sees must say which shader blocked it.
+            let operation = if error.contains("Vertex") {
+                "SetPipelineState: the vertex stage could not be registered with the host"
+            } else if error.contains("Pixel") {
+                "SetPipelineState: the pixel stage could not be registered with the host"
+            } else if error.contains("Mesh") {
+                "SetPipelineState: the mesh stage could not be registered with the host"
+            } else if stage == "mesh" {
+                "SetPipelineState: the mesh PSO could not be registered with the host"
+            } else {
+                "SetPipelineState: the graphics PSO could not be registered with the host"
+            };
+            with_metal(list, |producer| producer.refuse(operation, Some(opcode)));
+        }
+    }
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or

@@ -25,7 +25,7 @@
 //! | 2 | guest to host | `allocation_id: u64 LE`, `byte_len: u64 LE` |
 //! | 3 | guest to host | one complete encoded [`crate::wire::Submission`] |
 //! | 3 | host to guest | one complete encoded [`crate::wire::Reply`] |
-//! | 4 | guest to host | `ticket: u64 LE`, `entry_len: u16 LE`, entry bytes |
+//! | 4 | guest to host | v1 `ticket, entry_len, entry`, or the v2 pipeline frame |
 //! | 5 | guest to host | one version 3 request envelope (below) |
 //! | 5 | host to guest | one complete encoded [`crate::wire::Reply`] |
 //! | 6 | guest to host | `byte_len: u64 LE`, must be 4096; shared fence page |
@@ -154,6 +154,14 @@
 //! loaded pipeline is registered in the same native table used by kind 3
 //! submissions.
 //!
+//! A request whose first four bytes are [`PIPELINE_FRAME_MAGIC`] is the
+//! version 2 form. It names the pipeline kind, one `(stage, ticket, entry)` per
+//! stage, the encoded [`crate::macos::registry::PipelineState`], a `VAB1`
+//! per-stage ABI container and the raw root-signature bytes. Compute keeps the
+//! `load_metallib` family; graphics and mesh create content-hashed pipelines
+//! through the registry. Every field is validated before the executor runs, so
+//! a malformed frame creates no GPU work and consumes no ticket.
+//!
 //! # Allocation files
 //!
 //! Registration carries no path. For a registration of `id`, the host opens
@@ -201,9 +209,13 @@ use crate::abi::{VmBufferId, VmPipelineId};
 use crate::cmdlist::{ListLedger, RingError};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
-use crate::macos::device::DirectMetalTransport;
+use crate::macos::bindings::RootSignatureLayout;
+use crate::macos::device::{DirectMetalTransport, PipelineAbi};
 use crate::macos::objc::{self, ObjcObject};
-use crate::macos::registry::{TextureDesc, TextureDimension, TextureFormat, TextureUsage};
+use crate::macos::registry::{
+    PipelineStage as RegistryPipelineStage, PipelineState, TextureDesc, TextureDimension,
+    TextureFormat, TextureUsage,
+};
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
@@ -274,6 +286,42 @@ pub const PIPELINE_REPLY_OK: u8 = 0;
 pub const PIPELINE_REPLY_REJECTED: u8 = 1;
 /// Exact length of a successful pipeline reply: status plus `u64` id.
 pub const PIPELINE_REPLY_OK_LEN: usize = 1 + 8;
+/// First four bytes of a version 2 kind 4 request. A version 1 request starts
+/// with its nonzero `u64` ticket, so the two forms are selected by this magic
+/// word; a v1 ticket whose low four bytes happen to equal it is refused rather
+/// than guessed at.
+pub const PIPELINE_FRAME_MAGIC: [u8; 4] = *b"VP2\0";
+/// Version byte of the version 2 pipeline frame.
+pub const PIPELINE_FRAME_VERSION_V2: u8 = 1;
+/// Fixed header length of a version 2 pipeline frame.
+pub const PIPELINE_V2_HEADER_LEN: usize = 24;
+/// Largest number of stage entries in one version 2 frame (vertex, pixel,
+/// mesh, object).
+pub const PIPELINE_V2_MAX_STAGES: usize = 4;
+/// Version 2 pipeline kinds.
+pub const PIPELINE_KIND_COMPUTE: u8 = 0;
+/// A vertex/fragment render pipeline.
+pub const PIPELINE_KIND_GRAPHICS: u8 = 1;
+/// A mesh/object/fragment render pipeline.
+pub const PIPELINE_KIND_MESH: u8 = 2;
+/// Version 2 per-stage codes (independent of the registry's stage enum).
+pub const PIPELINE_STAGE_VERTEX: u8 = 0;
+/// Pixel/fragment stage.
+pub const PIPELINE_STAGE_PIXEL: u8 = 1;
+/// Mesh stage.
+pub const PIPELINE_STAGE_MESH: u8 = 2;
+/// Object stage.
+pub const PIPELINE_STAGE_OBJECT: u8 = 3;
+/// Compute stage.
+pub const PIPELINE_STAGE_COMPUTE: u8 = 4;
+/// Largest encoded `PipelineState` blob accepted in a version 2 frame.
+pub const MAX_PIPELINE_STATE_BYTES: usize = 4 * 1024;
+/// Largest encoded pipeline ABI accepted in a version 2 frame.
+pub const MAX_PIPELINE_ABI_BYTES: usize = 16 * 1024;
+/// Largest raw root-signature blob accepted in a version 2 frame.
+pub const MAX_ROOT_SIGNATURE_BYTES: usize = 16 * 1024;
+/// Magic of the per-stage ABI container carried in a version 2 frame.
+pub const PIPELINE_ABI_MAGIC: [u8; 4] = *b"VAB1";
 
 const ENVELOPE_LEN: usize = 5;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -423,6 +471,42 @@ pub trait BatchExecutor {
         ))
     }
 
+    /// Registers a content-hashed graphics pipeline under `handle`.
+    ///
+    /// The default refuses the request; an executor that owns an ADR-013
+    /// registry implements it through
+    /// [`DirectMetalTransport::register_content_hashed_graphics_pipeline`].
+    /// `state` is the encoded [`PipelineState`] the registry decodes, and `abi`
+    /// is the per-stage root layout stored with the handle.
+    fn register_graphics_pipeline(
+        &self,
+        _handle: u64,
+        _metallib: &[u8],
+        _vertex_entry: &str,
+        _state: &[u8],
+        _abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "graphics pipeline registration is not enabled by this executor",
+        ))
+    }
+
+    /// Registers a content-hashed mesh pipeline under `handle`.
+    ///
+    /// The default refuses the request; see [`Self::register_graphics_pipeline`].
+    fn register_mesh_pipeline(
+        &self,
+        _handle: u64,
+        _metallib: &[u8],
+        _mesh_entry: &str,
+        _state: &[u8],
+        _abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "mesh pipeline registration is not enabled by this executor",
+        ))
+    }
+
     /// Creates a registry texture under `id`.
     ///
     /// The default deliberately refuses the request, so texture registration is
@@ -503,6 +587,32 @@ impl BatchExecutor for DirectMetalTransport {
 
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
         DirectMetalTransport::load_metallib(self, metallib, entry)
+    }
+
+    fn register_graphics_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        vertex_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        DirectMetalTransport::register_content_hashed_graphics_pipeline(
+            self, handle, metallib, vertex_entry, state, abi,
+        )
+    }
+
+    fn register_mesh_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        mesh_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        DirectMetalTransport::register_content_hashed_mesh_pipeline(
+            self, handle, metallib, mesh_entry, state, abi,
+        )
     }
 
     fn register_texture(&self, id: u64, desc: TextureDesc) -> Result<(), MetalError> {
@@ -743,6 +853,9 @@ pub struct IpcHost<E: BatchExecutor> {
     surfaces: BTreeMap<u64, u64>,
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
+    /// Next wire handle for a content-hashed graphics/mesh pipeline. Compute
+    /// pipelines keep using the executor's own `load_pipeline` id space.
+    next_content_pipeline: u64,
     /// Opt-in shared completion page registered by kind 6.
     ///
     /// The mapping is reference-counted because the executor keeps a clone while
@@ -791,6 +904,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             surfaces: BTreeMap::new(),
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
+            next_content_pipeline: 1,
             fence_page: None,
             fence_page_attached: false,
             next_sequence: 1,
@@ -1460,9 +1574,19 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// connection close: the file contents never reach the error path and the
     /// peer may retry the failed ticket or a later one.
     fn register_pipeline(&mut self, payload: &[u8]) -> Vec<u8> {
-        let Some((ticket, entry)) = decode_pipeline_request(payload) else {
-            return vec![PIPELINE_REPLY_REJECTED];
-        };
+        match decode_pipeline_request(payload) {
+            Some(PipelineRequest::V1 { ticket, entry }) => {
+                self.register_compute_pipeline_v1(ticket, entry)
+            }
+            Some(PipelineRequest::V2(request)) => self.register_pipeline_v2(&request),
+            None => vec![PIPELINE_REPLY_REJECTED],
+        }
+    }
+
+    /// The original kind 4 form: one ticket, one entry, a compute pipeline.
+    ///
+    /// The bytes on the wire are unchanged, so an old guest keeps working.
+    fn register_compute_pipeline_v1(&mut self, ticket: u64, entry: &str) -> Vec<u8> {
         if ticket <= self.last_pipeline_ticket {
             return vec![PIPELINE_REPLY_REJECTED];
         }
@@ -1476,11 +1600,100 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
 
         self.last_pipeline_ticket = ticket;
-        let mut reply = Vec::with_capacity(PIPELINE_REPLY_OK_LEN);
-        reply.push(PIPELINE_REPLY_OK);
-        reply.extend_from_slice(&pipeline.0.to_le_bytes());
-        reply
+        pipeline_reply_ok(pipeline.0)
     }
+
+    /// Version 2: one frame carries the pipeline kind, one library per stage,
+    /// the encoded [`PipelineState`], the encoded [`PipelineAbi`] and the raw
+    /// root-signature bytes.
+    ///
+    /// Every field is validated before the executor is called, so a malformed
+    /// frame creates no GPU work and consumes no ticket. Graphics and mesh
+    /// pipelines use the registry's content-hashed entry points and the host's
+    /// own handle space; compute keeps the old `load_pipeline` family.
+    fn register_pipeline_v2(&mut self, request: &PipelineRequestV2) -> Vec<u8> {
+        let validation = match validate_pipeline_v2(request) {
+            Ok(validation) => validation,
+            Err(()) => return vec![PIPELINE_REPLY_REJECTED],
+        };
+        if request
+            .stages
+            .iter()
+            .any(|stage| stage.ticket <= self.last_pipeline_ticket)
+        {
+            return vec![PIPELINE_REPLY_REJECTED];
+        }
+
+        // Read every per-stage library before creating anything: a missing
+        // file rejects the whole frame, never a partially registered pipeline.
+        let mut metallibs = Vec::with_capacity(request.stages.len());
+        for stage in &request.stages {
+            match read_pipeline_file(&self.share_dir, stage.ticket) {
+                Ok(metallib) => metallibs.push(metallib),
+                Err(_) => return vec![PIPELINE_REPLY_REJECTED],
+            }
+        }
+
+        let id = match request.kind {
+            PIPELINE_KIND_COMPUTE => {
+                let index = validation.compute_stage;
+                match self
+                    .executor
+                    .load_pipeline(&metallibs[index], &request.stages[index].entry)
+                {
+                    Ok(pipeline) if pipeline.0 != 0 => pipeline.0,
+                    _ => return vec![PIPELINE_REPLY_REJECTED],
+                }
+            }
+            PIPELINE_KIND_GRAPHICS => {
+                let index = validation.graphics_vertex_stage;
+                let handle = self.next_content_pipeline;
+                match self.executor.register_graphics_pipeline(
+                    handle,
+                    &metallibs[index],
+                    &request.stages[index].entry,
+                    &request.state,
+                    validation.abi,
+                ) {
+                    Ok(()) => handle,
+                    Err(_) => return vec![PIPELINE_REPLY_REJECTED],
+                }
+            }
+            PIPELINE_KIND_MESH => {
+                let index = validation.mesh_stage;
+                let handle = self.next_content_pipeline;
+                match self.executor.register_mesh_pipeline(
+                    handle,
+                    &metallibs[index],
+                    &request.stages[index].entry,
+                    &request.state,
+                    validation.abi,
+                ) {
+                    Ok(()) => handle,
+                    Err(_) => return vec![PIPELINE_REPLY_REJECTED],
+                }
+            }
+            _ => return vec![PIPELINE_REPLY_REJECTED],
+        };
+
+        self.last_pipeline_ticket = request
+            .stages
+            .iter()
+            .map(|stage| stage.ticket)
+            .max()
+            .unwrap_or(self.last_pipeline_ticket);
+        if matches!(request.kind, PIPELINE_KIND_GRAPHICS | PIPELINE_KIND_MESH) {
+            self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
+        }
+        pipeline_reply_ok(id)
+    }
+}
+
+fn pipeline_reply_ok(id: u64) -> Vec<u8> {
+    let mut reply = Vec::with_capacity(PIPELINE_REPLY_OK_LEN);
+    reply.push(PIPELINE_REPLY_OK);
+    reply.extend_from_slice(&id.to_le_bytes());
+    reply
 }
 
 impl<E: BatchExecutor> Drop for IpcHost<E> {
@@ -1587,8 +1800,52 @@ fn read_u64(payload: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// One kind 4 request decoded from the wire.
+enum PipelineRequest<'a> {
+    /// The original `ticket + entry` compute request.
+    V1 { ticket: u64, entry: &'a str },
+    /// The versioned multi-stage request.
+    V2(PipelineRequestV2),
+}
+
+/// One `(stage, ticket, entry)` of a version 2 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineStageEntry {
+    stage: u8,
+    ticket: u64,
+    entry: String,
+}
+
+/// A fully decoded version 2 kind 4 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineRequestV2 {
+    kind: u8,
+    stages: Vec<PipelineStageEntry>,
+    state: Vec<u8>,
+    abi: Vec<u8>,
+    root_signature: Vec<u8>,
+}
+
+/// Indices and ABI produced by [`validate_pipeline_v2`].
+struct PipelineValidation {
+    compute_stage: usize,
+    graphics_vertex_stage: usize,
+    mesh_stage: usize,
+    abi: PipelineAbi,
+}
+
 /// Decodes a kind 4 payload into a ticket and a validated entry name.
-fn decode_pipeline_request(payload: &[u8]) -> Option<(u64, &str)> {
+fn decode_pipeline_request(payload: &[u8]) -> Option<PipelineRequest<'_>> {
+    if payload.len() >= PIPELINE_FRAME_MAGIC.len()
+        && payload[..PIPELINE_FRAME_MAGIC.len()] == PIPELINE_FRAME_MAGIC
+    {
+        return decode_pipeline_request_v2(payload).map(PipelineRequest::V2);
+    }
+    decode_pipeline_request_v1(payload).map(|(ticket, entry)| PipelineRequest::V1 { ticket, entry })
+}
+
+/// Decodes the original kind 4 payload: `ticket: u64, entry_len: u16, entry`.
+fn decode_pipeline_request_v1(payload: &[u8]) -> Option<(u64, &str)> {
     if payload.len() < PIPELINE_HEADER_LEN {
         return None;
     }
@@ -1605,6 +1862,303 @@ fn decode_pipeline_request(payload: &[u8]) -> Option<(u64, &str)> {
     }
     let entry = std::str::from_utf8(&payload[PIPELINE_HEADER_LEN..]).ok()?;
     valid_pipeline_entry(entry).then_some((ticket, entry))
+}
+
+/// Decodes the version 2 frame.
+///
+/// | offset | size | field |
+/// | ---: | ---: | --- |
+/// | 0 | 4 | magic `VP2\0` |
+/// | 4 | 1 | frame version, `1` |
+/// | 5 | 1 | pipeline kind: 0 compute, 1 graphics, 2 mesh |
+/// | 6 | 1 | stage count, 1..=4 |
+/// | 7 | 1 | reserved, zero |
+/// | 8 | 4 | encoded `PipelineState` length |
+/// | 12 | 4 | encoded pipeline ABI length |
+/// | 16 | 4 | raw root-signature length |
+/// | 20 | 4 | reserved, zero |
+/// | 24 | N | stage entries: `stage u8, ticket u64, entry_len u16, entry` |
+/// | ... | S | encoded `PipelineState` |
+/// | ... | A | encoded pipeline ABI (`VAB1` container) |
+/// | ... | R | raw root-signature bytes |
+fn decode_pipeline_request_v2(payload: &[u8]) -> Option<PipelineRequestV2> {
+    if payload.len() < PIPELINE_V2_HEADER_LEN {
+        return None;
+    }
+    if payload[..4] != PIPELINE_FRAME_MAGIC {
+        return None;
+    }
+    let version = payload[4];
+    let kind = payload[5];
+    let stage_count = payload[6];
+    if version != PIPELINE_FRAME_VERSION_V2
+        || kind > PIPELINE_KIND_MESH
+        || stage_count == 0
+        || usize::from(stage_count) > PIPELINE_V2_MAX_STAGES
+        || payload[7] != 0
+    {
+        return None;
+    }
+    let state_len = usize::try_from(read_u32_checked(payload, 8)?).ok()?;
+    let abi_len = usize::try_from(read_u32_checked(payload, 12)?).ok()?;
+    let root_len = usize::try_from(read_u32_checked(payload, 16)?).ok()?;
+    if read_u32_checked(payload, 20)? != 0
+        || state_len > MAX_PIPELINE_STATE_BYTES
+        || abi_len > MAX_PIPELINE_ABI_BYTES
+        || root_len > MAX_ROOT_SIGNATURE_BYTES
+    {
+        return None;
+    }
+
+    let mut offset = PIPELINE_V2_HEADER_LEN;
+    let mut stages = Vec::with_capacity(usize::from(stage_count));
+    for _ in 0..stage_count {
+        let stage = *payload.get(offset)?;
+        offset = offset.checked_add(1)?;
+        let ticket = read_u64_checked(payload, offset)?;
+        offset = offset.checked_add(8)?;
+        let entry_len = usize::from(read_u16_checked(payload, offset)?);
+        offset = offset.checked_add(2)?;
+        if entry_len == 0 || entry_len > MAX_PIPELINE_ENTRY_LEN {
+            return None;
+        }
+        let end = offset.checked_add(entry_len)?;
+        let entry = std::str::from_utf8(payload.get(offset..end)?).ok()?;
+        if !valid_pipeline_entry(entry) {
+            return None;
+        }
+        stages.push(PipelineStageEntry {
+            stage,
+            ticket,
+            entry: entry.to_string(),
+        });
+        offset = end;
+    }
+
+    let state_end = offset.checked_add(state_len)?;
+    let state = payload.get(offset..state_end)?.to_vec();
+    let abi_end = state_end.checked_add(abi_len)?;
+    let abi = payload.get(state_end..abi_end)?.to_vec();
+    let root_end = abi_end.checked_add(root_len)?;
+    let root_signature = payload.get(abi_end..root_end)?.to_vec();
+    if root_end != payload.len() {
+        return None;
+    }
+
+    Some(PipelineRequestV2 {
+        kind,
+        stages,
+        state,
+        abi,
+        root_signature,
+    })
+}
+
+/// Validates a version 2 request against its kind, stage set, [`PipelineState`]
+/// and [`PipelineAbi`].
+///
+/// Every failure is an explicit rejection before the executor is called; no
+/// partial pipeline is ever created.
+fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidation, ()> {
+    let mut previous_ticket = 0u64;
+    let mut seen = Vec::with_capacity(request.stages.len());
+    for stage in &request.stages {
+        if stage.ticket == 0 || stage.ticket <= previous_ticket {
+            return Err(());
+        }
+        if !matches!(
+            stage.stage,
+            PIPELINE_STAGE_VERTEX
+                | PIPELINE_STAGE_PIXEL
+                | PIPELINE_STAGE_MESH
+                | PIPELINE_STAGE_OBJECT
+                | PIPELINE_STAGE_COMPUTE
+        ) || seen.contains(&stage.stage)
+        {
+            return Err(());
+        }
+        previous_ticket = stage.ticket;
+        seen.push(stage.stage);
+    }
+
+    let index_of = |stage_code: u8| {
+        request
+            .stages
+            .iter()
+            .position(|stage| stage.stage == stage_code)
+    };
+
+    let mut validation = PipelineValidation {
+        compute_stage: 0,
+        graphics_vertex_stage: 0,
+        mesh_stage: 0,
+        abi: PipelineAbi::default(),
+    };
+    let stage_count = request.stages.len();
+    match request.kind {
+        PIPELINE_KIND_COMPUTE => {
+            if stage_count != 1 {
+                return Err(());
+            }
+            let index = index_of(PIPELINE_STAGE_COMPUTE).ok_or(())?;
+            if !request.state.is_empty()
+                && PipelineState::decode_for(&request.state, RegistryPipelineStage::Compute)
+                    .is_err()
+            {
+                return Err(());
+            }
+            validation.compute_stage = index;
+        }
+        PIPELINE_KIND_GRAPHICS => {
+            if stage_count != 2
+                || !request.stages.iter().all(|stage| {
+                    matches!(stage.stage, PIPELINE_STAGE_VERTEX | PIPELINE_STAGE_PIXEL)
+                })
+            {
+                return Err(());
+            }
+            let vertex = index_of(PIPELINE_STAGE_VERTEX).ok_or(())?;
+            let pixel = index_of(PIPELINE_STAGE_PIXEL).ok_or(())?;
+            let state = PipelineState::decode_for(
+                &request.state,
+                RegistryPipelineStage::Graphics,
+            )
+            .map_err(|_| ())?;
+            if state.fragment_entry.as_deref() != Some(request.stages[pixel].entry.as_str())
+                || state.object_entry.is_some()
+                || state.color_formats.is_empty()
+                || state.color_formats.len() > 8
+            {
+                return Err(());
+            }
+            validation.graphics_vertex_stage = vertex;
+        }
+        PIPELINE_KIND_MESH => {
+            if !(2..=3).contains(&stage_count)
+                || !request.stages.iter().all(|stage| {
+                    matches!(
+                        stage.stage,
+                        PIPELINE_STAGE_MESH | PIPELINE_STAGE_PIXEL | PIPELINE_STAGE_OBJECT
+                    )
+                })
+            {
+                return Err(());
+            }
+            let mesh = index_of(PIPELINE_STAGE_MESH).ok_or(())?;
+            let pixel = index_of(PIPELINE_STAGE_PIXEL).ok_or(())?;
+            let object = index_of(PIPELINE_STAGE_OBJECT);
+            let state =
+                PipelineState::decode_for(&request.state, RegistryPipelineStage::Mesh)
+                    .map_err(|_| ())?;
+            if state.fragment_entry.as_deref() != Some(request.stages[pixel].entry.as_str()) {
+                return Err(());
+            }
+            match (object, state.object_entry.as_deref()) {
+                (None, None) | (Some(_), Some(_)) => {}
+                _ => return Err(()),
+            }
+            if state
+                .mesh_threadgroup
+                .iter()
+                .chain(state.object_threadgroup.iter())
+                .any(|dimension| *dimension == 0)
+            {
+                return Err(());
+            }
+            validation.mesh_stage = mesh;
+        }
+        _ => return Err(()),
+    }
+
+    validation.abi = decode_pipeline_abi(&request.abi, request).ok_or(())?;
+    if !validation.abi.is_empty() && request.root_signature.is_empty() {
+        return Err(());
+    }
+    Ok(validation)
+}
+
+/// Decodes the `VAB1` per-stage ABI container into a [`PipelineAbi`].
+///
+/// Layout: `magic[4]`, `version u8 = 1`, `count u8`, then per entry
+/// `stage u8`, `json_len u32`, converter reflection JSON. An empty blob means
+/// "no automatic root binding" and decodes to the default ABI. Every stage
+/// must be one the frame already carries; a layout for a stage the frame does
+/// not name is a mismatch, not a partial ABI.
+fn decode_pipeline_abi(bytes: &[u8], request: &PipelineRequestV2) -> Option<PipelineAbi> {
+    if bytes.is_empty() {
+        return Some(PipelineAbi::default());
+    }
+    if bytes.len() < 6 || bytes[..4] != PIPELINE_ABI_MAGIC || bytes[4] != 1 {
+        return None;
+    }
+    let count = usize::from(bytes[5]);
+    if count == 0 || count > PIPELINE_V2_MAX_STAGES {
+        return None;
+    }
+    let mut offset = 6usize;
+    let mut abi = PipelineAbi::default();
+    let mut seen = Vec::with_capacity(count);
+    for _ in 0..count {
+        let stage = *bytes.get(offset)?;
+        offset = offset.checked_add(1)?;
+        let len = usize::try_from(read_u32_checked(bytes, offset)?).ok()?;
+        offset = offset.checked_add(4)?;
+        let end = offset.checked_add(len)?;
+        let json = std::str::from_utf8(bytes.get(offset..end)?).ok()?;
+        offset = end;
+        if !request.stages.iter().any(|entry| entry.stage == stage) || seen.contains(&stage) {
+            return None;
+        }
+        let layout = RootSignatureLayout::from_converter_reflection_json(json).ok()?;
+        let frame_entry = request
+            .stages
+            .iter()
+            .find(|entry| entry.stage == stage)?
+            .entry
+            .as_str();
+        if !layout.entry_point().is_empty() && layout.entry_point() != frame_entry {
+            return None;
+        }
+        match stage {
+            PIPELINE_STAGE_VERTEX if request.kind == PIPELINE_KIND_GRAPHICS => {
+                abi.vertex = Some(layout)
+            }
+            PIPELINE_STAGE_PIXEL if request.kind != PIPELINE_KIND_COMPUTE => {
+                abi.fragment = Some(layout)
+            }
+            PIPELINE_STAGE_MESH if request.kind == PIPELINE_KIND_MESH => abi.mesh = Some(layout),
+            PIPELINE_STAGE_OBJECT if request.kind == PIPELINE_KIND_MESH => abi.object = Some(layout),
+            PIPELINE_STAGE_COMPUTE if request.kind == PIPELINE_KIND_COMPUTE => {
+                abi.compute = Some(layout)
+            }
+            _ => return None,
+        }
+        seen.push(stage);
+    }
+    if offset != bytes.len() {
+        return None;
+    }
+    Some(abi)
+}
+
+fn read_u16_checked(payload: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let bytes = payload.get(offset..end)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_checked(payload: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes = payload.get(offset..end)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64_checked(payload: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let bytes = payload.get(offset..end)?;
+    let mut value = [0u8; 8];
+    value.copy_from_slice(bytes);
+    Some(u64::from_le_bytes(value))
 }
 
 /// One validated kind 8 texture registration.
@@ -1942,6 +2496,11 @@ mod tests {
         v3_submissions: Vec<SubmissionV3>,
         v3_executions: u64,
         v3_not_supported: bool,
+        /// Content-hashed graphics registrations: `(handle, metallib, entry,
+        /// state, abi)`.
+        graphics_pipelines: Vec<(u64, Vec<u8>, String, Vec<u8>, PipelineAbi)>,
+        /// Content-hashed mesh registrations, same shape.
+        mesh_pipelines: Vec<(u64, Vec<u8>, String, Vec<u8>, PipelineAbi)>,
     }
 
     struct StubExecutor {
@@ -2068,6 +2627,54 @@ mod tests {
             state.pipelines.push((metallib.to_vec(), entry.to_string()));
             Ok(VmPipelineId(id))
         }
+
+        fn register_graphics_pipeline(
+            &self,
+            handle: u64,
+            metallib: &[u8],
+            vertex_entry: &str,
+            state: &[u8],
+            abi: PipelineAbi,
+        ) -> Result<(), MetalError> {
+            if vertex_entry == "vm_fail" {
+                return Err(MetalError::CompileFailed(
+                    "synthetic graphics pipeline failure".into(),
+                ));
+            }
+            let mut stub = self.state();
+            stub.graphics_pipelines.push((
+                handle,
+                metallib.to_vec(),
+                vertex_entry.to_string(),
+                state.to_vec(),
+                abi,
+            ));
+            Ok(())
+        }
+
+        fn register_mesh_pipeline(
+            &self,
+            handle: u64,
+            metallib: &[u8],
+            mesh_entry: &str,
+            state: &[u8],
+            abi: PipelineAbi,
+        ) -> Result<(), MetalError> {
+            if mesh_entry == "vm_fail" {
+                return Err(MetalError::CompileFailed(
+                    "synthetic mesh pipeline failure".into(),
+                ));
+            }
+            let mut stub = self.state();
+            stub.mesh_pipelines.push((
+                handle,
+                metallib.to_vec(),
+                mesh_entry.to_string(),
+                state.to_vec(),
+                abi,
+            ));
+            Ok(())
+        }
     }
 
     struct TestDir(PathBuf);
@@ -2158,6 +2765,78 @@ mod tests {
         payload.extend_from_slice(&(entry.len() as u16).to_le_bytes());
         payload.extend_from_slice(entry.as_bytes());
         payload
+    }
+
+    /// The exact version 2 frame the guest builds.
+    fn pipeline_request_v2(
+        kind: u8,
+        stages: &[(u8, u64, &str)],
+        state: &[u8],
+        abi: &[u8],
+        root_signature: &[u8],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&PIPELINE_FRAME_MAGIC);
+        payload.push(PIPELINE_FRAME_VERSION_V2);
+        payload.push(kind);
+        payload.push(stages.len() as u8);
+        payload.push(0);
+        payload.extend_from_slice(&(state.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(abi.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(root_signature.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for (stage, ticket, entry) in stages {
+            payload.push(*stage);
+            payload.extend_from_slice(&ticket.to_le_bytes());
+            payload.extend_from_slice(&(entry.len() as u16).to_le_bytes());
+            payload.extend_from_slice(entry.as_bytes());
+        }
+        payload.extend_from_slice(state);
+        payload.extend_from_slice(abi);
+        payload.extend_from_slice(root_signature);
+        payload
+    }
+
+    fn abi_container(stages: &[(u8, &str)]) -> Vec<u8> {
+        let mut abi = Vec::new();
+        abi.extend_from_slice(&PIPELINE_ABI_MAGIC);
+        abi.push(1);
+        abi.push(stages.len() as u8);
+        for (stage, json) in stages {
+            abi.push(*stage);
+            abi.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            abi.extend_from_slice(json.as_bytes());
+        }
+        abi
+    }
+
+    const VERTEX_REFLECTION: &str =
+        r#"{"EntryPoint":"vs_main","ShaderType":"Vertex","TopLevelArgumentBuffer":[]}"#;
+    const PIXEL_REFLECTION: &str =
+        r#"{"EntryPoint":"ps_main","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#;
+    const MESH_REFLECTION: &str =
+        r#"{"EntryPoint":"ms_main","ShaderType":"Mesh","TopLevelArgumentBuffer":[]}"#;
+
+    fn graphics_state() -> Vec<u8> {
+        PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            depth_format: Some(TextureFormat::Depth32Float),
+            fragment_entry: Some("ps_main".to_string()),
+            ..PipelineState::default()
+        }
+        .encode(RegistryPipelineStage::Graphics)
+    }
+
+    fn mesh_state() -> Vec<u8> {
+        PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            depth_format: None,
+            fragment_entry: Some("ps_main".to_string()),
+            mesh_threadgroup: [32, 1, 1],
+            object_threadgroup: [1, 1, 1],
+            ..PipelineState::default()
+        }
+        .encode(RegistryPipelineStage::Mesh)
     }
 
     fn read_pipeline_reply(client: &mut TcpStream) -> (u8, Option<u64>) {
@@ -2894,6 +3573,239 @@ mod tests {
             ],
             "only tickets 7 and 8 reached the executor"
         );
+    }
+
+    /// A version 2 frame registers a graphics pipeline in the content-hashed
+    /// family and captures the exact state and ABI the guest sent.
+    #[test]
+    fn pipeline_registration_v2_round_trips_graphics() {
+        let dir = TestDir::new();
+        dir.write_pipeline(1, b"vertex metallib");
+        dir.write_pipeline(2, b"pixel metallib");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let state = graphics_state();
+        let abi = abi_container(&[
+            (PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_REFLECTION),
+        ]);
+        let request = pipeline_request_v2(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, 1, "vs_main"),
+                (PIPELINE_STAGE_PIXEL, 2, "ps_main"),
+            ],
+            &state,
+            &abi,
+            b"raw root signature",
+        );
+        write_frame(&mut client, KIND_PIPELINE, &request).expect("send v2 graphics");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(1))
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert!(state.pipelines.is_empty(), "no compute load for a graphics PSO");
+        assert_eq!(state.graphics_pipelines.len(), 1);
+        let (handle, metallib, entry, captured_state, abi) = &state.graphics_pipelines[0];
+        assert_eq!(*handle, 1);
+        assert_eq!(metallib, b"vertex metallib");
+        assert_eq!(entry, "vs_main");
+        assert_eq!(captured_state, &graphics_state());
+        assert!(abi.vertex.is_some(), "vertex ABI captured");
+        assert!(abi.fragment.is_some(), "fragment ABI captured");
+        assert!(abi.mesh.is_none() && abi.object.is_none() && abi.compute.is_none());
+    }
+
+    /// A version 2 frame registers a mesh pipeline in its own family.
+    #[test]
+    fn pipeline_registration_v2_round_trips_mesh() {
+        let dir = TestDir::new();
+        dir.write_pipeline(1, b"mesh metallib");
+        dir.write_pipeline(2, b"pixel metallib");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let state = mesh_state();
+        let abi = abi_container(&[
+            (PIPELINE_STAGE_MESH, MESH_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_REFLECTION),
+        ]);
+        let request = pipeline_request_v2(
+            PIPELINE_KIND_MESH,
+            &[
+                (PIPELINE_STAGE_MESH, 1, "ms_main"),
+                (PIPELINE_STAGE_PIXEL, 2, "ps_main"),
+            ],
+            &state,
+            &abi,
+            b"mesh root signature",
+        );
+        write_frame(&mut client, KIND_PIPELINE, &request).expect("send v2 mesh");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(1))
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert_eq!(state.mesh_pipelines.len(), 1);
+        let (_, metallib, entry, captured_state, abi) = &state.mesh_pipelines[0];
+        assert_eq!(metallib, b"mesh metallib");
+        assert_eq!(entry, "ms_main");
+        assert_eq!(captured_state, &mesh_state());
+        assert!(abi.mesh.is_some(), "mesh ABI captured");
+        assert!(abi.fragment.is_some(), "fragment ABI captured");
+    }
+
+    /// Malformed version 2 frames are one rejection byte before any executor
+    /// call: a bad stage count, a mismatched ABI and a missing root signature.
+    #[test]
+    fn pipeline_registration_v2_rejects_malformed_frames() {
+        let dir = TestDir::new();
+        dir.write_pipeline(1, b"vertex metallib");
+        dir.write_pipeline(2, b"pixel metallib");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let state = graphics_state();
+        let good_abi = abi_container(&[
+            (PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_REFLECTION),
+        ]);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "one stage is not a graphics pipeline",
+                pipeline_request_v2(
+                    PIPELINE_KIND_GRAPHICS,
+                    &[(PIPELINE_STAGE_VERTEX, 1, "vs_main")],
+                    &state,
+                    &good_abi,
+                    b"root",
+                ),
+            ),
+            (
+                "graphics ABI with a mesh layout",
+                pipeline_request_v2(
+                    PIPELINE_KIND_GRAPHICS,
+                    &[
+                        (PIPELINE_STAGE_VERTEX, 1, "vs_main"),
+                        (PIPELINE_STAGE_PIXEL, 2, "ps_main"),
+                    ],
+                    &state,
+                    &abi_container(&[(PIPELINE_STAGE_MESH, MESH_REFLECTION)]),
+                    b"root",
+                ),
+            ),
+            (
+                "ABI with no root signature",
+                pipeline_request_v2(
+                    PIPELINE_KIND_GRAPHICS,
+                    &[
+                        (PIPELINE_STAGE_VERTEX, 1, "vs_main"),
+                        (PIPELINE_STAGE_PIXEL, 2, "ps_main"),
+                    ],
+                    &state,
+                    &good_abi,
+                    b"",
+                ),
+            ),
+            (
+                "mesh state on a graphics frame",
+                pipeline_request_v2(
+                    PIPELINE_KIND_GRAPHICS,
+                    &[
+                        (PIPELINE_STAGE_VERTEX, 1, "vs_main"),
+                        (PIPELINE_STAGE_PIXEL, 2, "ps_main"),
+                    ],
+                    &mesh_state(),
+                    &good_abi,
+                    b"root",
+                ),
+            ),
+        ];
+        for (label, request) in cases {
+            write_frame(&mut client, KIND_PIPELINE, &request).expect("send malformed v2");
+            assert_eq!(
+                read_pipeline_reply(&mut client),
+                (PIPELINE_REPLY_REJECTED, None),
+                "{label}"
+            );
+        }
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert!(state.graphics_pipelines.is_empty());
+        assert!(state.mesh_pipelines.is_empty());
+        assert!(state.pipelines.is_empty());
+    }
+
+    /// The monotonic ticket ledger covers every stage ticket and is only
+    /// advanced by a successful version 2 registration.
+    #[test]
+    fn pipeline_registration_v2_keeps_the_monotonic_ticket_ledger() {
+        let dir = TestDir::new();
+        for ticket in 1..=4 {
+            dir.write_pipeline(ticket, b"a stage metallib");
+        }
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let state = graphics_state();
+        let abi = abi_container(&[
+            (PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_REFLECTION),
+        ]);
+        let request = |first: u64, second: u64| {
+            pipeline_request_v2(
+                PIPELINE_KIND_GRAPHICS,
+                &[
+                    (PIPELINE_STAGE_VERTEX, first, "vs_main"),
+                    (PIPELINE_STAGE_PIXEL, second, "ps_main"),
+                ],
+                &state,
+                &abi,
+                b"root",
+            )
+        };
+
+        write_frame(&mut client, KIND_PIPELINE, &request(1, 2)).expect("first v2");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(1))
+        );
+        // The last ledger entry is 2, so a frame reusing ticket 2 is rejected
+        // without consuming 3 or 4.
+        write_frame(&mut client, KIND_PIPELINE, &request(2, 3)).expect("nonmonotonic v2");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_REJECTED, None)
+        );
+        write_frame(&mut client, KIND_PIPELINE, &request(3, 4)).expect("later v2");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(2)),
+            "the next content handle is used"
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        assert_eq!(host.executor.state().graphics_pipelines.len(), 2);
+        assert_eq!(host.last_pipeline_ticket, 4);
     }
 
     #[test]

@@ -711,6 +711,74 @@ pub fn register_pipeline(metallib: &[u8], entry: &str) -> Result<u64, NativeQueu
     client.register_pipeline(ticket, entry)
 }
 
+/// One pre-translated stage of a version 2 pipeline registration.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineStageLibrary<'a> {
+    /// Wire stage code (`client::PIPELINE_STAGE_*`).
+    pub stage: u8,
+    /// Serialized metallib for this stage, written to the next ticket's file.
+    pub metallib: &'a [u8],
+    /// Entry point the host resolves inside that library.
+    pub entry: &'a str,
+}
+
+/// Registers a multi-stage graphics, mesh or compute pipeline (kind 4 v2).
+///
+/// Each stage gets its own consecutive ticket and `{ticket:016x}.metallib`
+/// file, then one v2 frame carries the stage list, the encoded `PipelineState`,
+/// the encoded ABI and the raw root-signature bytes. Nothing is written until
+/// the whole request is validated by the caller, and a host rejection leaves
+/// the session open.
+#[cfg(any(windows, test))]
+pub fn register_pipeline_v2(
+    kind: u8,
+    stages: &[PipelineStageLibrary<'_>],
+    state: &[u8],
+    abi: &[u8],
+    root_signature: &[u8],
+) -> Result<u64, NativeQueueError> {
+    if stages.is_empty() {
+        return Err(NativeQueueError::Refused(
+            "pipeline registration needs at least one stage".to_string(),
+        ));
+    }
+    for stage in stages {
+        if stage.metallib.is_empty() {
+            return Err(NativeQueueError::Refused(format!(
+                "pipeline stage {} has no metallib",
+                stage.stage
+            )));
+        }
+    }
+    ensure_live(LiveConfig::from_env)
+        .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
+    let mut queue = native_queue();
+    let client = queue.sink_mut().client_mut().ok_or_else(|| {
+        NativeQueueError::Transport("no live Wire v3 host session".to_string())
+    })?;
+    let first = client.next_pipeline_ticket();
+    let mut wire: Vec<(u8, u64, &str)> = Vec::with_capacity(stages.len());
+    for (index, stage) in stages.iter().enumerate() {
+        let ticket = first
+            .checked_add(u64::try_from(index).expect("stage index fits u64"))
+            .ok_or_else(|| {
+                NativeQueueError::Refused("pipeline ticket space exhausted".to_string())
+            })?;
+        let path = crate::native_metal::pso::metallib_path(ticket).ok_or_else(|| {
+            NativeQueueError::Refused(
+                "pipeline registration needs VICTORY_METAL_SHARE_DIR for the host's metallib \
+                 file"
+                    .to_string(),
+            )
+        })?;
+        crate::native_metal::pso::write_metallib(&path, stage.metallib)
+            .map_err(NativeQueueError::Transport)?;
+        wire.push((stage.stage, ticket, stage.entry));
+    }
+    client.register_pipeline_v2(kind, &wire, state, abi, root_signature)
+}
+
 /// Connects the session queue from the environment exactly once per process.
 ///
 /// Device creation calls this under `VICTORY_BACKEND=metal`. The result is
