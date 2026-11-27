@@ -31,7 +31,7 @@ use crate::macos::render::{
     new_less_depth_state, plan_encoder_segments, texture_info,
 };
 use crate::macos::residency::ResidencySet;
-use crate::macos::retire::RetireQueue;
+use crate::macos::retire::{BackpressureBudget, RetireQueue};
 use crate::macos::state::{self, DepthStencilCache};
 use crate::macos::texture::VmTextureId;
 use crate::macos::{blit, indirect};
@@ -549,11 +549,16 @@ unsafe extern "C" fn completion_block_invoke(block: *mut CompletionBlock, comman
 /// Records one observed completion and publishes the contiguous watermark.
 ///
 /// A poisoned lock means a panic aborted a previous holder; the publication is
-/// dropped rather than resumed with possibly inconsistent state.
+/// dropped rather than resumed with possibly inconsistent state. The
+/// diagnostics-only `stall_publication` flag suppresses the record so a lost
+/// completion can be reproduced; it is never set by the host.
 fn publish_completion(state: &Mutex<AsyncSubmitState>, fence: u64, succeeded: bool) {
     let Ok(mut state) = state.lock() else {
         return;
     };
+    if state.stall_publication {
+        return;
+    }
     state.note_completion(fence, succeeded);
 }
 
@@ -689,11 +694,15 @@ struct AsyncSubmitState {
     /// Caller ids released since the last `drain_retired`.
     released: Vec<u64>,
     next_token: u64,
+    /// Diagnostics-only fault injection: a stalled completion publication is
+    /// never recorded, so the bounded retire backpressure path can be proven
+    /// without a hung GPU. Always `false` for the host.
+    stall_publication: bool,
     counters: AsyncCounters,
 }
 
 impl AsyncSubmitState {
-    fn new(fence_page: Arc<FencePage>, cap: usize) -> Self {
+    fn new(fence_page: Arc<FencePage>, cap: usize, retire_capacity: usize) -> Self {
         Self {
             fence_page,
             shared_fence: None,
@@ -701,11 +710,12 @@ impl AsyncSubmitState {
             next_fence: 0,
             watermark: CompletionWatermark::new(),
             held: HashMap::new(),
-            retire: RetireQueue::new(),
+            retire: RetireQueue::with_capacity(retire_capacity),
             staged: HashMap::new(),
             pins: HashMap::new(),
             released: Vec::new(),
             next_token: 1,
+            stall_publication: false,
             counters: AsyncCounters::default(),
         }
     }
@@ -737,21 +747,30 @@ impl AsyncSubmitState {
             .max(self.watermark.len() as u64);
     }
 
-    /// Pins prepared staging objects behind `fence`.
-    fn pin_staged(&mut self, fence: u64, staged: Vec<ObjcObject>) {
+    /// Stages prepared objects and returns the retire token that owns them.
+    ///
+    /// The token is inserted before the queue push so a completion that covers
+    /// the fence can never release an id the release bookkeeping does not know
+    /// yet. `None` means nothing was staged and no retire entry is needed.
+    ///
+    /// This only assigns ownership; the caller pushes the token into the retire
+    /// queue with [`DirectMetalTransport::retire_pin`], which may wait on the
+    /// GPU and therefore must run without this mutex.
+    fn stage_staged(&mut self, staged: Vec<ObjcObject>) -> Option<u64> {
         if staged.is_empty() {
-            return;
+            return None;
         }
         let token = self.alloc_token();
         self.staged.insert(token, staged);
-        self.retire.push(fence, token);
+        Some(token)
     }
 
-    /// Pins a caller-visible resource id behind `fence`.
-    fn pin_caller(&mut self, fence: u64, caller_id: u64) -> u64 {
+    /// Registers a caller-visible resource id and returns its retire token.
+    ///
+    /// Inserted before the queue push for the same reason as [`Self::stage_staged`].
+    fn stage_caller_pin(&mut self, caller_id: u64) -> u64 {
         let token = self.alloc_token();
         self.pins.insert(token, caller_id);
-        self.retire.push(fence, token);
         token
     }
 
@@ -847,6 +866,9 @@ impl AsyncSubmitState {
             in_flight_peak: self.counters.in_flight_peak,
             frames_in_flight_cap: self.cap as u64,
             retire_depth: self.retire.len(),
+            retire_high_watermark: self.retire.high_watermark(),
+            retire_capacity: self.retire.capacity(),
+            retire_refusals: self.retire.refusals(),
             retire_max_wait_micros: self.counters.retire_wait_micros_max,
             backpressure_waits: self.counters.backpressure_waits,
             completed_fence: self.watermark.completed(),
@@ -875,10 +897,20 @@ pub struct AsyncSubmitStats {
     pub frames_in_flight_cap: u64,
     /// Resources still pinned in the retire queue.
     pub retire_depth: usize,
+    /// Highest retire depth ever observed. Never above [`Self::retire_capacity`]
+    /// once the transport applies backpressure; a value above it means the hard
+    /// bound was bypassed.
+    pub retire_high_watermark: usize,
+    /// Hard bound of the retire queue.
+    pub retire_capacity: usize,
+    /// Pins accepted over capacity through the legacy soft path. Always zero for
+    /// the transport, which pins through the bounded path.
+    pub retire_refusals: u64,
     /// Longest single frame-boundary wait on the oldest command buffer, in
     /// microseconds. This is the only place a submit can block (ADR-017).
     pub retire_max_wait_micros: u64,
-    /// Number of frame-boundary waits on the oldest command buffer.
+    /// Number of waits on the oldest command buffer: the in-flight-cap gate and
+    /// the retire-queue backpressure path.
     pub backpressure_waits: u64,
     /// Contiguous completed fence value published in the shared page.
     pub completed_fence: u64,
@@ -945,6 +977,19 @@ pub struct DirectMetalTransport {
 impl DirectMetalTransport {
     /// Opens the system default Metal GPU device and initializes a command queue.
     pub fn new() -> Result<Self, MetalError> {
+        Self::open(RetireQueue::DEFAULT_CAPACITY)
+    }
+
+    /// Opens the same device with an explicit hard retire-queue bound.
+    ///
+    /// Diagnostics and hardware tests use this to drive a pipeline whose pins
+    /// outnumber the bound; production callers use [`Self::new`]. The capacity
+    /// is clamped to at least one by [`RetireQueue::with_capacity`].
+    pub fn with_retire_capacity(retire_capacity: usize) -> Result<Self, MetalError> {
+        Self::open(retire_capacity)
+    }
+
+    fn open(retire_capacity: usize) -> Result<Self, MetalError> {
         let _pool = AutoreleasePool::new();
         let device = objc::create_system_default_device().ok_or(MetalError::DeviceUnavailable)?;
 
@@ -960,6 +1005,7 @@ impl DirectMetalTransport {
         let async_submit = Arc::new(Mutex::new(AsyncSubmitState::new(
             Arc::new(FencePage::new()),
             resolve_frames_in_flight(),
+            retire_capacity,
         )));
 
         Ok(Self {
@@ -1120,13 +1166,149 @@ impl DirectMetalTransport {
     /// lets a caller recycle staging memory without a use-after-free. Returns
     /// the fence value it is pinned behind, or `None` when nothing is in flight
     /// (nothing can still read the resource).
+    ///
+    /// A full retire queue applies backpressure here: the call may wait on the
+    /// oldest committed command buffer, and fails with
+    /// [`MetalError::Backpressure`] instead of growing the queue when that fence
+    /// never completes.
     pub fn pin_until_complete(&self, caller_id: u64) -> Result<Option<u64>, MetalError> {
-        let mut state = self.lock_async()?;
-        let Some(fence) = state.watermark.back() else {
-            return Ok(None);
+        // The pin bookkeeping and the token are registered before the queue
+        // push: a completion that covers the fence must never release an id the
+        // release path cannot map back to the caller.
+        let (fence, token) = {
+            let mut state = self.lock_async()?;
+            let Some(fence) = state.watermark.back() else {
+                return Ok(None);
+            };
+            let token = state.stage_caller_pin(caller_id);
+            (fence, token)
         };
-        state.pin_caller(fence, caller_id);
+        if let Err(error) = self.retire_pin(fence, token) {
+            // The pin was never queued; drop the bookkeeping so a later drain
+            // cannot report an id this call refused.
+            if let Ok(mut state) = self.async_submit.lock() {
+                state.pins.remove(&token);
+            }
+            return Err(error);
+        }
         Ok(Some(fence))
+    }
+
+    /// Pins retire `token` behind `fence`, applying hard backpressure.
+    ///
+    /// The queue capacity is a hard bound: this never pushes over it and never
+    /// drops a live pin. When the queue is full, [`Self::relieve_retire`] waits
+    /// on the oldest committed command buffer and records its completion; the
+    /// retry then has room. At most
+    /// [`RetireQueue::MAX_BACKPRESSURE_WAITS`] waits are performed, after which
+    /// the pin fails with [`MetalError::Backpressure`].
+    ///
+    /// # Lock order
+    ///
+    /// The submit mutex is taken only to attempt the push and inside
+    /// [`Self::relieve_retire`] for its snapshot and its recording. No lock is
+    /// held across `waitUntilCompleted`: the command buffer's completion handler
+    /// takes the same submit mutex, so waiting under it would deadlock.
+    fn retire_pin(&self, fence: u64, token: u64) -> Result<(), MetalError> {
+        let mut budget = BackpressureBudget::new();
+        loop {
+            let full = {
+                let mut state = self.lock_async()?;
+                // A cheap drain first: a completion handler may have published
+                // while this pin was between attempts, and the queue only learns
+                // about it through a drain.
+                state.drain();
+                match state.retire.try_push(fence, token) {
+                    Ok(()) => return Ok(()),
+                    Err(full) => full,
+                }
+            };
+            let oldest = budget.next(full).map_err(|error| {
+                MetalError::Backpressure {
+                    capacity: error.capacity,
+                    oldest: error.oldest,
+                    completed: error.completed,
+                    waits: error.waits,
+                }
+            })?;
+            // The next iteration retries the push with whatever the wait made
+            // visible; if it made none, the budget is one step closer to the
+            // typed error above.
+            let _ = self.relieve_retire(oldest)?;
+        }
+    }
+
+    /// Waits on the oldest committed command buffer for `fence` and records the
+    /// completion it observes.
+    ///
+    /// Returns `true` only when the completion watermark advanced or a retire
+    /// entry was released, i.e. the wait made progress the pin can use.
+    ///
+    /// # Lock order
+    ///
+    /// The submit mutex is released for the `waitUntilCompleted` call and for the
+    /// duration of every other GPU wait. `waitUntilCompleted` delivers the
+    /// buffer's completion handler before returning, and that handler takes this
+    /// same mutex; holding it here would deadlock the pipeline.
+    fn relieve_retire(&self, fence: u64) -> Result<bool, MetalError> {
+        let (retained, before_completed, before_len) = {
+            let state = self.lock_async()?;
+            (
+                state
+                    .held
+                    .get(&fence)
+                    .and_then(|buffer| retain_command_buffer(buffer.as_raw())),
+                state.completed(),
+                state.retire.len(),
+            )
+        };
+        let Some(retained) = retained else {
+            // The buffer is no longer tracked: either the watermark already
+            // advanced past it (then the next push attempt sees the released
+            // slot) or the transport never held it. There is nothing to wait on,
+            // so report "no progress" and let the budget decide.
+            return Ok(false);
+        };
+        let started = Instant::now();
+        // SAFETY: `retained` is a live retained committed `MTLCommandBuffer`, so
+        // `waitUntilCompleted` blocks until it is done.
+        unsafe {
+            objc::msg_send_void_0(retained.as_raw(), objc::sel(c"waitUntilCompleted"))
+        };
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        // SAFETY: the buffer completed above, so `status` is final.
+        let status = unsafe {
+            objc::msg_send_usize_0(retained.as_raw(), objc::sel(c"status"))
+        };
+        let mut state = self.lock_async()?;
+        state.counters.backpressure_waits += 1;
+        state.counters.retire_wait_micros_max = state.counters.retire_wait_micros_max.max(micros);
+        if state.stall_publication {
+            // Diagnostics-only: the observed completion is deliberately lost, so
+            // the bounded budget is the only way out of the wait.
+            return Ok(false);
+        }
+        // The completion handler normally recorded this observation; the
+        // fallback covers a handler that was never delivered and is exactly what
+        // `wait_on_buffer` does for the in-flight-cap gate.
+        if state.watermark.is_pending(fence) {
+            state.note_completion(fence, status == MTL_COMMAND_BUFFER_STATUS_COMPLETED);
+        }
+        state.drain();
+        Ok(state.completed() > before_completed || state.retire.len() < before_len)
+    }
+
+    /// Diagnostics-only: suppresses every completion publication.
+    ///
+    /// The host never calls this. `retire_backpressure_gpu` uses it to prove
+    /// that a lost completion publication surfaces as
+    /// [`MetalError::Backpressure`] inside the bounded wait rather than a hang.
+    /// Clear it before dropping the transport so teardown can drain.
+    #[doc(hidden)]
+    pub fn set_stall_completion_publication(&self, stalled: bool) -> Result<(), MetalError> {
+        let mut state = self.lock_async()?;
+        state.stall_publication = stalled;
+        Ok(())
     }
 
     /// Waits until every committed command buffer has completed.
@@ -1252,17 +1434,40 @@ impl DirectMetalTransport {
     /// buffer before the publication path exists. The reply status is decided by
     /// pre-GPU validation only; GPU status is reported through the shared page
     /// and [`Self::async_submit_stats`].
+    ///
+    /// The staging pin is applied **before** the commit is registered in the
+    /// watermark, because a full retire queue makes that pin wait: registering an
+    /// uncommitted buffer first would expose it to a concurrent `wait_on_buffer`.
+    /// The fence is reserved first, so the pin is behind a value no published
+    /// completion can cover yet.
     fn commit_async(&self, encoded: EncodedSubmission, sequence: u32) -> Result<(), MetalError> {
         self.await_slot()?;
         let state_ptr = Arc::as_ptr(&self.async_submit);
-        let (fence, command_buffer_raw) = {
+        let EncodedSubmission {
+            command_buffer,
+            staged,
+        } = encoded;
+        let command_buffer_raw = command_buffer.as_raw();
+        let (fence, staged_token) = {
             let mut state = self.lock_async()?;
             let fence = state.reserve_fence(sequence);
-            let raw = encoded.command_buffer.as_raw();
-            state.note_commit(fence, encoded.command_buffer);
-            state.pin_staged(fence, encoded.staged);
-            (fence, raw)
+            let token = state.stage_staged(staged);
+            (fence, token)
         };
+        if let Some(token) = staged_token
+            && let Err(error) = self.retire_pin(fence, token)
+        {
+            // The pin was never queued; drop the staged objects so they are not
+            // retained until a release that will never come.
+            if let Ok(mut state) = self.async_submit.lock() {
+                state.staged.remove(&token);
+            }
+            return Err(error);
+        }
+        {
+            let mut state = self.lock_async()?;
+            state.note_commit(fence, command_buffer);
+        }
         let block = CompletionBlock {
             // SAFETY: `_NSConcreteStackBlock` is the libclosure class object; its
             // address is the `isa` every stack block literal carries.
@@ -9157,10 +9362,14 @@ mod async_pipeline_tests {
 
     #[test]
     fn retired_pins_release_only_after_the_watermark_advances() {
-        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3);
+        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3, 64);
         let fence = state.reserve_fence(7);
         state.watermark.push(fence);
-        state.pin_caller(fence, 77);
+        let token = state.stage_caller_pin(77);
+        state
+            .retire
+            .try_push(fence, token)
+            .expect("a fresh queue has room");
 
         // Nothing is observed complete yet: the pin must stay.
         assert_eq!(state.drain(), 0);
@@ -9177,7 +9386,7 @@ mod async_pipeline_tests {
 
     #[test]
     fn reserve_fence_is_monotonic_across_a_replayed_sequence() {
-        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3);
+        let mut state = AsyncSubmitState::new(Arc::new(FencePage::new()), 3, 64);
         assert_eq!(state.reserve_fence(1), 1);
         assert_eq!(state.reserve_fence(2), 2);
         // A replay of an older sequence must not move the fence backwards.
@@ -9189,7 +9398,7 @@ mod async_pipeline_tests {
     #[test]
     fn empty_submission_completes_without_jumping_in_flight_work() {
         let page = Arc::new(FencePage::new());
-        let mut state = AsyncSubmitState::new(Arc::clone(&page), 3);
+        let mut state = AsyncSubmitState::new(Arc::clone(&page), 3, 64);
 
         // Fence 1 is committed and still running.
         let in_flight = state.reserve_fence(1);

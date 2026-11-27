@@ -40,6 +40,26 @@ pub enum MetalError {
     /// Metal command execution or internal synchronization failed.
     #[error("internal Metal error: {0}")]
     InternalError(String),
+    /// A GPU completion fence never covered the oldest pinned resource within
+    /// the bounded retire backpressure budget.
+    ///
+    /// The pin was refused, not silently queued: the GPU (or its completion
+    /// handler) is stuck, and the host must reset or recreate the device rather
+    /// than grow the retire queue without bound.
+    #[error(
+        "retire backpressure: capacity {capacity} still full on fence {oldest} after \
+         {waits} waits (completed {completed})"
+    )]
+    Backpressure {
+        /// Retire capacity that could not admit the pin.
+        capacity: usize,
+        /// Oldest pinned fence value that never completed.
+        oldest: u64,
+        /// Highest completion value observed when the budget was spent.
+        completed: u64,
+        /// Waits performed before giving up.
+        waits: u32,
+    },
 }
 
 impl MetalError {
@@ -53,6 +73,7 @@ impl MetalError {
             Self::CompileFailed(_) => VmStatus::CompileFailed,
             Self::NotFound(_) => VmStatus::NotFound,
             Self::InternalError(_) => VmStatus::InternalError,
+            Self::Backpressure { .. } => VmStatus::InternalError,
         }
     }
 }
