@@ -53,6 +53,7 @@ use crate::native_metal::present::{
     present_surface,
 };
 use crate::native_metal::producer::{self, ProducerError};
+use crate::native_metal::telemetry::submit_refusals;
 
 /// `E_FAIL`: the refusal code for everything that is not an unsupported
 /// operation or an invalid argument.
@@ -603,6 +604,7 @@ pub fn native_queue_install_client(client: WireV3Client) {
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn native_queue_reset() {
     native_queue().reset(NativeSink::Disconnected(DisconnectedSink));
+    deferred_batches_reset();
     TEXTURE_FORMATS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1366,16 +1368,39 @@ where
 /// The Metal path records one frame sample, including a frame the producer
 /// refused for an unsupported opcode (that is what the histogram counts). A
 /// transport failure records nothing: no frame reached the host.
+///
+/// A batch that carries no frame at all is not a submission: it is refused with
+/// [`NativeQueueError::Empty`] before anything is encoded, sent or counted, so
+/// an empty list executed after a `Close` that carried no command buffer can
+/// never inflate the refusal total. Every counted refusal passes a static
+/// reason from [`crate::native_metal::telemetry::SUBMIT_REFUSAL_NAMES`].
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn submit_recorded_batch(
     submissions: &[SubmissionV3],
     record_us: u64,
 ) -> Result<NativeDispatch, NativeQueueError> {
+    // An empty stream is not a frame: nothing reaches the host, nothing is
+    // counted and nothing consumes a sequence. Counting it as a refused
+    // submission is exactly the unnamed per-boot refusal this guards against.
+    if !carries_a_frame(submissions) {
+        tracing::debug!(
+            submissions = submissions.len(),
+            "VICTORY_BACKEND=metal: the batch carried no command buffer; it is not a submission"
+        );
+        return Err(NativeQueueError::Empty(
+            "the batch carried no command buffer",
+        ));
+    }
+
     // The backend decision was made by `crate::queue::execute` before it
     // called the native path, so the environment is the only gate left.
-    if let Err(error) = ensure_live(LiveConfig::from_env) {
-        tracing::warn!(%error, "VICTORY_BACKEND=metal: the native queue has no live sink");
-    }
+    let attached = match ensure_live(LiveConfig::from_env) {
+        Ok(attached) => attached,
+        Err(error) => {
+            tracing::warn!(%error, "VICTORY_BACKEND=metal: the native queue has no live sink");
+            false
+        }
+    };
 
     let mut queue = native_queue();
     let outcome = dispatch_measured(GpuBackend::Metal, &mut queue, submissions);
@@ -1386,6 +1411,8 @@ pub fn submit_recorded_batch(
 
     match outcome {
         Ok((dispatch, timing)) => {
+            // A carried batch ends any no-client deferral streak.
+            deferred_batches_reset();
             if highest_sequence != 0 {
                 LAST_SEQUENCE.fetch_max(u64::from(highest_sequence), Ordering::AcqRel);
             }
@@ -1416,13 +1443,22 @@ pub fn submit_recorded_batch(
             ) {
                 crate::native_metal::telemetry::note_submit_ok();
             } else if matches!(dispatch, NativeDispatch::Native { .. }) {
-                crate::native_metal::telemetry::note_submit_refused();
+                crate::native_metal::telemetry::note_submit_refused(submit_refusals::HOST_REFUSED);
                 crate::native_metal::telemetry::record_frame(record_us, 0, 0, 0, None);
             }
             Ok(dispatch)
         }
         Err(error) => {
-            crate::native_metal::telemetry::note_submit_refused();
+            let reason = submit_refusal_reason(&error, attached);
+            // A submission that arrives before the client is attached is
+            // deferred, not refused: `flush` keeps its frame queued, so the
+            // first batch after the client attaches carries it. The deferral
+            // is bounded, and at the bound the refusal is counted exactly once
+            // under `no_client` (never once per attempt).
+            let suppressed = reason == submit_refusals::NO_CLIENT && defer_no_client_refusal();
+            if !suppressed {
+                crate::native_metal::telemetry::note_submit_refused(reason);
+            }
             if let NativeQueueError::Producer(producer) = &error
                 && producer.opcode().is_some()
             {
@@ -1433,13 +1469,115 @@ pub fn submit_recorded_batch(
     }
 }
 
+/// Whether `submissions` carries at least one command buffer.
+///
+/// A batch with no commands (or no submission at all) is an empty stream: the
+/// queue would carry nothing, so it is never a submission and never a refusal.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn carries_a_frame(submissions: &[SubmissionV3]) -> bool {
+    submissions
+        .iter()
+        .any(|submission| !submission.commands.is_empty())
+}
+
+/// The static reason a refused submission batch is counted under.
+///
+/// `attached` is whether a live Wire v3 client was installed when the batch was
+/// offered, so a transport error before the client existed is named `no_client`
+/// instead of a generic transport fault. The `Empty` arm is defensive: an empty
+/// batch is refused before it can reach the counter, and if a future caller
+/// bypasses that check the refusal is still named.
+fn submit_refusal_reason(error: &NativeQueueError, attached: bool) -> &'static str {
+    use crate::native_metal::telemetry::submit_refusals as names;
+    match error {
+        NativeQueueError::Empty(_) => names::NO_COMMAND_BUFFER,
+        NativeQueueError::Encode(_) => names::ENCODE,
+        NativeQueueError::Refused(_) => names::HOST_REFUSED,
+        NativeQueueError::Transport(_) if !attached => names::NO_CLIENT,
+        NativeQueueError::Transport(_) => names::TRANSPORT,
+        NativeQueueError::Producer(producer) => producer.submit_refusal_name(),
+        NativeQueueError::NoSurface(_) | NativeQueueError::NoSwapchain => names::PRESENT_REFUSED,
+        NativeQueueError::Present(_) => names::PRESENT_REFUSED,
+    }
+}
+
+/// How many batches of one streak may be deferred while no client is attached.
+///
+/// A guest that submits before the transport is attached defers its frame (the
+/// queue keeps it and the next submission carries it). Past this bound the
+/// deferral is abandoned and the refusal is counted once under `no_client`; the
+/// count is not repeated for the rest of the streak, and any carried batch
+/// starts a new one.
+pub const NO_CLIENT_DEFER_BOUND: u32 = 8;
+
+/// Batches deferred in the current no-client streak.
+#[cfg(any(windows, test, target_os = "macos"))]
+static DEFERRED_WITHOUT_CLIENT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Counts one deferred batch; true while the refusal must stay uncounted.
+///
+/// The first [`NO_CLIENT_DEFER_BOUND`] batches are silent, the next one is
+/// counted (this returns false) and every later batch of the same streak is
+/// silent again, so the refusal is counted exactly once.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn defer_no_client_refusal() -> bool {
+    let deferred = DEFERRED_WITHOUT_CLIENT.fetch_add(1, Ordering::AcqRel);
+    let suppressed = deferred != NO_CLIENT_DEFER_BOUND;
+    if suppressed {
+        tracing::debug!(
+            deferred = deferred.saturating_add(1),
+            budget = NO_CLIENT_DEFER_BOUND,
+            "VICTORY_BACKEND=metal: the batch is deferred until the Wire v3 client attaches"
+        );
+    }
+    suppressed
+}
+
+/// Ends the no-client deferral streak (a batch was carried, or a new session).
+#[cfg(any(windows, test, target_os = "macos"))]
+fn deferred_batches_reset() {
+    DEFERRED_WITHOUT_CLIENT.store(0, Ordering::Release);
+}
+
+/// How many batches of the current streak were deferred without a client.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+fn deferred_batches() -> u32 {
+    DEFERRED_WITHOUT_CLIENT.load(Ordering::Acquire)
+}
+
+/// Carries one list's recorded batch over the native queue.
+///
+/// A list that recorded nothing is not a submission: it returns `Ok(None)`, the
+/// sink is never touched and no counter moves. This is the per-list decision
+/// the live entry point and the tests share, so an empty stream is skipped in
+/// exactly one place instead of becoming a refused frame.
+#[cfg(any(windows, test, target_os = "macos"))]
+#[allow(dead_code)] // the live entry point is Windows-only; the tests use it everywhere
+pub(crate) fn submit_list_batch(
+    submissions: &[SubmissionV3],
+    record_us: u64,
+) -> Result<Option<NativeDispatch>, NativeQueueError> {
+    if !carries_a_frame(submissions) {
+        tracing::debug!(
+            submissions = submissions.len(),
+            "VICTORY_BACKEND=metal: a list carried no native submission; nothing is submitted"
+        );
+        return Ok(None);
+    }
+    submit_recorded_batch(submissions, record_us).map(Some)
+}
+
 /// `ExecuteCommandLists` under `VICTORY_BACKEND=metal`.
 ///
 /// Drains each title list's finished Wire v3 submissions (in list order, and
 /// in each list's recorded order) into the native queue. Host D3D12 work is
 /// never enqueued on this path: an empty list or a refused batch is logged and
-/// surfaced through the queue, with no fallback. The first batch also connects
-/// the session when `VICTORY_METAL_ENDPOINT`/`VICTORY_METAL_SECRET` are set.
+/// surfaced through the queue, with no fallback. A list that recorded nothing
+/// is skipped: it carries no frame, so it is neither submitted nor counted (the
+/// one refusal per boot this path used to report). The first batch also
+/// connects the session when `VICTORY_METAL_ENDPOINT`/`VICTORY_METAL_SECRET`
+/// are set.
 #[cfg(windows)]
 pub fn execute_native(count: u32, lists: *const crate::object::This) {
     if count == 0 || lists.is_null() {
@@ -1463,11 +1601,12 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
                 );
             }
         }
-        match submit_recorded_batch(&submissions, record_us) {
-            Ok(NativeDispatch::Native {
+        match submit_list_batch(&submissions, record_us) {
+            Ok(None) => {}
+            Ok(Some(NativeDispatch::Native {
                 status,
                 submissions: carried,
-            }) => {
+            })) => {
                 let list = submissions.first().and_then(|submission| submission.list);
                 if status == ReplyStatus::Ok {
                     tracing::trace!(carried, ?list, "native queue carried a list");
@@ -1480,7 +1619,7 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
                     );
                 }
             }
-            Ok(NativeDispatch::Host) => {}
+            Ok(Some(NativeDispatch::Host)) => {}
             Err(NativeQueueError::Empty(_)) => {
                 tracing::debug!(
                     "VICTORY_BACKEND=metal: a submitted list carried no native submission"
@@ -2241,6 +2380,270 @@ mod tests {
         native_queue_reset();
         assert_eq!(native_queue().pending(), 0);
     }
+
+    // ------------------------------------------- named submission refusals
+
+    /// The per-boot refusal this task fixes: a list that recorded nothing
+    /// reaches the queue as an empty batch. It is not a submission, so the sink
+    /// is never touched and no refusal is counted. Before the fix it moved
+    /// `submits_refused` by one, unnamed.
+    #[test]
+    fn an_empty_list_batch_is_not_a_refused_submission() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        assert_eq!(ensure_live(|| None), Ok(false));
+        // The submit counters are session totals, so the test compares the
+        // delta: another test in this process may already have counted one.
+        let before = telemetry::global().submit_counts();
+        let before_named = telemetry::global().named_submit_refusal_histogram();
+
+        let error = submit_recorded_batch(&[], 0).expect_err("an empty batch carries no frame");
+        assert!(
+            matches!(&error, NativeQueueError::Empty(why) if why.contains("no command buffer")),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            telemetry::global().submit_counts(),
+            before,
+            "an empty stream is not a refused submission"
+        );
+        assert_eq!(
+            telemetry::global().named_submit_refusal_histogram(),
+            before_named,
+            "nothing was refused, so nothing is named"
+        );
+        assert_eq!(native_queue().pending(), 0, "nothing was queued either");
+        native_queue_reset();
+    }
+
+    /// The other empty-stream shape: submissions present, none carrying a
+    /// command. Still not a submission, still not a refusal.
+    #[test]
+    fn a_batch_with_no_command_buffer_is_not_a_submission() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        assert_eq!(ensure_live(|| None), Ok(false));
+        let before = telemetry::global().submit_counts();
+        let before_named = telemetry::global().named_submit_refusal_histogram();
+
+        let mut empty = submission(41, 411, 1);
+        empty.commands.clear();
+        assert!(matches!(
+            submit_recorded_batch(std::slice::from_ref(&empty), 0),
+            Err(NativeQueueError::Empty(_))
+        ));
+        assert_eq!(telemetry::global().submit_counts(), before);
+        assert_eq!(
+            telemetry::global().named_submit_refusal_histogram(),
+            before_named
+        );
+        assert_eq!(native_queue().pending(), 0);
+        native_queue_reset();
+    }
+
+    /// The per-list seam skips a list that recorded nothing and returns
+    /// `Ok(None)`; a list that did record is carried exactly as before.
+    #[test]
+    fn a_list_that_recorded_nothing_is_skipped_not_refused() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        assert_eq!(ensure_live(|| None), Ok(false));
+        let before = telemetry::global().submit_counts();
+        let before_named = telemetry::global().named_submit_refusal_histogram();
+
+        assert_eq!(
+            submit_list_batch(&[], 0),
+            Ok(None),
+            "no frame: nothing to submit"
+        );
+        assert_eq!(telemetry::global().submit_counts(), before);
+        assert_eq!(
+            telemetry::global().named_submit_refusal_histogram(),
+            before_named
+        );
+        assert_eq!(native_queue().pending(), 0);
+        native_queue_reset();
+    }
+
+    /// The no-client deferral is bounded: the first
+    /// [`NO_CLIENT_DEFER_BOUND`] batches are deferred (their frames stay
+    /// queued), the next one counts the refusal exactly once under
+    /// `no_client`, and the rest of the streak stays silent.
+    #[test]
+    fn a_no_client_streak_refuses_exactly_once_at_the_bound() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        assert_eq!(ensure_live(|| None), Ok(false));
+        let (ok_before, refused_before) = telemetry::global().submit_counts();
+        let named_before = telemetry::global()
+            .named_submit_refusal_histogram()
+            .get(submit_refusals::NO_CLIENT)
+            .copied()
+            .unwrap_or(0);
+
+        let batch = submission(0, 512, 1);
+        for deferred in 0..NO_CLIENT_DEFER_BOUND {
+            assert_eq!(deferred_batches(), deferred);
+            let error = submit_recorded_batch(std::slice::from_ref(&batch), 0)
+                .expect_err("no client means no success");
+            assert!(
+                matches!(error, NativeQueueError::Transport(_)),
+                "unexpected error {error:?}"
+            );
+            assert_eq!(
+                telemetry::global().submit_counts().1,
+                refused_before,
+                "batch {deferred} is deferred, not refused"
+            );
+        }
+        assert_eq!(deferred_batches(), NO_CLIENT_DEFER_BOUND);
+
+        // The bound is hit: one refusal, named.
+        let _ = submit_recorded_batch(std::slice::from_ref(&batch), 0).expect_err("still no host");
+        assert_eq!(telemetry::global().submit_counts().1, refused_before + 1);
+        assert_eq!(telemetry::global().submit_counts().0, ok_before);
+        assert_eq!(
+            telemetry::global()
+                .named_submit_refusal_histogram()
+                .get(submit_refusals::NO_CLIENT)
+                .copied(),
+            Some(named_before + 1),
+            "the one refusal carries the no_client name"
+        );
+
+        // Later attempts of the same streak do not inflate the count.
+        for _ in 0..3 {
+            let _ = submit_recorded_batch(std::slice::from_ref(&batch), 0);
+            assert_eq!(telemetry::global().submit_counts().1, refused_before + 1);
+        }
+
+        // Teardown starts a new streak; a carried batch does the same (the
+        // reconstructed boot below carries one and leaves the streak at zero).
+        native_queue_reset();
+        assert_eq!(deferred_batches(), 0);
+        assert_eq!(native_queue().pending(), 0);
+    }
+
+    /// Every refusal the queue counts passes a static reason from the fixed
+    /// table, and each class maps to its own name.
+    #[test]
+    fn every_refused_batch_is_counted_under_a_static_reason() {
+        use crate::native_metal::telemetry::{SUBMIT_REFUSAL_NAMES, submit_refusals};
+
+        let producer = ProducerError::unsupported_opcode("test", 7);
+        let cases = [
+            (
+                NativeQueueError::Empty("test"),
+                submit_refusals::NO_COMMAND_BUFFER,
+            ),
+            (
+                NativeQueueError::Encode(WireError::ZeroSequence),
+                submit_refusals::ENCODE,
+            ),
+            (
+                NativeQueueError::Refused("host".to_string()),
+                submit_refusals::HOST_REFUSED,
+            ),
+            (
+                NativeQueueError::Transport("reset".to_string()),
+                submit_refusals::NO_CLIENT,
+            ),
+            (
+                NativeQueueError::Producer(producer),
+                submit_refusals::PRODUCER_UNSUPPORTED,
+            ),
+            (NativeQueueError::NoSwapchain, submit_refusals::PRESENT_REFUSED),
+        ];
+        for (error, expected) in cases {
+            for attached in [false, true] {
+                let reason = submit_refusal_reason(&error, attached);
+                assert!(
+                    SUBMIT_REFUSAL_NAMES.contains(&reason),
+                    "{reason} is not in the fixed table"
+                );
+                if !(attached && matches!(&error, NativeQueueError::Transport(_))) {
+                    assert_eq!(reason, expected, "{error:?} attached={attached}");
+                }
+            }
+        }
+        // A transport fault on a live session is a transport refusal, not a
+        // missing client.
+        assert_eq!(
+            submit_refusal_reason(&NativeQueueError::Transport("reset".to_string()), true),
+            submit_refusals::TRANSPORT
+        );
+    }
+
+    /// The boot sequence reconstructed: two lists with commands are carried,
+    /// the empty one is skipped, and the session reports two successes and no
+    /// refused submission.
+    #[test]
+    fn a_reconstructed_boot_sequence_reports_no_refused_submission() {
+        let _serial = serialized();
+        native_queue_reset();
+        reset_sequences(1);
+        telemetry::global().reset();
+        let (ok_before, refused_before) = telemetry::global().submit_counts();
+        let named_before = telemetry::global().named_submit_refusal_histogram();
+        let (host, carried) = TestHost::spawn(vec![ReplyStatus::Ok, ReplyStatus::Ok]);
+        let config = host.config();
+        assert_eq!(ensure_live(|| Some(Ok(config))), Ok(true));
+
+        let first = submission(0, 601, 1);
+        let second = submission(0, 602, 1);
+        assert!(matches!(
+            submit_list_batch(std::slice::from_ref(&first), 3),
+            Ok(Some(NativeDispatch::Native {
+                status: ReplyStatus::Ok,
+                ..
+            }))
+        ));
+        // The title executes a list that recorded nothing: skipped, not refused.
+        assert_eq!(submit_list_batch(&[], 1), Ok(None));
+        assert!(matches!(
+            submit_list_batch(std::slice::from_ref(&second), 2),
+            Ok(Some(NativeDispatch::Native {
+                status: ReplyStatus::Ok,
+                ..
+            }))
+        ));
+
+        assert_eq!(
+            telemetry::global().submit_counts(),
+            (ok_before + 2, refused_before),
+            "the reconstructed boot reports two submissions and no refusal"
+        );
+        assert_eq!(
+            telemetry::global().named_submit_refusal_histogram(),
+            named_before,
+            "no submission-refusal reason was recorded"
+        );
+        assert_eq!(telemetry::global().recorded_frames(), 2);
+        assert_eq!(deferred_batches(), 0, "a carried batch ends the streak");
+        assert_eq!(
+            telemetry::global().d3dmetal_fallback_count(),
+            0,
+            "no host D3D12 and no D3DMetal involvement"
+        );
+        let mut expected_first = first.clone();
+        expected_first.sequence = 1;
+        let mut expected_second = second.clone();
+        expected_second.sequence = 2;
+        assert_eq!(
+            carried.recv_timeout(TEST_TIMEOUT).expect("first"),
+            expected_first,
+            "the first list's identity and sequence are preserved"
+        );
+        assert_eq!(
+            carried.recv_timeout(TEST_TIMEOUT).expect("second"),
+            expected_second,
+            "the skipped empty list consumed no sequence"
+        );
+        native_queue_reset();    }
 
     /// A refused send leaves the batch at the front of the queue, intact and
     /// unsent; the next flush carries exactly those bytes once.
