@@ -1101,18 +1101,33 @@ fn create_heap_impl(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
-    tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
         if placement.address.checked_add(size).is_none() {
             return E_INVALIDARG;
         }
         (placement.address, None)
     } else {
-        match Memory::zeroed(size, 64) {
+        match Memory::for_descriptors(size, 64) {
             Ok(memory) => (memory.address(), Some(memory)),
             Err(hr) => return hr,
         }
     };
+    // One bounded line per heap: what it is and where its memory came from
+    // (a placement's memory is the title's own; never its bytes).
+    let source = if placed || memory.as_ref().is_some_and(Memory::from_title_allocator) {
+        "title"
+    } else {
+        "host"
+    };
+    tracing::debug!(
+        kind = desc.kind,
+        count = desc.count,
+        size,
+        flags = format_args!("{:#x}", desc.flags),
+        start = format_args!("{start:#x}"),
+        allocator = source,
+        "descriptor heap memory"
+    );
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
@@ -1159,14 +1174,20 @@ extern "system" fn desc(this: This, out: *mut HeapDesc) {
 }
 /// The same address for the CPU and the GPU start.
 fn start_checked(this: This, name: &'static str) -> u64 {
-    let start = heap(this).start;
+    let heap = heap(this);
+    let start = heap.start;
     #[cfg(any(windows, test, target_os = "macos"))]
     if start == 0 {
         telemetry::note_call_failure(name, crate::object::S_OK, [0, 0, 0]);
     }
     #[cfg(not(any(windows, test, target_os = "macos")))]
     let _ = name;
-    start
+    // A heap whose memory exists always has a real start: a lost address is
+    // repaired from the memory itself (and recorded above).
+    match heap.memory.as_ref().map(Memory::address) {
+        Some(address) if start == 0 => address,
+        _ => start,
+    }
 }
 
 extern "system" fn cpu_start(this: This) -> u64 {
@@ -1210,6 +1231,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+    use std::alloc::Layout;
+    use std::ffi::c_void;
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
@@ -1595,5 +1618,273 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    /// A test allocator: records what it hands out, zeroes it, and frees it
+    /// with the same layout. Descriptor heaps only, single-threaded tests.
+    #[derive(Clone, Copy)]
+    struct Allocation {
+        ptr: usize,
+        layout: Layout,
+        size: usize,
+        attributes: u64,
+    }
+
+    static HEAP_ALLOCATIONS: std::sync::Mutex<Vec<Allocation>> = std::sync::Mutex::new(Vec::new());
+    static HEAP_FREES: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    extern "system" fn test_alloc(size: usize, attributes: u64) -> *mut c_void {
+        let align = 1usize << ((attributes >> 24) & 0x1f).max(4);
+        let Ok(layout) = Layout::from_size_align(size.max(1), align) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return ptr.cast();
+        }
+        HEAP_ALLOCATIONS.lock().unwrap().push(Allocation {
+            ptr: ptr as usize,
+            layout,
+            size,
+            attributes,
+        });
+        ptr.cast()
+    }
+
+    extern "system" fn test_free(ptr: *mut c_void, attributes: u64) {
+        HEAP_FREES.lock().unwrap().push((ptr as usize, attributes));
+        let record = {
+            let mut records = HEAP_ALLOCATIONS.lock().unwrap();
+            records
+                .iter()
+                .position(|record| record.ptr == ptr as usize)
+                .map(|i| records.swap_remove(i))
+        };
+        if let Some(record) = record {
+            // SAFETY: allocated by `test_alloc` with this layout.
+            unsafe { std::alloc::dealloc(record.ptr as *mut u8, record.layout) };
+        }
+    }
+
+    /// Refuses every allocation (returns null).
+    extern "system" fn refusing_alloc(_: usize, _: u64) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// Installs a test allocator (or forces the host path) for one test.
+    struct AllocatorGuard;
+
+    impl AllocatorGuard {
+        fn install(
+            alloc: crate::resource::AllocRoutine,
+            free: crate::resource::FreeRoutine,
+        ) -> Self {
+            HEAP_ALLOCATIONS.lock().unwrap().clear();
+            HEAP_FREES.lock().unwrap().clear();
+            crate::resource::set_allocator_for_test(Some((alloc, free)));
+            Self
+        }
+
+        fn fake() -> Self {
+            Self::install(test_alloc, test_free)
+        }
+
+        fn refusing() -> Self {
+            Self::install(refusing_alloc, test_free)
+        }
+
+        fn host() -> Self {
+            HEAP_ALLOCATIONS.lock().unwrap().clear();
+            HEAP_FREES.lock().unwrap().clear();
+            crate::resource::set_allocator_for_test(None);
+            Self
+        }
+    }
+
+    impl Drop for AllocatorGuard {
+        fn drop(&mut self) {
+            crate::resource::clear_allocator_for_test();
+        }
+    }
+
+    fn heap_allocations() -> Vec<Allocation> {
+        HEAP_ALLOCATIONS.lock().unwrap().clone()
+    }
+
+    fn heap_frees() -> Vec<(usize, u64)> {
+        HEAP_FREES.lock().unwrap().clone()
+    }
+
+    fn unplaced() -> Placement {
+        Placement {
+            address: 0,
+            size: 0,
+        }
+    }
+
+    /// A non-placed heap of 3,128 CBV_SRV_UAV descriptors is allocated
+    /// through the title's allocator, and starts (and frees) exactly there.
+    #[test]
+    fn descriptor_heap_memory_comes_from_the_title_allocator() {
+        let _allocator = AllocatorGuard::fake();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 3128,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, unplaced(), &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        let gpu = slot::<extern "system" fn(This) -> u64>(h, 0x50)(h);
+        let allocated = heap_allocations();
+        assert_eq!(allocated.len(), 1, "one allocation for the heap");
+        assert_eq!(allocated[0].size, 3128 * 32);
+        assert_eq!(
+            (allocated[0].attributes >> 24) & 0x1f,
+            6,
+            "the heap's own alignment, 64"
+        );
+        assert_eq!(allocated[0].attributes >> 29, 3, "cacheable, CPU-visible");
+        assert_eq!(start, allocated[0].ptr as u64);
+        assert_eq!(gpu, start);
+        assert_ne!(start, 0);
+        release(h);
+        assert_eq!(
+            heap_frees(),
+            [(allocated[0].ptr, allocated[0].attributes)],
+            "freed once, through the same allocator"
+        );
+        assert!(heap_allocations().is_empty(), "the allocation went back");
+    }
+
+    /// Without an installed allocator the host path is unchanged: non-zero,
+    /// 64-byte-aligned memory freed on Drop, and no failure recorded.
+    #[test]
+    fn descriptor_heaps_use_host_memory_without_an_allocator() {
+        let _allocator = AllocatorGuard::host();
+        let telemetry = crate::native_metal::telemetry::global();
+        telemetry.reset_call_failures();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, unplaced(), &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        assert_ne!(start, 0, "a live heap has a real start");
+        assert_eq!(start % 64, 0, "the heap's alignment");
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), start);
+        assert_eq!(
+            telemetry.call_failure_count(),
+            0,
+            "a live heap's handles must not record a zero start"
+        );
+        assert!(heap_allocations().is_empty());
+        release(h);
+        assert!(
+            heap_frees().is_empty(),
+            "host memory does not go to the title's free"
+        );
+    }
+
+    /// A title allocator that refuses an allocation leaves the host path:
+    /// the heap still exists with a real start.
+    #[test]
+    fn a_refusing_title_allocator_falls_back_to_host_memory() {
+        let _allocator = AllocatorGuard::refusing();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, unplaced(), &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        assert_ne!(start, 0);
+        assert!(heap_allocations().is_empty());
+        release(h);
+        assert!(heap_frees().is_empty());
+    }
+
+    /// A placed heap keeps using the title's own memory and never allocates.
+    #[test]
+    fn placed_descriptor_heaps_never_allocate() {
+        let _allocator = AllocatorGuard::fake();
+        let mut memory = vec![0u8; 64 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: 0,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address,
+            size: 64 * 32,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        assert!(
+            heap_allocations().is_empty(),
+            "the title's memory is used as is"
+        );
+        release(h);
+        assert!(heap_frees().is_empty());
+    }
+
+    /// 64 live heaps get distinct starts, each inside its own allocation,
+    /// and every allocation is freed exactly once.
+    #[test]
+    fn repeated_descriptor_heaps_stay_inside_their_own_allocations() {
+        let _allocator = AllocatorGuard::fake();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 16,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut heaps = Vec::new();
+        for _ in 0..64 {
+            let mut h = std::ptr::null();
+            assert_eq!(create(desc, unplaced(), &mut h), S_OK);
+            heaps.push(h);
+        }
+        let allocated = heap_allocations();
+        assert_eq!(allocated.len(), 64, "one allocation per heap");
+        let mut starts = Vec::new();
+        for &h in &heaps {
+            let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+            assert_ne!(start, 0);
+            let inside = allocated.iter().any(|allocation| {
+                let first = allocation.ptr as u64;
+                (first..first + allocation.size as u64).contains(&start)
+            });
+            assert!(inside, "start {start:#x} lies in one of the allocations");
+            starts.push(start);
+        }
+        let distinct = {
+            let mut sorted = starts.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len()
+        };
+        assert_eq!(distinct, 64, "no two live heaps alias");
+        for h in heaps {
+            release(h);
+        }
+        assert_eq!(heap_frees().len(), 64, "each allocation freed once");
+        assert!(heap_allocations().is_empty());
+        let mut freed: Vec<usize> = heap_frees().iter().map(|&(ptr, _)| ptr).collect();
+        freed.sort_unstable();
+        let mut allocated_ptrs: Vec<usize> = allocated.iter().map(|a| a.ptr).collect();
+        allocated_ptrs.sort_unstable();
+        assert_eq!(freed, allocated_ptrs, "every allocation went back");
     }
 }

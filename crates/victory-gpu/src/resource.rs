@@ -602,24 +602,53 @@ fn place<'a>(
     total
 }
 
-/// Zeroed host memory standing in for GPU memory.
+/// Zeroed memory standing in for GPU memory: the title's own when its
+/// allocator is in force, host memory otherwise.
 pub(crate) struct Memory {
     ptr: NonNull<u8>,
     layout: Layout,
-    /// Set when the memory came from the title's allocator, with these
-    /// allocation attributes (it goes back there).
-    attributes: Option<u64>,
+    /// Set when the memory came from the title's allocator, with the
+    /// allocation attributes and the routine that takes it back.
+    title: Option<(u64, FreeRoutine)>,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
 
-/// Committed resources get their memory from the title's general
-/// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
-/// block of its own and checks they fill it). The runtime names it before
-/// the device exists.
+/// Tests choose the allocator: `Some(None)` forces the host path,
+/// `Some(Some(pair))` installs one, `None` uses [`ALLOCATOR`].
+#[cfg(test)]
+static TEST_ALLOCATOR: std::sync::Mutex<Option<Option<(AllocRoutine, FreeRoutine)>>> =
+    std::sync::Mutex::new(None);
+
+/// The title's allocator, if one is in force.
+fn allocator() -> Option<(AllocRoutine, FreeRoutine)> {
+    #[cfg(test)]
+    if let Some(choice) = *TEST_ALLOCATOR.lock().unwrap_or_else(|e| e.into_inner()) {
+        return choice;
+    }
+    ALLOCATOR.get().copied()
+}
+
+/// Installs (or forces the host path with `None`) the allocator for a test,
+/// replacing the runtime's for the test's duration.
+#[cfg(test)]
+pub(crate) fn set_allocator_for_test(choice: Option<(AllocRoutine, FreeRoutine)>) {
+    *TEST_ALLOCATOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(choice);
+}
+
+/// Drops the test choice: the runtime's allocator (if any) applies again.
+#[cfg(test)]
+pub(crate) fn clear_allocator_for_test() {
+    *TEST_ALLOCATOR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Committed resources and descriptor heaps get their memory from the
+/// title's general allocator, as on the console, where titles hook it to
+/// place graphics memory themselves (Grand Theft Auto VI places its back
+/// buffers in a block of its own and checks they fill it). The runtime
+/// names it before the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
     let _ = ALLOCATOR.set((alloc, free));
 }
@@ -639,26 +668,45 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
-/// Allocation attributes for resource memory: allocator id, page size
-/// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
-/// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
-/// heaps, cacheable for the CPU-visible ones).
+/// Allocation attributes: allocator id, page size (bits 14-15: 2 MiB pages
+/// from 2 MiB up, else 64 KiB), alignment as log2 (bits 24-28) and memory
+/// type (bits 29-32: write-combined for GPU-only heaps, cacheable for the
+/// CPU-visible ones).
 /// shortcut: the console runtime's own choice of page size and memory type
 /// is not known; this is the plausible one.
-fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
+fn allocation_attributes(info: AllocationInfo, memory: u64) -> u64 {
     const GRAPHICS_ALLOCATOR: u64 = 128 << 16;
-    const DEFAULT_HEAP: u32 = 1;
     let pages: u64 = if info.size >= 2 << 20 { 2 } else { 1 };
-    let memory: u64 = if heap_kind == DEFAULT_HEAP { 1 } else { 3 };
     let alignment = u64::from(info.alignment.max(1).trailing_zeros());
     GRAPHICS_ALLOCATOR | pages << 14 | alignment << 24 | memory << 29
+}
+
+/// The memory type field's cacheable value (CPU-visible memory).
+const CACHEABLE: u64 = 3;
+/// The memory type field's write-combined value (GPU-only memory).
+const WRITE_COMBINED: u64 = 1;
+
+fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
+    const DEFAULT_HEAP: u32 = 1;
+    let memory = if heap_kind == DEFAULT_HEAP {
+        WRITE_COMBINED
+    } else {
+        CACHEABLE
+    };
+    allocation_attributes(info, memory)
+}
+
+/// Descriptor heaps are CPU-visible: the title writes handles into them
+/// itself, so their memory is cacheable.
+fn descriptor_attributes(info: AllocationInfo) -> u64 {
+    allocation_attributes(info, CACHEABLE)
 }
 
 impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
-        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+        let Some((alloc, free)) = allocator() else {
             return Memory::new(info);
         };
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
@@ -671,17 +719,48 @@ impl Memory {
         Ok(Memory {
             ptr,
             layout,
-            attributes: Some(attributes),
+            title: Some((attributes, free)),
         })
     }
 
-    /// `size` zeroed bytes aligned to `alignment` (a power of two).
-    pub(crate) fn zeroed(size: u64, alignment: u64) -> Result<Memory, HRESULT> {
-        Memory::new(AllocationInfo { size, alignment })
+    /// A descriptor heap's memory: from the title's allocator if the runtime
+    /// named one and it hands out the heap, else our own zeroed host memory.
+    /// Descriptor heaps are CPU-visible, so the title's memory gets cacheable
+    /// attributes and the heap's own size and alignment.
+    pub(crate) fn for_descriptors(size: u64, alignment: u64) -> Result<Memory, HRESULT> {
+        let info = AllocationInfo { size, alignment };
+        let Some((alloc, free)) = allocator() else {
+            return Memory::new(info);
+        };
+        let layout = usize::try_from(info.size)
+            .ok()
+            .zip(usize::try_from(info.alignment).ok())
+            .filter(|&(size, _)| size > 0)
+            .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
+            .ok_or(E_INVALIDARG)?;
+        let attributes = descriptor_attributes(info);
+        let Some(ptr) = NonNull::new(alloc(layout.size(), attributes).cast::<u8>()) else {
+            // The title's allocator refused: host memory stands in, as before
+            // the allocator was in force.
+            return Memory::new(info);
+        };
+        // SAFETY: the allocator handed out `layout.size()` bytes.
+        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        Ok(Memory {
+            ptr,
+            layout,
+            title: Some((attributes, free)),
+        })
     }
 
     pub(crate) fn address(&self) -> u64 {
         self.ptr.as_ptr() as u64
+    }
+
+    /// Whether the memory came from the title's allocator (rather than the
+    /// host fallback).
+    pub(crate) fn from_title_allocator(&self) -> bool {
+        self.title.is_some()
     }
 
     fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
@@ -696,17 +775,17 @@ impl Memory {
         Ok(Memory {
             ptr,
             layout,
-            attributes: None,
+            title: None,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+        match self.title {
+            Some((attributes, free)) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            None => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
     }
 }
@@ -2914,7 +2993,9 @@ extern "system" fn gpu_address(this: This) -> u64 {
     if at >> 40 != 0 {
         static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
         let backing = match r.backing {
-            Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
+            Backing::Committed(ref m) => {
+                format!("committed, attributes {:?}", m.title.map(|(a, _)| a))
+            }
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
         };
