@@ -570,6 +570,24 @@ fn encode_drawable_blit(
     Ok(())
 }
 
+/// The opaque diagnostic colour the present path clears the drawable to when a
+/// source cannot be blitted. The probe compares a uniform sample against this
+/// so a real title clear can be told apart from the diagnostic one.
+const DIAGNOSTIC_CLEAR: ClearColor = ClearColor {
+    red: 0.05,
+    green: 0.10,
+    blue: 0.20,
+    alpha: 1.0,
+};
+
+/// [`DIAGNOSTIC_CLEAR`] after Metal's UNORM8 conversion, in canonical RGBA
+/// order: `round(0.05 * 255) = 13`, `round(0.10 * 255) = 26`,
+/// `round(0.20 * 255) = 51`, alpha `255`. The BGRA8 byte order of the same
+/// pixel is `[51, 26, 13, 255]`; [`probe_diagnostic_clear_rgba`] exposes this
+/// and the unit test pins the UNORM8 derivation, so the clear constant and the
+/// probe's name cannot drift.
+const DIAGNOSTIC_CLEAR_RGBA: [u8; 4] = [13, 26, 51, 255];
+
 /// Clears the drawable texture to an opaque diagnostic colour.
 fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<(), PresentError> {
     let class = objc::class(c"MTLRenderPassDescriptor");
@@ -613,10 +631,10 @@ fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<
             attachment,
             objc::sel(c"setClearColor:"),
             MTLClearColor {
-                red: 0.05,
-                green: 0.10,
-                blue: 0.20,
-                alpha: 1.0,
+                red: DIAGNOSTIC_CLEAR.red,
+                green: DIAGNOSTIC_CLEAR.green,
+                blue: DIAGNOSTIC_CLEAR.blue,
+                alpha: DIAGNOSTIC_CLEAR.alpha,
             },
         );
     }
@@ -652,8 +670,26 @@ fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<
 // 8x8 grid of 8x8 blocks into one 64x64 shared staging texture (16 KiB), and it
 // never waits on the GPU for longer than `FRAME_PROBE_WAIT`. Exactly one probe
 // command buffer may be in flight; further opportunities are counted and
-// dropped. The probe never writes pixels to disk: only counters and a CRC reach
-// telemetry and the host log.
+// dropped. The probe never writes pixels to disk: counters, a CRC and a compact
+// colour summary (min/max/mean RGBA, variance, distinct sample count and a
+// `uniform_color` name) reach telemetry and the host log.
+//
+// What is sampled, precisely (after Wave 13A the present path blits the title
+// back-buffer into the acquired `CAMetalDrawable`, so this is the drawable's
+// texture, not the IOSurface and not the source):
+//
+// - texture: `CAMetalDrawable.texture`, the one just presented; its extent and
+//   pixel format are resized to the source's when `present` retargets the layer
+//   (`BGRA8Unorm` or `RGBA8Unorm`; `RGBA16Float` is displayable but not
+//   sampled, and yields `probe_unsupported_pixel_format_115`).
+// - region: 8x8 blocks centred on an 8x8 grid. At 3840x2160 the step is
+//   `3840 / 8 = 480` by `2160 / 8 = 270`, and the last block starts at
+//   `(7 * 480, 7 * 270) = (3360, 1890)`, so every block is inside the texture.
+// - row stride: the source copy is texture-to-texture, so it never sees a row
+//   pitch. The only stride the probe names is the readback of the 64-pixel-wide
+//   staging atlas: `64 * 4 = 256` bytes per row, 64 rows, 16 KiB.
+// - format of the readback: the same 4-byte UNORM format as the drawable, read
+//   as `[u8; 4]`; `PixelOrder::Bgra` reorders to canonical RGBA for the report.
 
 /// Environment variable that opts into the presented-frame probe.
 pub const FRAME_PROBE_ENV: &str = "VICTORY_METAL_FRAME_PROBE";
@@ -661,9 +697,9 @@ pub const FRAME_PROBE_ENV: &str = "VICTORY_METAL_FRAME_PROBE";
 pub const FRAME_PROBE_EVERY_ENV: &str = "VICTORY_METAL_FRAME_PROBE_EVERY";
 /// Default sampling interval: one probe every 30 presented frames.
 pub const FRAME_PROBE_DEFAULT_EVERY: u64 = 30;
-/// A channel counts as content when it differs from the clear value by more
-/// than this many 8-bit steps (out of 255). The comparison is strict: a
-/// difference of exactly 8 is still considered clear.
+/// A colour channel counts as content when it differs from the clear value by
+/// more than this many 8-bit steps (out of 255). The comparison is strict: a
+/// difference of exactly 8 is still considered clear. Alpha is not compared.
 pub const FRAME_PROBE_CHANNEL_THRESHOLD: u8 = 8;
 /// The probe copies an 8x8 grid of blocks.
 pub const FRAME_PROBE_GRID: u32 = 8;
@@ -765,16 +801,45 @@ pub enum PixelOrder {
 }
 
 /// One probe measurement over a sampled BGRA8/RGBA8 buffer.
+///
+/// Statistics are expressed in canonical RGBA order (red, green, blue, alpha)
+/// regardless of the surface's byte order, so a report reads the same for a
+/// BGRA8 drawable and an RGBA8 one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameProbeSample {
-    /// Pixels with any channel farther than the threshold from the clear value.
+    /// Pixels whose **colour** channels are farther than the threshold from the
+    /// clear value. Alpha alone never makes a pixel content: a fully
+    /// transparent (all-zero) surface is the diagnostic case this field must
+    /// not confuse with a drawn frame.
     pub non_black_pixels: u64,
     /// Distinct 5-bit luma buckets seen (0..=32).
     pub unique_luma_buckets: u32,
-    /// CRC-64/ECMA-182 over the sampled pixels in row-major order.
+    /// CRC-64/ECMA-182 over the sampled bytes in row-major order.
+    ///
+    /// The documented value for an all-zero sample is `0` (init `0`, no final
+    /// XOR, zero bytes leave the register at zero). Any sample with content in
+    /// its colour channels is non-zero: a repeated `0x80` byte, a two-tone
+    /// frame and an opaque black clear all checksum non-zero, and the test
+    /// suite pins those cases. `frame_crc=0` therefore means "the sampled bytes
+    /// were all zero", never "the checksum was not computed"; the min/max/mean
+    /// and `uniform_color` fields say whether that zero sample was a
+    /// transparent surface.
     pub frame_crc: u64,
     /// Number of pixels in this measurement.
     pub probe_pixels: u64,
+    /// Per-channel minimum, canonical RGBA.
+    pub min_rgba: [u8; 4],
+    /// Per-channel maximum, canonical RGBA.
+    pub max_rgba: [u8; 4],
+    /// Per-channel integer mean, canonical RGBA.
+    pub mean_rgba: [u8; 4],
+    /// Largest per-channel population variance, in 8-bit squared units
+    /// (`0..=16256`; a uniform sample is `0`).
+    pub variance: u32,
+    /// Distinct exact pixel values in the sample, `1..=probe_pixels`.
+    pub distinct_sample_values: u32,
+    /// The exact pixel when every sampled pixel is identical, else `None`.
+    pub uniform_rgba: Option<[u8; 4]>,
 }
 
 /// The accumulated probe result reported in telemetry.
@@ -800,6 +865,25 @@ pub struct FrameProbeReport {
     pub probe_every: u64,
     /// First named failure, if any. A set failure stops further sampling.
     pub failure: Option<String>,
+    /// Per-channel minimum of the last sample, canonical RGBA.
+    pub min_rgba: [u8; 4],
+    /// Per-channel maximum of the last sample, canonical RGBA.
+    pub max_rgba: [u8; 4],
+    /// Per-channel mean of the last sample, canonical RGBA.
+    pub mean_rgba: [u8; 4],
+    /// Largest per-channel variance of the last sample, 8-bit squared units.
+    pub variance: u32,
+    /// Distinct exact pixel values in the last sample.
+    pub distinct_sample_values: u32,
+    /// Name of the last sample's colour: `black`, `transparent_black`,
+    /// `swatch_0d1a33`, `mixed`, and so on.
+    pub uniform_color: String,
+    /// True when the last sample is a uniform colour equal to
+    /// [`DIAGNOSTIC_CLEAR_RGBA`] within one 8-bit step, i.e. the frame is the
+    /// diagnostic clear rather than a title clear that merely looks similar.
+    pub matches_diagnostic_clear: bool,
+    /// CPU microseconds spent reading back and analysing the last sample.
+    pub sample_cost_us: u64,
 }
 
 impl Default for FrameProbeReport {
@@ -815,12 +899,24 @@ impl Default for FrameProbeReport {
             fallback_clear: false,
             probe_every: FRAME_PROBE_DEFAULT_EVERY,
             failure: None,
+            min_rgba: [0; 4],
+            max_rgba: [0; 4],
+            mean_rgba: [0; 4],
+            variance: 0,
+            distinct_sample_values: 0,
+            uniform_color: "none".to_string(),
+            matches_diagnostic_clear: false,
+            sample_cost_us: 0,
         }
     }
 }
 
 impl FrameProbeReport {
     /// One stable `frame_probe=...` line for the host log.
+    ///
+    /// The pre-existing field order and spelling are unchanged; the new
+    /// fidelity fields are appended after `failure=`, so a reader that keys on
+    /// a field name keeps working.
     pub fn log_line(&self) -> String {
         let frame = self
             .last_sampled_frame
@@ -829,7 +925,10 @@ impl FrameProbeReport {
         format!(
             "frame_probe=frame={frame} non_black_pixels={} unique_luma_buckets={} \
              frame_crc={:016x} sampled_frames={} probe_pixels={} dropped_samples={} \
-             fallback_clear={} probe_every={} failure={failure}",
+             fallback_clear={} probe_every={} failure={failure} \
+             min_rgba={},{},{},{} max_rgba={},{},{},{} mean_rgba={},{},{},{} \
+             variance={} distinct_sample_values={} uniform_color={} \
+             matches_diagnostic_clear={} sample_cost_us={}",
             self.non_black_pixels,
             self.unique_luma_buckets,
             self.frame_crc,
@@ -838,6 +937,23 @@ impl FrameProbeReport {
             self.dropped_samples,
             u8::from(self.fallback_clear),
             self.probe_every,
+            self.min_rgba[0],
+            self.min_rgba[1],
+            self.min_rgba[2],
+            self.min_rgba[3],
+            self.max_rgba[0],
+            self.max_rgba[1],
+            self.max_rgba[2],
+            self.max_rgba[3],
+            self.mean_rgba[0],
+            self.mean_rgba[1],
+            self.mean_rgba[2],
+            self.mean_rgba[3],
+            self.variance,
+            self.distinct_sample_values,
+            self.uniform_color,
+            u8::from(self.matches_diagnostic_clear),
+            self.sample_cost_us,
         )
     }
 }
@@ -856,15 +972,30 @@ pub fn frame_crc64(pixels: &[[u8; 4]]) -> u64 {
 
 fn crc64_ecma_update(mut crc: u64, bytes: &[u8]) -> u64 {
     const POLYNOMIAL: u64 = 0x42F0_E1EB_A9EA_3693;
-    for &byte in bytes {
-        crc ^= u64::from(byte) << 56;
-        for _ in 0..8 {
-            crc = if crc & (1 << 63) != 0 {
-                (crc << 1) ^ POLYNOMIAL
-            } else {
-                crc << 1
-            };
+    // Byte-at-a-time table: 4096 sampled pixels are 16 KiB, and the bitwise
+    // form would spend most of a sample's cost on the checksum.
+    const TABLE: [u64; 256] = {
+        let mut table = [0u64; 256];
+        let mut index = 0usize;
+        while index < 256 {
+            let mut value = (index as u64) << 56;
+            let mut bit = 0;
+            while bit < 8 {
+                value = if value & (1 << 63) != 0 {
+                    (value << 1) ^ POLYNOMIAL
+                } else {
+                    value << 1
+                };
+                bit += 1;
+            }
+            table[index] = value;
+            index += 1;
         }
+        table
+    };
+    for &byte in bytes {
+        let slot = ((crc >> 56) as u8 ^ byte) as usize;
+        crc = (crc << 8) ^ TABLE[slot];
     }
     crc
 }
@@ -880,11 +1011,91 @@ pub fn luma_bucket(pixel: [u8; 4], order: PixelOrder) -> u32 {
     (luma.min(255)) >> 3
 }
 
+/// The canonical `[r, g, b, a]` view of a stored pixel of either byte order.
+fn canonical_rgba(pixel: [u8; 4], order: PixelOrder) -> [u8; 4] {
+    match order {
+        PixelOrder::Bgra => [pixel[2], pixel[1], pixel[0], pixel[3]],
+        PixelOrder::Rgba => pixel,
+    }
+}
+
+/// UNORM8 conversion of one normalised clear-colour component, the same
+/// rounding Metal applies to `MTLClearColor`.
+#[cfg(test)]
+fn unorm8(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// [`DIAGNOSTIC_CLEAR`] as canonical RGBA bytes.
+pub fn probe_diagnostic_clear_rgba() -> [u8; 4] {
+    DIAGNOSTIC_CLEAR_RGBA
+}
+
+/// Distinct exact pixel values in `pixels`.
+///
+/// A uniform buffer is the common probe case (clear and diagnostic frames), so
+/// it takes a single comparison pass instead of a sort.
+fn distinct_sample_values(pixels: &[[u8; 4]]) -> u32 {
+    let Some(first) = pixels.first() else {
+        return 0;
+    };
+    if pixels.iter().all(|pixel| pixel == first) {
+        return 1;
+    }
+    let mut values: Vec<u32> = pixels
+        .iter()
+        .map(|pixel| u32::from_le_bytes(*pixel))
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    u32::try_from(values.len()).unwrap_or(u32::MAX)
+}
+
+/// A human-readable name for the colour a probe sample represents.
+///
+/// A uniform sample names its exact colour (`black`, `white`, `swatch_0d1a33`,
+/// ...). A sample with one luma bucket but more than one exact value is named
+/// by its mean swatch, and anything with several luma buckets is `mixed`.
+pub fn probe_color_name(sample: &FrameProbeSample) -> String {
+    if sample.distinct_sample_values == 0 {
+        return "no_samples".to_string();
+    }
+    if let Some(rgba) = sample.uniform_rgba {
+        let [red, green, blue, alpha] = rgba;
+        if alpha == 0 {
+            return if red == 0 && green == 0 && blue == 0 {
+                "transparent_black".to_string()
+            } else {
+                format!("transparent_{red:02x}{green:02x}{blue:02x}")
+            };
+        }
+        return match (red, green, blue) {
+            (0, 0, 0) => "black".to_string(),
+            (255, 255, 255) => "white".to_string(),
+            (255, 0, 0) => "red".to_string(),
+            (0, 255, 0) => "green".to_string(),
+            (0, 0, 255) => "blue".to_string(),
+            _ if red == green && green == blue => {
+                format!("grey_{red:02x}{green:02x}{blue:02x}")
+            }
+            _ => format!("swatch_{red:02x}{green:02x}{blue:02x}"),
+        };
+    }
+    if sample.unique_luma_buckets <= 1 {
+        let [red, green, blue, _] = sample.mean_rgba;
+        return format!("swatch_{red:02x}{green:02x}{blue:02x}");
+    }
+    "mixed".to_string()
+}
+
 /// Measures a sampled buffer against `clear`.
 ///
-/// A pixel is non-black when any of its four channels differs from the matching
-/// `clear` channel by more than `threshold`. `clear` is expressed in the same
-/// byte order as `pixels`.
+/// A pixel is non-black when any of its **colour** channels differs from the
+/// matching `clear` channel by more than `threshold`. `clear` is expressed in
+/// the same byte order as `pixels`. Alpha is deliberately excluded: it is not
+/// content, and comparing it was the Boot #18b bug in which an all-zero
+/// (fully transparent) sample reported `non_black_pixels=4096` with
+/// `frame_crc=0`.
 pub fn analyze_pixels(
     pixels: &[[u8; 4]],
     order: PixelOrder,
@@ -893,21 +1104,64 @@ pub fn analyze_pixels(
 ) -> FrameProbeSample {
     let mut non_black_pixels = 0u64;
     let mut buckets = 0u32;
+    let mut min_rgba = [u8::MAX; 4];
+    let mut max_rgba = [0u8; 4];
+    let mut sums = [0u64; 4];
+    let mut sum_squares = [0u64; 4];
+    let clear_rgba = canonical_rgba(clear, order);
     for &pixel in pixels {
-        if pixel
+        let rgba = canonical_rgba(pixel, order);
+        if rgba
             .iter()
-            .zip(clear.iter())
+            .take(3)
+            .zip(clear_rgba.iter().take(3))
             .any(|(&value, &clear)| value.abs_diff(clear) > threshold)
         {
             non_black_pixels += 1;
         }
         buckets |= 1u32 << luma_bucket(pixel, order);
+        for (channel, &value) in rgba.iter().enumerate() {
+            min_rgba[channel] = min_rgba[channel].min(value);
+            max_rgba[channel] = max_rgba[channel].max(value);
+            let value = u64::from(value);
+            sums[channel] += value;
+            sum_squares[channel] += value * value;
+        }
     }
+    let count = pixels.len() as u64;
+    let mut mean_rgba = [0u8; 4];
+    let mut variance = 0u32;
+    if count > 0 {
+        for channel in 0..4 {
+            mean_rgba[channel] = (sums[channel] / count) as u8;
+            // Population variance without floating point:
+            // (n * Σx² − (Σx)²) / n².
+            let n = u128::from(count);
+            let numerator = n * u128::from(sum_squares[channel])
+                - u128::from(sums[channel]) * u128::from(sums[channel]);
+            let channel_variance = (numerator / (n * n)) as u32;
+            variance = variance.max(channel_variance);
+        }
+    } else {
+        min_rgba = [0; 4];
+    }
+    let distinct = distinct_sample_values(pixels);
+    let uniform_rgba = if distinct == 1 {
+        pixels.first().map(|pixel| canonical_rgba(*pixel, order))
+    } else {
+        None
+    };
     FrameProbeSample {
         non_black_pixels,
         unique_luma_buckets: buckets.count_ones(),
         frame_crc: frame_crc64(pixels),
-        probe_pixels: pixels.len() as u64,
+        probe_pixels: count,
+        min_rgba,
+        max_rgba,
+        mean_rgba,
+        variance,
+        distinct_sample_values: distinct,
+        uniform_rgba,
     }
 }
 
@@ -917,6 +1171,9 @@ pub fn analyze_bgra8(pixels: &[[u8; 4]], clear: [u8; 4], threshold: u8) -> Frame
 }
 
 /// Layout of the fixed-size sampling grid for one drawable extent.
+///
+/// The source copy is texture-to-texture, so no source row pitch is involved;
+/// only the block origins and the staging atlas geometry are computed here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProbeLayout {
     block_width: u32,
@@ -1081,6 +1338,9 @@ impl FrameProbe {
             format,
             MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM
         ) {
+            // RGBA16Float drawables are displayable (Wave 13A blits them) but
+            // the probe has no 16F analysis path: fail once, named, instead of
+            // sampling bytes under the wrong format.
             return Err(format!("probe_unsupported_pixel_format_{format}"));
         }
         let width = u32::try_from(width).map_err(|_| "probe_extent_overflow".to_string())?;
@@ -1224,6 +1484,7 @@ impl FrameProbe {
             },
         };
         let bytes_per_row = (width as usize) * (BYTES_PER_PIXEL as usize);
+        let sample_started = Instant::now();
         // SAFETY: the command buffer completed, so the shared staging texture
         // holds final bytes; `pixels` is exactly `width * height` pixels and
         // `bytes_per_row` matches its row stride.
@@ -1257,6 +1518,19 @@ impl FrameProbe {
         self.report.unique_luma_buckets = sample.unique_luma_buckets;
         self.report.frame_crc = sample.frame_crc;
         self.report.fallback_clear = self.in_flight_fallback_clear;
+        self.report.min_rgba = sample.min_rgba;
+        self.report.max_rgba = sample.max_rgba;
+        self.report.mean_rgba = sample.mean_rgba;
+        self.report.variance = sample.variance;
+        self.report.distinct_sample_values = sample.distinct_sample_values;
+        self.report.uniform_color = probe_color_name(&sample);
+        self.report.matches_diagnostic_clear = sample.uniform_rgba.is_some_and(|rgba| {
+            rgba.iter()
+                .zip(probe_diagnostic_clear_rgba())
+                .all(|(value, diagnostic)| value.abs_diff(diagnostic) <= 1)
+        });
+        self.report.sample_cost_us =
+            u64::try_from(sample_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         drop(command_buffer);
         self.publish();
     }
@@ -2256,7 +2530,7 @@ unsafe fn msg_send_void_clear_color(target: objc::Id, s: objc::Sel, color: MTLCl
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -2670,7 +2944,10 @@ mod tests {
         let clear = [10, 20, 30, 200];
         let all_clear = vec![clear; 64];
         let sample = analyze_bgra8(&all_clear, clear, FRAME_PROBE_CHANNEL_THRESHOLD);
-        assert_eq!(sample.non_black_pixels, 0, "an all-clear frame has no content");
+        assert_eq!(
+            sample.non_black_pixels, 0,
+            "an all-clear frame has no content"
+        );
         assert_eq!(sample.unique_luma_buckets, 1);
         assert_eq!(sample.probe_pixels, 64);
 
@@ -2682,13 +2959,22 @@ mod tests {
             0
         );
 
-        // One step beyond the threshold on any channel counts exactly one pixel.
-        for channel in 0..4 {
+        // One step beyond the threshold on any colour channel counts exactly one
+        // pixel. Alpha is not content: Boot #18b's all-zero sample must not read
+        // as 4096 non-black pixels just because alpha 0 differs from 255.
+        for channel in 0..3 {
             let mut one = all_clear.clone();
             one[7][channel] = clear[channel] + FRAME_PROBE_CHANNEL_THRESHOLD + 1;
             let sample = analyze_bgra8(&one, clear, FRAME_PROBE_CHANNEL_THRESHOLD);
             assert_eq!(sample.non_black_pixels, 1, "channel {channel}");
         }
+        let mut alpha_only = all_clear.clone();
+        alpha_only[7][3] = 0;
+        assert_eq!(
+            analyze_bgra8(&alpha_only, clear, FRAME_PROBE_CHANNEL_THRESHOLD).non_black_pixels,
+            0,
+            "a transparent pixel is clear, not content"
+        );
     }
 
     #[test]
@@ -2723,6 +3009,25 @@ mod tests {
         assert_eq!(crc64_ecma_update(0, b"123456789"), 0x6C40_DF5F_0B49_7347);
         assert_eq!(frame_crc64(&[]), 0);
 
+        // The documented zero value: the all-zero sample (init 0, no final
+        // XOR, zero bytes leave the register at zero). This is exactly Boot
+        // #18b's surface, and it is why `frame_crc=0` alone could not be told
+        // apart from an uninitialised sample. The new mean/min/max/alpha and
+        // `uniform_color` fields name it `transparent_black`.
+        let all_zero = vec![[0u8; 4]; FRAME_PROBE_PIXELS as usize];
+        assert_eq!(frame_crc64(&all_zero), 0, "all-zero CRC is 0 by definition");
+
+        // A known non-zero pattern: one 0x80 byte repeated.
+        let mid_grey = vec![[0x80u8; 4]; 64];
+        assert_ne!(
+            frame_crc64(&mid_grey),
+            0,
+            "0x80 bytes must not checksum to 0"
+        );
+        let sample = analyze_bgra8(&mid_grey, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert!(sample.non_black_pixels > 0, "mid-grey is content");
+        assert_ne!(sample.frame_crc, 0, "non-black content must not CRC to 0");
+
         let frame = vec![[1u8, 2, 3, 4]; 16];
         let same = frame.clone();
         assert_eq!(
@@ -2753,6 +3058,14 @@ mod tests {
             fallback_clear: false,
             probe_every: 30,
             failure: None,
+            min_rgba: [1, 2, 3, 4],
+            max_rgba: [250, 251, 252, 253],
+            mean_rgba: [13, 26, 51, 255],
+            variance: 900,
+            distinct_sample_values: 7,
+            uniform_color: "swatch_0d1a33".to_string(),
+            matches_diagnostic_clear: true,
+            sample_cost_us: 42,
         };
         let line = report.log_line();
         assert!(line.starts_with("frame_probe="), "{line}");
@@ -2766,10 +3079,289 @@ mod tests {
             "fallback_clear=0",
             "probe_every=30",
             "failure=none",
+            "min_rgba=1,2,3,4",
+            "max_rgba=250,251,252,253",
+            "mean_rgba=13,26,51,255",
+            "variance=900",
+            "distinct_sample_values=7",
+            "uniform_color=swatch_0d1a33",
+            "matches_diagnostic_clear=1",
+            "sample_cost_us=42",
         ] {
             assert!(line.contains(expected), "{line} must contain {expected}");
         }
         assert!(line.contains("frame_crc=0123456789abcdef"));
+    }
+
+    #[test]
+    fn probe_all_zero_sample_is_transparent_black_not_content() {
+        // Boot #18b's exact evidence: 4096 pixels, all zero bytes. The old
+        // analyser counted them all as non-black because alpha 0 differs from
+        // the opaque-black reference's 255, while the CRC was legitimately 0.
+        let all_zero = vec![[0u8; 4]; FRAME_PROBE_PIXELS as usize];
+        let sample = analyze_bgra8(&all_zero, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(
+            sample.non_black_pixels, 0,
+            "a transparent sample is not content"
+        );
+        assert_eq!(
+            sample.frame_crc, 0,
+            "all-zero bytes checksum to the documented 0"
+        );
+        assert_eq!(sample.unique_luma_buckets, 1);
+        assert_eq!(sample.probe_pixels, FRAME_PROBE_PIXELS);
+        assert_eq!(sample.distinct_sample_values, 1);
+        assert_eq!(sample.uniform_rgba, Some([0, 0, 0, 0]));
+        assert_eq!(
+            probe_color_name(&sample),
+            "transparent_black",
+            "the name must separate a zero sample from an opaque black clear"
+        );
+        assert_eq!(sample.mean_rgba, [0, 0, 0, 0]);
+        assert_eq!(sample.max_rgba, [0, 0, 0, 0]);
+        assert_eq!(sample.variance, 0);
+
+        // Opaque black is a different surface: same luma bucket, same RGB
+        // minimum, but a name and alpha that tell them apart, and a non-zero
+        // CRC because the alpha bytes are non-zero.
+        let opaque_black = vec![[0u8, 0, 0, 255]; FRAME_PROBE_PIXELS as usize];
+        let sample = analyze_bgra8(&opaque_black, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.non_black_pixels, 0);
+        assert_ne!(sample.frame_crc, 0, "opaque black has non-zero alpha bytes");
+        assert_eq!(probe_color_name(&sample), "black");
+        assert_eq!(sample.mean_rgba, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn probe_two_halves_have_two_buckets_and_a_nonzero_crc() {
+        // The 64x64 staging atlas: black left half, white right half.
+        let mut staging = vec![[0u8, 0, 0, 255]; 64 * 64];
+        for row in staging.chunks_exact_mut(64) {
+            for pixel in &mut row[32..] {
+                *pixel = [255, 255, 255, 255];
+            }
+        }
+        let sample = analyze_bgra8(&staging, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert!(
+            sample.unique_luma_buckets >= 2,
+            "black and white must occupy two luma buckets, got {}",
+            sample.unique_luma_buckets
+        );
+        assert_ne!(sample.frame_crc, 0);
+        assert_eq!(sample.distinct_sample_values, 2);
+        assert_eq!(sample.min_rgba, [0, 0, 0, 255]);
+        assert_eq!(sample.max_rgba, [255, 255, 255, 255]);
+        assert!(sample.variance > 0, "a two-tone frame has colour spread");
+        assert_eq!(probe_color_name(&sample), "mixed");
+        // Half the frame differs from black, all of the white half does.
+        assert_eq!(sample.non_black_pixels, 32 * 64);
+    }
+
+    #[test]
+    fn probe_uniform_mid_grey_is_distinguishable_from_black() {
+        let grey = vec![[128u8, 128, 128, 255]; FRAME_PROBE_PIXELS as usize];
+        let grey_sample = analyze_bgra8(&grey, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        let black = vec![[0u8, 0, 0, 255]; FRAME_PROBE_PIXELS as usize];
+        let black_sample = analyze_bgra8(&black, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+
+        assert_eq!(probe_color_name(&grey_sample), "grey_808080");
+        assert_eq!(probe_color_name(&black_sample), "black");
+        assert_eq!(grey_sample.mean_rgba, [128, 128, 128, 255]);
+        assert_eq!(grey_sample.min_rgba, [128, 128, 128, 255]);
+        assert_eq!(grey_sample.max_rgba, [128, 128, 128, 255]);
+        assert_eq!(grey_sample.variance, 0, "a uniform field has no variance");
+        assert_eq!(grey_sample.distinct_sample_values, 1);
+        assert_ne!(grey_sample.mean_rgba, black_sample.mean_rgba);
+        assert_ne!(grey_sample.frame_crc, black_sample.frame_crc);
+        assert!(grey_sample.non_black_pixels > 0);
+        assert_eq!(black_sample.non_black_pixels, 0);
+    }
+
+    #[test]
+    fn probe_diagnostic_clear_converts_to_the_documented_rgba() {
+        // The documented bytes are only correct if Metal's UNORM8 rounding of
+        // the clear constant produces them; pin the derivation.
+        assert_eq!(
+            [
+                unorm8(DIAGNOSTIC_CLEAR.red),
+                unorm8(DIAGNOSTIC_CLEAR.green),
+                unorm8(DIAGNOSTIC_CLEAR.blue),
+                unorm8(DIAGNOSTIC_CLEAR.alpha),
+            ],
+            DIAGNOSTIC_CLEAR_RGBA
+        );
+        assert_eq!(probe_diagnostic_clear_rgba(), DIAGNOSTIC_CLEAR_RGBA);
+        assert_eq!(probe_diagnostic_clear_rgba(), [13, 26, 51, 255]);
+        // The BGRA8 byte order the drawable actually holds.
+        assert_eq!(expected_bgra(DIAGNOSTIC_CLEAR), [51, 26, 13, 255]);
+
+        let diagnostic = vec![[51u8, 26, 13, 255]; FRAME_PROBE_PIXELS as usize];
+        let sample = analyze_bgra8(&diagnostic, diagnostic[0], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.non_black_pixels, 0);
+        assert_eq!(probe_color_name(&sample), "swatch_0d1a33");
+        assert_eq!(sample.uniform_rgba, Some([13, 26, 51, 255]));
+        assert!(sample.uniform_rgba.is_some_and(|rgba| {
+            rgba.iter()
+                .zip(probe_diagnostic_clear_rgba())
+                .all(|(value, diagnostic)| value.abs_diff(diagnostic) <= 1)
+        }));
+    }
+
+    /// Copies the probe's 8x8 grid of 8x8 blocks from a full-size source
+    /// buffer, byte for byte, exactly as the GPU blit + `getBytes` pair does.
+    fn sample_like_the_probe(
+        source: &[[u8; 4]],
+        width: u32,
+        height: u32,
+        layout: ProbeLayout,
+    ) -> Vec<[u8; 4]> {
+        let mut staging = vec![[0u8; 4]; (layout.staging_width * layout.staging_height) as usize];
+        for grid_y in 0..FRAME_PROBE_GRID {
+            for grid_x in 0..FRAME_PROBE_GRID {
+                let source_origin = layout.block_origin(grid_x, grid_y, width, height);
+                let staging_origin = layout.staging_origin(grid_x, grid_y);
+                for row in 0..layout.block_height as usize {
+                    for column in 0..layout.block_width as usize {
+                        let source_index =
+                            (source_origin.y + row) * width as usize + source_origin.x + column;
+                        let staging_index = (staging_origin.y + row)
+                            * layout.staging_width as usize
+                            + staging_origin.x
+                            + column;
+                        staging[staging_index] = source[source_index];
+                    }
+                }
+            }
+        }
+        staging
+    }
+
+    #[test]
+    fn probe_layout_for_a_4k_source_reads_real_sampled_bytes() {
+        let (width, height) = (3840u32, 2160u32);
+        let layout = ProbeLayout::new(width, height).expect("4K layout");
+        // Two grid steps per 4K axis, each block 8x8, atlas 64x64.
+        assert_eq!(layout.step_x, 480);
+        assert_eq!(layout.step_y, 270);
+        assert_eq!(layout.block_width, 8);
+        assert_eq!(layout.block_height, 8);
+        assert_eq!(layout.staging_width, 64);
+        assert_eq!(layout.staging_height, 64);
+        let last = layout.block_origin(7, 7, width, height);
+        assert_eq!((last.x, last.y), (3360, 1890));
+        assert!(last.x + 8 <= width as usize && last.y + 8 <= height as usize);
+
+        // BGRA8 4K: 4 bytes per pixel, 15 360 bytes per row, 33 177 600 bytes.
+        assert_eq!(width as usize * BYTES_PER_PIXEL as usize, 15_360);
+        assert_eq!(
+            width as usize * height as usize * BYTES_PER_PIXEL as usize,
+            33_177_600
+        );
+
+        // A source whose sampled pixels are all distinct. Filling only the
+        // sampled coordinates would prove the offsets, but a full buffer shows
+        // the copy ignores the source row pitch instead of trusting it.
+        let mut source = vec![[0u8; 4]; (width * height) as usize];
+        for (y, row) in source.chunks_exact_mut(width as usize).enumerate() {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                *pixel = [
+                    (x & 0xff) as u8,
+                    (y & 0xff) as u8,
+                    (((x >> 8) ^ (y >> 8)) & 0xff) as u8,
+                    255,
+                ];
+            }
+        }
+
+        let staging = sample_like_the_probe(&source, width, height, layout);
+        // Every staging pixel is the source pixel at the computed origin, so no
+        // block reads zero padding from a wrong offset.
+        for grid_y in 0..FRAME_PROBE_GRID {
+            for grid_x in 0..FRAME_PROBE_GRID {
+                let source_origin = layout.block_origin(grid_x, grid_y, width, height);
+                let staging_origin = layout.staging_origin(grid_x, grid_y);
+                for row in 0..8usize {
+                    for column in 0..8usize {
+                        let source_index =
+                            (source_origin.y + row) * width as usize + source_origin.x + column;
+                        let staging_index =
+                            (staging_origin.y + row) * 64 + staging_origin.x + column;
+                        assert_eq!(
+                            staging[staging_index], source[source_index],
+                            "grid ({grid_x},{grid_y}) pixel ({column},{row})"
+                        );
+                    }
+                }
+            }
+        }
+
+        let sample = analyze_bgra8(&staging, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.probe_pixels, FRAME_PROBE_PIXELS);
+        assert_eq!(sample.distinct_sample_values, 4096);
+        assert_eq!(sample.uniform_rgba, None, "a 4K gradient is not uniform");
+        assert_ne!(sample.frame_crc, 0);
+        assert_eq!(sample.min_rgba[1], 0);
+        assert_eq!(sample.max_rgba[3], 255);
+        assert_eq!(sample.mean_rgba[3], 255);
+        assert_ne!(sample.min_rgba, sample.max_rgba);
+        assert!(sample.variance > 0);
+        assert!(sample.non_black_pixels > 0);
+        assert!(sample.unique_luma_buckets >= 2);
+    }
+
+    /// Measures the CPU side of one sample: `getBytes` of the 16 KiB atlas plus
+    /// the full analysis of its 4096 pixels. The GPU blit is measured by
+    /// `frame_probe_4k_sample_cost_is_small` on a real device.
+    #[test]
+    fn probe_analysis_of_4096_pixels_stays_cheap() {
+        let uniform = vec![[13u8, 26, 51, 255]; FRAME_PROBE_PIXELS as usize];
+        let mut mixed = vec![[0u8; 4]; FRAME_PROBE_PIXELS as usize];
+        for (index, pixel) in mixed.iter_mut().enumerate() {
+            *pixel = [
+                (index & 0xff) as u8,
+                ((index >> 4) & 0xff) as u8,
+                ((index * 7) & 0xff) as u8,
+                255,
+            ];
+        }
+        let measure = |pixels: &[[u8; 4]], label: &str| -> u128 {
+            for _ in 0..3 {
+                std::hint::black_box(analyze_bgra8(
+                    pixels,
+                    [0, 0, 0, 255],
+                    FRAME_PROBE_CHANNEL_THRESHOLD,
+                ));
+            }
+            let mut runs = Vec::with_capacity(21);
+            for _ in 0..21 {
+                let started = Instant::now();
+                std::hint::black_box(analyze_bgra8(
+                    pixels,
+                    [0, 0, 0, 255],
+                    FRAME_PROBE_CHANNEL_THRESHOLD,
+                ));
+                runs.push(started.elapsed().as_nanos());
+            }
+            runs.sort_unstable();
+            let median = runs[runs.len() / 2];
+            eprintln!(
+                "probe analysis of 4096 {label} pixels: median {:.1} us \
+                 (min {:.1} us, max {:.1} us, n=21)",
+                median as f64 / 1000.0,
+                runs[0] as f64 / 1000.0,
+                runs[runs.len() - 1] as f64 / 1000.0,
+            );
+            median
+        };
+        let uniform_ns = measure(&uniform, "uniform");
+        let mixed_ns = measure(&mixed, "mixed");
+        // A very generous bound: the point is that 4096 probes are not a
+        // millisecond-scale cost, not to benchmark the test runner.
+        assert!(
+            uniform_ns < 5_000_000,
+            "uniform analysis took {uniform_ns} ns"
+        );
+        assert!(mixed_ns < 5_000_000, "mixed analysis took {mixed_ns} ns");
     }
 
     #[test]
@@ -2841,5 +3433,86 @@ mod tests {
         let expected = expected_bgra(ClearColor::OPAQUE_RED);
         let mismatch = pixels.iter().position(|pixel| *pixel != expected);
         assert_eq!(mismatch, None, "staging copy differs at pixel {mismatch:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device: measures the 4K probe sample cost"]
+    fn frame_probe_4k_sample_cost_is_small() {
+        let (width, height) = (3840u32, 2160u32);
+        let transport = open_transport();
+        let image = create_surface(&transport, width, height);
+        // Fill the real 4K surface with the diagnostic clear through the same
+        // render pass the present path uses.
+        encode_clear_pass(transport.queue_raw(), image.texture_raw(), DIAGNOSTIC_CLEAR)
+            .expect("4K clear pass");
+        let layout = ProbeLayout::new(width, height).expect("4K layout");
+        let staging = create_probe_staging_texture(
+            transport.device_raw(),
+            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            layout.staging_width,
+            layout.staging_height,
+        )
+        .expect("probe staging texture");
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc::MTLSize {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+        };
+        let mut pixels = vec![[0u8; 4]; 64 * 64];
+        let mut runs = Vec::with_capacity(11);
+        for _ in 0..11 {
+            let started = Instant::now();
+            // SAFETY: both textures are live 4K/64x64 BGRA8 textures, the
+            // block rectangles are inside the 4K source and the 64x64 atlas,
+            // and `pixels` holds 64 rows of 256 bytes for `getBytes`.
+            unsafe {
+                let command_buffer =
+                    objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer"));
+                let encoder = objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
+                for grid_y in 0..FRAME_PROBE_GRID {
+                    for grid_x in 0..FRAME_PROBE_GRID {
+                        encode_texture_block_copy(
+                            encoder,
+                            image.texture_raw(),
+                            layout.block_origin(grid_x, grid_y, width, height),
+                            layout.block_width,
+                            layout.block_height,
+                            staging.as_raw(),
+                            layout.staging_origin(grid_x, grid_y),
+                        );
+                    }
+                }
+                objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+                objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+                objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
+                get_texture_bytes(staging.as_raw(), pixels.as_mut_ptr().cast(), 64 * 4, region);
+            }
+            runs.push(started.elapsed().as_nanos());
+        }
+        runs.sort_unstable();
+        let median = runs[runs.len() / 2];
+        eprintln!(
+            "probe 4K sample (64 block blits + 16 KiB readback): median {:.1} us \
+             (min {:.1} us, max {:.1} us, n=11)",
+            median as f64 / 1000.0,
+            runs[0] as f64 / 1000.0,
+            runs[runs.len() - 1] as f64 / 1000.0,
+        );
+
+        let analysis_started = Instant::now();
+        let sample = analyze_bgra8(&pixels, pixels[0], FRAME_PROBE_CHANNEL_THRESHOLD);
+        eprintln!(
+            "probe 4K analysis (4096 pixels): {:.1} us",
+            analysis_started.elapsed().as_nanos() as f64 / 1000.0
+        );
+        assert_eq!(sample.probe_pixels, FRAME_PROBE_PIXELS);
+        assert_eq!(sample.distinct_sample_values, 1);
+        assert_eq!(probe_color_name(&sample), "swatch_0d1a33");
+        assert_eq!(sample.uniform_rgba, Some([13, 26, 51, 255]));
+        assert_eq!(sample.non_black_pixels, 0);
+        assert_ne!(sample.frame_crc, 0, "the diagnostic clear is not all-zero bytes");
     }
 }
