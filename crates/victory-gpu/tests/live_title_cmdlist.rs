@@ -5,39 +5,58 @@
 //! and installs the native presenter), a queue, an allocator, a command list
 //! and a fence through the device's own vtable, then:
 //!
-//! 1. closes the list and runs `ExecuteCommandLists`; the host must receive
-//!    exactly one ordered submission for that list generation;
-//! 2. replays the same list; nothing is sent again (`AlreadyExecuted` is the
-//!    host's answer for a replayed identity, and an empty drain is not a
-//!    batch);
-//! 3. `Signal`s the fence and reads `GetCompletedValue`;
-//! 4. presents with no swapchain-less path: the installed `WirePresenter`
-//!    registers the surface and carries one `CommandV3::Present`, so the
-//!    guest entry point returns `S_OK` only when the host accepted it.
+//! 1. creates a committed buffer whose range the installed resolver maps to the
+//!    one share allocation; the creation registers it with the host (kind 2,
+//!    `id + whole share-file length`) and the host sees exactly one such frame;
+//! 2. closes a list with a barrier on that buffer and runs
+//!    `ExecuteCommandLists`; the host must receive exactly one ordered
+//!    submission for that list generation, and a replay sends nothing;
+//! 3. binds the same buffer twice (`IASetVertexBuffers`); the second bind sends
+//!    no registration (idempotent by allocation);
+//! 4. binds a buffer whose range resolves to an allocation with no share file:
+//!    the list refuses it explicitly, `Close` returns a failure HRESULT and
+//!    nothing is submitted (no silent skip, no D3DMetal fallback);
+//! 5. registers a PSO: kind 4 carries the session ticket and entry name, kind
+//!    129 returns the host's native pipeline id, and a producer submission
+//!    names that id in `SetComputePipeline` and the registered allocation in
+//!    `SetVertexBuffers`;
+//! 6. prints which path served the pool translation (a worker, the disk cache,
+//!    or the explicit "converter unavailable" refusal of a Win64 guest);
+//! 7. `Signal`s the fence, reads `GetCompletedValue`, and presents one
+//!    `CommandV3::Present` through the installed `WirePresenter`.
 //!
 //! The endpoint is an in-process loopback V3 host fixture, labelled here as
 //! such: the 5B live gate repeats the same chain over the real host socket.
 //! This test is Windows-only because the D3D12 entry points and their
 //! descriptors exist only in the Win64 guest build; `cargo check --target
 //! x86_64-pc-windows-gnullvm --all-targets` compiles it, and the gate runs
-//! it.
+//! it. The transport halves of kinds 2 and 4/129 run on every target in
+//! `native_metal::client`'s unit tests.
 
 #![cfg(windows)]
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::ptr::null;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, mpsc::{self, Receiver}};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use victory_gpu::device;
+use victory_gpu::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
+use victory_gpu::native_metal::{pso, queue, telemetry};
 use victory_gpu::object::{Object, S_OK};
 use victory_metal::wire::ReplyStatus;
-use victory_metal::wire_v3::{decode_submission_v3, CommandV3};
+use victory_metal::wire_v3::{decode_submission_v3, CommandV3, SubmissionV3};
 
 const SECRET_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Allocation id the fixture's share file backs.
+const SHARE_ID: u64 = 1;
+/// Its file length, which is exactly what a kind 2 frame must carry.
+const SHARE_LEN: u64 = 64 * 1024;
+/// Bytes one share page holds.
+const PAGE_LEN: u64 = 4096;
 /// `ID3D12Device` creation parameter version the layouts were checked against.
 const CHECKED_VERSION: u32 = 0x0002_0004;
 /// The device-creation interface id.
@@ -133,6 +152,15 @@ const RESOURCE_IID: [u8; 16] = guid(
     [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
 );
 
+/// `crate::draw::VertexView` as the title passes it (private there).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MetalVertexView {
+    address: u64,
+    size: u32,
+    stride: u32,
+}
+
 /// A D3D12 buffer barrier on the buffer at `resource`.
 #[repr(C)]
 struct Barrier {
@@ -182,21 +210,35 @@ type CreateCommitted = unsafe extern "system" fn(
 ) -> Hresult;
 type BarrierCall = unsafe extern "system" fn(This, u32, *const Barrier) -> u32;
 type Close = unsafe extern "system" fn(This) -> Hresult;
+type SetVertexBuffers =
+    unsafe extern "system" fn(This, u32, u32, *const MetalVertexView) -> ();
 type Execute = unsafe extern "system" fn(This, u32, *const This);
 type Signal = unsafe extern "system" fn(This, This, u64) -> Hresult;
 type Completed = unsafe extern "system" fn(This) -> u64;
 type Present = unsafe extern "system" fn(This, u32, *const u8, *const u8) -> Hresult;
 
-/// A loopback V3 host fixture: authenticates one peer, acknowledges surface
-/// registrations and answers every submission with `Ok`, reporting each
-/// decoded submission it saw.
+/// What the loopback fixture saw, in arrival order.
+#[derive(Debug)]
+enum Seen {
+    /// One version 3 submission.
+    Submission(SubmissionV3),
+    /// One kind 2 allocation registration: `(id, byte_len)`.
+    Buffer(u64, u64),
+    /// One kind 4 pipeline registration: `(ticket, entry)`.
+    Pipeline(u64, String),
+}
+
+/// A loopback V3 host fixture: authenticates one peer, acknowledges surface,
+/// fence and allocation registrations, answers pipeline registrations with a
+/// fresh native id, and answers every submission with `Ok`, reporting each
+/// frame it saw.
 struct TestHost {
     port: u16,
     handle: Option<JoinHandle<()>>,
 }
 
 impl TestHost {
-    fn spawn() -> (Self, Receiver<victory_metal::wire_v3::SubmissionV3>) {
+    fn spawn() -> (Self, Receiver<Seen>) {
         let listener =
             TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
         let port = listener.local_addr().expect("address").port();
@@ -210,12 +252,43 @@ impl TestHost {
             assert_eq!(payload.len(), 32);
             write_frame(&mut stream, 128, &[0]);
 
+            let mut next_pipeline = 0x51u64;
             while let Some((kind, payload)) = try_frame(&mut stream) {
                 match kind {
                     // KIND_FENCE_PAGE
                     6 => write_frame(&mut stream, 128, &[0]),
                     // KIND_TEXTURE_REG / KIND_SURFACE_REG
                     8 | 9 => write_frame(&mut stream, 128, &[0]),
+                    // KIND_REGISTER: authentication closes on a refusal, so
+                    // the length is validated here before the ack.
+                    2 => {
+                        assert_eq!(payload.len(), 16, "a kind 2 payload");
+                        let id =
+                            u64::from_le_bytes(payload[0..8].try_into().expect("eight bytes"));
+                        let len =
+                            u64::from_le_bytes(payload[8..16].try_into().expect("eight bytes"));
+                        sender.send(Seen::Buffer(id, len)).expect("report the registration");
+                        write_frame(&mut stream, 128, &[0]);
+                    }
+                    // KIND_PIPELINE: ticket, entry length, entry.
+                    4 => {
+                        let ticket = u64::from_le_bytes(
+                            payload[0..8].try_into().expect("eight bytes"),
+                        );
+                        let entry_len =
+                            u16::from_le_bytes(payload[8..10].try_into().expect("two bytes"))
+                                as usize;
+                        assert_eq!(payload.len(), 10 + entry_len);
+                        let entry = String::from_utf8(payload[10..].to_vec())
+                            .expect("an ASCII entry name");
+                        sender
+                            .send(Seen::Pipeline(ticket, entry))
+                            .expect("report the registration");
+                        let mut reply = vec![0u8];
+                        reply.extend_from_slice(&next_pipeline.to_le_bytes());
+                        next_pipeline += 1;
+                        write_frame(&mut stream, 129, &reply);
+                    }
                     // KIND_SUBMISSION_V3
                     5 => {
                         let submission =
@@ -223,7 +296,9 @@ impl TestHost {
                         let sequence = u32::from_le_bytes([
                             payload[6], payload[7], payload[8], payload[9],
                         ]);
-                        sender.send(submission).expect("report the submission");
+                        sender
+                            .send(Seen::Submission(submission))
+                            .expect("report the submission");
                         let reply =
                             victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
                                 sequence,
@@ -294,10 +369,70 @@ fn write_frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
     stream.flush().expect("flush");
 }
 
+/// A resolver the test drives: a list of `(base, size, allocation)` rules,
+/// matched first to last, over pinned ranges it counts.
+struct TestResolver {
+    rules: Arc<Mutex<Vec<(u64, u64, u64)>>>,
+    retained: Arc<Mutex<Vec<u64>>>,
+}
+
+impl TestResolver {
+    fn new(rules: &[(u64, u64, u64)]) -> (Self, Arc<Mutex<Vec<(u64, u64, u64)>>>) {
+        let rules = Arc::new(Mutex::new(rules.to_vec()));
+        (
+            Self {
+                rules: rules.clone(),
+                retained: Arc::new(Mutex::new(Vec::new())),
+            },
+            rules,
+        )
+    }
+}
+
+impl GuestRangeResolver for TestResolver {
+    fn resolve(&self, address: u64, len: u64) -> Result<GuestRange, ResolveError> {
+        if address == 0 || len == 0 {
+            return Err(ResolveError::Invalid("zero address or length"));
+        }
+        let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
+        for (base, size, allocation) in rules.iter() {
+            let end = base.saturating_add(*size);
+            if address >= *base && address.saturating_add(len) <= end {
+                return Ok(GuestRange {
+                    allocation_id: *allocation,
+                    generation: 1,
+                    byte_offset: 0,
+                    size: SHARE_LEN,
+                });
+            }
+        }
+        Err(ResolveError::Unmapped { address, len })
+    }
+
+    fn retain(&self, range: &GuestRange) -> Result<u64, ResolveError> {
+        let mut retained = self.retained.lock().unwrap_or_else(|e| e.into_inner());
+        let token = retained.len() as u64 + 1;
+        retained.push(range.allocation_id);
+        Ok(token)
+    }
+
+    fn retire(&self, _token: u64) -> Result<(), ResolveError> {
+        Ok(())
+    }
+}
+
 /// The real device/queue/list/fence/present chain against the fixture host.
 #[test]
 fn a_recorded_title_list_reaches_the_host_exactly_once() {
-    let (host, submissions) = TestHost::spawn();
+    let (host, seen) = TestHost::spawn();
+    // The launcher's share directory: one host-visible allocation file with the
+    // whole length a kind 2 registration must carry.
+    let share = tempfile::tempdir().expect("a share directory");
+    let share_file = share.path().join(format!("{SHARE_ID:016x}.bin"));
+    std::fs::File::create(&share_file)
+        .and_then(|file| file.set_len(SHARE_LEN))
+        .expect("a share file of the allocation's exact length");
+
     // SAFETY: this test owns the process environment (one test per binary).
     unsafe {
         std::env::set_var("VICTORY_BACKEND", "metal");
@@ -305,7 +440,12 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
         std::env::set_var("VICTORY_METAL_SECRET", SECRET_HEX);
         // The installed presenter's surface (the host fixture accepts it).
         std::env::set_var("VICTORY_METAL_SURFACE", "7");
+        std::env::set_var("VICTORY_METAL_SHARE_DIR", share.path());
     }
+    // Every address resolves to the one shared allocation to begin with; the
+    // refusal case rewrites the rules to an allocation with no share file.
+    let (resolver, rules) = TestResolver::new(&[(0, u64::MAX, SHARE_ID)]);
+    bindings::set_resolver(resolver);
 
     // Device creation auto-connects the session and installs the presenter.
     let version = CHECKED_VERSION;
@@ -362,8 +502,9 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
         S_OK
     );
 
-    // A committed buffer, then one UAV barrier on it: a non-empty list
-    // generation whose single ordered submission the host must see once.
+    // A committed buffer. Creating it registers its share allocation with the
+    // host (kind 2) because the resolver maps its range to the one share file
+    // this test created.
     let create_resource: CreateCommitted = unsafe { slot(device_ptr, 0xd8) };
     let heap = HeapProperties {
         kind: 0,
@@ -402,6 +543,22 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
         S_OK,
         "a committed buffer is created through the real device"
     );
+    match seen.recv_timeout(TIMEOUT).expect("the kind 2 registration") {
+        Seen::Buffer(id, len) => assert_eq!(
+            (id, len),
+            (SHARE_ID, SHARE_LEN),
+            "the registration carries the allocation id and the whole share file"
+        ),
+        other => panic!("expected a buffer registration, saw {other:?}"),
+    }
+    // The buffer's GPU virtual address is what the resolver and the wire
+    // bindings name; read it through the resource's own table.
+    let gpu_address: unsafe extern "system" fn(This) -> u64 = unsafe { slot(buffer, 0x58) };
+    let address = unsafe { gpu_address(buffer) };
+    assert_ne!(address, 0, "a committed buffer has a GPU virtual address");
+
+    // A UAV barrier on the registered buffer: a non-empty list generation whose
+    // single ordered submission the host must see once.
     let barrier_call: BarrierCall = unsafe { slot(list, 0xd0) };
     let barrier = Barrier {
         kind: 2, // UAV
@@ -411,32 +568,247 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
         last: 0,
     };
     unsafe { barrier_call(list, 1, &barrier) };
-
-    // Close the list (flushes its one wire submission) and run it.
     let close: Close = unsafe { slot(list, 0x48) };
     assert_eq!(unsafe { close(list) }, S_OK);
     let execute: Execute = unsafe { slot(queue_ptr, 0x50) };
     unsafe { execute(queue_ptr, 1, &list) };
-    let first = submissions
-        .recv_timeout(TIMEOUT)
-        .expect("one ordered submission for the list generation");
-    assert_eq!(first.list.map(|identity| identity.list_id), Some(1));
-    assert!(
-        matches!(
-            first.commands.as_slice(),
-            [CommandV3::ResourceBarrier(barrier)] if !barrier.entries.is_empty()
-        ),
-        "unexpected commands {:?}",
-        first.commands
-    );
+    match seen.recv_timeout(TIMEOUT).expect("one ordered submission") {
+        Seen::Submission(first) => {
+            assert_eq!(first.list.map(|identity| identity.list_id), Some(1));
+            assert!(
+                matches!(
+                    first.commands.as_slice(),
+                    [CommandV3::ResourceBarrier(barrier)] if !barrier.entries.is_empty()
+                ),
+                "unexpected commands {:?}",
+                first.commands
+            );
+        }
+        other => panic!("expected a submission, saw {other:?}"),
+    }
 
-    // Draining the same list generation again sends nothing: the submission
-    // is consumed exactly once.
+    // Draining the same list generation again sends nothing: the submission is
+    // consumed exactly once.
     unsafe { execute(queue_ptr, 1, &list) };
     assert!(
-        submissions.recv_timeout(Duration::from_millis(100)).is_err(),
+        seen.recv_timeout(Duration::from_millis(100)).is_err(),
         "a replayed list generation must not be sent twice"
     );
+
+    // The same buffer bound twice: two `IASetVertexBuffers` calls, one host
+    // registration (the fixture saw exactly one kind 2 frame above, and the
+    // binds send none).
+    let close_list: Close = unsafe { slot(list, 0x48) };
+    let mut list3: This = null();
+    assert_eq!(
+        unsafe {
+            list_create(
+                device_ptr,
+                0,
+                list_desc.kind,
+                allocator,
+                null(),
+                &LIST_IID,
+                &mut list3,
+            )
+        },
+        S_OK
+    );
+    let set_vertex_buffers: SetVertexBuffers = unsafe { slot(list3, 0x180) };
+    let view = MetalVertexView {
+        address,
+        size: PAGE_LEN as u32,
+        stride: 16,
+    };
+    unsafe { set_vertex_buffers(list3, 0, 1, &view) };
+    unsafe { set_vertex_buffers(list3, 0, 1, &view) };
+    assert_eq!(
+        unsafe { close_list(list3) },
+        S_OK,
+        "binding the same range twice is idempotent"
+    );
+    assert!(
+        seen.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the second bind of a registered range sends no registration"
+    );
+
+    // A buffer whose range resolves to an allocation with no share file is
+    // refused explicitly: the list records the refusal and `Close` returns it,
+    // and nothing is submitted (no silent skip, no D3DMetal fallback).
+    *rules.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, u64::MAX, SHARE_ID + 1)];
+    let mut refused: This = null();
+    assert_eq!(
+        unsafe {
+            create_resource(
+                device_ptr,
+                &heap,
+                0,
+                &desc,
+                0,
+                null(),
+                &RESOURCE_IID,
+                &mut refused,
+            )
+        },
+        S_OK,
+        "creation itself does not depend on host visibility"
+    );
+    let mut list4: This = null();
+    assert_eq!(
+        unsafe {
+            list_create(
+                device_ptr,
+                0,
+                list_desc.kind,
+                allocator,
+                null(),
+                &LIST_IID,
+                &mut list4,
+            )
+        },
+        S_OK
+    );
+    let set_refused: SetVertexBuffers = unsafe { slot(list4, 0x180) };
+    let refused_view = MetalVertexView {
+        address,
+        size: PAGE_LEN as u32,
+        stride: 16,
+    };
+    unsafe { set_refused(list4, 0, 1, &refused_view) };
+    let close_refused: Close = unsafe { slot(list4, 0x48) };
+    assert_ne!(
+        unsafe { close_refused(list4) },
+        S_OK,
+        "an unregistered range is an explicit failure HRESULT"
+    );
+    assert!(
+        seen.recv_timeout(Duration::from_millis(100)).is_err(),
+        "a refused list submits nothing"
+    );
+    *rules.lock().unwrap_or_else(|e| e.into_inner()) = vec![(0, u64::MAX, SHARE_ID)];
+
+    // PSO registration: kind 4 carries the session's ticket and the entry name,
+    // kind 129 answers with the host's native pipeline id.
+    let pipeline_id = queue::register_pipeline(b"MTLB fixture bytes", "main")
+        .expect("the host accepts a pipeline registration");
+    assert_eq!(pipeline_id, 0x51, "the host's own id is what the guest keeps");
+    match seen.recv_timeout(TIMEOUT).expect("the kind 4 registration") {
+        Seen::Pipeline(ticket, entry) => {
+            assert_eq!(ticket, 1, "the session's first ticket");
+            assert_eq!(entry, "main");
+        }
+        other => panic!("expected a pipeline registration, saw {other:?}"),
+    }
+    let (buffers_registered, psos_registered) = telemetry::registration_counts();
+    assert!(buffers_registered >= 1, "the buffer was registered");
+    assert!(psos_registered >= 1, "the PSO was registered");
+
+    // The registered pipeline id and a resolved vertex binding are what the
+    // wire carries: a producer submission names the host's id, never a title
+    // pointer or a guest address.
+    let mut producer =
+        victory_gpu::native_metal::producer::MetalProducer::new(9, 1).expect("a list identity");
+    let resolved = bindings::vertex_buffer(
+        &*bindings::resolver().expect("the test installed a resolver"),
+        address,
+        PAGE_LEN,
+        16,
+    )
+    .expect("the range resolves");
+    let (bound, _tokens) = resolved.into_parts();
+    producer
+        .set_vertex_buffers_bound(0, &[bound])
+        .expect("the resolved binding records");
+    producer
+        .set_render_targets(
+            &[victory_gpu::native_metal::producer::RenderTarget::cleared(
+                victory_gpu::native_metal::producer::ResourceId::new(SHARE_ID, 1)
+                    .expect("a target identity"),
+                [0.0, 0.0, 0.0, 1.0],
+            )],
+            None,
+        )
+        .expect("one colour target");
+    // A graphics PSO cannot be registered over kind 4, so the producer-level
+    // draw that forces the vertex state out uses a literal id: what is under
+    // test here is the resolved binding the wire carries.
+    producer.set_pipeline(0xA1).expect("a graphics pipeline id");
+    producer
+        .draw(3, 1, 0, 0)
+        .expect("a draw flushes the bound vertex state");
+    producer
+        .set_compute_pipeline(pipeline_id)
+        .expect("the host's pipeline id is the compute pipeline");
+    producer
+        .set_compute_threadgroup_size([64, 1, 1])
+        .expect("a threadgroup size");
+    producer.dispatch(1, 1, 1).expect("a dispatch records");
+    let submission = producer.flush().expect("one submission");
+    queue::submit_recorded_batch(&[submission], 0).expect("the host accepts the batch");
+    match seen.recv_timeout(TIMEOUT).expect("the submitted batch") {
+        Seen::Submission(carried) => {
+            assert!(
+                carried.commands.iter().any(|command| matches!(
+                    command,
+                    CommandV3::SetVertexBuffers(set)
+                        if set.buffers.iter().all(|buffer| buffer.allocation_id == SHARE_ID)
+                )),
+                "the vertex binding names the registered allocation: {:?}",
+                carried.commands
+            );
+            assert!(
+                carried.commands.iter().any(|command| matches!(
+                    command,
+                    CommandV3::SetComputePipeline(reference) if reference.pipeline_id == pipeline_id
+                )),
+                "the submission names the host's pipeline id: {:?}",
+                carried.commands
+            );
+        }
+        other => panic!("expected a submission, saw {other:?}"),
+    }
+
+    // The pool path is explicit about what served a translation. A macOS
+    // process with a converter uses the persistent workers (never a new
+    // process per shader); this Win64 guest cannot load the x86_64 macOS
+    // converter, so a cold shader is an explicit refusal that names it.
+    let program = pso::StageProgram {
+        stage: pso::PipelineStage::Compute,
+        dxil: b"DXIL fixture bytes the converter would read".to_vec(),
+        entry: "main".to_string(),
+    };
+    match pso::translate(&program) {
+        Ok((metallib, serving)) => {
+            eprintln!(
+                "pool served one translation: {} metallib bytes, warm = {}",
+                metallib.len(),
+                serving.warm
+            );
+        }
+        Err(error) => eprintln!(
+            "pool translation skipped (converter available: {}): {error}",
+            pso::converter_available()
+        ),
+    }
+    eprintln!(
+        "pool worker job counts: {:?}, worker program: {:?}, converter: {:?}",
+        pso::pool_worker_jobs(),
+        pso::pool_worker_program(),
+        pso::converter_library()
+    );
+    // A graphics PSO cannot be registered over kind 4 (the host form builds a
+    // compute pipeline only); the refusal names the missing frame fields.
+    let graphics = pso::StageProgram {
+        stage: pso::PipelineStage::Vertex,
+        dxil: Vec::new(),
+        entry: "main".to_string(),
+    };
+    match pso::register(&[graphics]) {
+        Err(pso::PipelineError::HostCannotRegister { missing, .. }) => {
+            assert!(missing.contains("PipelineState"));
+        }
+        other => panic!("a graphics PSO must be refused explicitly, saw {other:?}"),
+    }
 
     // Signal advances the fence; GetCompletedValue reads it.
     let signal: Signal = unsafe { slot(queue_ptr, 0x70) };
@@ -444,24 +816,28 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
     let completed: Completed = unsafe { slot(fence, 0x40) };
     assert_eq!(unsafe { completed(fence) }, 7);
 
-    // Present: the installed WirePresenter registers surface 7 and carries
-    // one Present command to the host.
+    // Present: the installed WirePresenter registers surface 7 and carries one
+    // Present command to the host.
     let present: Present = unsafe { slot(queue_ptr, 0xf0) };
     let hr = unsafe { present(queue_ptr, 0, null(), null()) };
     assert_eq!(hr, S_OK, "the host accepted the native present");
-    let presented = submissions
-        .recv_timeout(TIMEOUT)
-        .expect("the host saw the present submission");
-    assert!(
-        matches!(
-            presented.commands.as_slice(),
-            [CommandV3::Present(present)] if present.surface_id == 7
+    match seen.recv_timeout(TIMEOUT).expect("the present submission") {
+        Seen::Submission(presented) => assert!(
+            matches!(
+                presented.commands.as_slice(),
+                [CommandV3::Present(present)] if present.surface_id == 7
+            ),
+            "unexpected commands {:?}",
+            presented.commands
         ),
-        "unexpected commands {:?}",
-        presented.commands
-    );
+        other => panic!("expected a submission, saw {other:?}"),
+    }
 
-    // A refused frame is a real failure HRESULT (the no-swapchain shape is
-    // covered by the queue unit tests; a host that refuses the surface is
-    // what the gate injects).
+    // Nothing on this path may fall back to D3DMetal.
+    assert_eq!(telemetry::d3dmetal_fallback_count(), 0);
+    assert!(
+        telemetry::registration_failures() >= 1,
+        "the refused range was counted, not swallowed"
+    );
+    bindings::clear_resolver();
 }

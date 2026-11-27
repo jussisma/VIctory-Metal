@@ -291,6 +291,20 @@ fn refuse_binding(this: This, why: &'static str, error: impl std::fmt::Display) 
     with_metal(this, |producer| producer.refuse(why, None));
 }
 
+/// Refuses a binding whose guest allocation the host has not registered.
+///
+/// The operation is expressible, so the title sees `E_FAIL`, not `E_NOTIMPL`:
+/// nothing about the command list is unimplemented, the backing is simply not
+/// visible to the host (no share file, no resolver range, or a refused kind 2).
+#[cfg(windows)]
+fn refuse_unregistered(this: This, why: &'static str, error: impl std::fmt::Display) {
+    tracing::warn!(error = %error, "{why}");
+    crate::native_metal::telemetry::note_registration_failure();
+    with_metal(this, |_| {
+        Err(crate::native_metal::producer::ProducerError::unregistered(why))
+    });
+}
+
 /// Resolves and records a graphics root CBV/SRV/UAV as a Wire v3 root buffer
 /// view, pinning its guest backing until the queue retires the list.
 ///
@@ -325,9 +339,127 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
         }
     };
     let (view, tokens) = resolved.into_parts();
+    if let Err(error) = crate::native_metal::queue::ensure_allocation(view.allocation_id) {
+        bindings::retire_all(&*resolver, &tokens);
+        refuse_unregistered(
+            this,
+            "a root view's allocation is not registered with the host",
+            error,
+        );
+        return;
+    }
     let mut recorded = None;
     with_metal(this, |producer| {
         let result = producer.set_graphics_root_buffer_view(view);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
+}
+
+/// Resolves and records a title list's vertex buffers, pinning their backing.
+///
+/// Each view's GPU virtual address goes through the `GuestRangeResolver` seam,
+/// so the wire carries the share allocation id, generation and exact offset
+/// instead of the address. The host validates every binding against its kind 2
+/// registry at execution, so an allocation that is not registered is refused
+/// here (and its pins released) rather than producing a submission the host
+/// must reject: no silent skip and no D3DMetal fallback.
+#[cfg(windows)]
+fn bind_vertex_buffers(this: This, start: u32, views: &[MetalVertexView]) {
+    use crate::native_metal::{bindings, queue};
+    let Some(resolver) = bindings::resolver() else {
+        refuse_binding(
+            this,
+            "a vertex buffer needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let mut entries = Vec::with_capacity(views.len());
+    let mut tokens = Vec::new();
+    for view in views {
+        let resolved = match bindings::vertex_buffer(
+            &*resolver,
+            view.address,
+            u64::from(view.size),
+            view.stride,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                bindings::retire_all(&*resolver, &tokens);
+                refuse_binding(this, "a vertex buffer could not be resolved", error);
+                return;
+            }
+        };
+        let (entry, mut held) = resolved.into_parts();
+        if let Err(error) = queue::ensure_allocation(entry.allocation_id) {
+            bindings::retire_all(&*resolver, &held);
+            bindings::retire_all(&*resolver, &tokens);
+            refuse_unregistered(
+                this,
+                "a vertex buffer's allocation is not registered with the host",
+                error,
+            );
+            return;
+        }
+        entries.push(entry);
+        tokens.append(&mut held);
+    }
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_vertex_buffers_bound(start, &entries);
+        recorded = Some(result.is_ok());
+        result
+    });
+    match recorded {
+        Some(true) => retain_on_list(this, &tokens),
+        _ => bindings::retire_all(&*resolver, &tokens),
+    }
+}
+
+/// Resolves and records a title list's index buffer (`IASetIndexBuffer`).
+#[cfg(windows)]
+fn bind_index_buffer(this: This, address: u64, len: u64, format: u32) {
+    use crate::native_metal::{bindings, producer, queue};
+    let index_format = match producer::index_format(format) {
+        Ok(index_format) => index_format,
+        Err(error) => {
+            with_metal(this, |_| Err(error));
+            return;
+        }
+    };
+    let Some(resolver) = bindings::resolver() else {
+        refuse_binding(
+            this,
+            "an index buffer needs the guest range resolver",
+            "VICTORY_BACKEND=metal without the xmem share resolver",
+        );
+        return;
+    };
+    let resolved = match bindings::index_buffer(&*resolver, address, len, index_format) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            refuse_binding(this, "an index buffer could not be resolved", error);
+            return;
+        }
+    };
+    let (entry, tokens) = resolved.into_parts();
+    if let Err(error) = queue::ensure_allocation(entry.allocation_id) {
+        bindings::retire_all(&*resolver, &tokens);
+        refuse_unregistered(
+            this,
+            "an index buffer's allocation is not registered with the host",
+            error,
+        );
+        return;
+    }
+    let mut recorded = None;
+    with_metal(this, |producer| {
+        let result = producer.set_index_buffer_bound(entry);
         recorded = Some(result.is_ok());
         result
     });
@@ -479,6 +611,17 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         }
     };
     let (table, tokens) = resolved.into_parts();
+    for binding in &table.bindings {
+        if let Err(error) = crate::native_metal::queue::ensure_allocation(binding.allocation_id) {
+            bindings::retire_all(&*resolver, &tokens);
+            refuse_unregistered(
+                this,
+                "a descriptor table's allocation is not registered with the host",
+                error,
+            );
+            return;
+        }
+    }
     let mut recorded = None;
     with_metal(this, |producer| {
         let result = producer.set_graphics_descriptor_table(table);
@@ -1938,13 +2081,76 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
-        with_metal(this, |producer| producer.set_pipeline(pipeline as u64));
+        set_native_pipeline(this, pipeline);
         return;
     }
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
     let _ = this;
+}
+
+/// `SetPipelineState` on the native path: the list names the host's own
+/// pipeline id, never the title's pointer.
+///
+/// A compute PSO is registered on first use (`pipeline::native_pipeline`),
+/// which translates its DXIL through the persistent IRConverter pool and sends
+/// transport kind 4; the id the host answers with (kind 129) is what the
+/// producer records. A graphics or mesh PSO is refused with the fields the
+/// host's kind 4 form is missing: the frame carries one ticket and one entry,
+/// so it can only build the compute pipeline `load_metallib` makes.
+#[cfg(windows)]
+fn set_native_pipeline(list: This, pipeline: This) {
+    use victory_metal::wire_v3::{
+        OP_SET_COMPUTE_PIPELINE, OP_SET_GRAPHICS_PIPELINE, OP_SET_MESH_PIPELINE,
+    };
+
+    if pipeline.is_null() {
+        with_metal(list, |producer| {
+            producer.refuse("SetPipelineState(null)", Some(OP_SET_GRAPHICS_PIPELINE))
+        });
+        return;
+    }
+    let stages = crate::pipeline::stage_names(pipeline);
+    if stages.iter().all(|stage| *stage == "compute") {
+        match crate::pipeline::native_pipeline(pipeline) {
+            Ok(id) => {
+                with_metal(list, |producer| producer.set_compute_pipeline(id));
+            }
+            Err(error) => {
+                with_metal(list, |producer| {
+                    producer.refuse(
+                        "SetPipelineState: the compute PSO could not be registered with the host",
+                        Some(OP_SET_COMPUTE_PIPELINE),
+                    )
+                });
+                tracing::warn!(error, "native compute pipeline registration refused");
+            }
+        }
+        return;
+    }
+    let (stage, opcode) = if stages.iter().any(|stage| *stage == "mesh") {
+        ("mesh", OP_SET_MESH_PIPELINE)
+    } else {
+        ("graphics", OP_SET_GRAPHICS_PIPELINE)
+    };
+    let missing = crate::native_metal::pso::GRAPHICS_MESH_FRAME_FIELDS;
+    tracing::warn!(
+        ?pipeline,
+        stage,
+        "VICTORY_BACKEND=metal: the host kind 4 form registers compute pipelines only; a {stage} \
+         PSO needs {missing}"
+    );
+    crate::native_metal::telemetry::note_registration_failure();
+    with_metal(list, |producer| {
+        producer.refuse(
+            match stage {
+                "mesh" => "SetPipelineState: a mesh PSO cannot be registered over kind 4",
+                _ => "SetPipelineState: a graphics PSO cannot be registered over kind 4",
+            },
+            Some(opcode),
+        )
+    });
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
@@ -2097,9 +2303,7 @@ mod state {
     use super::{This, metal_resource, with_metal, with_state};
     use crate::backend::GpuBackend;
     use crate::draw::{IndexView, VertexView};
-    use crate::native_metal::producer::{
-        DepthTarget, ProducerError, RenderTarget, VertexBufferView,
-    };
+    use crate::native_metal::producer::{DepthTarget, ProducerError, RenderTarget};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
@@ -2317,13 +2521,17 @@ mod state {
             // SAFETY: the title passes a view or null; `MetalIndexView` has
             // the same `repr(C)` layout.
             let view = unsafe { view.cast::<super::MetalIndexView>().as_ref() }.copied();
-            with_metal(this, |p| match view {
-                Some(view) => p.set_index_buffer_at(view.address, view.size, view.format),
-                None => p.refuse(
-                    "IASetIndexBuffer(null)",
-                    Some(victory_metal::wire_v3::OP_SET_INDEX_BUFFER),
-                ),
-            });
+            match view {
+                Some(view) => {
+                    super::bind_index_buffer(this, view.address, u64::from(view.size), view.format)
+                }
+                None => with_metal(this, |p| {
+                    p.refuse(
+                        "IASetIndexBuffer(null)",
+                        Some(victory_metal::wire_v3::OP_SET_INDEX_BUFFER),
+                    )
+                }),
+            }
             return;
         }
         // SAFETY: the title passes a view or null.
@@ -2339,16 +2547,11 @@ mod state {
             if views.is_null() {
                 with_metal(this, |p| p.clear_vertex_buffers(start, count));
             } else {
-                let views: Vec<VertexBufferView> =
-                    items(views.cast::<super::MetalVertexView>(), count)
-                        .iter()
-                        .map(|view| VertexBufferView {
-                            address: view.address,
-                            size: view.size,
-                            stride: view.stride,
-                        })
-                        .collect();
-                with_metal(this, |p| p.set_vertex_buffers_at(start, &views));
+                super::bind_vertex_buffers(
+                    this,
+                    start,
+                    items(views.cast::<super::MetalVertexView>(), count),
+                );
             }
             return;
         }

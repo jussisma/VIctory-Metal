@@ -144,7 +144,7 @@ fn primitive_topology(value: u32) -> Result<PrimitiveTopology, ProducerError> {
 }
 
 /// A DXGI index format number as a version 3 element width.
-fn index_format(format: u32) -> Result<IndexFormat, ProducerError> {
+pub(crate) fn index_format(format: u32) -> Result<IndexFormat, ProducerError> {
     match format {
         57 => Ok(IndexFormat::Uint16),
         42 => Ok(IndexFormat::Uint32),
@@ -290,6 +290,15 @@ pub enum ProducerError {
         /// Wire opcode that would be needed, when one exists.
         opcode: Option<u16>,
     },
+    /// A binding named an allocation the host has not registered.
+    ///
+    /// The operation is supported; the guest backing is not visible to the
+    /// host, so the submission the host would receive could only be refused.
+    /// The title sees `E_FAIL`, not `E_NOTIMPL`.
+    Unregistered {
+        /// Operation whose binding named it.
+        operation: &'static str,
+    },
     /// A draw or dispatch ran without a pipeline of that stage.
     MissingPipeline {
         /// Stage the command needs (`graphics`, `compute`, `mesh`).
@@ -331,6 +340,12 @@ impl ProducerError {
             operation,
             opcode: None,
         }
+    }
+
+    /// A binding whose allocation the host has not registered: `E_FAIL`,
+    /// because the operation is supported and the backing is what is missing.
+    pub fn unregistered(operation: &'static str) -> Self {
+        Self::Unregistered { operation }
     }
 
     /// An unsupported operation that would need `opcode`.
@@ -376,6 +391,10 @@ impl fmt::Display for ProducerError {
                 Some(opcode) => write!(f, "{operation} is not expressible (opcode {opcode})"),
                 None => write!(f, "{operation} is not expressible"),
             },
+            Self::Unregistered { operation } => write!(
+                f,
+                "{operation}: the binding's allocation is not registered with the host"
+            ),
             Self::MissingPipeline { stage } => write!(f, "a {stage} command has no pipeline"),
             Self::NoRenderTargets { operation } => {
                 write!(f, "{operation} has no render targets bound")
@@ -914,6 +933,63 @@ impl MetalProducer {
             *slot = None;
         }
         self.dirty.vertex_buffers = true;
+        Ok(())
+    }
+
+    /// `IASetVertexBuffers` with views already resolved to wire bindings.
+    ///
+    /// The guest resolves each title view's GPU address through the
+    /// `GuestRangeResolver` seam (allocation id, generation, exact in-page
+    /// offset) and requires the host to have registered that allocation, so the
+    /// host's `binding_within_allocation` check is satisfied at execution. The
+    /// allocation id is never the address: an unregistered or unresolved range
+    /// is refused before anything is recorded.
+    pub fn set_vertex_buffers_bound(
+        &mut self,
+        start_slot: u32,
+        views: &[VertexBuffer],
+    ) -> Result<(), ProducerError> {
+        let start = usize::try_from(start_slot).map_err(|_| ProducerError::InvalidResource {
+            operation: "IASetVertexBuffers",
+        })?;
+        if start
+            .checked_add(views.len())
+            .is_none_or(|end| end > MAX_VERTEX_SLOTS)
+        {
+            return Err(ProducerError::InvalidResource {
+                operation: "IASetVertexBuffers",
+            });
+        }
+        for view in views {
+            if view.length == 0 || view.stride == 0 {
+                return Err(ProducerError::unsupported_opcode(
+                    "IASetVertexBuffers: empty buffer or stride",
+                    OP_SET_VERTEX_BUFFERS,
+                ));
+            }
+            ResourceId::new(view.allocation_id, view.generation)?;
+        }
+        for (offset, view) in views.iter().enumerate() {
+            self.graphics.vertex_buffers[start + offset] = Some(*view);
+        }
+        self.dirty.vertex_buffers = true;
+        Ok(())
+    }
+
+    /// `IASetIndexBuffer` with a view already resolved to a wire binding.
+    pub fn set_index_buffer_bound(
+        &mut self,
+        binding: IndexBufferBinding,
+    ) -> Result<(), ProducerError> {
+        if binding.length == 0 {
+            return Err(ProducerError::unsupported_opcode(
+                "IASetIndexBuffer: empty buffer",
+                OP_SET_INDEX_BUFFER,
+            ));
+        }
+        ResourceId::new(binding.allocation_id, binding.generation)?;
+        self.graphics.index = Some(binding);
+        self.dirty.index = true;
         Ok(())
     }
 
