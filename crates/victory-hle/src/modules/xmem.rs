@@ -10,22 +10,18 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, ERROR_INVALID_ADDRESS, HANDLE, INVALID_HANDLE_VALUE,
-    SetLastError,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT,
-    MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE,
-    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEM_RESET,
-    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
-    PAGE_READWRITE, PAGE_WRITECOPY,
-    SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2,
-    VirtualFree as HostVirtualFree, VirtualProtect, VirtualQueryEx,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -79,11 +75,6 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
-/// `MEM_RESET_UNDEFINED`, beside the host's `MEM_RESET`: windows-sys does
-/// not name it.
-const MEM_RESET_UNDEFINED: u32 = 0x0100_0000;
-/// The protections whose pages a decommit or reset may zero through the view.
-const WRITABLE: u32 = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY;
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -114,63 +105,6 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
-    let requested_kind = kind;
-    let requested_protect = protect;
-    // The console has no separate virtual-free export: a title releases,
-    // decommits or resets a region by passing the matching allocation type
-    // here, as it would to `VirtualFree`. A region this module handed out is
-    // ours to act on; every other address keeps the host's answer.
-    if kind & MEM_RELEASE != 0 {
-        if virtual_release(base as usize) {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "released");
-            return base;
-        }
-        // SAFETY: the title's own release call, unchanged.
-        if !base.is_null() && unsafe { HostVirtualFree(base, 0, MEM_RELEASE) } != 0 {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "released by the host");
-            return base;
-        }
-        return virtual_failure("release names no tracked reservation", ERROR_INVALID_ADDRESS);
-    }
-    // `MEM_DECOMMIT` shares its value with `MEM_REPLACE_PLACEHOLDER`, which a
-    // title also passes to split a 64 KiB placeholder: only a call that
-    // names no reserve or commit is a decommit.
-    if kind & MEM_DECOMMIT != 0 && kind & (MEM_RESERVE | MEM_COMMIT) == 0 {
-        if virtual_decommit(base as usize, size) {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "decommitted");
-            return base;
-        }
-        // SAFETY: the title's own decommit call, unchanged.
-        if !base.is_null() && unsafe { HostVirtualFree(base, size, MEM_DECOMMIT) } != 0 {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "decommitted by the host");
-            return base;
-        }
-        return virtual_failure("decommit leaves its reservation", ERROR_INVALID_ADDRESS);
-    }
-    if kind & (MEM_RESET | MEM_RESET_UNDEFINED) != 0 {
-        if virtual_reset(base as usize, size, kind & MEM_RESET_UNDEFINED != 0) {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "reset");
-            return base;
-        }
-        // SAFETY: the title's own reset call; the parameter points nowhere.
-        if !base.is_null()
-            && unsafe {
-                VirtualAlloc2(
-                    GetCurrentProcess(),
-                    base,
-                    size,
-                    MEM_RESET,
-                    PAGE_NOACCESS,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            } != std::ptr::null_mut()
-        {
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "reset by the host");
-            return base;
-        }
-        return virtual_failure("reset names no committed range", ERROR_INVALID_ADDRESS);
-    }
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -181,11 +115,10 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
-    let requested = match protect & HOST_PROTECTION {
+    let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
     };
-    let mut protect = requested;
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
     // shortcut: committing part of such a reservation later would fail
@@ -195,7 +128,6 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
-            trace_virtual(size, requested_kind, requested_protect, base, base, false, "placeholder split");
             return base;
         }
         protect = PAGE_NOACCESS;
@@ -211,71 +143,17 @@ pub extern "system" fn XMemVirtualAlloc(
     let constrained = base.is_null();
     if constrained {
         kind |= MEM_RESERVE;
-    }
-    // ADR-045: exact reserve/commit over host-visible backing. A reservation
-    // owns address space only; every commit maps a view of a share file over
-    // exactly the pages it names, so the same bytes are readable at the guest
-    // VA and by the native host. A reserve alone registers nothing and stays
-    // `MEM_RESERVE` to the title (that is what its own assertion checks).
-    // Any request this path cannot serve falls back to the host allocation
-    // below, exactly as before, so a title's working call never turns into a
-    // null one because of the share path.
-    if share::configured() && !placeholder {
-        if let Some(rounded) = size.checked_next_multiple_of(PAGE) {
-            let served = if kind & MEM_COMMIT != 0 {
-                virtual_commit(
-                    base,
-                    rounded,
-                    flags,
-                    requested,
-                    &mut requirements,
-                    constrained,
-                    highest,
-                )
-            } else if let Some(at) = virtual_reserve(
-                base,
-                rounded,
-                flags,
-                requested,
-                &mut requirements,
-                constrained,
-                highest,
-                false,
-            ) {
-                Served::At(at, false)
-            } else {
-                Served::Unserved
-            };
-            match served {
-                Served::At(at, registered) => {
-                    trace_virtual(
-                        size,
-                        requested_kind,
-                        requested_protect,
-                        base,
-                        at,
-                        registered,
-                        "virtual region",
-                    );
-                    return at;
-                }
-                Served::Refused(reason) => {
-                    return virtual_failure(reason, ERROR_INVALID_ADDRESS);
-                }
-                Served::Unserved => {}
-            }
+        // The GPU side copies only the pages the title wrote since its last
+        // copy (`victory_gpu`, decision 0007); placeholders cannot be
+        // watched (their physical-page views are copied whole). Nor is
+        // anything under Rosetta, where Wine's watch faults on first writes
+        // Rosetta cannot resume (`victory_gpu::fault_tracking`).
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && victory_gpu::fault_tracking() {
+            kind |= MEM_WRITE_WATCH;
         }
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    if constrained && victory_gpu::fault_tracking() {
-        // The GPU side copies only the pages the title wrote since its last
-        // copy (`victory_gpu`, decision 0007); a placeholder commit has a
-        // share range instead and needs no watch. Nor is anything under
-        // Rosetta, where Wine's watch faults on first writes Rosetta cannot
-        // resume (`victory_gpu::fault_tracking`).
-        kind |= MEM_WRITE_WATCH;
-    }
     let allocate = |parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
@@ -311,7 +189,6 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    let mut registered = false;
     if !at.is_null()
         && victory_gpu::alias_buffers()
         && kind & MEM_COMMIT != 0
@@ -321,46 +198,19 @@ pub extern "system" fn XMemVirtualAlloc(
         && size >= PAGE
         && size.is_multiple_of(PAGE)
     {
-        registered = victory_gpu::alias_region(at as usize, size, false);
+        victory_gpu::alias_region(at as usize, size, false);
     }
-    trace_virtual(
-        size,
-        requested_kind,
-        requested_protect,
-        base,
-        at,
-        registered,
-        "host memory",
-    );
+    if base.is_null() {
+        tracing::debug!(
+            size,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            at = format_args!("{at:p}"),
+            "XMemVirtualAlloc"
+        );
+    }
     at
 }
-
-/// One bounded debug line per `XMemVirtualAlloc`, whatever the call did: the
-/// requested kind and protection, the returned base and whether a
-/// host-visible range was registered for it. Debug level, so the default
-/// boot log stays quiet and a `RUST_LOG=debug` boot can diff the title's
-/// whole memory sequence.
-fn trace_virtual(
-    size: usize,
-    kind: u32,
-    protect: u32,
-    base: *mut c_void,
-    at: *mut c_void,
-    registered: bool,
-    note: &'static str,
-) {
-    tracing::debug!(
-        size,
-        kind = format_args!("{kind:#x}"),
-        protect = format_args!("{protect:#x}"),
-        base = format_args!("{base:p}"),
-        at = format_args!("{at:p}"),
-        registered,
-        note,
-        "XMemVirtualAlloc"
-    );
-}
-
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
 /// same), then the XMem flags and tag.
@@ -389,20 +239,6 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        // ADR-045: a virtual region's state follows its commits, not the
-        // placeholder that holds its address space. A committed page reports
-        // `MEM_COMMIT` with the protection it asked for; an uncommitted gap
-        // reports `MEM_RESERVE`/`PAGE_NOACCESS`. A page is never reported
-        // committed unless its bytes are really mapped.
-        if let Some(state) = reservation_state(address as usize) {
-            info.host.BaseAddress = state.base as *mut c_void;
-            info.host.AllocationBase = state.allocation_base as *mut c_void;
-            info.host.AllocationProtect = state.allocation_protect;
-            info.host.RegionSize = state.size;
-            info.host.State = state.state;
-            info.host.Protect = state.protect;
-            info.host.Type = MEM_PRIVATE;
-        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -577,12 +413,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            // A share-backed virtual region is ours to release; every other
-            // reservation stays the host's.
-            if !virtual_release(address as usize) {
-                victory_gpu::unalias_region(address as usize);
-                HostVirtualFree(address, 0, MEM_RELEASE);
-            }
+            victory_gpu::unalias_region(address as usize);
+            VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -606,7 +438,7 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-pub(super) struct Section {
+struct Section {
     handle: HANDLE,
     /// The allocation's real size: what the guest may map and resolve. A
     /// share file is rounded up to whole pages, so this can be smaller than
@@ -774,998 +606,6 @@ fn pagefile_section(size: usize) -> Option<Arc<Section>> {
     }))
 }
 
-// ------------------------------------------------ virtual regions (ADR-045)
-
-/// One committed run of a [`Reservation`]: `len` bytes starting `offset`
-/// bytes into the reservation, mapped by a view of `section` that starts at
-/// `file_offset` inside it.
-///
-/// Each commit gets its own section, sized to that commit: a multi-GiB
-/// reservation that commits one page creates a one-page file, not a
-/// multi-GiB one. A protection change splits a run while keeping its section
-/// and file offset, so the bytes stay where they were.
-#[derive(Clone)]
-pub(super) struct Committed {
-    pub(super) len: usize,
-    /// The guest protection the commit asked for.
-    pub(super) protect: u32,
-    /// The section whose bytes this run is.
-    pub(super) section: Arc<Section>,
-    /// Where this run starts inside `section`; always a whole page and
-    /// `file_offset + len <= section.map_size`.
-    pub(super) file_offset: usize,
-}
-
-/// A virtual region `XMemVirtualAlloc` handed out (ADR-045): the whole
-/// reservation is one host placeholder, so a commit can map a view over
-/// exactly the pages it names. A plain `MEM_RESERVE` owns no bytes at all.
-pub(super) struct Reservation {
-    pub(super) base: usize,
-    /// The guest-visible length: the requested size rounded up to a whole
-    /// 64 KiB page, as the console rounds.
-    pub(super) size: usize,
-    /// The committed runs, by offset from `base`.
-    pub(super) commits: BTreeMap<usize, Committed>,
-    /// The guest flags the reservation was requested with (diagnostics).
-    #[allow(dead_code)]
-    pub(super) flags: u64,
-    /// What the reservation reports as `AllocationProtect`.
-    pub(super) allocation_protect: u32,
-    /// The address space is a host placeholder, so a commit can replace
-    /// exactly its pages with a section view. A host that refuses placeholders
-    /// keeps a plain reservation, whose commits stay on the host path.
-    pub(super) placeholder: bool,
-    /// A 64 KiB-page reservation for `XMemMapPhysicalPages`: its pages are
-    /// shown by physical-page views, so a plain gap is "not mapped" rather
-    /// than "reserved but uncommitted".
-    pub(super) physical_pages: bool,
-}
-
-impl Reservation {
-    /// The committed run holding `offset`, if any.
-    pub(super) fn committed_at(&self, offset: usize) -> Option<(usize, &Committed)> {
-        let (start, run) = self.commits.range(..=offset).next_back()?;
-        (offset < start.checked_add(run.len)?).then_some((*start, run))
-    }
-
-    /// The runs of `[offset, offset + len)` no commit covers, in order.
-    fn gaps(&self, offset: usize, len: usize) -> Vec<(usize, usize)> {
-        let end = offset.saturating_add(len);
-        let mut gaps = Vec::new();
-        let mut cursor = offset;
-        while cursor < end {
-            match self.committed_at(cursor) {
-                Some((start, run)) => cursor = start.saturating_add(run.len).min(end),
-                None => {
-                    let next = self
-                        .commits
-                        .range(cursor..)
-                        .next()
-                        .map_or(end, |(&start, _)| start.min(end));
-                    let stop = next.max(cursor);
-                    gaps.push((cursor, stop - cursor));
-                    cursor = stop;
-                }
-            }
-        }
-        gaps
-    }
-
-    /// The committed pieces of `[offset, offset + len)` as
-    /// `(start, length, protect)`, in order.
-    fn pieces(&self, offset: usize, len: usize) -> Vec<(usize, usize, u32)> {
-        let end = offset.saturating_add(len);
-        self.commits
-            .range(..end)
-            .filter(|(start, run)| start.saturating_add(run.len) > offset)
-            .map(|(&start, run)| {
-                let from = offset.max(start);
-                let to = (start + run.len).min(end);
-                (from, to - from, run.protect)
-            })
-            .collect()
-    }
-
-    /// Splits the recorded runs around `[offset, offset + len)` and returns
-    /// each intersection, so the caller acts on exactly the bytes it names
-    /// without mistaking a partly covered run for the whole of it. Each piece
-    /// keeps its section and the right file offset.
-    fn partition(&mut self, offset: usize, len: usize) -> Vec<(usize, usize, Committed)> {
-        let end = offset.saturating_add(len);
-        let affected: Vec<(usize, Committed)> = self
-            .commits
-            .range(..end)
-            .filter(|(start, run)| start.saturating_add(run.len) > offset)
-            .map(|(&start, run)| (start, run.clone()))
-            .collect();
-        let mut pieces = Vec::with_capacity(affected.len());
-        for (start, run) in affected {
-            let stop = start + run.len;
-            let (from, to) = (offset.max(start), end.min(stop));
-            self.commits.remove(&start);
-            if start < from {
-                self.commits.insert(
-                    start,
-                    Committed {
-                        len: from - start,
-                        ..run.clone()
-                    },
-                );
-            }
-            if stop > to {
-                self.commits.insert(
-                    to,
-                    Committed {
-                        len: stop - to,
-                        file_offset: run.file_offset + (to - start),
-                        ..run.clone()
-                    },
-                );
-            }
-            if to > from {
-                let piece = Committed {
-                    len: to - from,
-                    file_offset: run.file_offset + (from - start),
-                    ..run
-                };
-                self.commits.insert(from, piece.clone());
-                pieces.push((from, to - from, piece));
-            }
-        }
-        pieces
-    }
-
-    /// Sets the protection recorded for `[offset, offset + len)`.
-    fn reprotect(&mut self, offset: usize, len: usize, protect: u32) {
-        for (from, length, run) in self.partition(offset, len) {
-            self.commits.insert(
-                from,
-                Committed {
-                    len: length,
-                    protect,
-                    ..run
-                },
-            );
-        }
-    }
-}
-
-/// What `XMemVirtualQuery` reports for one address of a virtual region.
-struct ReservationState {
-    base: usize,
-    allocation_base: usize,
-    allocation_protect: u32,
-    size: usize,
-    state: u32,
-    protect: u32,
-}
-
-/// What the share-backed path did with an `XMemVirtualAlloc` request.
-enum Served {
-    /// Served here: the returned base and whether a host-visible range was
-    /// registered for it.
-    At(*mut c_void, bool),
-    /// Not this path's to serve: the caller keeps the host allocation,
-    /// exactly as it did before ADR-045.
-    Unserved,
-    /// Ours to refuse: a commit inside a region that already holds committed
-    /// bytes could not be mapped, so returning a pointer would hand the title
-    /// pages that are not there.
-    Refused(&'static str),
-}
-
-impl Physical {
-    /// The virtual region holding `at`, if any.
-    pub(super) fn reservation_at(&self, at: usize) -> Option<(usize, &Reservation)> {
-        self.reservations
-            .range(..=at)
-            .next_back()
-            .filter(|(base, region)| at < base.saturating_add(region.size))
-            .map(|(&base, region)| (base, region))
-    }
-
-    /// The virtual region holding `at`, mutably.
-    fn reservation_mut(&mut self, at: usize) -> Option<(usize, &mut Reservation)> {
-        let base = self.reservation_at(at).map(|(base, _)| base)?;
-        self.reservations
-            .get_mut(&base)
-            .map(|region| (base, region))
-    }
-}
-
-/// Bounded, named counters for the virtual region path (ADR-045): counts and
-/// bytes only, never contents.
-static VIRTUAL_RESERVES: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_COMMITS: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_DECOMMITS: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_RELEASES: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_RESETS: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL_REFUSALS: AtomicU64 = AtomicU64::new(0);
-static LAST_REFUSAL: Mutex<&'static str> = Mutex::new("");
-
-/// The virtual region counters, for a boot trace and for tests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct VirtualCounters {
-    pub(crate) reserves: u64,
-    pub(crate) commits: u64,
-    pub(crate) decommits: u64,
-    pub(crate) releases: u64,
-    pub(crate) resets: u64,
-    pub(crate) committed_bytes: u64,
-    pub(crate) refusals: u64,
-}
-
-#[allow(dead_code)]
-pub(crate) fn virtual_counters() -> VirtualCounters {
-    VirtualCounters {
-        reserves: VIRTUAL_RESERVES.load(Ordering::Relaxed),
-        commits: VIRTUAL_COMMITS.load(Ordering::Relaxed),
-        decommits: VIRTUAL_DECOMMITS.load(Ordering::Relaxed),
-        releases: VIRTUAL_RELEASES.load(Ordering::Relaxed),
-        resets: VIRTUAL_RESETS.load(Ordering::Relaxed),
-        committed_bytes: VIRTUAL_COMMITTED_BYTES.load(Ordering::Relaxed),
-        refusals: VIRTUAL_REFUSALS.load(Ordering::Relaxed),
-    }
-}
-
-/// The last refusal's reason: a fixed, bounded phrase (at most 120 chars).
-#[allow(dead_code)]
-pub(crate) fn last_refusal() -> &'static str {
-    *LAST_REFUSAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Records why a virtual operation was refused and answers null, with the
-/// matching Windows error.
-fn virtual_failure(reason: &'static str, error: u32) -> *mut c_void {
-    debug_assert!(reason.len() <= 120, "a refusal reason is bounded");
-    *LAST_REFUSAL.lock().unwrap_or_else(|e| e.into_inner()) = reason;
-    VIRTUAL_REFUSALS.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(reason, error, "XMemVirtualAlloc refused");
-    // SAFETY: writes this thread's last-error value, as the host API would.
-    unsafe { SetLastError(error) };
-    std::ptr::null_mut()
-}
-
-/// Reserves `size` bytes of address space (one host placeholder) and records
-/// it. `None` when the host refuses, so the caller can keep its host path.
-fn virtual_reserve(
-    base: *mut c_void,
-    size: usize,
-    flags: u64,
-    allocation_protect: u32,
-    requirements: &mut MEM_ADDRESS_REQUIREMENTS,
-    constrained: bool,
-    highest: usize,
-    physical_pages: bool,
-) -> Option<*mut c_void> {
-    // A base inside a region this module already reserved is a split of it:
-    // the address space is reserved already, so there is nothing to do.
-    if !base.is_null() {
-        let physical = physical();
-        if let Some((region_base, region)) = physical.reservation_at(base as usize)
-            && (base as usize)
-                .checked_add(size)
-                .is_some_and(|end| end <= region_base + region.size)
-        {
-            return Some(base);
-        }
-    }
-    let mut parameter = MEM_EXTENDED_PARAMETER::default();
-    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-    parameter.Anonymous2.Pointer = (requirements as *mut MEM_ADDRESS_REQUIREMENTS).cast();
-    let mut allocate = |placeholder: bool| {
-        // SAFETY: the title's own base and size; the parameter points at
-        // `requirements`, which outlives every call here.
-        unsafe {
-            VirtualAlloc2(
-                GetCurrentProcess(),
-                base,
-                size,
-                MEM_RESERVE
-                    | if placeholder {
-                        MEM_RESERVE_PLACEHOLDER
-                    } else {
-                        0
-                    },
-                PAGE_NOACCESS,
-                if constrained {
-                    &raw mut parameter
-                } else {
-                    std::ptr::null_mut()
-                },
-                constrained.into(),
-            )
-        }
-    };
-    let mut at = allocate(true);
-    let mut placeholder = true;
-    if at.is_null() {
-        // A host without placeholder support keeps the plain reservation the
-        // previous code made; its commits then stay on the host path.
-        placeholder = false;
-        at = allocate(false);
-    }
-    if at.is_null() && constrained && highest < FOUR_GIB {
-        at = low_guards::retry(size, || allocate(placeholder));
-    }
-    if at.is_null() {
-        return None;
-    }
-    let base = at as usize;
-    physical().reservations.insert(
-        base,
-        Reservation {
-            base,
-            size,
-            commits: BTreeMap::new(),
-            flags,
-            allocation_protect,
-            placeholder,
-            physical_pages,
-        },
-    );
-    VIRTUAL_RESERVES.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(
-        size,
-        at = format_args!("{base:#x}"),
-        placeholder,
-        "XMemVirtualAlloc reserved"
-    );
-    Some(at)
-}
-
-/// A commit: maps the requested pages over their placeholders and records
-/// them, or a fresh reserve-and-commit when `base` is null.
-fn virtual_commit(
-    base: *mut c_void,
-    size: usize,
-    flags: u64,
-    protect: u32,
-    requirements: &mut MEM_ADDRESS_REQUIREMENTS,
-    constrained: bool,
-    highest: usize,
-) -> Served {
-    if size == 0 {
-        return Served::Refused("a commit size is zero");
-    }
-    if base.is_null() {
-        let Some(at) = virtual_reserve(
-            std::ptr::null_mut(),
-            size,
-            flags,
-            protect,
-            requirements,
-            constrained,
-            highest,
-            false,
-        ) else {
-            return Served::Unserved;
-        };
-        if commit_pages(at as usize, size, protect) {
-            return Served::At(at, true);
-        }
-        // Nothing was committed: give the address space back and let the host
-        // allocation serve the request exactly as it did before.
-        virtual_release(at as usize);
-        return Served::Unserved;
-    }
-    let at = base as usize;
-    // Win32 rounds a commit's address down and its end up to whole pages; the
-    // returned base is the rounded one.
-    let start = at & !(PAGE - 1);
-    let Some(len) = at
-        .checked_add(size)
-        .and_then(|end| end.checked_next_multiple_of(PAGE))
-        .and_then(|end| end.checked_sub(start))
-    else {
-        return Served::Refused("commit size overflows");
-    };
-    // A commit only belongs inside a reservation this module made (the host
-    // cannot turn a placeholder into committed memory). Anything else keeps
-    // the host path, exactly as before.
-    let tracked = {
-        let physical = physical();
-        physical.reservation_at(at).map(|(base, region)| {
-            let end = base.saturating_add(region.size);
-            let shown = physical
-                .views
-                .range(..end)
-                .any(|(&view, (size, _))| view.saturating_add(*size) > base);
-            (
-                base,
-                !region.commits.is_empty(),
-                shown,
-                region.placeholder,
-                region.physical_pages,
-            )
-        })
-    };
-    let Some((region_base, has_commits, shown, placeholder, physical_pages)) = tracked else {
-        return Served::Unserved;
-    };
-    if commit_pages(start, len, protect) {
-        return Served::At(start as *mut c_void, true);
-    }
-    // The share path could not map these pages. If the region still holds no
-    // committed bytes, turn it back into a plain host reservation and let the
-    // host commit: the title gets exactly the memory it got before, and the
-    // range is a host range with no share backing rather than a silently
-    // reserved one.
-    if !has_commits && !shown && placeholder && !physical_pages && downgrade(region_base) {
-        return Served::Unserved;
-    }
-    Served::Refused("a commit could not be mapped over its reservation")
-}
-
-/// Turns a placeholder reservation that has committed nothing back into a
-/// plain host reservation, so the host can commit it as it did before.
-fn downgrade(base: usize) -> bool {
-    let size = {
-        let mut physical = physical();
-        let Some(region) = physical.reservations.remove(&base) else {
-            return false;
-        };
-        if !region.commits.is_empty() {
-            physical.reservations.insert(base, region);
-            return false;
-        }
-        region.size
-    };
-    // Nothing is committed, so no bytes are lost: free the placeholder and
-    // take a plain reservation for the same address space.
-    // SAFETY: the placeholder this module made.
-    if unsafe { HostVirtualFree(base as *mut c_void, 0, MEM_RELEASE) } == 0 {
-        tracing::warn!(
-            at = format_args!("{base:#x}"),
-            error = %std::io::Error::last_os_error(),
-            "dropping a placeholder reservation failed"
-        );
-        return false;
-    }
-    // SAFETY: the range is free again; the base was ours a moment ago.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base as *const c_void,
-            size,
-            MEM_RESERVE,
-            PAGE_NOACCESS,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if at.is_null() {
-        tracing::warn!(
-            size,
-            at = format_args!("{base:#x}"),
-            error = %std::io::Error::last_os_error(),
-            "re-reserving a virtual region without a placeholder failed"
-        );
-        return false;
-    }
-    tracing::debug!(
-        size,
-        at = format_args!("{base:#x}"),
-        "XMemVirtualAlloc reservation without placeholders"
-    );
-    true
-}
-
-/// The section backing one committed run: the share provider when it serves
-/// the size, else the pagefile. The pagefile fallback keeps the run readable
-/// and writable but cannot be named to the host
-/// ([`share::ResolveError::Pagefile`]).
-fn commit_backing(size: usize) -> Option<Arc<Section>> {
-    #[cfg(test)]
-    if let Some(section) = tests::file_section(size) {
-        return Some(section);
-    }
-    match share::section(size) {
-        Ok(section) => return Some(section),
-        Err(share::Failure::Unconfigured) => {}
-        Err(error) => tracing::warn!(
-            size,
-            %error,
-            "host-visible commit backing failed; keeping the pagefile"
-        ),
-    }
-    pagefile_section(size)
-}
-
-/// The placeholder holding `[at, at + len)`, as `(base, end)`. Windows splits a
-/// placeholder only at its edges, so a middle run takes two splits; the caller
-/// needs the bounds to know which edges to cut.
-fn placeholder_bounds(at: usize, len: usize) -> Option<(usize, usize)> {
-    // SAFETY: a zeroed `MEMORY_BASIC_INFORMATION` is valid.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: reads this process's address-space bookkeeping, not `at` itself.
-    let queried = unsafe {
-        VirtualQueryEx(
-            GetCurrentProcess(),
-            at as *const c_void,
-            &mut info,
-            size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    if queried == 0 || info.State != MEM_RESERVE {
-        return None;
-    }
-    let base = info.BaseAddress as usize;
-    let end = base.checked_add(info.RegionSize)?;
-    let stop = at.checked_add(len)?;
-    (at >= base && stop <= end).then_some((base, end))
-}
-
-/// Maps `[at, at + len)` of one reservation: a view of `section` at
-/// `file_offset`, over the placeholder there.
-fn map_commit(section: &Section, at: usize, file_offset: usize, len: usize) -> bool {
-    // Carve exactly `[at, at + len)` out of its placeholder first: a head split
-    // (when the run starts inside the placeholder) and then the run itself,
-    // each preserving both halves. A single call only splits at one edge, so a
-    // middle run would not become a replaceable placeholder.
-    let Some((base, end)) = placeholder_bounds(at, len) else {
-        tracing::warn!(
-            at = format_args!("{at:#x}"),
-            len,
-            "a committed virtual run is not inside one placeholder"
-        );
-        return false;
-    };
-    unsafe {
-        if at > base {
-            // SAFETY: the placeholder's head; both halves stay placeholders.
-            HostVirtualFree(
-                base as *mut c_void,
-                at - base,
-                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-            );
-        }
-        if at + len < end {
-            // SAFETY: the run itself, preserved as the placeholder to replace;
-            // its tail becomes a placeholder of its own.
-            HostVirtualFree(
-                at as *mut c_void,
-                len,
-                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-            );
-        }
-    }
-    // A data view cannot be mapped with every protection a commit may ask for,
-    // so map it read-write and apply the protection afterwards.
-    // SAFETY: `[at, at + len)` is now one placeholder of this reservation.
-    let view = unsafe {
-        MapViewOfFile3(
-            section.handle,
-            GetCurrentProcess(),
-            at as *const c_void,
-            file_offset as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if view.Value as usize != at {
-        tracing::warn!(
-            at = format_args!("{at:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "mapping a committed virtual run failed"
-        );
-        return false;
-    }
-    true
-}
-
-/// Returns one committed run to its placeholder, keeping the reservation.
-fn unmap_commit(at: usize, len: usize) -> bool {
-    // SAFETY: the view mapped at `at`; it becomes a placeholder again.
-    let unmapped = unsafe {
-        UnmapViewOfFile2(
-            GetCurrentProcess(),
-            MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: at as *mut c_void,
-            },
-            MEM_PRESERVE_PLACEHOLDER,
-        )
-    };
-    if unmapped == 0 {
-        tracing::warn!(
-            at = format_args!("{at:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "unmapping a committed virtual run failed"
-        );
-        return false;
-    }
-    victory_gpu::title_memory_remapped(at, len);
-    true
-}
-
-/// The parts of `[from, from + len)` no physical-page view already shows:
-/// those pages are committed already and are not ours to map.
-fn without_views(physical: &Physical, from: usize, len: usize) -> Vec<(usize, usize)> {
-    let end = from.saturating_add(len);
-    let mut runs = vec![(from, len)];
-    for (&view_base, (view_len, _)) in physical.views.range(..end) {
-        let view_end = view_base.saturating_add(*view_len);
-        if view_end <= from {
-            continue;
-        }
-        let mut next = Vec::with_capacity(runs.len() + 1);
-        for (run_at, run_len) in runs {
-            let run_end = run_at.saturating_add(run_len);
-            if view_end <= run_at || view_base >= run_end {
-                next.push((run_at, run_len));
-                continue;
-            }
-            if run_at < view_base {
-                next.push((run_at, view_base - run_at));
-            }
-            if view_end < run_end {
-                next.push((view_end, run_end - view_end));
-            }
-        }
-        runs = next;
-    }
-    runs
-}
-
-/// Maps and records `[at, at + size)` inside its reservation.
-fn commit_pages(at: usize, size: usize, protect: u32) -> bool {
-    if !at.is_multiple_of(PAGE) || size == 0 {
-        virtual_failure("a commit is not page aligned", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    // Plan under the lock: the runs no committed view and no physical-page
-    // view already covers, and the committed pieces whose protection changes.
-    let plan = {
-        let physical = physical();
-        let Some((base, region)) = physical.reservation_at(at) else {
-            virtual_failure("commit names no reservation", ERROR_INVALID_ADDRESS);
-            return false;
-        };
-        if !region.placeholder {
-            virtual_failure(
-                "the reservation holds no placeholder for a committed view",
-                ERROR_INVALID_ADDRESS,
-            );
-            return false;
-        }
-        let offset = at - base;
-        let Some(end) = offset.checked_add(size) else {
-            virtual_failure("commit size overflows", ERROR_INVALID_ADDRESS);
-            return false;
-        };
-        if end > region.size {
-            virtual_failure("commit past the reservation", ERROR_INVALID_ADDRESS);
-            return false;
-        }
-        let mut runs = Vec::new();
-        for (gap_offset, gap_len) in region.gaps(offset, size) {
-            runs.extend(without_views(&physical, base + gap_offset, gap_len));
-        }
-        (base, runs, region.pieces(offset, size))
-    };
-    let (base, runs, pieces) = plan;
-    // Map one section per run: sized to the run, so a small commit into a huge
-    // reservation costs a small file.
-    let mut mapped: Vec<(usize, usize, Committed)> = Vec::with_capacity(runs.len());
-    for (run_at, run_len) in runs {
-        let Some(section) = commit_backing(run_len) else {
-            for (at, len, _) in mapped {
-                unmap_commit(at, len);
-            }
-            tracing::warn!(
-                size = run_len,
-                "a committed virtual run has no backing section"
-            );
-            return false;
-        };
-        if !map_commit(&section, run_at, 0, run_len) {
-            for (at, len, _) in mapped {
-                unmap_commit(at, len);
-            }
-            return false;
-        }
-        mapped.push((
-            run_at,
-            run_len,
-            Committed {
-                len: run_len,
-                protect,
-                section,
-                file_offset: 0,
-            },
-        ));
-    }
-    let Some(end) = at.checked_add(size) else {
-        return false;
-    };
-    {
-        let mut physical = physical();
-        let Some((_, region)) = physical.reservation_mut(at) else {
-            for (at, len, _) in mapped {
-                unmap_commit(at, len);
-            }
-            return false;
-        };
-        for (piece_offset, piece_len, old) in pieces {
-            if old != protect {
-                region.reprotect(piece_offset, piece_len, protect);
-            }
-        }
-        for (run_at, _, run) in mapped {
-            region.commits.insert(run_at - base, run);
-        }
-        drop(physical);
-        if protect != PAGE_READWRITE {
-            // Best-effort: a data view grants the commit's protection through
-            // `VirtualProtect`, which an executable page may refuse.
-            let mut previous = PAGE_NOACCESS;
-            // SAFETY: every page of the range is now a mapped view.
-            if unsafe {
-                VirtualProtect(at as *const c_void, size, protect, &mut previous)
-            } == 0
-            {
-                tracing::debug!(
-                    at = format_args!("{at:#x}"),
-                    size,
-                    protect = format_args!("{protect:#x}"),
-                    error = %std::io::Error::last_os_error(),
-                    "a committed run keeps read-write instead of its requested protection"
-                );
-            }
-        }
-    }
-    victory_gpu::title_memory_remapped(at, end - at);
-    VIRTUAL_COMMITS.fetch_add(1, Ordering::Relaxed);
-    VIRTUAL_COMMITTED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    tracing::debug!(
-        at = format_args!("{at:#x}"),
-        size,
-        protect = format_args!("{protect:#x}"),
-        "XMemVirtualAlloc committed"
-    );
-    true
-}
-
-/// Decommits `[at, at + size)` inside a reservation: its pages become
-/// inaccessible but keep their address space. The bytes are zeroed through
-/// the view first, so a re-commit reads zeros deterministically.
-fn virtual_decommit(at: usize, size: usize) -> bool {
-    let Some(len) = size.checked_next_multiple_of(PAGE) else {
-        virtual_failure("decommit size overflows", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    if !at.is_multiple_of(PAGE) || len == 0 {
-        virtual_failure("decommit is not page aligned", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    let mut physical = physical();
-    let Some((base, region)) = physical.reservation_mut(at) else {
-        virtual_failure("decommit names no reservation", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    let offset = at - base;
-    let Some(end) = offset.checked_add(len) else {
-        virtual_failure("decommit overflows", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    if end > region.size {
-        virtual_failure("decommit past the reservation", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    // Physical-page views in the range go back to placeholders too.
-    unmap(&mut physical, at, len);
-    let Some((base, region)) = physical.reservation_mut(at) else {
-        virtual_failure("decommit names no reservation", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    let affected: Vec<(usize, Committed)> = region
-        .commits
-        .range(..end)
-        .filter(|(start, run)| start.saturating_add(run.len) > offset)
-        .map(|(&start, run)| (start, run.clone()))
-        .collect();
-    for (start, run) in affected {
-        let stop = start + run.len;
-        let (zero_from, zero_to) = (offset.max(start), end.min(stop));
-        if zero_to > zero_from && run.protect & WRITABLE != 0 {
-            // SAFETY: the run is a live read-write view covering the bytes.
-            unsafe {
-                std::ptr::write_bytes((base + zero_from) as *mut u8, 0, zero_to - zero_from)
-            };
-        }
-        unmap_commit(base + start, run.len);
-        region.commits.remove(&start);
-        // A run reaching past the decommitted range keeps its remainder.
-        if start < zero_from {
-            let left = zero_from - start;
-            if map_commit(&run.section, base + start, run.file_offset, left) {
-                region.commits.insert(
-                    start,
-                    Committed {
-                        len: left,
-                        ..run.clone()
-                    },
-                );
-            }
-        }
-        if stop > zero_to {
-            let right = stop - zero_to;
-            if map_commit(
-                &run.section,
-                base + zero_to,
-                run.file_offset + (zero_to - start),
-                right,
-            ) {
-                region.commits.insert(
-                    zero_to,
-                    Committed {
-                        len: right,
-                        file_offset: run.file_offset + (zero_to - start),
-                        ..run
-                    },
-                );
-            }
-        }
-    }
-    drop(physical);
-    VIRTUAL_DECOMMITS.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(
-        at = format_args!("{at:#x}"),
-        len,
-        "XMemVirtualAlloc decommitted"
-    );
-    true
-}
-
-/// Applies `MEM_RESET`/`MEM_RESET_UNDEFINED` to a committed range: the pages
-/// stay committed but their old contents are discarded.
-fn virtual_reset(at: usize, size: usize, undefined: bool) -> bool {
-    let Some(len) = size.checked_next_multiple_of(PAGE) else {
-        virtual_failure("reset size overflows", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    if !at.is_multiple_of(PAGE) || len == 0 {
-        virtual_failure("reset is not page aligned", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    let mut physical = physical();
-    let Some((base, region)) = physical.reservation_mut(at) else {
-        virtual_failure("reset names no reservation", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    let offset = at - region.base;
-    let Some(end) = offset.checked_add(len) else {
-        virtual_failure("reset overflows", ERROR_INVALID_ADDRESS);
-        return false;
-    };
-    if end > region.size {
-        virtual_failure("reset past the reservation", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    // Every byte must already be committed: only then may it be reset.
-    let mut cursor = offset;
-    while cursor < end {
-        match region.committed_at(cursor) {
-            Some((start, run)) => cursor = (start + run.len).min(end),
-            None => break,
-        }
-    }
-    if cursor < end {
-        virtual_failure("reset does not name committed pages", ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    for (from, length, run) in region.partition(offset, len) {
-        if !undefined && run.protect & WRITABLE != 0 {
-            // SAFETY: the piece is a live read-write view covering the bytes.
-            unsafe { std::ptr::write_bytes((base + from) as *mut u8, 0, length) };
-        }
-        region.commits.insert(from, run);
-    }
-    drop(physical);
-    VIRTUAL_RESETS.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(at = format_args!("{at:#x}"), len, undefined, "XMemVirtualAlloc reset");
-    true
-}
-
-/// Frees a virtual region: every committed and physical-page view returns to
-/// a placeholder, then the address space is released.
-fn virtual_release(at: usize) -> bool {
-    let mut physical = physical();
-    let Some(region) = physical.reservations.remove(&at) else {
-        return false;
-    };
-    unmap(&mut physical, at, region.size);
-    let commits: Vec<(usize, usize)> = region
-        .commits
-        .iter()
-        .map(|(&offset, run)| (at + offset, run.len))
-        .collect();
-    drop(physical);
-    for (run_at, len) in commits {
-        unmap_commit(run_at, len);
-    }
-    victory_gpu::unalias_region(at);
-    // SAFETY: the placeholder reservation this module made, with every view
-    // gone; a whole reservation's split pieces are released together.
-    let freed = unsafe { HostVirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
-    if freed == 0 {
-        tracing::warn!(
-            at = format_args!("{at:#x}"),
-            error = %std::io::Error::last_os_error(),
-            "releasing a virtual region reservation failed"
-        );
-    }
-    VIRTUAL_RELEASES.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(
-        at = format_args!("{at:#x}"),
-        size = region.size,
-        committed = region.commits.len(),
-        "XMemVirtualAlloc released"
-    );
-    true
-}
-
-/// The state `XMemVirtualQuery` reports for `at` when it lies in a virtual
-/// region; `None` for every other address (the host's own answer stands,
-/// physical-page views included).
-fn reservation_state(at: usize) -> Option<ReservationState> {
-    let physical = physical();
-    // A physical-page view inside a region is the host's to report, as
-    // before: the virtual region only answers for the pages it backs.
-    if physical
-        .views
-        .range(..=at)
-        .next_back()
-        .is_some_and(|(base, (size, _))| at < base.saturating_add(*size))
-    {
-        return None;
-    }
-    let (base, region) = physical.reservation_at(at)?;
-    // A 64 KiB physical-page reservation with no virtual commit keeps the
-    // host's answer (its views were checked above).
-    if region.physical_pages && region.commits.is_empty() {
-        return None;
-    }
-    let offset = at - base;
-    if let Some((start, run)) = region.committed_at(offset) {
-        let stop = (start + run.len).min(region.size);
-        return Some(ReservationState {
-            base: base + start,
-            allocation_base: base,
-            allocation_protect: region.allocation_protect,
-            size: stop - start,
-            state: MEM_COMMIT,
-            protect: run.protect,
-        });
-    }
-    // A reserved gap: up to the next commit or the end of the region.
-    let next = region
-        .commits
-        .range(offset..)
-        .next()
-        .map_or(region.size, |(&start, _)| start);
-    let start = region
-        .commits
-        .range(..offset)
-        .next_back()
-        .map_or(0, |(&start, run)| start + run.len);
-    Some(ReservationState {
-        base: base + start,
-        allocation_base: base,
-        allocation_protect: region.allocation_protect,
-        size: next.saturating_sub(start),
-        state: MEM_RESERVE,
-        protect: PAGE_NOACCESS,
-    })
-}
-
 impl Drop for Section {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
@@ -1804,10 +644,6 @@ struct Physical {
     /// follows writes through one view to the others,
     /// `victory_gpu::title_memory_aliased`).
     shown: HashMap<(usize, usize), Vec<usize>>,
-    /// Address space `XMemVirtualAlloc` handed out, by base: reservations
-    /// own no bytes; each committed run is a view of its own share file
-    /// (ADR-045).
-    reservations: BTreeMap<usize, Reservation>,
 }
 
 impl Slice {
@@ -2257,7 +1093,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        HostVirtualFree(
+        VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
@@ -2861,7 +1697,7 @@ mod tests {
         // Not under Rosetta (`victory_gpu::fault_tracking`).
         assert_eq!(watched == 0, victory_gpu::fault_tracking());
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { HostVirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -2875,7 +1711,7 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { HostVirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
