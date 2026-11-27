@@ -2755,26 +2755,12 @@ fn texture_dimension_from_code(code: u8) -> Option<TextureDimension> {
 /// pipeline-state numbering), where `R32Uint`/`R32Sint` are codes 18 and 19;
 /// the two spaces never decode each other's bytes.
 fn texture_format_from_code(code: u8) -> Option<TextureFormat> {
-    Some(match code {
-        0 => TextureFormat::Rgba8Unorm,
-        1 => TextureFormat::Bgra8Unorm,
-        2 => TextureFormat::Rgba8Srgb,
-        3 => TextureFormat::R32Float,
-        4 => TextureFormat::R16Float,
-        5 => TextureFormat::Rg11g11b10Float,
-        6 => TextureFormat::Rgb10a2Unorm,
-        7 => TextureFormat::Depth32Float,
-        8 => TextureFormat::Depth32FloatStencil8,
-        // RGBA16Float (DXGI_FORMAT_R16G16B16A16_FLOAT), the title's
-        // SDR-presented FP16 back-buffer.
-        9 => TextureFormat::Rgba16Float,
-        // R32_UINT and R32_SINT integer storage/colour targets. MTL 53/54.
-        10 => TextureFormat::R32Uint,
-        11 => TextureFormat::R32Sint,
-        // Codes 12 and above stay unsupported and are rejected before the
-        // executor sees a descriptor.
-        _ => return None,
-    })
+    // ADR-033: the canonical table owns the kind 8 code space. Codes 0-11 keep
+    // their historical meaning (RGBA8, BGRA8, RGBA8 sRGB, R32F, R16F,
+    // R11G11B10F, RGB10A2, D32F, D32S8, RGBA16F, R32Uint, R32Sint); every
+    // later code is the canonical table's `wire` value, so a guest format the
+    // table maps is accepted here without a second partial match.
+    TextureFormat::from_wire_code(code)
 }
 
 /// Maps a kind 8 usage code to a registry usage set.
@@ -2802,9 +2788,14 @@ fn texture_usage_from_code(code: u8) -> Option<TextureUsage> {
 /// sampled or depth use is left exactly as sent.
 fn texture_usage_for_format(code: u8, format: TextureFormat) -> Option<TextureUsage> {
     let usage = texture_usage_from_code(code)?;
-    if !matches!(format, TextureFormat::R32Uint | TextureFormat::R32Sint)
-        || (!usage.render_target && !usage.shader_write)
-    {
+    if (!usage.render_target && !usage.shader_write) || format.is_depth_stencil() {
+        return Some(usage);
+    }
+    // ADR-033: an integer storage target (R8/R16/R32 UINT or SINT, including the
+    // title's 640x360 R8_UINT pass) is readable, writable and attachable. The
+    // historical R32-only widening could not express any other integer format.
+    let name = format.name();
+    if !name.contains("UINT") && !name.contains("SINT") {
         return Some(usage);
     }
     Some(TextureUsage {
@@ -5237,17 +5228,56 @@ mod tests {
         assert!(request.desc.validate().is_ok());
     }
 
-    /// Codes 12 and above are still refused explicitly: the decoder returns
-    /// no format, so no default host format can be substituted.
+    /// ADR-033: every canonical table row is decodable by its kind 8 wire code,
+    /// so the host no longer keeps a second partial format map. Codes the table
+    /// does not own stay refused with no default substitution.
     #[test]
-    fn host_format_codes_above_11_are_refused() {
-        for code in 12..=u8::MAX {
-            assert_eq!(texture_format_from_code(code), None, "code {code}");
-            assert!(
-                decode_texture_request(&texture_registration_payload(code)).is_none(),
-                "code {code}"
+    fn host_wire_codes_follow_the_canonical_table() {
+        for format in TextureFormat::ALL {
+            let code = format.wire_code();
+            assert_eq!(
+                texture_format_from_code(code),
+                Some(format),
+                "wire code {code} ({})",
+                format.name()
             );
         }
+        for code in 0..=u8::MAX {
+            let mapped = texture_format_from_code(code);
+            assert_eq!(
+                mapped.is_some(),
+                TextureFormat::from_wire_code(code).is_some(),
+                "code {code}"
+            );
+            if mapped.is_none() {
+                assert!(decode_texture_request(&texture_registration_payload(code)).is_none());
+            }
+        }
+    }
+
+    /// Boot #3: the 640x360 UAV+RT target the title stopped on is DXGI 62
+    /// (`R8_UINT`, Metal `R8Uint` 13). Its kind 8 wire code decodes, and the
+    /// integer widening makes one host texture legal as a UAV write and an RTV.
+    #[test]
+    fn the_640x360_r8_uint_target_registers() {
+        let format = TextureFormat::from_dxgi(62).expect("DXGI 62 is mapped");
+        assert_eq!(format, TextureFormat::R8Uint);
+        assert_eq!(format.mtl_pixel_format(), 13);
+        let code = format.wire_code();
+        assert_eq!(texture_format_from_code(code), Some(format));
+
+        let mut payload = texture_registration_payload(code);
+        payload[14] = 1; // colour attachment
+        payload[16..20].copy_from_slice(&640u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&360u32.to_le_bytes());
+        let request = decode_texture_request(&payload)
+            .expect("a 640x360 R8_UINT UAV+RT target is a valid registration");
+        assert_eq!(request.desc.format, format);
+        assert_eq!((request.desc.width, request.desc.height), (640, 360));
+        assert!(request.desc.usage.shader_read);
+        assert!(request.desc.usage.shader_write);
+        assert!(request.desc.usage.render_target);
+        assert!(request.desc.validate().is_ok(), "the descriptor is accepted");
     }
 
     /// A GPU `ExecutionFailed` is a per-submission refusal, not a protocol
