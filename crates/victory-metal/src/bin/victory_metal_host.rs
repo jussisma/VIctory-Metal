@@ -1004,6 +1004,13 @@ fn serve_session(
     pipeline_handles: &Arc<AtomicU64>,
     aaa_frame: bool,
 ) -> Result<(), String> {
+    // On macOS an accepted socket inherits the listener's non-blocking flag, so
+    // a `--once` daemon whose listener is non-blocking would hand every session
+    // an EAGAIN stream. A session is always a blocking stream with the host's
+    // bounded I/O timeout.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot make the session from {peer} blocking: {error}"))?;
     let executor = build_executor(transport, stats, window);
     let mut host = IpcHost::new(secret, share, executor)
         .map_err(|error| format!("cannot start the session for {peer}: {error}"))?
@@ -1371,21 +1378,53 @@ fn run(args: Args) -> Result<(), String> {
         .flush()
         .map_err(|error| format!("cannot flush the ready banner: {error}"))?;
 
-    let mut outcome = Ok(());
+    // Every exit of the accept loop assigns the outcome; `--once` returns its
+    // render session's result and an accept failure returns the error. The
+    // teardown below may replace a success with a D3DMetal/telemetry failure.
+    let mut outcome: Result<(), String>;
     let mut sessions: Vec<thread::JoinHandle<()>> = Vec::new();
     let active = Arc::new(AtomicUsize::new(0));
+    // `--once` serves one GUEST, not one socket: ADR-041 gives the guest a
+    // dedicated pipeline connection beside its render connection, so the
+    // document's "serve exactly one session" means the whole guest. The first
+    // peer is the render session and decides the exit status; accepting stops
+    // when it ends, and the pipeline session it opened is joined with it.
+    let primary: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+    let mut primary_taken = false;
+    if args.once {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot make the listener non-blocking: {error}"))?;
+    }
     loop {
         // Reap finished session handles so a long-lived daemon does not grow
         // one `JoinHandle` per connection forever.
         sessions.retain(|session| !session.is_finished());
 
-        let (stream, peer) = match listener.accept() {
-            Ok(accepted) => accepted,
+        let accepted = match listener.accept() {
+            Ok(accepted) => Some(accepted),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
             Err(error) => {
                 outcome = Err(format!("accept failed: {error}"));
                 break;
             }
+        };
+        let Some((stream, peer)) = accepted else {
+            // Only `--once` has a non-blocking listener: it is done as soon as
+            // its render session returned.
+            if args.once {
+                let finished = primary
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                if let Some(result) = finished {
+                    outcome = result;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            continue;
         };
         if !peer.ip().is_loopback() {
             // Binding is loopback-only, so this cannot normally happen; refuse
@@ -1393,23 +1432,6 @@ fn run(args: Args) -> Result<(), String> {
             eprintln!("victory-metal-host: refused a non-loopback peer {peer}");
             let _ = stream.shutdown(Shutdown::Both);
             continue;
-        }
-
-        // `--once` keeps its documented meaning: serve exactly one connection
-        // on this thread, then exit. Its failure is the daemon's exit status.
-        if args.once {
-            outcome = serve_session(
-                stream,
-                peer,
-                &share.path,
-                args.secret,
-                &stats,
-                &transport,
-                window.clone(),
-                &pipeline_handles,
-                args.aaa_frame,
-            );
-            break;
         }
 
         if active.load(Ordering::Acquire) >= MAX_CONCURRENT_SESSIONS {
@@ -1422,10 +1444,13 @@ fn run(args: Args) -> Result<(), String> {
         }
         active.fetch_add(1, Ordering::AcqRel);
 
+        let is_primary = !primary_taken;
+        primary_taken = true;
         let stats = Arc::clone(&stats);
         let transport = Arc::clone(&transport);
         let pipeline_handles = Arc::clone(&pipeline_handles);
         let active = Arc::clone(&active);
+        let primary = Arc::clone(&primary);
         let window = window.clone();
         let share_path = share.path.clone();
         let secret = args.secret;
@@ -1442,7 +1467,10 @@ fn run(args: Args) -> Result<(), String> {
                 &pipeline_handles,
                 aaa_frame,
             );
-            if let Err(error) = result {
+            if is_primary {
+                // The render session's result is the daemon's exit status.
+                *primary.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(result);
+            } else if let Err(error) = result {
                 // One peer's protocol or transport failure must not stop the
                 // other sessions, so it is recorded and logged instead.
                 {
