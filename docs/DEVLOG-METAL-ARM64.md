@@ -1173,3 +1173,127 @@ the host decodes eleven.
 - **Retail shader translation is unexercised.** No title pipeline reached the
   converter in these boots; the 19/21 mesh-pair and 111 compute census remains
   historical.
+
+## Cycle 09 — structural unblock: the complete format table, lazy buffer registration, wire failure text, and a title-side assert
+
+Base `c78ef5f5` (cycle-08). This cycle removed the three structural blockers
+Cycle 08 identified, then pushed the same locally authorized title past resource
+probes into its full render-target set and descriptor-heap binding. No
+proprietary binary, asset, key or path is recorded here: only counts, DXGI
+values, categories and frame times. Every number comes from a run in this
+workspace on the Apple M4 Max.
+
+### 9.1 What changed
+
+- **ADR-033 — one canonical DXGI→MTLPixelFormat table.** The three partial maps
+  (`PixelFormat` in the host views module, the host `TextureFormat` code table,
+  and the guest wire/PSO code mirrors) are replaced by a 93-row table: 91
+  DXGI-backed rows plus two Metal-only sRGB mirrors. Every row answers dxgi
+  value, Metal pixel format, one-byte PSO code, one-byte kind 8 wire code,
+  view family, depth kind, element size, sRGB pair, typeless base and
+  view-compatibility. `*_TYPELESS` resources are created with
+  `MTLTextureUsagePixelFormatView` and a compatible base format; typed views
+  are accepted inside a family only. Existing codes 0–19 (PSO) and 0–11
+  (kind 8) keep their meaning. The SDK enumeration is authoritative: **62 is
+  `R8_UINT` (Metal 13), 63 `R8_SNORM`, 64 `R8_SINT`, 65 `A8_UNORM`,
+  57 `R16_UINT`, 87 `B8G8R8A8_UNORM`, 88 `B8G8R8X8_UNORM`**; the cycle
+  directive's guessed names were off by one and are corrected in the table and
+  tests. Formats Metal cannot express stay explicit named refusals.
+- **ADR-034 — lazy first-bind buffer registration.** One idempotent helper
+  family resolves a guest address or a resolved range, registers ascending (the
+  host closes a session on a decreasing id), discovers a share backing that
+  appeared after bind time, and never caps buffer size. The Boot #2 set
+  (182,452,224 B plus four 19,680 B plus 352 B) is reproduced in tests and
+  registers in one ascending sequence; copy, indirect and both descriptor-table
+  paths use the same helper.
+- **ADR-035 — bounded failure reason on Wire v3 error replies.** An error reply
+  may carry `VMR3`, a u16 length and up to 256 UTF-8 bytes, truncated on a
+  character boundary. Legacy four-byte payloads and v3 success replies stay
+  byte-identical; the guest logs one `METAL_HOST_ERROR sequence=<n> reason=…`
+  line and keeps a bounded count plus the last reason in telemetry.
+- **Diagnostics that made the next failure visible.** A hermetic boot census
+  (`tools/macos/metal-poc/boot-census.py`, 224 assertions, `--gate`), a bounded
+  first-failure latch across descriptor/resource create and `Map`
+  (`call_failures` / `first_call_failure`), a pipeline attempt census
+  (`pipeline_attempts` by kind and outcome with the first bounded refusal), a
+  descriptor-heap binding census (`heaps_bound`, `heaps_distinct`,
+  `heaps_last`, `heap_bind_refusals`), and descriptor-heap memory taken from the
+  title's own allocator when one is installed.
+- **The native `SetDescriptorHeaps` gap.** The binding path routed through a
+  state helper that returns early when no host D3D12 list exists, so on
+  `VICTORY_BACKEND=metal` every title binding was dropped silently. The
+  classification is now shared: the host path keeps its slot selection, the
+  native path records the same binds.
+- **DStorage duplicate lanes.** Eleven identical queue descriptions in one
+  startup shared one scheduler lane (bounded dedup map of 64 descriptions,
+  per-object status arrays, unchanged single-queue behaviour).
+
+### 9.2 Boot progression (counts only)
+
+| | Boot #1 | Boot #2 | Boot #3 | Boot #4 | Boot #5 |
+|---|---|---|---|---|---|
+| head | `44df1d70` | `c78ef5f5` | `6d8eb117` | `58319d96` | `c652a848` |
+| host D3D12 (D3DMetal) device | yes | **no** | **no** | **no** | **no** |
+| fallback count | 0 | 0 | 0 | 0 | 0 |
+| host submissions / frames in window | 0 / 0 | 2 / 2 | 2 / 2 | 2 / 2 | 2 / 2 |
+| host p50 / p95 ms | — | 0.008 / 2.873 | 0.015 / 2.119 | 0.006 / 1.882 | 0.006 / 2.201 |
+| guest p50 / p95 ms | — | 0.400 / 3.952 | 0.470 / 3.954 | 0.245 / 3.048 | 0.271 / 3.602 |
+| unmapped-format refusals | 1 | 1 (DXGI 62) | **0** | **0** | **0** |
+| buffers created before the resolver | 6 | 6 | 8 | 8 | 8 |
+| descriptor heaps created / bound | — | — | 10 / not recorded | 10 / not recorded | 10 / 4 (2 distinct) |
+| pipeline attempts / created | — | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| furthest event | first present attempt, then assert | 2 submissions, then DXGI 62 abort | 2 submissions, full RT set + 10 heaps, then title assert | same | same, with heaps bound and audited |
+| surviving processes | 0 | 0 | 0 | 0 | 0 |
+
+The 640x360 `R8_UINT` UAV+RT target that aborted Boot #2 now registers and is
+accepted as one texture that is readable, writable and attachable. Boot #3
+continued into a 1024x1024 `D32_FLOAT_S8X24` texture, three 994x624 and four
+3840x2160 `B8G8R8A8` textures, ten CBV_SRV_UAV descriptor heaps of 3128
+descriptors, one 460,800 B and one 16 B buffer, and a 4K `BGRA8` present
+surface before it stopped.
+
+### 9.3 Why the title still stops
+
+The fault at title image `+0x2215c35` is not a dereference of one of our null
+returns: it is the title's own fatal-assert stub — `movl $0,0x0; int3` —
+reached from a guard loop over a table with a 0x48-byte stride whose addresses
+come from globals next to the title's `__XMemAllocationHooks__`. At that point
+`call_failures=0` (no instrumented export returned a failure or left a null
+output), `pipeline_attempts=0` (no shader was attempted yet) and
+`heap_bind_refusals=0` (the bound heaps were accepted). The remaining condition
+is inside the title's own resource/heap validation, not an unmapped format, a
+refused registration or a wire error. Resolving it needs the guard's predicate,
+which this cycle did not establish.
+
+### 9.4 Counts at the integration head
+
+- `victory-metal` lib **308 passed / 0 failed / 6 ignored**; `victory-gpu`
+  **303 / 0 / 1**; `victory-shader` **254 / 0 / 2**; Wine `victory-hle`
+  **183 / 0 / 1**; `victory` bin **16 / 0 / 0**; DStorage subset under Wine
+  **20 / 0 / 0** (three new lane-sharing tests included).
+- Win64 `diag` build exit 0; `victory-metal` and `victory-hle` Windows
+  all-targets exit 0; `victory-gpu` (diagnostics) Windows all-targets exit 0;
+  x86_64 `victory-irconverter` exit 0.
+- `boot-census.py --gate` exit 0 on Boot #3, #4 and #5 (fallback 0, host D3D12
+  attempts 0, no surviving process); `git diff --check` clean; `pgrep` clean
+  after every boot.
+- GPU proofs: the format-table proof created 8 textures and every typed view on
+  the M4 Max (6/6 ignored tests pass); heap-memory and heap-binding tests are
+  host-side.
+
+### 9.5 Remaining gaps (honest)
+
+- **The title still stops before its first pipeline**, so no retail shader has
+  been compiled, no 3D draw or compute dispatch has been submitted, and no
+  world frame is validated. The pipeline census is ready to report the moment
+  the title reaches one.
+- **The assert predicate is unknown.** The next cycle should read the guard
+  (the 0x48-stride table and the float comparison) or bisect it by supplying
+  console-exact heap and allocation metadata; descriptor heap memory still
+  landed at host allocator addresses, not in the title's XMem range.
+- **Six create-time registrations still fail** (the pre-resolver buffers); the
+  bind-time lazy path covers them, but the create-time counter still reports 6.
+- **One submission per boot is refused guest-side** in every boot since #2; it
+  is not a host refusal and is still unnamed.
+- **Present counts are not asserted.** `present_status=0` and `graphics_status=0`
+  are success codes; no frame checksum is read back in title mode.
