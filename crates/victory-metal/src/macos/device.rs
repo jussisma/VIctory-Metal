@@ -20,8 +20,8 @@ use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
 use crate::macos::msc::{self, MscUavDispatch};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::registry::{
-    PipelineKey, PipelineRegistry, PipelineStage, RegistryError, TextureDesc, TextureFormat,
-    TextureRegistry,
+    PipelineKey, PipelineRegistry, PipelineStage, RegistryError, StageLibrary, TextureDesc,
+    TextureFormat, TextureRegistry,
 };
 use crate::macos::render::{
     GraphicsPipeline, IndexType, LoadAction, MTL_BARRIER_SCOPE_BUFFERS, MTL_BARRIER_SCOPE_TEXTURES,
@@ -4801,6 +4801,23 @@ fn pipeline_abi(state: &DeviceState, id: u64) -> Option<PipelineAbi> {
     state.abis.get(&id).cloned()
 }
 
+/// Borrows the device's content-hashed pipeline registry, creating it on first
+/// use.
+fn content_pipeline_registry<'a>(
+    transport: &DirectMetalTransport,
+    state: &'a mut DeviceState,
+) -> Result<&'a mut PipelineRegistry, MetalError> {
+    if state.pipeline_registry.is_none() {
+        state.pipeline_registry = Some(PipelineRegistry::new(transport).map_err(registry_error)?);
+    }
+    state
+        .pipeline_registry
+        .as_mut()
+        .ok_or(MetalError::InternalError(
+            "pipeline registry was not created".to_string(),
+        ))
+}
+
 /// Maps a host-registry failure to the transport error surface.
 ///
 /// A Metal failure created inside the registry keeps its original
@@ -5069,6 +5086,71 @@ impl DirectMetalTransport {
         )
     }
 
+    /// Registers a content-hashed graphics pipeline from one library per stage.
+    ///
+    /// `stages` carries the vertex and pixel functions with the library each one
+    /// lives in, so a live `--stdio` pool that emits one metallib per stage is
+    /// registrable. Unlike
+    /// [`Self::register_content_hashed_graphics_pipeline`] the two functions
+    /// need not share a metallib; no bytes are concatenated. The content key
+    /// covers every stage's library, so a changed pixel library is a different
+    /// pipeline state.
+    pub fn register_content_hashed_graphics_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline_stages(
+            handle,
+            stages,
+            state,
+            PipelineStage::Graphics,
+            abi,
+        )
+    }
+
+    /// Registers a content-hashed mesh pipeline from one library per stage.
+    ///
+    /// `stages` carries the mesh, the fragment and (when the state names an
+    /// object entry) the object function, each in its own library.
+    pub fn register_content_hashed_mesh_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline_stages(
+            handle,
+            stages,
+            state,
+            PipelineStage::Mesh,
+            abi,
+        )
+    }
+
+    /// Registers a content-hashed compute pipeline from one library per stage.
+    ///
+    /// The kernel function is resolved in the stage that names it, never in an
+    /// assumed first library.
+    pub fn register_content_hashed_compute_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[StageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline_stages(
+            handle,
+            stages,
+            state,
+            PipelineStage::Compute,
+            abi,
+        )
+    }
+
     /// Registers a content-hashed compute pipeline under a wire `handle`.
     pub fn register_content_hashed_compute_pipeline(
         &self,
@@ -5104,16 +5186,7 @@ impl DirectMetalTransport {
         }
         let key = PipelineKey::from_parts(metallib, entry, stage, state_bytes);
         let mut state = self.lock_state()?;
-        if state.pipeline_registry.is_none() {
-            state.pipeline_registry =
-                Some(PipelineRegistry::new(self).map_err(registry_error)?);
-        }
-        let registry = state
-            .pipeline_registry
-            .as_mut()
-            .ok_or(MetalError::InternalError(
-                "pipeline registry was not created".to_string(),
-            ))?;
+        let registry = content_pipeline_registry(self, &mut state)?;
         let pipeline = match stage {
             PipelineStage::Graphics => {
                 registry.register_graphics(key, metallib, entry, state_bytes)
@@ -5122,6 +5195,34 @@ impl DirectMetalTransport {
             PipelineStage::Compute => {
                 registry.register_compute(key, metallib, entry, state_bytes)
             }
+        }
+        .map_err(registry_error)?;
+        state.content_pipelines.insert(handle, pipeline);
+        state.abis.insert(handle, abi);
+        Ok(())
+    }
+
+    /// Registers a content-hashed pipeline created from one library per stage.
+    fn register_content_hashed_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[StageLibrary<'_>],
+        state_bytes: &[u8],
+        stage: PipelineStage,
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        if handle == 0 {
+            return Err(MetalError::InvalidArg(
+                "content pipeline handle must be nonzero",
+            ));
+        }
+        let key = PipelineKey::from_stages(stages, stage, state_bytes);
+        let mut state = self.lock_state()?;
+        let registry = content_pipeline_registry(self, &mut state)?;
+        let pipeline = match stage {
+            PipelineStage::Graphics => registry.register_graphics_stages(key, stages, state_bytes),
+            PipelineStage::Mesh => registry.register_mesh_stages(key, stages, state_bytes),
+            PipelineStage::Compute => registry.register_compute_stages(key, stages, state_bytes),
         }
         .map_err(registry_error)?;
         state.content_pipelines.insert(handle, pipeline);

@@ -157,10 +157,14 @@
 //! A request whose first four bytes are [`PIPELINE_FRAME_MAGIC`] is the
 //! version 2 form. It names the pipeline kind, one `(stage, ticket, entry)` per
 //! stage, the encoded [`crate::macos::registry::PipelineState`], a `VAB1`
-//! per-stage ABI container and the raw root-signature bytes. Compute keeps the
-//! `load_metallib` family; graphics and mesh create content-hashed pipelines
-//! through the registry. Every field is validated before the executor runs, so
-//! a malformed frame creates no GPU work and consumes no ticket.
+//! per-stage ABI container and the raw root-signature bytes. Every family is
+//! created from the stage libraries the frame names: the vertex function comes
+//! from the vertex stage's own metallib and the fragment function from the pixel
+//! stage's own metallib (and likewise for mesh/object/pixel, while the staged
+//! compute form resolves the kernel in the compute stage's own library), so the
+//! persistent `--stdio` pool's one-library-per-stage output registers directly.
+//! Every field is validated before the executor runs, so a malformed frame
+//! creates no GPU work and consumes no ticket.
 //!
 //! # Allocation files
 //!
@@ -213,8 +217,8 @@ use crate::macos::bindings::RootSignatureLayout;
 use crate::macos::device::{DirectMetalTransport, PipelineAbi};
 use crate::macos::objc::{self, ObjcObject};
 use crate::macos::registry::{
-    PipelineStage as RegistryPipelineStage, PipelineState, TextureDesc, TextureDimension,
-    TextureFormat, TextureUsage,
+    FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
+    TextureDimension, TextureFormat, TextureUsage,
 };
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
@@ -322,6 +326,24 @@ pub const MAX_PIPELINE_ABI_BYTES: usize = 16 * 1024;
 pub const MAX_ROOT_SIGNATURE_BYTES: usize = 16 * 1024;
 /// Magic of the per-stage ABI container carried in a version 2 frame.
 pub const PIPELINE_ABI_MAGIC: [u8; 4] = *b"VAB1";
+
+/// One stage of a version 2 registration: the stage's own library and the entry
+/// point resolved inside it.
+///
+/// A version 2 frame names one ticket per stage, so a graphics or mesh pipeline
+/// can be built from distinct metallibs (the persistent `--stdio` pool emits one
+/// per stage). The slice is per stage on purpose: nothing downstream may assume
+/// a single library holds every function.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineStageLibrary<'a> {
+    /// Wire stage code, one of [`PIPELINE_STAGE_VERTEX`] to
+    /// [`PIPELINE_STAGE_COMPUTE`].
+    pub stage: u8,
+    /// The stage's own metallib bytes.
+    pub metallib: &'a [u8],
+    /// Entry point the executor resolves inside that library.
+    pub entry: &'a str,
+}
 
 const ENVELOPE_LEN: usize = 5;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -507,6 +529,61 @@ pub trait BatchExecutor {
         ))
     }
 
+    /// Registers a content-hashed graphics pipeline from one library per stage.
+    ///
+    /// `stages` carries the vertex and pixel functions with the library each one
+    /// lives in; the executor must resolve every function in its own library and
+    /// create one `MTLRenderPipelineState`. A missing function is an explicit
+    /// error naming the stage, never a fallback to another library.
+    ///
+    /// The default refuses the request: an executor that only implements the
+    /// single-library entry point must not silently build both functions from
+    /// the vertex library.
+    fn register_graphics_pipeline_stages(
+        &self,
+        _handle: u64,
+        _stages: &[PipelineStageLibrary<'_>],
+        _state: &[u8],
+        _abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "per-stage graphics pipeline registration is not enabled by this executor",
+        ))
+    }
+
+    /// Registers a content-hashed mesh pipeline from one library per stage.
+    ///
+    /// The default refuses the request; see
+    /// [`Self::register_graphics_pipeline_stages`].
+    fn register_mesh_pipeline_stages(
+        &self,
+        _handle: u64,
+        _stages: &[PipelineStageLibrary<'_>],
+        _state: &[u8],
+        _abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "per-stage mesh pipeline registration is not enabled by this executor",
+        ))
+    }
+
+    /// Registers a content-hashed compute pipeline from one library per stage.
+    ///
+    /// A compute pipeline has one kernel function, but the staged form keeps the
+    /// kernel in the library its own stage names rather than an assumed first
+    /// library.
+    fn register_compute_pipeline_stages(
+        &self,
+        _handle: u64,
+        _stages: &[PipelineStageLibrary<'_>],
+        _state: &[u8],
+        _abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        Err(MetalError::NotSupported(
+            "per-stage compute pipeline registration is not enabled by this executor",
+        ))
+    }
+
     /// Creates a registry texture under `id`.
     ///
     /// The default deliberately refuses the request, so texture registration is
@@ -612,6 +689,45 @@ impl BatchExecutor for DirectMetalTransport {
     ) -> Result<(), MetalError> {
         DirectMetalTransport::register_content_hashed_mesh_pipeline(
             self, handle, metallib, mesh_entry, state, abi,
+        )
+    }
+
+    fn register_graphics_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        let stages = registry_stages(stages)?;
+        DirectMetalTransport::register_content_hashed_graphics_pipeline_stages(
+            self, handle, &stages, state, abi,
+        )
+    }
+
+    fn register_mesh_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        let stages = registry_stages(stages)?;
+        DirectMetalTransport::register_content_hashed_mesh_pipeline_stages(
+            self, handle, &stages, state, abi,
+        )
+    }
+
+    fn register_compute_pipeline_stages(
+        &self,
+        handle: u64,
+        stages: &[PipelineStageLibrary<'_>],
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        let stages = registry_stages(stages)?;
+        DirectMetalTransport::register_content_hashed_compute_pipeline_stages(
+            self, handle, &stages, state, abi,
         )
     }
 
@@ -853,9 +969,13 @@ pub struct IpcHost<E: BatchExecutor> {
     surfaces: BTreeMap<u64, u64>,
     last_allocation_id: u64,
     last_pipeline_ticket: u64,
-    /// Next wire handle for a content-hashed graphics/mesh pipeline. Compute
-    /// pipelines keep using the executor's own `load_pipeline` id space.
+    /// Next wire handle for a content-hashed version 2 pipeline (graphics, mesh
+    /// and compute). The v1 compute request keeps using the executor's own
+    /// `load_pipeline` id space.
     next_content_pipeline: u64,
+    /// Why the last kind 4 request was refused, with the executor's stage-named
+    /// diagnostic when there is one. The wire answer stays one status byte.
+    last_pipeline_rejection: Option<String>,
     /// Opt-in shared completion page registered by kind 6.
     ///
     /// The mapping is reference-counted because the executor keeps a clone while
@@ -905,6 +1025,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             last_allocation_id: 0,
             last_pipeline_ticket: 0,
             next_content_pipeline: 1,
+            last_pipeline_rejection: None,
             fence_page: None,
             fence_page_attached: false,
             next_sequence: 1,
@@ -917,6 +1038,16 @@ impl<E: BatchExecutor> IpcHost<E> {
     pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
         self.io_timeout = timeout;
         self
+    }
+
+    /// Why the last kind 4 request was refused, if it was.
+    ///
+    /// The wire reply is one status byte, so this host-side record carries the
+    /// executor's stage-named diagnostic (a pixel library that does not contain
+    /// the pixel entry point, for example) without changing the protocol.
+    /// A successful registration clears it.
+    pub fn last_pipeline_rejection(&self) -> Option<&str> {
+        self.last_pipeline_rejection.as_deref()
     }
 
     /// Serves exactly one authenticated peer until clean disconnect or a
@@ -1608,19 +1739,31 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// root-signature bytes.
     ///
     /// Every field is validated before the executor is called, so a malformed
-    /// frame creates no GPU work and consumes no ticket. Graphics and mesh
-    /// pipelines use the registry's content-hashed entry points and the host's
-    /// own handle space; compute keeps the old `load_pipeline` family.
+    /// frame creates no GPU work and consumes no ticket. All three families use
+    /// the registry's content-hashed per-stage entry points and the host's own
+    /// handle space: each stage's function is resolved in the library its own
+    /// ticket names, so a `--stdio` pool that emits one metallib per stage is
+    /// registrable. A rejection is one status byte and leaves a diagnostic that
+    /// names the failing family (and, from the executor, the failing stage).
     fn register_pipeline_v2(&mut self, request: &PipelineRequestV2) -> Vec<u8> {
-        let validation = match validate_pipeline_v2(request) {
-            Ok(validation) => validation,
-            Err(()) => return vec![PIPELINE_REPLY_REJECTED],
+        self.last_pipeline_rejection = None;
+        let abi = match validate_pipeline_v2(request) {
+            Ok(abi) => abi,
+            Err(()) => {
+                self.last_pipeline_rejection =
+                    Some("version 2 pipeline frame failed validation".to_string());
+                return vec![PIPELINE_REPLY_REJECTED];
+            }
         };
         if request
             .stages
             .iter()
             .any(|stage| stage.ticket <= self.last_pipeline_ticket)
         {
+            self.last_pipeline_rejection = Some(format!(
+                "a stage ticket is not greater than the last accepted ticket {}",
+                self.last_pipeline_ticket
+            ));
             return vec![PIPELINE_REPLY_REJECTED];
         }
 
@@ -1630,50 +1773,60 @@ impl<E: BatchExecutor> IpcHost<E> {
         for stage in &request.stages {
             match read_pipeline_file(&self.share_dir, stage.ticket) {
                 Ok(metallib) => metallibs.push(metallib),
-                Err(_) => return vec![PIPELINE_REPLY_REJECTED],
+                Err(_) => {
+                    self.last_pipeline_rejection = Some(format!(
+                        "the {} stage file is missing or unreadable",
+                        pipeline_stage_label(stage.stage)
+                    ));
+                    return vec![PIPELINE_REPLY_REJECTED];
+                }
             }
         }
 
-        let id = match request.kind {
-            PIPELINE_KIND_COMPUTE => {
-                let index = validation.compute_stage;
-                match self
-                    .executor
-                    .load_pipeline(&metallibs[index], &request.stages[index].entry)
-                {
-                    Ok(pipeline) if pipeline.0 != 0 => pipeline.0,
-                    _ => return vec![PIPELINE_REPLY_REJECTED],
-                }
+        let stages: Vec<PipelineStageLibrary<'_>> = request
+            .stages
+            .iter()
+            .zip(&metallibs)
+            .map(|(stage, metallib)| PipelineStageLibrary {
+                stage: stage.stage,
+                metallib,
+                entry: &stage.entry,
+            })
+            .collect();
+        let handle = self.next_content_pipeline;
+        let outcome = match request.kind {
+            PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            PIPELINE_KIND_GRAPHICS => self.executor.register_graphics_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            PIPELINE_KIND_MESH => self.executor.register_mesh_pipeline_stages(
+                handle,
+                &stages,
+                &request.state,
+                abi,
+            ),
+            _ => {
+                self.last_pipeline_rejection = Some("unknown pipeline kind".to_string());
+                return vec![PIPELINE_REPLY_REJECTED];
             }
-            PIPELINE_KIND_GRAPHICS => {
-                let index = validation.graphics_vertex_stage;
-                let handle = self.next_content_pipeline;
-                match self.executor.register_graphics_pipeline(
-                    handle,
-                    &metallibs[index],
-                    &request.stages[index].entry,
-                    &request.state,
-                    validation.abi,
-                ) {
-                    Ok(()) => handle,
-                    Err(_) => return vec![PIPELINE_REPLY_REJECTED],
-                }
+        };
+        let id = match outcome {
+            Ok(()) => handle,
+            Err(error) => {
+                self.last_pipeline_rejection = Some(format!(
+                    "{} pipeline registration failed: {error}",
+                    pipeline_kind_label(request.kind)
+                ));
+                return vec![PIPELINE_REPLY_REJECTED];
             }
-            PIPELINE_KIND_MESH => {
-                let index = validation.mesh_stage;
-                let handle = self.next_content_pipeline;
-                match self.executor.register_mesh_pipeline(
-                    handle,
-                    &metallibs[index],
-                    &request.stages[index].entry,
-                    &request.state,
-                    validation.abi,
-                ) {
-                    Ok(()) => handle,
-                    Err(_) => return vec![PIPELINE_REPLY_REJECTED],
-                }
-            }
-            _ => return vec![PIPELINE_REPLY_REJECTED],
         };
 
         self.last_pipeline_ticket = request
@@ -1682,9 +1835,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             .map(|stage| stage.ticket)
             .max()
             .unwrap_or(self.last_pipeline_ticket);
-        if matches!(request.kind, PIPELINE_KIND_GRAPHICS | PIPELINE_KIND_MESH) {
-            self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
-        }
+        self.next_content_pipeline = self.next_content_pipeline.wrapping_add(1).max(1);
         pipeline_reply_ok(id)
     }
 }
@@ -1694,6 +1845,60 @@ fn pipeline_reply_ok(id: u64) -> Vec<u8> {
     reply.push(PIPELINE_REPLY_OK);
     reply.extend_from_slice(&id.to_le_bytes());
     reply
+}
+
+/// Human-readable name of a version 2 pipeline kind.
+fn pipeline_kind_label(kind: u8) -> &'static str {
+    match kind {
+        PIPELINE_KIND_COMPUTE => "compute",
+        PIPELINE_KIND_GRAPHICS => "graphics",
+        PIPELINE_KIND_MESH => "mesh",
+        _ => "unknown",
+    }
+}
+
+/// Human-readable name of a version 2 stage code.
+fn pipeline_stage_label(stage: u8) -> &'static str {
+    match stage {
+        PIPELINE_STAGE_VERTEX => "vertex",
+        PIPELINE_STAGE_PIXEL => "pixel",
+        PIPELINE_STAGE_MESH => "mesh",
+        PIPELINE_STAGE_OBJECT => "object",
+        PIPELINE_STAGE_COMPUTE => "compute",
+        _ => "unknown",
+    }
+}
+
+/// Maps one wire stage code to the registry role of the function it names.
+fn registry_stage_role(stage: u8) -> Result<FunctionRole, MetalError> {
+    Ok(match stage {
+        PIPELINE_STAGE_VERTEX => FunctionRole::Vertex,
+        PIPELINE_STAGE_PIXEL => FunctionRole::Fragment,
+        PIPELINE_STAGE_MESH => FunctionRole::Mesh,
+        PIPELINE_STAGE_OBJECT => FunctionRole::Object,
+        PIPELINE_STAGE_COMPUTE => FunctionRole::Kernel,
+        _ => {
+            return Err(MetalError::InvalidArg(
+                "pipeline stage code is not one an executor registers",
+            ));
+        }
+    })
+}
+
+/// Rewrites the frame's per-stage libraries as registry stage libraries.
+fn registry_stages<'a>(
+    stages: &'a [PipelineStageLibrary<'a>],
+) -> Result<Vec<StageLibrary<'a>>, MetalError> {
+    stages
+        .iter()
+        .map(|stage| {
+            Ok(StageLibrary {
+                role: registry_stage_role(stage.stage)?,
+                metallib: stage.metallib,
+                entry: stage.entry,
+            })
+        })
+        .collect()
 }
 
 impl<E: BatchExecutor> Drop for IpcHost<E> {
@@ -1826,14 +2031,6 @@ struct PipelineRequestV2 {
     root_signature: Vec<u8>,
 }
 
-/// Indices and ABI produced by [`validate_pipeline_v2`].
-struct PipelineValidation {
-    compute_stage: usize,
-    graphics_vertex_stage: usize,
-    mesh_stage: usize,
-    abi: PipelineAbi,
-}
-
 /// Decodes a kind 4 payload into a ticket and a validated entry name.
 fn decode_pipeline_request(payload: &[u8]) -> Option<PipelineRequest<'_>> {
     if payload.len() >= PIPELINE_FRAME_MAGIC.len()
@@ -1955,11 +2152,11 @@ fn decode_pipeline_request_v2(payload: &[u8]) -> Option<PipelineRequestV2> {
 }
 
 /// Validates a version 2 request against its kind, stage set, [`PipelineState`]
-/// and [`PipelineAbi`].
+/// and [`PipelineAbi`], returning the decoded ABI.
 ///
 /// Every failure is an explicit rejection before the executor is called; no
 /// partial pipeline is ever created.
-fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidation, ()> {
+fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineAbi, ()> {
     let mut previous_ticket = 0u64;
     let mut seen = Vec::with_capacity(request.stages.len());
     for stage in &request.stages {
@@ -1988,26 +2185,19 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidatio
             .position(|stage| stage.stage == stage_code)
     };
 
-    let mut validation = PipelineValidation {
-        compute_stage: 0,
-        graphics_vertex_stage: 0,
-        mesh_stage: 0,
-        abi: PipelineAbi::default(),
-    };
     let stage_count = request.stages.len();
     match request.kind {
         PIPELINE_KIND_COMPUTE => {
             if stage_count != 1 {
                 return Err(());
             }
-            let index = index_of(PIPELINE_STAGE_COMPUTE).ok_or(())?;
+            index_of(PIPELINE_STAGE_COMPUTE).ok_or(())?;
             if !request.state.is_empty()
                 && PipelineState::decode_for(&request.state, RegistryPipelineStage::Compute)
                     .is_err()
             {
                 return Err(());
             }
-            validation.compute_stage = index;
         }
         PIPELINE_KIND_GRAPHICS => {
             if stage_count != 2
@@ -2017,7 +2207,7 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidatio
             {
                 return Err(());
             }
-            let vertex = index_of(PIPELINE_STAGE_VERTEX).ok_or(())?;
+            index_of(PIPELINE_STAGE_VERTEX).ok_or(())?;
             let pixel = index_of(PIPELINE_STAGE_PIXEL).ok_or(())?;
             let state = PipelineState::decode_for(
                 &request.state,
@@ -2031,7 +2221,6 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidatio
             {
                 return Err(());
             }
-            validation.graphics_vertex_stage = vertex;
         }
         PIPELINE_KIND_MESH => {
             if !(2..=3).contains(&stage_count)
@@ -2044,7 +2233,7 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidatio
             {
                 return Err(());
             }
-            let mesh = index_of(PIPELINE_STAGE_MESH).ok_or(())?;
+            index_of(PIPELINE_STAGE_MESH).ok_or(())?;
             let pixel = index_of(PIPELINE_STAGE_PIXEL).ok_or(())?;
             let object = index_of(PIPELINE_STAGE_OBJECT);
             let state =
@@ -2065,16 +2254,15 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineValidatio
             {
                 return Err(());
             }
-            validation.mesh_stage = mesh;
         }
         _ => return Err(()),
     }
 
-    validation.abi = decode_pipeline_abi(&request.abi, request).ok_or(())?;
-    if !validation.abi.is_empty() && request.root_signature.is_empty() {
+    let abi = decode_pipeline_abi(&request.abi, request).ok_or(())?;
+    if !abi.is_empty() && request.root_signature.is_empty() {
         return Err(());
     }
-    Ok(validation)
+    Ok(abi)
 }
 
 /// Decodes the `VAB1` per-stage ABI container into a [`PipelineAbi`].
@@ -2496,11 +2684,15 @@ mod tests {
         v3_submissions: Vec<SubmissionV3>,
         v3_executions: u64,
         v3_not_supported: bool,
-        /// Content-hashed graphics registrations: `(handle, metallib, entry,
-        /// state, abi)`.
-        graphics_pipelines: Vec<(u64, Vec<u8>, String, Vec<u8>, PipelineAbi)>,
-        /// Content-hashed mesh registrations, same shape.
-        mesh_pipelines: Vec<(u64, Vec<u8>, String, Vec<u8>, PipelineAbi)>,
+        /// Content-hashed per-stage graphics registrations: `(handle, stages,
+        /// state, abi)` where each stage is `(wire code, metallib, entry)`.
+        graphics_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
+        /// Content-hashed per-stage mesh registrations, same shape.
+        mesh_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
+        /// Content-hashed per-stage compute registrations, same shape.
+        compute_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
+        /// Refusals the executor returned to the host, in arrival order.
+        refusals: Vec<String>,
     }
 
     struct StubExecutor {
@@ -2522,6 +2714,53 @@ mod tests {
 
         fn state(&self) -> MutexGuard<'_, StubState> {
             self.state.lock().expect("stub state mutex")
+        }
+
+        /// Records one per-stage registration, refusing an entry point the stub
+        /// pretends is absent from its own library.
+        ///
+        /// The real executor resolves every function in the library the stage
+        /// names; `ps_missing` (and `vm_fail` for any stage) stands in for a
+        /// library that does not contain the requested function, so its error
+        /// message names the failing stage exactly like a real Metal failure.
+        fn record_stages(
+            &self,
+            family: &'static str,
+            handle: u64,
+            stages: &[PipelineStageLibrary<'_>],
+            state: &[u8],
+            abi: PipelineAbi,
+        ) -> Result<(), MetalError> {
+            let recorded: Vec<(u8, Vec<u8>, String)> = stages
+                .iter()
+                .map(|stage| {
+                    (
+                        stage.stage,
+                        stage.metallib.to_vec(),
+                        stage.entry.to_string(),
+                    )
+                })
+                .collect();
+            if let Some(stage) = recorded
+                .iter()
+                .find(|stage| stage.2 == "ps_missing" || stage.2 == "vm_fail")
+            {
+                let message = format!(
+                    "the {} stage entry point `{}` was not found in its library",
+                    pipeline_stage_label(stage.0),
+                    stage.2
+                );
+                self.state().refusals.push(message.clone());
+                return Err(MetalError::InternalError(message));
+            }
+            let mut stub = self.state();
+            let record = (handle, recorded, state.to_vec(), abi);
+            match family {
+                "graphics" => stub.graphics_pipelines.push(record),
+                "mesh" => stub.mesh_pipelines.push(record),
+                _ => stub.compute_pipelines.push(record),
+            }
+            Ok(())
         }
     }
 
@@ -2628,52 +2867,34 @@ mod tests {
             Ok(VmPipelineId(id))
         }
 
-        fn register_graphics_pipeline(
+        fn register_graphics_pipeline_stages(
             &self,
             handle: u64,
-            metallib: &[u8],
-            vertex_entry: &str,
+            stages: &[PipelineStageLibrary<'_>],
             state: &[u8],
             abi: PipelineAbi,
         ) -> Result<(), MetalError> {
-            if vertex_entry == "vm_fail" {
-                return Err(MetalError::CompileFailed(
-                    "synthetic graphics pipeline failure".into(),
-                ));
-            }
-            let mut stub = self.state();
-            stub.graphics_pipelines.push((
-                handle,
-                metallib.to_vec(),
-                vertex_entry.to_string(),
-                state.to_vec(),
-                abi,
-            ));
-            Ok(())
+            self.record_stages("graphics", handle, stages, state, abi)
         }
 
-        fn register_mesh_pipeline(
+        fn register_mesh_pipeline_stages(
             &self,
             handle: u64,
-            metallib: &[u8],
-            mesh_entry: &str,
+            stages: &[PipelineStageLibrary<'_>],
             state: &[u8],
             abi: PipelineAbi,
         ) -> Result<(), MetalError> {
-            if mesh_entry == "vm_fail" {
-                return Err(MetalError::CompileFailed(
-                    "synthetic mesh pipeline failure".into(),
-                ));
-            }
-            let mut stub = self.state();
-            stub.mesh_pipelines.push((
-                handle,
-                metallib.to_vec(),
-                mesh_entry.to_string(),
-                state.to_vec(),
-                abi,
-            ));
-            Ok(())
+            self.record_stages("mesh", handle, stages, state, abi)
+        }
+
+        fn register_compute_pipeline_stages(
+            &self,
+            handle: u64,
+            stages: &[PipelineStageLibrary<'_>],
+            state: &[u8],
+            abi: PipelineAbi,
+        ) -> Result<(), MetalError> {
+            self.record_stages("compute", handle, stages, state, abi)
         }
     }
 
@@ -2814,6 +3035,8 @@ mod tests {
         r#"{"EntryPoint":"vs_main","ShaderType":"Vertex","TopLevelArgumentBuffer":[]}"#;
     const PIXEL_REFLECTION: &str =
         r#"{"EntryPoint":"ps_main","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#;
+    const PIXEL_MISSING_REFLECTION: &str =
+        r#"{"EntryPoint":"ps_missing","ShaderType":"Fragment","TopLevelArgumentBuffer":[]}"#;
     const MESH_REFLECTION: &str =
         r#"{"EntryPoint":"ms_main","ShaderType":"Mesh","TopLevelArgumentBuffer":[]}"#;
 
@@ -3575,10 +3798,11 @@ mod tests {
         );
     }
 
-    /// A version 2 frame registers a graphics pipeline in the content-hashed
-    /// family and captures the exact state and ABI the guest sent.
+    /// A version 2 graphics frame builds each function from the library its own
+    /// stage names: a distinct vertex and pixel metallib both reach the
+    /// executor, in stage order, with the exact state and ABI the guest sent.
     #[test]
-    fn pipeline_registration_v2_round_trips_graphics() {
+    fn pipeline_registration_v2_graphics_uses_each_stage_library() {
         let dir = TestDir::new();
         dir.write_pipeline(1, b"vertex metallib");
         dir.write_pipeline(2, b"pixel metallib");
@@ -3610,20 +3834,109 @@ mod tests {
         drop(client);
         let (result, host) = server.handle.join().expect("server thread");
         result.expect("session succeeds");
+        assert!(host.last_pipeline_rejection().is_none());
         let state = host.executor.state();
         assert!(state.pipelines.is_empty(), "no compute load for a graphics PSO");
         assert_eq!(state.graphics_pipelines.len(), 1);
-        let (handle, metallib, entry, captured_state, abi) = &state.graphics_pipelines[0];
+        let (handle, stages, captured_state, abi) = &state.graphics_pipelines[0];
         assert_eq!(*handle, 1);
-        assert_eq!(metallib, b"vertex metallib");
-        assert_eq!(entry, "vs_main");
+        assert_eq!(
+            stages,
+            &vec![
+                (PIPELINE_STAGE_VERTEX, b"vertex metallib".to_vec(), "vs_main".to_string()),
+                (PIPELINE_STAGE_PIXEL, b"pixel metallib".to_vec(), "ps_main".to_string()),
+            ],
+            "the vertex and pixel functions come from their own libraries"
+        );
         assert_eq!(captured_state, &graphics_state());
         assert!(abi.vertex.is_some(), "vertex ABI captured");
         assert!(abi.fragment.is_some(), "fragment ABI captured");
         assert!(abi.mesh.is_none() && abi.object.is_none() && abi.compute.is_none());
     }
 
-    /// A version 2 frame registers a mesh pipeline in its own family.
+    /// A graphics frame whose pixel library exists but does not contain the
+    /// pixel entry point is refused: status 1, a diagnostic naming the pixel
+    /// stage, and no content pipeline handle consumed.
+    #[test]
+    fn pipeline_registration_v2_refuses_a_missing_pixel_stage_function() {
+        let dir = TestDir::new();
+        dir.write_pipeline(1, b"vertex metallib");
+        dir.write_pipeline(2, b"pixel metallib");
+        dir.write_pipeline(3, b"vertex metallib");
+        dir.write_pipeline(4, b"pixel metallib");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let missing_state = PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            fragment_entry: Some("ps_missing".to_string()),
+            ..PipelineState::default()
+        }
+        .encode(RegistryPipelineStage::Graphics);
+        let missing_abi = abi_container(&[
+            (PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_MISSING_REFLECTION),
+        ]);
+        let refused = pipeline_request_v2(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, 1, "vs_main"),
+                (PIPELINE_STAGE_PIXEL, 2, "ps_missing"),
+            ],
+            &missing_state,
+            &missing_abi,
+            b"raw root signature",
+        );
+        write_frame(&mut client, KIND_PIPELINE, &refused).expect("send refused v2 graphics");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_REJECTED, None),
+            "a missing pixel function is an explicit rejection"
+        );
+
+        // The refused frame consumed no handle: the next valid registration is
+        // the first content pipeline.
+        let abi = abi_container(&[
+            (PIPELINE_STAGE_VERTEX, VERTEX_REFLECTION),
+            (PIPELINE_STAGE_PIXEL, PIXEL_REFLECTION),
+        ]);
+        let accepted = pipeline_request_v2(
+            PIPELINE_KIND_GRAPHICS,
+            &[
+                (PIPELINE_STAGE_VERTEX, 3, "vs_main"),
+                (PIPELINE_STAGE_PIXEL, 4, "ps_main"),
+            ],
+            &graphics_state(),
+            &abi,
+            b"raw root signature",
+        );
+        write_frame(&mut client, KIND_PIPELINE, &accepted).expect("send valid v2 graphics");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(1)),
+            "the refusal allocated no pipeline id"
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert_eq!(state.graphics_pipelines.len(), 1);
+        assert_eq!(state.graphics_pipelines[0].0, 1);
+        assert_eq!(state.refusals.len(), 1);
+        let refusal = &state.refusals[0];
+        assert!(refusal.contains("pixel"), "{refusal}");
+        assert!(refusal.contains("ps_missing"), "{refusal}");
+        assert_eq!(
+            host.last_pipeline_rejection(),
+            None,
+            "the later successful registration cleared the record"
+        );
+    }
+
+    /// A version 2 mesh frame registers the mesh and pixel functions from their
+    /// own libraries.
     #[test]
     fn pipeline_registration_v2_round_trips_mesh() {
         let dir = TestDir::new();
@@ -3659,12 +3972,53 @@ mod tests {
         result.expect("session succeeds");
         let state = host.executor.state();
         assert_eq!(state.mesh_pipelines.len(), 1);
-        let (_, metallib, entry, captured_state, abi) = &state.mesh_pipelines[0];
-        assert_eq!(metallib, b"mesh metallib");
-        assert_eq!(entry, "ms_main");
+        let (_, stages, captured_state, abi) = &state.mesh_pipelines[0];
+        assert_eq!(
+            stages,
+            &vec![
+                (PIPELINE_STAGE_MESH, b"mesh metallib".to_vec(), "ms_main".to_string()),
+                (PIPELINE_STAGE_PIXEL, b"pixel metallib".to_vec(), "ps_main".to_string()),
+            ]
+        );
         assert_eq!(captured_state, &mesh_state());
         assert!(abi.mesh.is_some(), "mesh ABI captured");
         assert!(abi.fragment.is_some(), "fragment ABI captured");
+    }
+
+    /// A version 2 compute frame resolves its kernel in the compute stage's own
+    /// library through the content-hashed family, not an assumed first library.
+    #[test]
+    fn pipeline_registration_v2_compute_uses_its_stage_library() {
+        let dir = TestDir::new();
+        dir.write_pipeline(1, b"compute metallib");
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let request = pipeline_request_v2(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, 1, "cs_main")],
+            b"",
+            b"",
+            b"",
+        );
+        write_frame(&mut client, KIND_PIPELINE, &request).expect("send v2 compute");
+        assert_eq!(
+            read_pipeline_reply(&mut client),
+            (PIPELINE_REPLY_OK, Some(1))
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert!(state.pipelines.is_empty(), "v2 compute keeps a content handle");
+        assert_eq!(state.compute_pipelines.len(), 1);
+        let (_, stages, _, _) = &state.compute_pipelines[0];
+        assert_eq!(
+            stages,
+            &vec![(PIPELINE_STAGE_COMPUTE, b"compute metallib".to_vec(), "cs_main".to_string())]
+        );
     }
 
     /// Malformed version 2 frames are one rejection byte before any executor
@@ -3749,6 +4103,7 @@ mod tests {
         let state = host.executor.state();
         assert!(state.graphics_pipelines.is_empty());
         assert!(state.mesh_pipelines.is_empty());
+        assert!(state.compute_pipelines.is_empty());
         assert!(state.pipelines.is_empty());
     }
 

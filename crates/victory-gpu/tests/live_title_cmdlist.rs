@@ -19,7 +19,9 @@
 //! 5. registers a PSO: kind 4 carries the session ticket and entry name, kind
 //!    129 returns the host's native pipeline id, and a producer submission
 //!    names that id in `SetComputePipeline` and the registered allocation in
-//!    `SetVertexBuffers`;
+//!    `SetVertexBuffers`; a graphics PSO then sends the version 2 frame with a
+//!    distinct ticket (its own metallib file) per stage, and the returned id is
+//!    the one `SetPipelineState` records in `SetGraphicsPipeline`;
 //! 6. prints which path served the pool translation (a worker, the disk cache,
 //!    or the explicit "converter unavailable" refusal of a Win64 guest);
 //! 7. `Signal`s the fence, reads `GetCompletedValue`, and presents one
@@ -903,6 +905,33 @@ fn a_recorded_title_list_reaches_the_host_exactly_once() {
             assert_eq!(stages.len(), 2);
             assert_eq!(stages[0].0, pso::WIRE_STAGE_VERTEX);
             assert_eq!(stages[1].0, pso::WIRE_STAGE_PIXEL);
+            // One library per stage: the persistent pool writes a distinct
+            // metallib file for the vertex and the pixel stage, and the host
+            // resolves each function in its own stage's library.
+            let (vertex_ticket, pixel_ticket) = (stages[0].1, stages[1].1);
+            assert_ne!(
+                vertex_ticket, pixel_ticket,
+                "each stage names its own ticket"
+            );
+            assert_eq!(
+                pixel_ticket,
+                vertex_ticket + 1,
+                "stage tickets are consecutive"
+            );
+            let vertex_library = share
+                .path()
+                .join(pso::metallib_name(vertex_ticket));
+            let pixel_library = share.path().join(pso::metallib_name(pixel_ticket));
+            assert_eq!(
+                std::fs::read(&vertex_library).expect("the vertex stage's library"),
+                b"MTLB vertex bytes",
+                "ticket {vertex_ticket} names the vertex library"
+            );
+            assert_eq!(
+                std::fs::read(&pixel_library).expect("the pixel stage's library"),
+                b"MTLB pixel bytes",
+                "ticket {pixel_ticket} names the pixel library"
+            );
             assert_eq!(state, graphics_state);
             assert_eq!(abi, graphics_abi);
             assert_eq!(root_signature, b"graphics root signature");
