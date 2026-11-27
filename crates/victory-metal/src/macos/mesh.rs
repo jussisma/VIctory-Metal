@@ -949,7 +949,7 @@ mod tests {
         let plan = MeshAbiPlan::new(mesh.clone(), None, Some(mesh), &tables).expect("plan builds");
         assert_eq!(plan.mesh().argument_buffer_len(), 32);
         assert_eq!(plan.argument_buffer_bytes(), 64);
-        assert_eq!(plan.descriptor_table_bytes(), 64);
+        assert_eq!(plan.descriptor_table_bytes(), 192);
         assert_eq!(plan.tables().len(), 1);
         assert!(plan.pipeline_abi().mesh.is_some());
         assert!(plan.pipeline_abi().fragment.is_some());
@@ -990,10 +990,10 @@ mod tests {
             }],
         )
         .expect("mesh layout");
-        // 8,193 eight-byte addresses = 65,544 B, just over the 64 KiB ceiling.
+        // 2,731 twenty-four-byte descriptors = 65,544 B, just over 64 KiB.
         let tables = [MeshTableExtent {
             kind: DescriptorTableKind::ShaderResourceView,
-            count: 8_193,
+            count: 2_731,
         }];
         let error = MeshAbiPlan::new(mesh, None, None, &tables).unwrap_err();
         assert_eq!(
@@ -1024,6 +1024,6 @@ mod tests {
         .expect("the reflected plan builds");
         assert_eq!(plan.mesh().parameters().len(), 2);
         assert_eq!(plan.mesh().argument_buffer_len(), 24);
-        assert_eq!(plan.descriptor_table_bytes(), 32);
+        assert_eq!(plan.descriptor_table_bytes(), 96);
     }
 }

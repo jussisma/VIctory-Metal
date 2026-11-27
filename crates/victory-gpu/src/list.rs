@@ -748,7 +748,10 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         }
     };
     let (table, tokens) = resolved.into_parts();
-    for binding in &table.bindings {
+    for entry in &table.bindings {
+        let Some(binding) = entry.as_buffer() else {
+            continue;
+        };
         if let Err(error) = crate::native_metal::queue::ensure_allocation(binding.allocation_id) {
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(
@@ -840,7 +843,10 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         }
     };
     let (table, tokens) = resolved.into_parts();
-    for binding in &table.bindings {
+    for entry in &table.bindings {
+        let Some(binding) = entry.as_buffer() else {
+            continue;
+        };
         if let Err(error) = queue::ensure_allocation(binding.allocation_id) {
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(

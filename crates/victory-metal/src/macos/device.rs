@@ -2945,38 +2945,6 @@ fn resolve_registered_texture(state: &DeviceState, handle: u64) -> Option<objc::
     registry.raw(registry_id)
 }
 
-/// Resolves one descriptor-table texture entry to its `MTLTexture`.
-///
-/// A `Texture` table names registered textures through the submission's
-/// allocation snapshot: `(allocation_id, generation)` maps to a transport
-/// handle, and that handle must be a live registry texture. The entry's
-/// `offset`/`length` are inert for a texture descriptor (the converted
-/// descriptor only carries a resource id), so they are not interpreted here.
-fn resolve_table_texture(
-    state: &DeviceState,
-    allocations: &HashMap<(u64, u32), VmBufferId>,
-    binding: &wire::BufferBinding,
-) -> Option<objc::Id> {
-    if binding.allocation_id == 0 || binding.generation == 0 {
-        return None;
-    }
-    let registered_id = *allocations.get(&(binding.allocation_id, binding.generation))?;
-    resolve_registered_texture(state, registered_id.0)
-}
-
-/// Resolves one descriptor-table sampler entry to its `MTLSamplerState`.
-fn resolve_table_sampler(
-    state: &DeviceState,
-    allocations: &HashMap<(u64, u32), VmBufferId>,
-    binding: &wire::BufferBinding,
-) -> Option<objc::Id> {
-    if binding.allocation_id == 0 || binding.generation == 0 {
-        return None;
-    }
-    let registered_id = *allocations.get(&(binding.allocation_id, binding.generation))?;
-    state.samplers.get(&registered_id.0).map(ObjcObject::as_raw)
-}
-
 /// Resolves a wire binding list to consecutive slots starting at `start_slot`.
 fn resolve_binding_slots(
     state: &DeviceState,
@@ -3157,21 +3125,113 @@ fn table_kind_accepts_wire(kind: DescriptorTableKind, wire_kind: DescriptorKind)
             matches!(wire_kind, DescriptorKind::Srv | DescriptorKind::Uav)
         }
         DescriptorTableKind::Sampler => wire_kind == DescriptorKind::Sampler,
-        DescriptorTableKind::Unspecified => {
-            matches!(
-                wire_kind,
-                DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav
-            )
+        // Reflection only says "Table". The wire entry variant selects the
+        // converter descriptor shape, so every wire kind is expressible here.
+        DescriptorTableKind::Unspecified => true,
+    }
+}
+
+/// The converted descriptor shape one table actually uses.
+///
+/// The wire entry variant is authoritative where reflection is `Unspecified`
+/// (the converter reports every range as `Type=Table`): a buffer entry is the
+/// 24-byte `{device_address, 0, 0}` resource descriptor, a texture entry is
+/// `{gpuResourceID, gpuResourceID, 0}`, and a sampler entry is
+/// `{gpuResourceID, 0, 0}`. An explicitly attached range kind is cross-checked
+/// against the entries so a mismatched caller cannot silently pick a shape.
+fn descriptor_table_shape(
+    table: &crate::wire_v3::DescriptorTableV3,
+    kind: DescriptorTableKind,
+) -> Result<DescriptorTableKind, MetalError> {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    let mut entry_shape: Option<DescriptorTableKind> = None;
+    for entry in &table.bindings {
+        let shape = match entry {
+            DescriptorTableEntryV3::Buffer(_) => {
+                if table.kind == DescriptorKind::Sampler {
+                    return Err(MetalError::InvalidArg(
+                        "a sampler table cannot hold buffer entries",
+                    ));
+                }
+                DescriptorTableKind::Unspecified
+            }
+            DescriptorTableEntryV3::Texture(_) => {
+                if !matches!(table.kind, DescriptorKind::Srv | DescriptorKind::Uav) {
+                    return Err(MetalError::InvalidArg(
+                        "a texture entry needs an SRV or UAV table",
+                    ));
+                }
+                DescriptorTableKind::Texture
+            }
+            DescriptorTableEntryV3::Sampler(_) => {
+                if table.kind != DescriptorKind::Sampler {
+                    return Err(MetalError::InvalidArg(
+                        "a sampler entry needs a sampler table",
+                    ));
+                }
+                DescriptorTableKind::Sampler
+            }
+        };
+        match entry_shape {
+            Some(previous) if previous != shape => {
+                return Err(MetalError::InvalidArg(
+                    "descriptor table mixes buffer, texture and sampler entries",
+                ));
+            }
+            _ => entry_shape = Some(shape),
         }
     }
+    let entry_shape = entry_shape
+        .ok_or(MetalError::InvalidArg("descriptor table is empty"))?;
+    match kind {
+        DescriptorTableKind::Unspecified => Ok(entry_shape),
+        DescriptorTableKind::Texture if entry_shape == DescriptorTableKind::Texture => {
+            Ok(DescriptorTableKind::Texture)
+        }
+        DescriptorTableKind::Sampler if entry_shape == DescriptorTableKind::Sampler => {
+            Ok(DescriptorTableKind::Sampler)
+        }
+        DescriptorTableKind::ConstantBufferView
+        | DescriptorTableKind::ShaderResourceView
+        | DescriptorTableKind::UnorderedAccessView
+            if entry_shape == DescriptorTableKind::Unspecified =>
+        {
+            Ok(kind)
+        }
+        _ => Err(MetalError::InvalidArg(
+            "descriptor table entry does not match the reflected range kind",
+        )),
+    }
+}
+
+/// Converts a wire table into buffer-range bindings for the pre-ABI path.
+///
+/// Registered texture and sampler handles have no plain `[[buffer(n)]]` slot
+/// binding; only a converted argument buffer carries their 24-byte descriptor,
+/// so the legacy path refuses them instead of misreading a handle as an
+/// address.
+fn buffer_table_bindings(
+    table: &crate::wire_v3::DescriptorTableV3,
+) -> Result<Vec<wire::BufferBinding>, MetalError> {
+    let mut bindings = Vec::with_capacity(table.bindings.len());
+    for entry in &table.bindings {
+        bindings.push(entry.as_buffer().copied().ok_or_else(|| {
+            MetalError::NotSupported(
+                "registered texture and sampler entries need a converted argument buffer",
+            )
+        })?);
+    }
+    Ok(bindings)
 }
 
 /// Builds the converted descriptor array for one wire table.
 ///
-/// Address tables copy the resolved view address of each `xmem::share`-backed
-/// buffer; texture tables copy `gpuResourceID`s of registered `MTLTexture`s;
-/// sampler tables copy `gpuResourceID`s of registered `MTLSamplerState`s. Every
-/// entry is resolved against the live maps first, so an unknown handle is
+/// Buffer entries copy the resolved view address of each `xmem::share`-backed
+/// buffer into the converter's 24-byte resource descriptor; texture entries
+/// copy `gpuResourceID`s of registered `MTLTexture`s; sampler entries copy
+/// `gpuResourceID`s of registered `MTLSamplerState`s. Every entry is resolved
+/// against the live maps first, so an unknown handle is
 /// [`PrepareAbort::UnknownHandle`] before any encoder exists.
 fn build_descriptor_table(
     device: objc::Id,
@@ -3180,65 +3240,51 @@ fn build_descriptor_table(
     table: &crate::wire_v3::DescriptorTableV3,
     kind: DescriptorTableKind,
 ) -> Result<PendingAbiBinding, PrepareAbort> {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
     if !table_kind_accepts_wire(kind, table.kind) {
         return Err(MetalError::InvalidArg(
             "descriptor table kind does not match the reflected range kind",
         )
         .into());
     }
-    let mut builder = DescriptorTableBuilder::new(kind);
-    let mut resources = Vec::with_capacity(table.bindings.len());
+    let shape = descriptor_table_shape(table, kind)?;
     let usage = match table.kind {
         DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
         _ => MTL_RESOURCE_USAGE_READ,
     };
-    // A converted texture descriptor stores the texture's opaque
-    // `gpuResourceID`, not a device address; the id is not required to be
-    // address-aligned, so the texture table is encoded here rather than through
-    // the address-aligned `DescriptorTableBuilder::push_texture` helper.
-    if kind == DescriptorTableKind::Texture {
-        if table.bindings.is_empty() {
-            return Err(MetalError::InvalidArg("descriptor table is empty").into());
-        }
-        let stride = DescriptorTableKind::Texture.descriptor_bytes();
-        let mut bytes = Vec::with_capacity(table.bindings.len() * stride);
-        for binding in &table.bindings {
-            let texture = resolve_table_texture(state, allocations, binding)
-                .ok_or(PrepareAbort::UnknownHandle)?;
-            let resource_id = resource_gpu_id(texture);
-            if resource_id == 0 {
-                return Err(
-                    MetalError::InvalidArg("texture descriptor resource id is zero").into(),
-                );
+    let mut builder = DescriptorTableBuilder::new(shape);
+    let mut resources = Vec::with_capacity(table.bindings.len());
+    for entry in &table.bindings {
+        match entry {
+            DescriptorTableEntryV3::Texture(handle)
+                if shape == DescriptorTableKind::Texture =>
+            {
+                let texture =
+                    resolve_registered_texture(state, *handle).ok_or(PrepareAbort::UnknownHandle)?;
+                builder.push_texture(resource_gpu_id(texture))?;
+                resources.push((texture, usage));
             }
-            bytes.extend_from_slice(&resource_id.to_le_bytes());
-            bytes.extend_from_slice(&resource_id.to_le_bytes());
-            bytes.extend_from_slice(&0u64.to_le_bytes());
-            resources.push((texture, usage));
-        }
-        let buffer = new_argument_buffer(device, &bytes)?;
-        let address = buffer_gpu_address(buffer.as_raw());
-        return Ok(PendingAbiBinding::Table {
-            parameter: usize::from(table.set),
-            kind,
-            buffer,
-            address,
-            length: bytes.len() as u64,
-            count: table.bindings.len() as u32,
-            stride,
-            resources,
-        });
-    }
-    for binding in &table.bindings {
-        match kind {
-            DescriptorTableKind::Sampler => {
-                let sampler = resolve_table_sampler(state, allocations, binding)
+            DescriptorTableEntryV3::Sampler(handle) if shape == DescriptorTableKind::Sampler => {
+                let sampler = state
+                    .samplers
+                    .get(handle)
+                    .map(ObjcObject::as_raw)
                     .ok_or(PrepareAbort::UnknownHandle)?;
                 builder.push_sampler(resource_gpu_id(sampler))?;
-                resources.push((sampler, MTL_RESOURCE_USAGE_READ));
+                // `MTLSamplerState` is not an `MTLResource`: it is referenced
+                // through the descriptor and kept alive by `state.samplers`,
+                // so it is never passed to `useResource:` (which would fault).
             }
-            DescriptorTableKind::Texture => unreachable!("texture tables return above"),
-            _ => {
+            DescriptorTableEntryV3::Buffer(binding)
+                if matches!(
+                    shape,
+                    DescriptorTableKind::ConstantBufferView
+                        | DescriptorTableKind::ShaderResourceView
+                        | DescriptorTableKind::UnorderedAccessView
+                        | DescriptorTableKind::Unspecified
+                ) =>
+            {
                 let (buffer, offset, _length) = resolve_buffer_range(
                     state,
                     allocations,
@@ -3255,6 +3301,12 @@ fn build_descriptor_table(
                     ))?;
                 builder.push_address(address)?;
                 resources.push((buffer, usage));
+            }
+            _ => {
+                return Err(MetalError::InvalidArg(
+                    "descriptor table entry does not match its encoding shape",
+                )
+                .into());
             }
         }
     }
@@ -3862,7 +3914,7 @@ fn prepare_compute_segment(
                     ops.push(PreparedComputeOp::Bind(resolve_binding_slots(
                         state,
                         allocations,
-                        &table.bindings,
+                        &buffer_table_bindings(table)?,
                         usize::from(table.base_register),
                     )?));
                 }
@@ -4645,7 +4697,7 @@ fn build_render_ops(
                     ops.push(PreparedRenderOp::VertexBuffers(resolve_binding_slots(
                         state,
                         allocations,
-                        &table.bindings,
+                        &buffer_table_bindings(table)?,
                         usize::from(table.base_register),
                     )?));
                 }

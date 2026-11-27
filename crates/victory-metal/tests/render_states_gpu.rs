@@ -52,11 +52,12 @@ use victory_metal::macos::registry::{
     TextureFormat, TextureUsage,
 };
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat, RenderTarget};
-use victory_metal::wire::{BufferBinding, ListIdentity, ReplyStatus};
+use victory_metal::wire::{ListIdentity, ReplyStatus};
 use victory_metal::wire_v3::{
     BeginRenderPass, BlendAttachment, BlendFactor, BlendOperation, BlendState,
     ClearDepthStencilView, ClearRenderTargetView, ColorAttachment, CommandV3, CompareFunction,
-    CullMode, DepthStencilAttachment, DepthStencilState, DescriptorKind, DescriptorTableV3,
+    CullMode, DepthStencilAttachment, DepthStencilState, DescriptorKind,
+    DescriptorTableEntryV3, DescriptorTableV3,
     DrawState, FillMode, FrontFaceWinding, LoadOp, PipelineRef, PrimitiveTopology, RasterizerState,
     RootConstantsV3, ScissorRect, StencilFaceState, StencilOperation, StoreOp, SubmissionV3,
     VertexBuffer, VertexBufferSet, Viewport,
@@ -948,12 +949,7 @@ fn render_states_pixels_are_exact() {
             set: 0,
             base_register: 0,
             kind: DescriptorKind::Srv,
-            bindings: vec![BufferBinding {
-                allocation_id: ALLOC_SAMPLED,
-                generation: 1,
-                offset: 0,
-                length: 16,
-            }],
+            bindings: vec![DescriptorTableEntryV3::Texture(SAMPLED)],
         }),
         CommandV3::Draw(DrawState {
             vertex_count: 3,

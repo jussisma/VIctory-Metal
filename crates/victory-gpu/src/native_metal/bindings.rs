@@ -30,7 +30,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use victory_metal::wire::BufferBinding;
 use victory_metal::wire_v3::{
-    DescriptorKind, DescriptorTableV3, IndexBufferBinding, IndexFormat, MAX_DESCRIPTOR_BINDINGS_V3,
+    DescriptorKind, DescriptorTableEntryV3, DescriptorTableV3, IndexBufferBinding, IndexFormat,
+    MAX_DESCRIPTOR_BINDINGS_V3,
     MAX_ROOT_CONSTANT_BYTES_V3, RootBufferView, RootConstantsV3, VertexBuffer,
 };
 use victory_metal::wire::MAX_RESOURCE_LEN;
@@ -511,8 +512,9 @@ pub fn root_buffer_view_page(
 /// `handle` is the D3D12 GPU descriptor handle of the table's first entry; it
 /// is validated (non-zero) but the Wire frame carries the resolved ranges, not
 /// the handle. `descriptors` are the table entries in register order, as the
-/// caller read them from guest descriptor memory. Sampler tables have no Wire
-/// v3 buffer binding and are refused.
+/// caller read them from guest descriptor memory. This resolver only expresses
+/// buffer ranges; sampler tables use registered sampler handles and are built
+/// by the caller instead.
 pub fn descriptor_table(
     resolver: &dyn GuestRangeResolver,
     handle: u64,
@@ -548,7 +550,7 @@ pub fn descriptor_table(
                 return Err(error);
             }
         };
-        bindings.push(resolved.0);
+        bindings.push(DescriptorTableEntryV3::Buffer(resolved.0));
         tokens.push(resolved.1);
     }
     Ok(Resolved {
@@ -881,11 +883,10 @@ mod tests {
         assert_eq!((table.set, table.base_register), (2, 5));
         assert_eq!(table.kind, DescriptorKind::Cbv);
         assert_eq!(table.bindings.len(), 2);
-        assert_eq!((table.bindings[0].offset, table.bindings[0].length), (0x20, 0x100));
-        assert_eq!(
-            (table.bindings[1].offset, table.bindings[1].length),
-            (PAGE + 0x10, 0x40)
-        );
+        let first = table.bindings[0].as_buffer().expect("first buffer entry");
+        let second = table.bindings[1].as_buffer().expect("second buffer entry");
+        assert_eq!((first.offset, first.length), (0x20, 0x100));
+        assert_eq!((second.offset, second.length), (PAGE + 0x10, 0x40));
         assert_eq!(tokens.len(), 2);
         assert_eq!(resolver.live(), 2);
 
