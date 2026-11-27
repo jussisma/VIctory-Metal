@@ -372,7 +372,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 #[cfg(target_os = "macos")]
 use std::process;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
@@ -1382,49 +1382,98 @@ fn run(args: Args) -> Result<(), String> {
     // render session's result and an accept failure returns the error. The
     // teardown below may replace a success with a D3DMetal/telemetry failure.
     let mut outcome: Result<(), String>;
-    let mut sessions: Vec<thread::JoinHandle<()>> = Vec::new();
-    let active = Arc::new(AtomicUsize::new(0));
-    // `--once` serves one GUEST, not one socket: ADR-041 gives the guest a
-    // dedicated pipeline connection beside its render connection, so the
-    // document's "serve exactly one session" means the whole guest. The first
-    // peer is the render session and decides the exit status; accepting stops
-    // when it ends, and the pipeline session it opened is joined with it.
-    let primary: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
-    let mut primary_taken = false;
-    if args.once {
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("cannot make the listener non-blocking: {error}"))?;
-    }
-    loop {
-        // Reap finished session handles so a long-lived daemon does not grow
-        // one `JoinHandle` per connection forever.
-        sessions.retain(|session| !session.is_finished());
+    // The RENDER session is served on this, the main thread. AppKit window
+    // presentation is main-thread-only, and moving it to a session thread
+    // aborted the host inside an Objective-C call (ADR-041, Boot #15). Extra
+    // connections (the guest's dedicated pipeline channel) are served by the
+    // supervisor below, without a window.
+    let primary_active = Arc::new(AtomicBool::new(false));
+    let stop_extras = Arc::new(AtomicBool::new(false));
+    let supervisor = {
+        let listener = listener
+            .try_clone()
+            .map_err(|error| format!("cannot clone the listener: {error}"))?;
+        let primary_active = Arc::clone(&primary_active);
+        let stop_extras = Arc::clone(&stop_extras);
+        let stats = Arc::clone(&stats);
+        let transport = Arc::clone(&transport);
+        let pipeline_handles = Arc::clone(&pipeline_handles);
+        let share_path = share.path.clone();
+        let secret = args.secret;
+        let aaa_frame = args.aaa_frame;
+        thread::spawn(move || {
+            if listener.set_nonblocking(true).is_err() {
+                return;
+            }
+            let mut extras: Vec<thread::JoinHandle<()>> = Vec::new();
+            while !stop_extras.load(Ordering::Acquire) {
+                extras.retain(|extra| !extra.is_finished());
+                let active = extras.len();
+                // Only while a render session is running: a render connection
+                // itself must never be mistaken for an extra session.
+                if !primary_active.load(Ordering::Acquire)
+                    || active + 1 >= MAX_CONCURRENT_SESSIONS
+                {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                let accepted = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        eprintln!("victory-metal-host: extra-session accept failed: {error}");
+                        break;
+                    }
+                };
+                let (stream, peer) = accepted;
+                if !peer.ip().is_loopback() {
+                    eprintln!("victory-metal-host: refused a non-loopback peer {peer}");
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let stats = Arc::clone(&stats);
+                let transport = Arc::clone(&transport);
+                let pipeline_handles = Arc::clone(&pipeline_handles);
+                let share_path = share_path.clone();
+                extras.push(thread::spawn(move || {
+                    if let Err(error) = serve_session(
+                        stream,
+                        peer,
+                        &share_path,
+                        secret,
+                        &stats,
+                        &transport,
+                        None,
+                        &pipeline_handles,
+                        aaa_frame,
+                    ) {
+                        {
+                            let mut stats =
+                                stats.lock().unwrap_or_else(|poison| poison.into_inner());
+                            stats.last_error = Some(one_line(&error));
+                        }
+                        eprintln!("victory-metal-host: {error}");
+                    }
+                }));
+            }
+            for extra in extras {
+                let _ = extra.join();
+            }
+        })
+    };
 
-        let accepted = match listener.accept() {
-            Ok(accepted) => Some(accepted),
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
             Err(error) => {
                 outcome = Err(format!("accept failed: {error}"));
                 break;
             }
-        };
-        let Some((stream, peer)) = accepted else {
-            // Only `--once` has a non-blocking listener: it is done as soon as
-            // its render session returned.
-            if args.once {
-                let finished = primary
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .take();
-                if let Some(result) = finished {
-                    outcome = result;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(2));
-            }
-            continue;
         };
         if !peer.ip().is_loopback() {
             // Binding is loopback-only, so this cannot normally happen; refuse
@@ -1434,57 +1483,32 @@ fn run(args: Args) -> Result<(), String> {
             continue;
         }
 
-        if active.load(Ordering::Acquire) >= MAX_CONCURRENT_SESSIONS {
-            eprintln!(
-                "victory-metal-host: refused a concurrent session from {peer}: \
-                 {MAX_CONCURRENT_SESSIONS} sessions already active"
-            );
-            let _ = stream.shutdown(Shutdown::Both);
-            continue;
+        // The render session runs here, on the main thread, so the window and
+        // the Metal device keep the thread affinity the host has always had.
+        primary_active.store(true, Ordering::Release);
+        outcome = serve_session(
+            stream,
+            peer,
+            &share.path,
+            args.secret,
+            &stats,
+            &transport,
+            window.clone(),
+            &pipeline_handles,
+            args.aaa_frame,
+        );
+        primary_active.store(false, Ordering::Release);
+        // `--once` serves this guest: its render session here and its pipeline
+        // session on the supervisor. Only the render result is the exit status.
+        if args.once {
+            break;
         }
-        active.fetch_add(1, Ordering::AcqRel);
-
-        let is_primary = !primary_taken;
-        primary_taken = true;
-        let stats = Arc::clone(&stats);
-        let transport = Arc::clone(&transport);
-        let pipeline_handles = Arc::clone(&pipeline_handles);
-        let active = Arc::clone(&active);
-        let primary = Arc::clone(&primary);
-        let window = window.clone();
-        let share_path = share.path.clone();
-        let secret = args.secret;
-        let aaa_frame = args.aaa_frame;
-        sessions.push(thread::spawn(move || {
-            let result = serve_session(
-                stream,
-                peer,
-                &share_path,
-                secret,
-                &stats,
-                &transport,
-                window,
-                &pipeline_handles,
-                aaa_frame,
-            );
-            if is_primary {
-                // The render session's result is the daemon's exit status.
-                *primary.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(result);
-            } else if let Err(error) = result {
-                // One peer's protocol or transport failure must not stop the
-                // other sessions, so it is recorded and logged instead.
-                {
-                    let mut stats = stats.lock().unwrap_or_else(|poison| poison.into_inner());
-                    stats.last_error = Some(one_line(&error));
-                }
-                eprintln!("victory-metal-host: {error}");
-            }
-            active.fetch_sub(1, Ordering::AcqRel);
-        }));
+        if let Err(error) = &outcome {
+            eprintln!("victory-metal-host: {error}");
+        }
     }
-    for session in sessions {
-        let _ = session.join();
-    }
+    stop_extras.store(true, Ordering::Release);
+    let _ = supervisor.join();
 
     // `--once` teardown must not hang: closing the window is a synchronous
     // orderOut/close with no nested run loop.
