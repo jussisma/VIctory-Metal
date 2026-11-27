@@ -2392,8 +2392,14 @@ impl<E: BatchExecutor> IpcHost<E> {
             .zip(&results)
             .find_map(|(stage, result)| result.as_ref().err().map(|error| (stage, error)))
         {
+            // The worker's own bounded reason, when it is short enough for
+            // telemetry, is the only way a boot can say WHY a converter died.
+            let detail = pool
+                .worker_stderr_for_telemetry()
+                .map(|stderr| format!(": {stderr}"))
+                .unwrap_or_default();
             return self.reject_host_translation(format!(
-                "{} stage translation failed: {}",
+                "{} stage translation failed: {}{detail}",
                 pipeline_stage_label(stage.stage),
                 pool_error_category(error)
             ));
