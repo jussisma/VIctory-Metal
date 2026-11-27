@@ -9,17 +9,26 @@ use std::ops::Range;
 use std::sync::Mutex;
 
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
+use crate::macos::bindings::{
+    ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind,
+    ReflectedStage, RootParameterKind, RootSignatureLayout,
+};
 use crate::macos::irconverter;
 use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
 use crate::macos::msc::{self, MscUavDispatch};
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
+use crate::macos::registry::{
+    PipelineKey, PipelineRegistry, PipelineStage, RegistryError, TextureDesc, TextureFormat,
+    TextureRegistry,
+};
 use crate::macos::render::{
     GraphicsPipeline, IndexType, LoadAction, MTL_BARRIER_SCOPE_BUFFERS, MTL_BARRIER_SCOPE_TEXTURES,
     PixelFormat, PrimitiveType, RawColorAttachment, RawDepthAttachment, RenderAttachment,
     RenderEncoder, RenderPass, RenderTarget, ScissorRect as RenderScissorRect, SegmentKind,
     StoreAction, Viewport as RenderViewport, build_mrt_render_pass_descriptor,
-    plan_encoder_segments, texture_info,
+    new_less_depth_state, plan_encoder_segments, texture_info,
 };
+use crate::macos::residency::ResidencySet;
 use crate::macos::texture::VmTextureId;
 use crate::macos::{blit, indirect};
 use crate::transport::{MetalError, MetalTransport};
@@ -107,6 +116,21 @@ pub(crate) struct DeviceState {
     pub(crate) textures: HashMap<u64, ObjcObject>,
     /// Swapchain surfaces handed to v3 `Present`, keyed by wire surface handle.
     pub(crate) surfaces: HashMap<u64, ObjcObject>,
+    /// Textures created through the ADR-013 [`TextureRegistry`], keyed by a
+    /// transport handle that is also the registry id. A handle here resolves
+    /// through the registry, never through the legacy `textures` map.
+    registry_textures: HashMap<u64, u64>,
+    /// `MTLSamplerState`s named by converted sampler descriptor tables.
+    samplers: HashMap<u64, ObjcObject>,
+    /// Content-hashed pipelines keyed by the wire handle a `Set*Pipeline`
+    /// command names.
+    content_pipelines: HashMap<u64, crate::macos::registry::PipelineId>,
+    /// Root-signature ABI registered for a content-hashed pipeline handle.
+    abis: HashMap<u64, PipelineAbi>,
+    /// Lazily created host registries and the persistent residency set.
+    texture_registry: Option<TextureRegistry>,
+    pipeline_registry: Option<PipelineRegistry>,
+    residency: Option<ResidencySet>,
     /// v3 list identities already executed or executing.
     executed_lists: HashSet<(u64, u32)>,
     executed_list_order: VecDeque<(u64, u32)>,
@@ -479,6 +503,13 @@ impl DirectMetalTransport {
                 host_target: None,
                 textures: HashMap::new(),
                 surfaces: HashMap::new(),
+                registry_textures: HashMap::new(),
+                samplers: HashMap::new(),
+                content_pipelines: HashMap::new(),
+                abis: HashMap::new(),
+                texture_registry: None,
+                pipeline_registry: None,
+                residency: None,
                 executed_lists: HashSet::new(),
                 executed_list_order: VecDeque::new(),
             }),
@@ -1658,6 +1689,162 @@ pub struct EncoderStats {
     pub barriers: u32,
 }
 
+/// Shader stage a converted root-signature argument buffer is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShaderStage {
+    /// `[[stage_in]]` producer: `setVertexBuffer:offset:atIndex:`.
+    Vertex,
+    /// `[[color(n)]]` producer: `setFragmentBuffer:offset:atIndex:`.
+    Fragment,
+    /// Metal 3 mesh stage: `setMeshBuffer:offset:atIndex:`.
+    Mesh,
+    /// Metal 3 object stage: `setObjectBuffer:offset:atIndex:`.
+    Object,
+    /// `MTLComputeCommandEncoder` kernel: `setBuffer:offset:atIndex:`.
+    Compute,
+}
+
+impl ShaderStage {
+    /// Whether the stage is part of a render encoder.
+    pub const fn is_render(self) -> bool {
+        !matches!(self, Self::Compute)
+    }
+}
+
+/// Reflected root-signature ABI of one content-hashed pipeline.
+///
+/// Each field is the converter-reflection layout of one shader stage. A stage
+/// with `None` has no top-level argument buffer, so the executor leaves it
+/// untouched. The ABI is registered with the pipeline handle, so a wire
+/// `SetGraphicsPipeline`/`SetMeshPipeline`/`SetComputePipeline` automatically
+/// selects the matching bindings.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineAbi {
+    /// Vertex-stage layout (graphics pipelines).
+    pub vertex: Option<RootSignatureLayout>,
+    /// Fragment-stage layout (graphics and mesh pipelines).
+    pub fragment: Option<RootSignatureLayout>,
+    /// Mesh-stage layout (mesh pipelines).
+    pub mesh: Option<RootSignatureLayout>,
+    /// Object-stage layout (mesh pipelines).
+    pub object: Option<RootSignatureLayout>,
+    /// Compute-stage layout (compute pipelines).
+    pub compute: Option<RootSignatureLayout>,
+}
+
+impl PipelineAbi {
+    /// ABI of a vertex/fragment graphics pipeline.
+    pub fn graphics(
+        vertex: Option<RootSignatureLayout>,
+        fragment: Option<RootSignatureLayout>,
+    ) -> Self {
+        Self {
+            vertex,
+            fragment,
+            ..Self::default()
+        }
+    }
+
+    /// ABI of a mesh/object/fragment mesh pipeline.
+    pub fn mesh(
+        mesh: Option<RootSignatureLayout>,
+        object: Option<RootSignatureLayout>,
+        fragment: Option<RootSignatureLayout>,
+    ) -> Self {
+        Self {
+            mesh,
+            object,
+            fragment,
+            ..Self::default()
+        }
+    }
+
+    /// ABI of a compute pipeline.
+    pub fn compute(layout: RootSignatureLayout) -> Self {
+        Self {
+            compute: Some(layout),
+            ..Self::default()
+        }
+    }
+
+    /// Whether no stage declares a root signature.
+    pub fn is_empty(&self) -> bool {
+        self.vertex.is_none()
+            && self.fragment.is_none()
+            && self.mesh.is_none()
+            && self.object.is_none()
+            && self.compute.is_none()
+    }
+
+    /// Layouts that apply to a converter-reflected stage, in binding order.
+    fn stages_for(&self, stage: ReflectedStage) -> Vec<(ShaderStage, &RootSignatureLayout)> {
+        match stage {
+            ReflectedStage::Vertex => self
+                .vertex
+                .iter()
+                .map(|layout| (ShaderStage::Vertex, layout))
+                .collect(),
+            ReflectedStage::Fragment => self
+                .fragment
+                .iter()
+                .map(|layout| (ShaderStage::Fragment, layout))
+                .collect(),
+            ReflectedStage::Compute => self
+                .compute
+                .iter()
+                .map(|layout| (ShaderStage::Compute, layout))
+                .collect(),
+            ReflectedStage::Other => Vec::new(),
+        }
+    }
+
+    /// Mesh-stage layouts (mesh, object, fragment) in Metal binding order.
+    fn mesh_stages(&self) -> Vec<(ShaderStage, &RootSignatureLayout)> {
+        let mut stages = Vec::new();
+        if let Some(layout) = self.mesh.as_ref() {
+            stages.push((ShaderStage::Mesh, layout));
+        }
+        if let Some(layout) = self.object.as_ref() {
+            stages.push((ShaderStage::Object, layout));
+        }
+        if let Some(layout) = self.fragment.as_ref() {
+            stages.push((ShaderStage::Fragment, layout));
+        }
+        stages
+    }
+}
+
+/// One sampler created for a converted sampler descriptor table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamplerDesc {
+    /// `MTLSamplerMinMagFilter` for minification (`0` nearest, `1` linear).
+    pub min_filter: usize,
+    /// `MTLSamplerMinMagFilter` for magnification (`0` nearest, `1` linear).
+    pub mag_filter: usize,
+    /// `MTLSamplerAddressMode` for S (`1` clamp-to-edge).
+    pub s_address_mode: usize,
+    /// `MTLSamplerAddressMode` for T.
+    pub t_address_mode: usize,
+    /// `MTLSamplerAddressMode` for R.
+    pub r_address_mode: usize,
+}
+
+impl SamplerDesc {
+    /// Nearest filtering with clamp-to-edge addressing on every axis.
+    ///
+    /// This is the sampler every exact-texel proof in this crate uses: with a
+    /// 1:1 footprint the sampled value is the texel, not a filtered blend.
+    pub const fn nearest_clamp() -> Self {
+        Self {
+            min_filter: 0,
+            mag_filter: 0,
+            s_address_mode: 1,
+            t_address_mode: 1,
+            r_address_mode: 1,
+        }
+    }
+}
+
 /// Why preparing a v3 submission stopped before any command buffer existed.
 enum PrepareAbort {
     /// A referenced pipeline, allocation, generation or surface is unknown.
@@ -1691,11 +1878,27 @@ struct PreparedV3Dispatch {
     bindings: Vec<BoundRange>,
 }
 
+/// One uploaded converted argument buffer plus its resident resources.
+///
+/// The buffer is a freshly allocated shared `MTLBuffer`; its bytes were written
+/// on the CPU from [`ArgumentBufferBuilder`] output before any encoder existed.
+/// No resource data is copied: root views and tables carry 64-bit device
+/// addresses / `gpuResourceID`s only.
+struct PreparedArgumentBuffer {
+    stage: ShaderStage,
+    index: usize,
+    buffer: ObjcObject,
+    /// Resources the argument buffer references, declared with `useResource:`.
+    resources: Vec<objc::Id>,
+}
+
 /// One validated compute-segment command.
 enum PreparedComputeOp {
     Pipeline(objc::Id),
     Bytes { slot: usize, bytes: Vec<u8> },
     Bind(Vec<BoundRange>),
+    /// One converted top-level argument buffer at its reflected buffer index.
+    ArgumentBuffer(PreparedArgumentBuffer),
     Dispatch(PreparedV3Dispatch),
     /// One GPU-driven dispatch; the grid is read by the GPU.
     DispatchIndirect {
@@ -1706,16 +1909,41 @@ enum PreparedComputeOp {
     Barrier,
 }
 
+/// Ownership of an optional depth-stencil state used by one prepared draw.
+enum DepthState {
+    /// State owned by a registered legacy `GraphicsPipeline`.
+    Borrowed(objc::Id),
+    /// State created for a content-hashed pipeline and owned by the prepare op.
+    Owned(ObjcObject),
+}
+
+impl DepthState {
+    fn raw(&self) -> objc::Id {
+        match self {
+            Self::Borrowed(raw) => *raw,
+            Self::Owned(object) => object.as_raw(),
+        }
+    }
+}
+
 /// One validated render-segment command.
 enum PreparedRenderOp {
     Pipeline {
         state: objc::Id,
-        depth_state: Option<objc::Id>,
+        depth_state: Option<DepthState>,
     },
     Viewport(RenderViewport),
     Scissor(RenderScissorRect),
     VertexBuffers(Vec<BoundVertex>),
     VertexBytes {
+        slot: usize,
+        bytes: Vec<u8>,
+    },
+    /// One converted top-level argument buffer at its reflected buffer index.
+    ArgumentBuffer(PreparedArgumentBuffer),
+    /// Root constants bound at a dedicated reflected Metal buffer index.
+    StageBytes {
+        stage: ShaderStage,
         slot: usize,
         bytes: Vec<u8>,
     },
@@ -1900,6 +2128,10 @@ fn resolve_buffer_range(
 }
 
 /// Resolves one texture handle and reads its geometry.
+///
+/// A handle resolves through the legacy `textures` map first and then through
+/// the ADR-013 [`TextureRegistry`]; the two handle spaces are disjoint because
+/// both draw from [`DeviceState::alloc_id`].
 fn resolve_texture(
     state: &DeviceState,
     allocations: &HashMap<(u64, u32), VmBufferId>,
@@ -1910,9 +2142,52 @@ fn resolve_texture(
         return None;
     }
     let registered_id = *allocations.get(&(allocation_id, generation))?;
-    let texture = state.textures.get(&registered_id.0)?;
-    let info = texture_info(texture.as_raw()).ok()?;
-    Some((texture.as_raw(), info))
+    if let Some(texture) = state.textures.get(&registered_id.0) {
+        let info = texture_info(texture.as_raw()).ok()?;
+        return Some((texture.as_raw(), info));
+    }
+    let raw = resolve_registered_texture(state, registered_id.0)?;
+    let info = texture_info(raw).ok()?;
+    Some((raw, info))
+}
+
+/// Resolves a transport texture handle through the ADR-013 texture registry.
+fn resolve_registered_texture(state: &DeviceState, handle: u64) -> Option<objc::Id> {
+    let registry_id = *state.registry_textures.get(&handle)?;
+    let registry = state.texture_registry.as_ref()?;
+    registry.raw(registry_id)
+}
+
+/// Resolves one descriptor-table texture entry to its `MTLTexture`.
+///
+/// A `Texture` table names registered textures through the submission's
+/// allocation snapshot: `(allocation_id, generation)` maps to a transport
+/// handle, and that handle must be a live registry texture. The entry's
+/// `offset`/`length` are inert for a texture descriptor (the converted
+/// descriptor only carries a resource id), so they are not interpreted here.
+fn resolve_table_texture(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    binding: &wire::BufferBinding,
+) -> Option<objc::Id> {
+    if binding.allocation_id == 0 || binding.generation == 0 {
+        return None;
+    }
+    let registered_id = *allocations.get(&(binding.allocation_id, binding.generation))?;
+    resolve_registered_texture(state, registered_id.0)
+}
+
+/// Resolves one descriptor-table sampler entry to its `MTLSamplerState`.
+fn resolve_table_sampler(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    binding: &wire::BufferBinding,
+) -> Option<objc::Id> {
+    if binding.allocation_id == 0 || binding.generation == 0 {
+        return None;
+    }
+    let registered_id = *allocations.get(&(binding.allocation_id, binding.generation))?;
+    state.samplers.get(&registered_id.0).map(ObjcObject::as_raw)
 }
 
 /// Resolves a wire binding list to consecutive slots starting at `start_slot`.
@@ -2005,6 +2280,406 @@ fn prepare_indirect_indexed_draw(
     Ok((buffer, base_offset, index_type))
 }
 
+/// One validated root-signature binding collected before its argument buffer
+/// is uploaded.
+enum PendingAbiBinding {
+    /// Inline root constants for one reflected parameter.
+    Constants { parameter: usize, bytes: Vec<u8> },
+    /// One root CBV/SRV/UAV device address and the resource it names.
+    RootView {
+        parameter: usize,
+        address: u64,
+        resource: objc::Id,
+        usage: usize,
+    },
+    /// One converted descriptor array in GPU-visible shared memory.
+    Table {
+        parameter: usize,
+        kind: DescriptorTableKind,
+        buffer: ObjcObject,
+        address: u64,
+        length: u64,
+        count: u32,
+        stride: usize,
+        resources: Vec<(objc::Id, usize)>,
+    },
+}
+
+/// Root-signature bindings collected for the active pipeline, in wire order.
+#[derive(Default)]
+struct AbiPending {
+    bindings: Vec<PendingAbiBinding>,
+}
+
+impl AbiPending {
+    fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.bindings.clear();
+    }
+}
+
+/// Allocates a shared `MTLBuffer` and copies `bytes` into it.
+///
+/// The copy is a CPU write of *binding metadata* (device addresses, descriptor
+/// arrays), never resource data and never a GPU readback. The returned object
+/// owns the buffer until the prepared op is dropped after completion.
+fn new_argument_buffer(device: objc::Id, bytes: &[u8]) -> Result<ObjcObject, MetalError> {
+    let len = bytes.len().max(8);
+    // SAFETY: `device` is a live `MTLDevice`; shared storage is CPU-visible.
+    let raw = unsafe { objc::msg_send_new_buffer(device, len, 0) };
+    let buffer = ObjcObject::from_retained(raw).ok_or_else(|| {
+        MetalError::InternalError("argument buffer allocation returned null".to_string())
+    })?;
+    // SAFETY: `buffer` is a fresh shared `MTLBuffer` of `len` bytes.
+    let contents = unsafe { objc::msg_send_ptr_0(buffer.as_raw(), objc::sel(c"contents")) };
+    if contents.is_null() {
+        return Err(MetalError::InternalError(
+            "argument buffer has no CPU-visible contents".to_string(),
+        ));
+    }
+    // SAFETY: The destination covers `bytes.len() <= len` bytes of a buffer no
+    // command buffer references yet.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.cast::<u8>(), bytes.len());
+    }
+    Ok(buffer)
+}
+
+/// 64-bit GPU address of a live `MTLBuffer`.
+fn buffer_gpu_address(buffer: objc::Id) -> u64 {
+    // SAFETY: `buffer` is a live `MTLBuffer`; `gpuAddress` returns its base.
+    unsafe { objc::msg_send_u64_0(buffer, objc::sel(c"gpuAddress")) }
+}
+
+/// 64-bit resource id of a live `MTLTexture`/`MTLSamplerState`.
+fn resource_gpu_id(resource: objc::Id) -> u64 {
+    // SAFETY: `resource` is a live `MTLResource`; `gpuResourceID` is its id.
+    unsafe { objc::msg_send_u64_0(resource, objc::sel(c"gpuResourceID")) }
+}
+
+/// Wire table kind a converted range kind requires.
+fn table_kind_accepts_wire(kind: DescriptorTableKind, wire_kind: DescriptorKind) -> bool {
+    match kind {
+        DescriptorTableKind::ConstantBufferView => wire_kind == DescriptorKind::Cbv,
+        DescriptorTableKind::ShaderResourceView => wire_kind == DescriptorKind::Srv,
+        DescriptorTableKind::UnorderedAccessView => wire_kind == DescriptorKind::Uav,
+        DescriptorTableKind::Texture => {
+            matches!(wire_kind, DescriptorKind::Srv | DescriptorKind::Uav)
+        }
+        DescriptorTableKind::Sampler => wire_kind == DescriptorKind::Sampler,
+        DescriptorTableKind::Unspecified => {
+            matches!(
+                wire_kind,
+                DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav
+            )
+        }
+    }
+}
+
+/// Builds the converted descriptor array for one wire table.
+///
+/// Address tables copy the resolved view address of each `xmem::share`-backed
+/// buffer; texture tables copy `gpuResourceID`s of registered `MTLTexture`s;
+/// sampler tables copy `gpuResourceID`s of registered `MTLSamplerState`s. Every
+/// entry is resolved against the live maps first, so an unknown handle is
+/// [`PrepareAbort::UnknownHandle`] before any encoder exists.
+fn build_descriptor_table(
+    device: objc::Id,
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    table: &crate::wire_v3::DescriptorTableV3,
+    kind: DescriptorTableKind,
+) -> Result<PendingAbiBinding, PrepareAbort> {
+    if !table_kind_accepts_wire(kind, table.kind) {
+        return Err(MetalError::InvalidArg(
+            "descriptor table kind does not match the reflected range kind",
+        )
+        .into());
+    }
+    let mut builder = DescriptorTableBuilder::new(kind);
+    let mut resources = Vec::with_capacity(table.bindings.len());
+    let usage = match table.kind {
+        DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+        _ => MTL_RESOURCE_USAGE_READ,
+    };
+    for binding in &table.bindings {
+        match kind {
+            DescriptorTableKind::Sampler => {
+                let sampler = resolve_table_sampler(state, allocations, binding)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                builder.push_sampler(resource_gpu_id(sampler))?;
+                resources.push((sampler, MTL_RESOURCE_USAGE_READ));
+            }
+            DescriptorTableKind::Texture => {
+                let texture = resolve_table_texture(state, allocations, binding)
+                    .ok_or(PrepareAbort::UnknownHandle)?;
+                builder.push_texture(resource_gpu_id(texture))?;
+                resources.push((texture, usage));
+            }
+            _ => {
+                let (buffer, offset, _length) = resolve_buffer_range(
+                    state,
+                    allocations,
+                    binding.allocation_id,
+                    binding.generation,
+                    binding.offset,
+                    binding.length,
+                )
+                .ok_or(PrepareAbort::UnknownHandle)?;
+                let address = buffer_gpu_address(buffer)
+                    .checked_add(offset as u64)
+                    .ok_or(MetalError::InvalidArg(
+                        "descriptor table address overflows u64",
+                    ))?;
+                builder.push_address(address)?;
+                resources.push((buffer, usage));
+            }
+        }
+    }
+    let buffer = new_argument_buffer(device, builder.bytes())?;
+    let address = buffer_gpu_address(buffer.as_raw());
+    let table_binding = builder.binding(address)?;
+    Ok(PendingAbiBinding::Table {
+        parameter: usize::from(table.set),
+        kind,
+        buffer,
+        address,
+        length: table_binding.length,
+        count: table_binding.count,
+        stride: table_binding.stride,
+        resources,
+    })
+}
+
+/// Reflected kind of the descriptor table a `set` ordinal names.
+///
+/// Reflection does not carry range kinds, so the registered layout supplies
+/// them in root-signature order ([`RootSignatureLayout::with_descriptor_table_kinds`]).
+/// A `set` ordinal that names different kinds across stages is an explicit
+/// error instead of a silently chosen table.
+fn abi_table_kind(
+    stages: &[(ShaderStage, RootSignatureLayout)],
+    set: usize,
+) -> Result<DescriptorTableKind, PrepareAbort> {
+    let mut found: Option<DescriptorTableKind> = None;
+    for (_stage, layout) in stages {
+        let mut ordinal = 0usize;
+        for parameter in layout.parameters() {
+            if let RootParameterKind::DescriptorTable(kind) = parameter.kind()
+                && ordinal == set
+            {
+                match found {
+                    Some(existing) if existing != kind => {
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table set ordinal names different range kinds",
+                        )
+                        .into());
+                    }
+                    _ => found = Some(kind),
+                }
+            }
+            if matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
+                ordinal += 1;
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        MetalError::InvalidArg("descriptor table set ordinal has no reflected root parameter").into()
+    })
+}
+
+/// Uploads one argument buffer per stage and appends the bind ops.
+///
+/// The builders write only checked 64-bit device addresses, `gpuResourceID`s
+/// and inline root constants. Stage layouts without any encoded parameter are
+/// skipped, so a fragment stage that does not read the root signature keeps its
+/// own `buffer(2)` untouched.
+fn flush_abi(
+    device: objc::Id,
+    stages: &[(ShaderStage, RootSignatureLayout)],
+    pending: &mut AbiPending,
+) -> Result<
+    (
+        Vec<PreparedArgumentBuffer>,
+        Vec<(ShaderStage, usize, Vec<u8>)>,
+    ),
+    PrepareAbort,
+> {
+    let mut buffers = Vec::new();
+    let mut bytes_ops = Vec::new();
+    if pending.is_empty() {
+        return Ok((buffers, bytes_ops));
+    }
+    for (stage, layout) in stages {
+        let mut builder = ArgumentBufferBuilder::new(layout);
+        let mut resources: Vec<(objc::Id, usize)> = Vec::new();
+        let mut stage_bytes: Option<(usize, Vec<u8>)> = None;
+        for binding in &pending.bindings {
+            match binding {
+                PendingAbiBinding::Constants { parameter, bytes } => {
+                    let Some(root) = layout.parameters().get(*parameter) else {
+                        continue;
+                    };
+                    if root.kind() != RootParameterKind::Constants {
+                        return Err(MetalError::InvalidArg(
+                            "root constants name a non-constant root parameter",
+                        )
+                        .into());
+                    }
+                    match layout.root_constants_metal_index() {
+                        Some(index) => stage_bytes = Some((index, bytes.clone())),
+                        None => builder.set_root_constants(*parameter, bytes)?,
+                    }
+                }
+                PendingAbiBinding::RootView {
+                    parameter,
+                    address,
+                    resource,
+                    usage,
+                } => {
+                    let Some(root) = layout.parameters().get(*parameter) else {
+                        continue;
+                    };
+                    match root.kind() {
+                        RootParameterKind::ConstantBufferView
+                        | RootParameterKind::ShaderResourceView
+                        | RootParameterKind::UnorderedAccessView => {}
+                        _ => {
+                            return Err(MetalError::InvalidArg(
+                                "root buffer view names a non-buffer root parameter",
+                            )
+                            .into());
+                        }
+                    }
+                    builder.set_buffer_address(*parameter, *address)?;
+                    resources.push((*resource, *usage));
+                }
+                PendingAbiBinding::Table {
+                    parameter,
+                    kind,
+                    buffer,
+                    address,
+                    length,
+                    count,
+                    stride,
+                    resources: table_resources,
+                } => {
+                    let Some(root) = layout.parameters().get(*parameter) else {
+                        continue;
+                    };
+                    if root.kind() != RootParameterKind::DescriptorTable(*kind) {
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table names a non-table root parameter",
+                        )
+                        .into());
+                    }
+                    // Re-check the converted extent against the bound range
+                    // before the argument buffer points at it.
+                    let extent = u64::from(*count)
+                        .checked_mul(*stride as u64)
+                        .ok_or(MetalError::InvalidArg(
+                            "descriptor table converted extent overflows",
+                        ))?;
+                    if extent > *length {
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table converted extent exceeds the bound range",
+                        )
+                        .into());
+                    }
+                    builder.set_table_address(*parameter, *address)?;
+                    resources.push((buffer.as_raw(), MTL_RESOURCE_USAGE_READ));
+                    resources.extend(table_resources.iter().copied());
+                }
+            }
+        }
+        if let Some((index, bytes)) = stage_bytes {
+            bytes_ops.push((*stage, index, bytes));
+        }
+        if builder.encoded_parameters() == 0 {
+            continue;
+        }
+        let buffer = new_argument_buffer(device, builder.bytes())?;
+        buffers.push(PreparedArgumentBuffer {
+            stage: *stage,
+            index: layout.argument_buffer_index(),
+            buffer,
+            resources: resources.into_iter().map(|(resource, _)| resource).collect(),
+        });
+    }
+    Ok((buffers, bytes_ops))
+}
+
+/// Flushes collected root-signature bindings for a render-family pipeline.
+fn flush_render_abi(
+    device: objc::Id,
+    abi: Option<&PipelineAbi>,
+    mesh_family: bool,
+    pending: &mut AbiPending,
+    ops: &mut Vec<PreparedRenderOp>,
+) -> Result<(), PrepareAbort> {
+    let Some(abi) = abi else {
+        pending.clear();
+        return Ok(());
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let stages: Vec<(ShaderStage, RootSignatureLayout)> = if mesh_family {
+        abi.mesh_stages()
+            .into_iter()
+            .map(|(stage, layout)| (stage, layout.clone()))
+            .collect()
+    } else {
+        abi.stages_for(ReflectedStage::Vertex)
+            .into_iter()
+            .chain(abi.stages_for(ReflectedStage::Fragment))
+            .map(|(stage, layout)| (stage, layout.clone()))
+            .collect()
+    };
+    let (buffers, bytes_ops) = flush_abi(device, &stages, pending)?;
+    for buffer in buffers {
+        ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
+    }
+    for (stage, slot, bytes) in bytes_ops {
+        ops.push(PreparedRenderOp::StageBytes { stage, slot, bytes });
+    }
+    pending.clear();
+    Ok(())
+}
+
+/// Flushes collected root-signature bindings for a compute pipeline.
+fn flush_compute_abi(
+    device: objc::Id,
+    abi: Option<&PipelineAbi>,
+    pending: &mut AbiPending,
+    ops: &mut Vec<PreparedComputeOp>,
+) -> Result<(), PrepareAbort> {
+    let Some(abi) = abi else {
+        pending.clear();
+        return Ok(());
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let stages: Vec<(ShaderStage, RootSignatureLayout)> = abi
+        .stages_for(ReflectedStage::Compute)
+        .into_iter()
+        .map(|(stage, layout)| (stage, layout.clone()))
+        .collect();
+    let (buffers, bytes_ops) = flush_abi(device, &stages, pending)?;
+    for buffer in buffers {
+        ops.push(PreparedComputeOp::ArgumentBuffer(buffer));
+    }
+    for (_stage, slot, bytes) in bytes_ops {
+        ops.push(PreparedComputeOp::Bytes { slot, bytes });
+    }
+    pending.clear();
+    Ok(())
+}
+
 fn validate_viewport(
     viewport: &crate::wire_v3::Viewport,
     width: u32,
@@ -2077,29 +2752,58 @@ fn validate_scissor(
     })
 }
 
+/// One resolved compute pipeline: raw state and threadgroup ceiling.
+struct ResolvedComputePipeline {
+    raw: objc::Id,
+    thread_limit: u64,
+}
+
+/// Resolves a compute handle through the legacy map or the content registry.
+fn resolve_compute_pipeline(
+    state: &DeviceState,
+    id: u64,
+) -> Result<ResolvedComputePipeline, PrepareAbort> {
+    if let Some(pso) = state.pipelines.get(&id) {
+        return Ok(ResolvedComputePipeline {
+            raw: pso.as_raw(),
+            thread_limit: pipeline_thread_limit(pso),
+        });
+    }
+    let entry = resolve_content_pipeline(state, id, PipelineStage::Compute)?;
+    // SAFETY: `entry` owns a live `MTLComputePipelineState`.
+    let limit =
+        unsafe { objc::msg_send_usize_0(entry.raw(), objc::sel(c"maxTotalThreadsPerThreadgroup")) };
+    Ok(ResolvedComputePipeline {
+        raw: entry.raw(),
+        thread_limit: limit as u64,
+    })
+}
+
 /// Validates and prepares a compute segment.
 fn prepare_compute_segment(
     state: &DeviceState,
+    transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     range: Range<usize>,
 ) -> Result<Vec<PreparedComputeOp>, PrepareAbort> {
+    let device = transport.device_raw();
     let mut ops = Vec::new();
+    let mut abi: Option<PipelineAbi> = None;
+    let mut pending = AbiPending::default();
     for index in range {
         match &commands[index] {
             CommandV3::SetComputePipeline(pipeline) => {
-                let pso = state
-                    .pipelines
-                    .get(&pipeline.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                ops.push(PreparedComputeOp::Pipeline(pso.as_raw()));
+                let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
+                pending.clear();
+                abi = pipeline_abi(state, pipeline.pipeline_id);
+                ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
             CommandV3::SetPipeline(pipeline) => {
-                let pso = state
-                    .pipelines
-                    .get(&pipeline.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                ops.push(PreparedComputeOp::Pipeline(pso.as_raw()));
+                let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
+                pending.clear();
+                abi = pipeline_abi(state, pipeline.pipeline_id);
+                ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
             CommandV3::Dispatch1d(dispatch) => {
                 if dispatch.bindings.len() > wire::MAX_BINDINGS_PER_DISPATCH {
@@ -2107,19 +2811,17 @@ fn prepare_compute_segment(
                         MetalError::InvalidArg("dispatch exceeds wire binding limit").into(),
                     );
                 }
-                let pso = state
-                    .pipelines
-                    .get(&dispatch.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let pso = resolve_compute_pipeline(state, dispatch.pipeline_id)?;
                 let threads_per_group = dispatch.threads_per_group as usize;
-                if threads_per_group as u64 > pipeline_thread_limit(pso) {
+                if threads_per_group as u64 > pso.thread_limit {
                     return Err(MetalError::InvalidArg(
                         "dispatch threads_per_group exceeds pipeline threadgroup maximum",
                     )
                     .into());
                 }
+                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
-                    pipeline: pso.as_raw(),
+                    pipeline: pso.raw,
                     grid: PreparedGrid::OneD {
                         threads: dispatch.threads as usize,
                         threads_per_group,
@@ -2133,24 +2835,22 @@ fn prepare_compute_segment(
                         MetalError::InvalidArg("dispatch exceeds wire binding limit").into(),
                     );
                 }
-                let pso = state
-                    .pipelines
-                    .get(&dispatch.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let pso = resolve_compute_pipeline(state, dispatch.pipeline_id)?;
                 let local_threads =
                     dispatch
                         .checked_threads_per_group()
                         .ok_or(MetalError::InvalidArg(
                             "3D dispatch local thread product overflows u64",
                         ))?;
-                if local_threads > pipeline_thread_limit(pso) {
+                if local_threads > pso.thread_limit {
                     return Err(MetalError::InvalidArg(
                         "3D dispatch threadgroup exceeds pipeline threadgroup maximum",
                     )
                     .into());
                 }
+                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
-                    pipeline: pso.as_raw(),
+                    pipeline: pso.raw,
                     grid: PreparedGrid::ThreeD {
                         group_counts: MTLSize {
                             width: dispatch.group_counts[0] as usize,
@@ -2176,10 +2876,7 @@ fn prepare_compute_segment(
                 .into());
             }
             CommandV3::ExecuteIndirectDispatch(dispatch) => {
-                let pso = state
-                    .pipelines
-                    .get(&dispatch.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                let pso = resolve_compute_pipeline(state, dispatch.pipeline_id)?;
                 if dispatch.threads_per_group.contains(&0) {
                     return Err(
                         MetalError::InvalidArg("indirect dispatch threadgroup must be nonzero")
@@ -2196,7 +2893,7 @@ fn prepare_compute_segment(
                     )
                     .into());
                 };
-                if local_threads > pipeline_thread_limit(pso) {
+                if local_threads > pso.thread_limit {
                     return Err(MetalError::InvalidArg(
                         "indirect dispatch exceeds the pipeline threadgroup maximum",
                     )
@@ -2209,8 +2906,9 @@ fn prepare_compute_segment(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
+                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
                 ops.push(PreparedComputeOp::DispatchIndirect {
-                    pipeline: pso.as_raw(),
+                    pipeline: pso.raw,
                     threads_per_group: MTLSize {
                         width: dispatch.threads_per_group[0] as usize,
                         height: dispatch.threads_per_group[1] as usize,
@@ -2227,10 +2925,17 @@ fn prepare_compute_segment(
                         MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
                     );
                 }
-                ops.push(PreparedComputeOp::Bytes {
-                    slot: usize::from(constants.slot),
-                    bytes: constants.bytes.clone(),
-                });
+                if abi.is_some() {
+                    pending.bindings.push(PendingAbiBinding::Constants {
+                        parameter: usize::from(constants.slot),
+                        bytes: constants.bytes.clone(),
+                    });
+                } else {
+                    ops.push(PreparedComputeOp::Bytes {
+                        slot: usize::from(constants.slot),
+                        bytes: constants.bytes.clone(),
+                    });
+                }
             }
             CommandV3::SetDescriptorTable(table) => {
                 if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
@@ -2239,18 +2944,34 @@ fn prepare_compute_segment(
                         MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
                     );
                 }
-                if table.kind == DescriptorKind::Sampler {
-                    return Err(MetalError::NotSupported(
-                        "sampler descriptor tables are not bound by the native compute path",
-                    )
-                    .into());
+                if let Some(active) = abi.as_ref() {
+                    let stages: Vec<(ShaderStage, RootSignatureLayout)> = active
+                        .stages_for(ReflectedStage::Compute)
+                        .into_iter()
+                        .map(|(stage, layout)| (stage, layout.clone()))
+                        .collect();
+                    let kind = abi_table_kind(&stages, usize::from(table.set))?;
+                    pending.bindings.push(build_descriptor_table(
+                        device,
+                        state,
+                        allocations,
+                        table,
+                        kind,
+                    )?);
+                } else {
+                    if table.kind == DescriptorKind::Sampler {
+                        return Err(MetalError::NotSupported(
+                            "sampler descriptor tables are not bound by the native compute path",
+                        )
+                        .into());
+                    }
+                    ops.push(PreparedComputeOp::Bind(resolve_binding_slots(
+                        state,
+                        allocations,
+                        &table.bindings,
+                        usize::from(table.base_register),
+                    )?));
                 }
-                ops.push(PreparedComputeOp::Bind(resolve_binding_slots(
-                    state,
-                    allocations,
-                    &table.bindings,
-                    usize::from(table.base_register),
-                )?));
             }
             CommandV3::SetRootBufferView(view) => {
                 let (buffer, offset, _length) = resolve_buffer_range(
@@ -2262,11 +2983,25 @@ fn prepare_compute_segment(
                     view.length,
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
-                ops.push(PreparedComputeOp::Bind(vec![(
-                    buffer,
-                    offset,
-                    usize::from(view.slot),
-                )]));
+                if abi.is_some() {
+                    let address = buffer_gpu_address(buffer)
+                        .checked_add(offset as u64)
+                        .ok_or(MetalError::InvalidArg(
+                            "root buffer view address overflows u64",
+                        ))?;
+                    pending.bindings.push(PendingAbiBinding::RootView {
+                        parameter: usize::from(view.slot),
+                        address,
+                        resource: buffer,
+                        usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+                    });
+                } else {
+                    ops.push(PreparedComputeOp::Bind(vec![(
+                        buffer,
+                        offset,
+                        usize::from(view.slot),
+                    )]));
+                }
             }
             CommandV3::ResourceBarrier(barrier) => {
                 if resolve_barrier_entries(state, allocations, &barrier.entries).is_none() {
@@ -2287,11 +3022,13 @@ fn prepare_compute_segment(
 /// Validates and prepares one render segment, including its pass descriptor.
 fn prepare_render_segment(
     state: &DeviceState,
+    transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     range: Range<usize>,
     pass: &BeginRenderPass,
 ) -> Result<(objc::Id, u32, u32, Vec<PreparedRenderOp>), PrepareAbort> {
+    let device = transport.device_raw();
     let mut colors = Vec::with_capacity(pass.colors.len());
     let mut color_formats = Vec::with_capacity(pass.colors.len());
     let mut extent: Option<(u32, u32)> = None;
@@ -2385,77 +3122,120 @@ fn prepare_render_segment(
     let mut current_pipeline = false;
     let mut index_binding: Option<(objc::Id, usize, IndexType, u64)> = None;
     let mut topology = PrimitiveType::Triangle;
+    // Root-signature state of the selected pipeline and its collected bindings.
+    let mut abi: Option<PipelineAbi> = None;
+    let mut pending = AbiPending::default();
     for index in range {
         match &commands[index] {
             CommandV3::BeginRenderPass(_) | CommandV3::EndRenderPass => continue,
             CommandV3::SetGraphicsPipeline(pipeline) => {
-                let graphics = state
-                    .render_pipelines
-                    .get(&pipeline.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                if graphics.color_formats() != color_formats.as_slice() {
-                    return Err(MetalError::InvalidArg(
-                        "graphics pipeline colour formats do not match the render pass",
-                    )
-                    .into());
+                let mut depth_state = None;
+                let state_raw;
+                if let Some(graphics) = state.render_pipelines.get(&pipeline.pipeline_id) {
+                    if graphics.color_formats() != color_formats.as_slice() {
+                        return Err(MetalError::InvalidArg(
+                            "graphics pipeline colour formats do not match the render pass",
+                        )
+                        .into());
+                    }
+                    if graphics.depth_format() != depth_format {
+                        return Err(MetalError::InvalidArg(
+                            "graphics pipeline depth format does not match the render pass",
+                        )
+                        .into());
+                    }
+                    state_raw = graphics.state_raw();
+                    depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                } else {
+                    // Content-hashed registry pipeline: the attachment state is
+                    // part of the content key and must match this pass exactly.
+                    let entry =
+                        resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Graphics)?;
+                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    state_raw = entry.raw();
+                    if entry.state().depth_format.is_some() {
+                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                    }
                 }
-                if graphics.depth_format() != depth_format {
-                    return Err(MetalError::InvalidArg(
-                        "graphics pipeline depth format does not match the render pass",
-                    )
-                    .into());
-                }
+                pending.clear();
+                abi = pipeline_abi(state, pipeline.pipeline_id);
                 ops.push(PreparedRenderOp::Pipeline {
-                    state: graphics.state_raw(),
-                    depth_state: graphics.depth_state_raw(),
+                    state: state_raw,
+                    depth_state,
                 });
                 current_pipeline = true;
                 mesh_pipeline = None;
             }
             CommandV3::SetPipeline(pipeline) => {
-                let graphics = state
-                    .render_pipelines
-                    .get(&pipeline.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                if graphics.color_formats() != color_formats.as_slice() {
-                    return Err(MetalError::InvalidArg(
-                        "graphics pipeline colour formats do not match the render pass",
-                    )
-                    .into());
+                let mut depth_state = None;
+                let state_raw;
+                if let Some(graphics) = state.render_pipelines.get(&pipeline.pipeline_id) {
+                    if graphics.color_formats() != color_formats.as_slice() {
+                        return Err(MetalError::InvalidArg(
+                            "graphics pipeline colour formats do not match the render pass",
+                        )
+                        .into());
+                    }
+                    if graphics.depth_format() != depth_format {
+                        return Err(MetalError::InvalidArg(
+                            "graphics pipeline depth format does not match the render pass",
+                        )
+                        .into());
+                    }
+                    state_raw = graphics.state_raw();
+                    depth_state = graphics.depth_state_raw().map(DepthState::Borrowed);
+                } else {
+                    // Content-hashed registry pipeline: the attachment state is
+                    // part of the content key and must match this pass exactly.
+                    let entry =
+                        resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Graphics)?;
+                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    state_raw = entry.raw();
+                    if entry.state().depth_format.is_some() {
+                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                    }
                 }
-                if graphics.depth_format() != depth_format {
-                    return Err(MetalError::InvalidArg(
-                        "graphics pipeline depth format does not match the render pass",
-                    )
-                    .into());
-                }
+                pending.clear();
+                abi = pipeline_abi(state, pipeline.pipeline_id);
                 ops.push(PreparedRenderOp::Pipeline {
-                    state: graphics.state_raw(),
-                    depth_state: graphics.depth_state_raw(),
+                    state: state_raw,
+                    depth_state,
                 });
                 current_pipeline = true;
                 mesh_pipeline = None;
             }
             CommandV3::SetMeshPipeline(pipeline) => {
-                let mesh = state
-                    .mesh_pipelines
-                    .get(&pipeline.pipeline_id)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                if mesh.color_formats() != color_formats.as_slice() {
-                    return Err(MetalError::InvalidArg(
-                        "mesh pipeline colour formats do not match the render pass",
-                    )
-                    .into());
+                let mut depth_state = None;
+                let state_raw;
+                if let Some(mesh) = state.mesh_pipelines.get(&pipeline.pipeline_id) {
+                    if mesh.color_formats() != color_formats.as_slice() {
+                        return Err(MetalError::InvalidArg(
+                            "mesh pipeline colour formats do not match the render pass",
+                        )
+                        .into());
+                    }
+                    if mesh.depth_format() != depth_format {
+                        return Err(MetalError::InvalidArg(
+                            "mesh pipeline depth format does not match the render pass",
+                        )
+                        .into());
+                    }
+                    state_raw = mesh.state_raw();
+                    depth_state = mesh.depth_state_raw().map(DepthState::Borrowed);
+                } else {
+                    let entry =
+                        resolve_content_pipeline(state, pipeline.pipeline_id, PipelineStage::Mesh)?;
+                    check_pipeline_attachments(entry, &color_formats, depth_format)?;
+                    state_raw = entry.raw();
+                    if entry.state().depth_format.is_some() {
+                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                    }
                 }
-                if mesh.depth_format() != depth_format {
-                    return Err(MetalError::InvalidArg(
-                        "mesh pipeline depth format does not match the render pass",
-                    )
-                    .into());
-                }
+                pending.clear();
+                abi = pipeline_abi(state, pipeline.pipeline_id);
                 ops.push(PreparedRenderOp::Pipeline {
-                    state: mesh.state_raw(),
-                    depth_state: mesh.depth_state_raw(),
+                    state: state_raw,
+                    depth_state,
                 });
                 current_pipeline = true;
                 mesh_pipeline = Some(pipeline.pipeline_id);
@@ -2538,10 +3318,22 @@ fn prepare_render_segment(
                         MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
                     );
                 }
-                ops.push(PreparedRenderOp::VertexBytes {
-                    slot: usize::from(constants.slot),
-                    bytes: constants.bytes.clone(),
-                });
+                if abi.is_some() {
+                    // Converted ABI: the bytes land at the reflected constant
+                    // slot (inline in the top-level argument buffer, or a
+                    // dedicated setBytes index).
+                    pending
+                        .bindings
+                        .push(PendingAbiBinding::Constants {
+                            parameter: usize::from(constants.slot),
+                            bytes: constants.bytes.clone(),
+                        });
+                } else {
+                    ops.push(PreparedRenderOp::VertexBytes {
+                        slot: usize::from(constants.slot),
+                        bytes: constants.bytes.clone(),
+                    });
+                }
             }
             CommandV3::SetDescriptorTable(table) => {
                 if table.bindings.is_empty() || table.bindings.len() > wire::MAX_DESCRIPTOR_BINDINGS
@@ -2550,18 +3342,35 @@ fn prepare_render_segment(
                         MetalError::InvalidArg("descriptor table needs 1..=16 bindings").into(),
                     );
                 }
-                if table.kind == DescriptorKind::Sampler {
-                    return Err(MetalError::NotSupported(
-                        "sampler descriptor tables are not bound by the native graphics path",
-                    )
-                    .into());
+                if let Some(active) = abi.as_ref() {
+                    let stages: Vec<(ShaderStage, RootSignatureLayout)> = active
+                        .stages_for(ReflectedStage::Vertex)
+                        .into_iter()
+                        .chain(active.stages_for(ReflectedStage::Fragment))
+                        .map(|(stage, layout)| (stage, layout.clone()))
+                        .collect();
+                    let kind = abi_table_kind(&stages, usize::from(table.set))?;
+                    pending.bindings.push(build_descriptor_table(
+                        device,
+                        state,
+                        allocations,
+                        table,
+                        kind,
+                    )?);
+                } else {
+                    if table.kind == DescriptorKind::Sampler {
+                        return Err(MetalError::NotSupported(
+                            "sampler descriptor tables are not bound by the native graphics path",
+                        )
+                        .into());
+                    }
+                    ops.push(PreparedRenderOp::VertexBuffers(resolve_binding_slots(
+                        state,
+                        allocations,
+                        &table.bindings,
+                        usize::from(table.base_register),
+                    )?));
                 }
-                ops.push(PreparedRenderOp::VertexBuffers(resolve_binding_slots(
-                    state,
-                    allocations,
-                    &table.bindings,
-                    usize::from(table.base_register),
-                )?));
             }
             CommandV3::SetRootBufferView(view) => {
                 let (buffer, offset, _length) = resolve_buffer_range(
@@ -2573,11 +3382,25 @@ fn prepare_render_segment(
                     view.length,
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
-                ops.push(PreparedRenderOp::VertexBuffers(vec![(
-                    buffer,
-                    offset,
-                    usize::from(view.slot),
-                )]));
+                if abi.is_some() {
+                    let address = buffer_gpu_address(buffer)
+                        .checked_add(offset as u64)
+                        .ok_or(MetalError::InvalidArg(
+                            "root buffer view address overflows u64",
+                        ))?;
+                    pending.bindings.push(PendingAbiBinding::RootView {
+                        parameter: usize::from(view.slot),
+                        address,
+                        resource: buffer,
+                        usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+                    });
+                } else {
+                    ops.push(PreparedRenderOp::VertexBuffers(vec![(
+                        buffer,
+                        offset,
+                        usize::from(view.slot),
+                    )]));
+                }
             }
             CommandV3::ResourceBarrier(barrier) => {
                 if resolve_barrier_entries(state, allocations, &barrier.entries).is_none() {
@@ -2612,6 +3435,13 @@ fn prepare_render_segment(
                     )
                     .into());
                 }
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DispatchMesh {
                     group_counts: MTLSize {
                         width: dispatch.group_counts[0] as usize,
@@ -2636,6 +3466,13 @@ fn prepare_render_segment(
                     )
                     .into());
                 }
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::Draw {
                     primitive: topology,
                     vertex_start: draw.start_vertex as usize,
@@ -2657,6 +3494,13 @@ fn prepare_render_segment(
                     )
                     .into());
                 }
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::Draw {
                     primitive: topology,
                     vertex_start: draw.start_vertex as usize,
@@ -2679,6 +3523,13 @@ fn prepare_render_segment(
                         MetalError::InvalidArg("draw instance count must be nonzero").into(),
                     );
                 }
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DrawIndexed {
                     primitive: topology,
                     index_count,
@@ -2707,6 +3558,13 @@ fn prepare_render_segment(
                         MetalError::InvalidArg("draw instance count must be nonzero").into(),
                     );
                 }
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DrawIndexed {
                     primitive: topology,
                     index_count,
@@ -2732,6 +3590,13 @@ fn prepare_render_segment(
                     indirect::DRAW_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DrawIndirect {
                     primitive: topology,
                     arguments,
@@ -2753,6 +3618,13 @@ fn prepare_render_segment(
                     indirect::DRAW_INDEXED_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DrawIndexedIndirect {
                     primitive: topology,
                     index_type,
@@ -2779,6 +3651,13 @@ fn prepare_render_segment(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
+                flush_render_abi(
+                    device,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    &mut pending,
+                    &mut ops,
+                )?;
                 ops.push(PreparedRenderOp::DispatchMeshIndirect {
                     threads_per_object_threadgroup: mesh.threads_per_object_threadgroup(),
                     threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup(),
@@ -3033,9 +3912,85 @@ fn prepare_blit_segment(
     Ok(ops)
 }
 
+/// Compares a content-hashed pipeline's declared attachment state with a pass.
+///
+/// A mismatch is an explicit error: the registry never rebuilds the pipeline
+/// with a different entry point or attachment layout to make a submission fit.
+fn check_pipeline_attachments(
+    entry: &crate::macos::registry::PipelineEntry,
+    color_formats: &[PixelFormat],
+    depth_format: Option<PixelFormat>,
+) -> Result<(), PrepareAbort> {
+    let declared = entry.state();
+    if declared.color_formats.len() != color_formats.len()
+        || declared
+            .color_formats
+            .iter()
+            .zip(color_formats)
+            .any(|(declared, pass)| declared.mtl_pixel_format() != pass.mtl_pixel_format())
+    {
+        return Err(MetalError::InvalidArg(
+            "content-hashed pipeline colour formats do not match the render pass",
+        )
+        .into());
+    }
+    let declared_depth = declared
+        .depth_format
+        .map(TextureFormat::mtl_pixel_format);
+    if declared_depth != depth_format.map(PixelFormat::mtl_pixel_format) {
+        return Err(MetalError::InvalidArg(
+            "content-hashed pipeline depth format does not match the render pass",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolves one wire handle through the content-hashed pipeline registry.
+fn resolve_content_pipeline(
+    state: &DeviceState,
+    id: u64,
+    expected: PipelineStage,
+) -> Result<&crate::macos::registry::PipelineEntry, PrepareAbort> {
+    let pipeline = state
+        .content_pipelines
+        .get(&id)
+        .ok_or(PrepareAbort::UnknownHandle)?;
+    let registry = state
+        .pipeline_registry
+        .as_ref()
+        .ok_or(PrepareAbort::UnknownHandle)?;
+    let entry = registry.get(*pipeline).ok_or(PrepareAbort::UnknownHandle)?;
+    if entry.stage() != expected {
+        return Err(MetalError::InvalidArg(
+            "pipeline handle names a different pipeline stage",
+        )
+        .into());
+    }
+    Ok(entry)
+}
+
+/// Extracts the root-signature ABI registered for `id`, if any.
+fn pipeline_abi(state: &DeviceState, id: u64) -> Option<PipelineAbi> {
+    state.abis.get(&id).cloned()
+}
+
+/// Maps a host-registry failure to the transport error surface.
+///
+/// A Metal failure created inside the registry keeps its original
+/// classification; every validation/cache failure becomes an internal error
+/// carrying the registry's message.
+fn registry_error(error: RegistryError) -> MetalError {
+    match error {
+        RegistryError::Metal(inner) => inner,
+        other => MetalError::InternalError(other.to_string()),
+    }
+}
+
 /// Validates every handle and bound and builds the executable segment plan.
 fn prepare_v3(
     state: &DeviceState,
+    transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     plan: &[crate::macos::render::Segment],
@@ -3051,14 +4006,20 @@ fn prepare_v3(
     for segment in plan {
         match &segment.kind {
             SegmentKind::Compute(range) => prepared.push(PreparedSegment::Compute(
-                prepare_compute_segment(state, allocations, commands, range.clone())?,
+                prepare_compute_segment(state, transport, allocations, commands, range.clone())?,
             )),
             SegmentKind::Render { pass_index, range } => {
                 let pass = passes.get(*pass_index).ok_or(MetalError::InternalError(
                     "render segment names a missing BeginRenderPass".to_string(),
                 ))?;
-                let (descriptor, width, height, ops) =
-                    prepare_render_segment(state, allocations, commands, range.clone(), pass)?;
+                let (descriptor, width, height, ops) = prepare_render_segment(
+                    state,
+                    transport,
+                    allocations,
+                    commands,
+                    range.clone(),
+                    pass,
+                )?;
                 prepared.push(PreparedSegment::Render {
                     descriptor,
                     width,
@@ -3110,6 +4071,406 @@ impl DirectMetalTransport {
         let mut state = self.lock_state()?;
         state.surfaces.insert(surface_id, texture);
         Ok(())
+    }
+
+    /// Registers an ADR-013 registry texture under `id`.
+    ///
+    /// The texture is created and owned by the persistent [`TextureRegistry`],
+    /// then aliased into the `textures` map [`resolve_texture`] consults, so a
+    /// `BeginRenderPass` colour/depth attachment that names the handle resolves
+    /// to the same object. The `registry_textures` alias lets
+    /// [`resolve_registered_texture`] resolve SRV/UAV descriptor-table entries
+    /// for the same handle.
+    pub fn register_registry_texture(
+        &self,
+        id: u64,
+        desc: TextureDesc,
+    ) -> Result<(), MetalError> {
+        if id == 0 {
+            return Err(MetalError::InvalidArg(
+                "registry texture handle must be nonzero",
+            ));
+        }
+        let mut state = self.lock_state()?;
+        if state.texture_registry.is_none() {
+            state.texture_registry =
+                Some(TextureRegistry::new(self).map_err(registry_error)?);
+        }
+        let raw = {
+            let registry = state
+                .texture_registry
+                .as_mut()
+                .ok_or(MetalError::InternalError(
+                    "texture registry was not created".to_string(),
+                ))?;
+            registry.register(id, desc).map_err(registry_error)?;
+            registry
+                .raw(id)
+                .ok_or(MetalError::InternalError(
+                    "registered texture is not resolvable".to_string(),
+                ))?
+        };
+        // SAFETY: `raw` is a live `MTLTexture` owned by the registry; `retain`
+        // returns the same object with an additional +1 reference.
+        let retained = ObjcObject::from_retained(unsafe {
+            objc::msg_send_id_0(raw, objc::sel(c"retain"))
+        })
+        .ok_or(MetalError::InternalError(
+            "registered texture retain returned null".to_string(),
+        ))?;
+        state.textures.insert(id, retained);
+        state.registry_textures.insert(id, id);
+        Ok(())
+    }
+
+    /// Registers (or reuses) an `MTLSamplerState` under `id`.
+    ///
+    /// Converted sampler descriptor tables name the registered handle; a second
+    /// registration for the same id is idempotent so a reconverted table cannot
+    /// churn sampler objects.
+    pub fn register_sampler(&self, id: u64, desc: SamplerDesc) -> Result<(), MetalError> {
+        if id == 0 {
+            return Err(MetalError::InvalidArg("sampler handle must be nonzero"));
+        }
+        {
+            let state = self.lock_state()?;
+            if state.samplers.contains_key(&id) {
+                return Ok(());
+            }
+        }
+        let _pool = AutoreleasePool::new();
+        let class = objc::class(c"MTLSamplerDescriptor");
+        if class.is_null() {
+            return Err(MetalError::NotSupported(
+                "MTLSamplerDescriptor class is unavailable",
+            ));
+        }
+        // SAFETY: `class` is `MTLSamplerDescriptor`; `new` returns +1.
+        let descriptor = ObjcObject::from_retained(unsafe {
+            objc::msg_send_id_0(class, objc::sel(c"new"))
+        })
+        .ok_or(MetalError::InternalError(
+            "MTLSamplerDescriptor creation returned null".to_string(),
+        ))?;
+        // SAFETY: `descriptor` is a live `MTLSamplerDescriptor` and every
+        // property takes a documented `NSUInteger` filter/address mode.
+        unsafe {
+            objc::msg_send_void_usize(
+                descriptor.as_raw(),
+                objc::sel(c"setMinFilter:"),
+                desc.min_filter,
+            );
+            objc::msg_send_void_usize(
+                descriptor.as_raw(),
+                objc::sel(c"setMagFilter:"),
+                desc.mag_filter,
+            );
+            objc::msg_send_void_usize(
+                descriptor.as_raw(),
+                objc::sel(c"setSAddressMode:"),
+                desc.s_address_mode,
+            );
+            objc::msg_send_void_usize(
+                descriptor.as_raw(),
+                objc::sel(c"setTAddressMode:"),
+                desc.t_address_mode,
+            );
+            objc::msg_send_void_usize(
+                descriptor.as_raw(),
+                objc::sel(c"setRAddressMode:"),
+                desc.r_address_mode,
+            );
+        }
+        // SAFETY: `descriptor` is a live sampler descriptor and the device is
+        // live; the returned sampler state is retained (+1).
+        let sampler = ObjcObject::from_retained(unsafe {
+            objc::msg_send_id_1(
+                self.device.as_raw(),
+                objc::sel(c"newSamplerStateWithDescriptor:"),
+                descriptor.as_raw(),
+            )
+        })
+        .ok_or(MetalError::InternalError(
+            "MTLDevice.newSamplerStateWithDescriptor returned null".to_string(),
+        ))?;
+        let mut state = self.lock_state()?;
+        state.samplers.entry(id).or_insert(sampler);
+        Ok(())
+    }
+
+    /// Registers a content-hashed graphics pipeline under a wire `handle`.
+    ///
+    /// The content key is derived from the metallib, vertex entry and encoded
+    /// [`crate::macos::registry::PipelineState`] blob, so two identical
+    /// registrations share one `MTLRenderPipelineState`. The handle is inserted
+    /// into the same `content_pipelines` table that `SetGraphicsPipeline`
+    /// resolves; `abi` is stored so the executor can bind the converted root
+    /// signature automatically.
+    pub fn register_content_hashed_graphics_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        vertex_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline(
+            handle,
+            metallib,
+            vertex_entry,
+            state,
+            PipelineStage::Graphics,
+            abi,
+        )
+    }
+
+    /// Registers a content-hashed mesh pipeline under a wire `handle`.
+    pub fn register_content_hashed_mesh_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        mesh_entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline(
+            handle,
+            metallib,
+            mesh_entry,
+            state,
+            PipelineStage::Mesh,
+            abi,
+        )
+    }
+
+    /// Registers a content-hashed compute pipeline under a wire `handle`.
+    pub fn register_content_hashed_compute_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        entry: &str,
+        state: &[u8],
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        self.register_content_hashed_pipeline(
+            handle,
+            metallib,
+            entry,
+            state,
+            PipelineStage::Compute,
+            abi,
+        )
+    }
+
+    fn register_content_hashed_pipeline(
+        &self,
+        handle: u64,
+        metallib: &[u8],
+        entry: &str,
+        state_bytes: &[u8],
+        stage: PipelineStage,
+        abi: PipelineAbi,
+    ) -> Result<(), MetalError> {
+        if handle == 0 {
+            return Err(MetalError::InvalidArg(
+                "content pipeline handle must be nonzero",
+            ));
+        }
+        let key = PipelineKey::from_parts(metallib, entry, stage, state_bytes);
+        let mut state = self.lock_state()?;
+        if state.pipeline_registry.is_none() {
+            state.pipeline_registry =
+                Some(PipelineRegistry::new(self).map_err(registry_error)?);
+        }
+        let registry = state
+            .pipeline_registry
+            .as_mut()
+            .ok_or(MetalError::InternalError(
+                "pipeline registry was not created".to_string(),
+            ))?;
+        let pipeline = match stage {
+            PipelineStage::Graphics => {
+                registry.register_graphics(key, metallib, entry, state_bytes)
+            }
+            PipelineStage::Mesh => registry.register_mesh(key, metallib, entry, state_bytes),
+            PipelineStage::Compute => {
+                registry.register_compute(key, metallib, entry, state_bytes)
+            }
+        }
+        .map_err(registry_error)?;
+        state.content_pipelines.insert(handle, pipeline);
+        state.abis.insert(handle, abi);
+        Ok(())
+    }
+
+    /// Attaches every live buffer and texture to the persistent residency set.
+    ///
+    /// The set is created once per transport. On the native `MTLResidencySet`
+    /// path the additions are committed and the set is attached to the queue;
+    /// the fallback records why it could not create a native set and declares
+    /// each allocation per encoder through [`ResidencySet::use_resources`].
+    fn sync_residency(&self, state: &mut DeviceState) -> Result<(), MetalError> {
+        if state.residency.is_none() {
+            let residency =
+                ResidencySet::new(self).map_err(|error| MetalError::InternalError(error.to_string()))?;
+            residency
+                .attach_to_queue(self)
+                .map_err(|error| MetalError::InternalError(error.to_string()))?;
+            state.residency = Some(residency);
+        }
+        let residency = state
+            .residency
+            .as_mut()
+            .ok_or(MetalError::InternalError(
+                "residency set was not created".to_string(),
+            ))?;
+        for buffer in state.buffers.values() {
+            residency
+                .add_buffer_raw(buffer.buffer.as_raw(), buffer.len)
+                .map_err(|error| MetalError::InternalError(error.to_string()))?;
+        }
+        for texture in state.textures.values() {
+            residency
+                .add_texture_raw(texture.as_raw())
+                .map_err(|error| MetalError::InternalError(error.to_string()))?;
+        }
+        if let Some(registry) = state.texture_registry.as_ref() {
+            for id in state.registry_textures.values() {
+                residency
+                    .add_texture(registry, *id)
+                    .map_err(|error| MetalError::InternalError(error.to_string()))?;
+            }
+        }
+        residency.commit();
+        Ok(())
+    }
+
+    /// Whether a native `MTLResidencySet` backs the persistent residency path.
+    pub fn residency_is_native(&self) -> Result<bool, MetalError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .residency
+            .as_ref()
+            .is_some_and(ResidencySet::is_native))
+    }
+
+    /// Exact selector and `file:line` that forced the residency fallback.
+    pub fn residency_fallback_reason(&self) -> Result<Option<String>, MetalError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .residency
+            .as_ref()
+            .and_then(ResidencySet::fallback_reason)
+            .map(str::to_string))
+    }
+
+    /// Number of allocations recorded by the persistent residency set.
+    pub fn residency_allocation_count(&self) -> Result<usize, MetalError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .residency
+            .as_ref()
+            .map_or(0, ResidencySet::allocation_count))
+    }
+
+    /// Reads a registry texture back as RGBA8 pixels through a shared staging
+    /// buffer.
+    ///
+    /// `handle` is the transport handle passed to
+    /// [`Self::register_registry_texture`]. The private texture is blitted into
+    /// a shared `MTLBuffer` and mapped there; raw `getBytes:` is never issued on
+    /// a private texture.
+    pub fn read_registered_texture_rgba8(
+        &self,
+        handle: u64,
+    ) -> Result<Vec<[u8; 4]>, MetalError> {
+        let _pool = AutoreleasePool::new();
+        let state = self.lock_state()?;
+        let raw = resolve_registered_texture(&state, handle).ok_or_else(|| {
+            MetalError::NotFound(format!("registry texture handle {handle} is not registered"))
+        })?;
+        let info = texture_info(raw)?;
+        if !info.format.is_color() {
+            return Err(MetalError::InvalidArg(
+                "readback texture must use a colour pixel format",
+            ));
+        }
+        let width = info.width as usize;
+        let height = info.height as usize;
+        let bytes_per_row = width.checked_mul(4).ok_or(MetalError::InvalidArg(
+            "texture row length overflows usize",
+        ))?;
+        let len = bytes_per_row
+            .checked_mul(height)
+            .ok_or(MetalError::InvalidArg("texture byte length overflows usize"))?;
+        // SAFETY: `device_raw()` is a valid `MTLDevice`; storage mode `0` is
+        // shared, `len` is nonzero, and the result is retained (+1).
+        let buffer = ObjcObject::from_retained(unsafe {
+            objc::msg_send_new_buffer(self.device_raw(), len, 0)
+        })
+        .ok_or_else(|| {
+            MetalError::InternalError("readback MTLBuffer allocation returned null".to_string())
+        })?;
+        // SAFETY: `queue_raw()` is a valid `MTLCommandQueue`; the command buffer
+        // is autoreleased and lives for this pool.
+        let cb = unsafe { objc::msg_send_id_0(self.queue_raw(), objc::sel(c"commandBuffer")) };
+        if cb.is_null() {
+            return Err(MetalError::InternalError(
+                "readback command buffer is null".to_string(),
+            ));
+        }
+        // SAFETY: `cb` is a live uncommitted command buffer.
+        let enc = unsafe { objc::msg_send_id_0(cb, objc::sel(c"blitCommandEncoder")) };
+        if enc.is_null() {
+            return Err(MetalError::InternalError(
+                "readback blit encoder is null".to_string(),
+            ));
+        }
+        // SAFETY: `enc` is a live blit encoder, `raw` is a live level-0 texture
+        // and `buffer` can hold exactly one image with this row pitch.
+        unsafe {
+            msg_send_copy_texture_to_buffer(
+                enc,
+                raw,
+                HostOrigin { x: 0, y: 0, z: 0 },
+                MTLSize {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                buffer.as_raw(),
+                0,
+                bytes_per_row,
+            );
+            objc::msg_send_void_0(enc, objc::sel(c"endEncoding"));
+            objc::msg_send_void_0(cb, objc::sel(c"commit"));
+            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
+        }
+        // SAFETY: `cb` completed via `waitUntilCompleted`.
+        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            // SAFETY: `[cb error]` returns null or an autoreleased `NSError *`.
+            let error_raw = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
+            // SAFETY: `error_raw` is null or a valid `NSError *`.
+            let message = unsafe { objc::nserror_message(error_raw) };
+            return Err(MetalError::InternalError(format!(
+                "registry texture readback failed (status={status}): {message}"
+            )));
+        }
+        // SAFETY: `buffer` uses shared storage; `contents` is valid for `len`
+        // bytes for the buffer's lifetime.
+        let contents = unsafe { objc::msg_send_ptr_0(buffer.as_raw(), objc::sel(c"contents")) };
+        if contents.is_null() {
+            return Err(MetalError::InternalError(
+                "readback buffer has no CPU-visible contents".to_string(),
+            ));
+        }
+        // SAFETY: `contents` points to `len` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(contents.cast::<u8>(), len) };
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect())
     }
 
     /// Executes one version 3 submission on a single `MTLCommandBuffer`.
@@ -3200,7 +4561,7 @@ impl DirectMetalTransport {
             }
         }
 
-        let prepared = match prepare_v3(&state, allocations, &submission.commands, &plan) {
+        let prepared = match prepare_v3(&state, self, allocations, &submission.commands, &plan) {
             Ok(prepared) => prepared,
             Err(PrepareAbort::UnknownHandle) => {
                 return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
@@ -3216,7 +4577,10 @@ impl DirectMetalTransport {
             return Ok((reply(ReplyStatus::Ok), stats));
         }
 
-        let completed = self.encode_v3_segments(&prepared, &mut stats)?;
+        // Attach every live buffer and registered texture to the persistent
+        // residency set and publish the additions before the queues run.
+        self.sync_residency(&mut state)?;
+        let completed = self.encode_v3_segments(&prepared, &mut stats, state.residency.as_ref())?;
         if let Some((list_id, generation)) = list_key {
             state.mark_list_executed(list_id, generation);
         }
@@ -3237,6 +4601,7 @@ impl DirectMetalTransport {
         &self,
         segments: &[PreparedSegment],
         stats: &mut EncoderStats,
+        residency: Option<&ResidencySet>,
     ) -> Result<bool, MetalError> {
         let _pool = AutoreleasePool::new();
         // SAFETY: `queue_raw()` is a valid `MTLCommandQueue`; the command buffer
@@ -3261,6 +4626,11 @@ impl DirectMetalTransport {
                         ));
                     }
                     stats.compute_encoders += 1;
+                    if let Some(residency) = residency {
+                        // Native residency is a no-op; the fallback declares
+                        // every allocation once per encoder.
+                        residency.use_resources(enc);
+                    }
                     for op in ops {
                         match op {
                             PreparedComputeOp::Pipeline(pipeline) => unsafe {
@@ -3278,6 +4648,25 @@ impl DirectMetalTransport {
                                     // SAFETY: registry-held buffer, validated range.
                                     unsafe {
                                         objc::msg_send_set_buffer(enc, *buffer, *offset, *slot);
+                                    }
+                                }
+                            }
+                            PreparedComputeOp::ArgumentBuffer(argument_buffer) => {
+                                // SAFETY: `enc` is a live compute encoder and the
+                                // buffer is owned by this prepared segment.
+                                unsafe {
+                                    objc::msg_send_set_buffer(
+                                        enc,
+                                        argument_buffer.buffer.as_raw(),
+                                        0,
+                                        argument_buffer.index,
+                                    );
+                                    for resource in &argument_buffer.resources {
+                                        objc::msg_send_use_resource(
+                                            enc,
+                                            *resource,
+                                            MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+                                        );
                                     }
                                 }
                             }
@@ -3368,7 +4757,13 @@ impl DirectMetalTransport {
                 } => {
                     if ops.iter().any(PreparedRenderOp::is_indirect) {
                         encode_indirect_render_segment(
-                            cb, *descriptor, *width, *height, ops, stats,
+                            cb,
+                            *descriptor,
+                            *width,
+                            *height,
+                            ops,
+                            stats,
+                            residency,
                         )?;
                         continue;
                     }
@@ -3376,10 +4771,16 @@ impl DirectMetalTransport {
                         RenderEncoder::new_with_descriptor(self, cb, *descriptor, *width, *height);
                     encoder.ensure_started()?;
                     stats.render_encoders += 1;
+                    if let Some(residency) = residency {
+                        residency.use_resources(encoder.raw_encoder());
+                    }
                     for op in ops {
                         match op {
                             PreparedRenderOp::Pipeline { state, depth_state } => {
-                                encoder.set_pipeline_state(*state, *depth_state)?;
+                                encoder.set_pipeline_state(
+                                    *state,
+                                    depth_state.as_ref().map(DepthState::raw),
+                                )?;
                             }
                             PreparedRenderOp::Viewport(viewport) => {
                                 encoder.set_viewport(*viewport)?;
@@ -3397,6 +4798,28 @@ impl DirectMetalTransport {
                             }
                             PreparedRenderOp::VertexBytes { slot, bytes } => {
                                 encoder.set_vertex_bytes(bytes, *slot)?;
+                            }
+                            PreparedRenderOp::ArgumentBuffer(argument_buffer) => {
+                                encoder.bind_argument_buffer(
+                                    argument_buffer.stage,
+                                    argument_buffer.buffer.as_raw(),
+                                    argument_buffer.index,
+                                )?;
+                                for resource in &argument_buffer.resources {
+                                    // SAFETY: the resource is a live Metal object
+                                    // named by the argument buffer.
+                                    unsafe {
+                                        objc::msg_send_use_resource(
+                                            encoder.raw_encoder(),
+                                            *resource,
+                                            MTL_RESOURCE_USAGE_READ
+                                            | MTL_RESOURCE_USAGE_WRITE,
+                                        );
+                                    }
+                                }
+                            }
+                            PreparedRenderOp::StageBytes { stage, slot, bytes } => {
+                                encoder.set_stage_bytes(*stage, bytes, *slot)?;
                             }
                             PreparedRenderOp::Barrier => {
                                 encoder.memory_barrier(MTL_BARRIER_SCOPE_BUFFERS)?;
@@ -3482,6 +4905,9 @@ impl DirectMetalTransport {
                         ));
                     }
                     stats.blit_encoders += 1;
+                    if let Some(residency) = residency {
+                        residency.use_resources(enc);
+                    }
                     for op in ops {
                         match op {
                             PreparedBlitOp::CopyBuffer {
@@ -3560,6 +4986,9 @@ impl DirectMetalTransport {
                                     ));
                                 }
                                 stats.blit_encoders += 1;
+                                if let Some(residency) = residency {
+                                    residency.use_resources(enc);
+                                }
                             }
                             PreparedBlitOp::Barrier => {
                                 // The blit encoder has no barrier API; the
@@ -3621,6 +5050,7 @@ fn encode_indirect_render_segment(
     height: u32,
     ops: &[PreparedRenderOp],
     stats: &mut EncoderStats,
+    residency: Option<&ResidencySet>,
 ) -> Result<(), MetalError> {
     let _pool = AutoreleasePool::new();
     // SAFETY: `cb` is a live uncommitted command buffer and `descriptor` is a
@@ -3638,6 +5068,9 @@ fn encode_indirect_render_segment(
         ));
     }
     stats.render_encoders += 1;
+    if let Some(residency) = residency {
+        residency.use_resources(enc);
+    }
 
     // SAFETY: `enc` is a live render encoder; the defaults cover the whole
     // attachment exactly like `RenderEncoder::ensure_encoder`.
@@ -3676,7 +5109,7 @@ fn encode_indirect_render_segment(
                         objc::msg_send_void_1(
                             enc,
                             objc::sel(c"setDepthStencilState:"),
-                            *depth_state,
+                            depth_state.raw(),
                         );
                     }
                 }
@@ -3724,6 +5157,32 @@ fn encode_indirect_render_segment(
                 // SAFETY: `bytes` is valid for the call; Metal copies it.
                 unsafe {
                     msg_send_set_vertex_bytes(enc, bytes.as_ptr(), bytes.len(), *slot);
+                }
+            }
+            PreparedRenderOp::ArgumentBuffer(argument_buffer) => {
+                // SAFETY: the buffer is owned by the prepared segment and the
+                // stage/index were validated by the layout.
+                unsafe {
+                    msg_send_set_stage_buffer(
+                        enc,
+                        argument_buffer.stage,
+                        argument_buffer.buffer.as_raw(),
+                        0,
+                        argument_buffer.index,
+                    );
+                    for resource in &argument_buffer.resources {
+                        objc::msg_send_use_resource(
+                            enc,
+                            *resource,
+                            MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+                        );
+                    }
+                }
+            }
+            PreparedRenderOp::StageBytes { stage, slot, bytes } => {
+                // SAFETY: `bytes` is valid for the call; Metal copies it.
+                unsafe {
+                    msg_send_set_stage_bytes(enc, *stage, bytes.as_ptr(), bytes.len(), *slot);
                 }
             }
             PreparedRenderOp::Barrier => {
@@ -3896,6 +5355,52 @@ unsafe fn msg_send_set_mesh_buffer(
             offset,
             index,
         )
+    }
+}
+
+/// `-[MTLRenderCommandEncoder setVertex|Fragment|Mesh|ObjectBuffer:offset:atIndex:]`.
+unsafe fn msg_send_set_stage_buffer(
+    enc: objc::Id,
+    stage: ShaderStage,
+    buffer: objc::Id,
+    offset: usize,
+    index: usize,
+) {
+    let selector = match stage {
+        ShaderStage::Vertex => objc::sel(c"setVertexBuffer:offset:atIndex:"),
+        ShaderStage::Fragment => objc::sel(c"setFragmentBuffer:offset:atIndex:"),
+        ShaderStage::Mesh => objc::sel(c"setMeshBuffer:offset:atIndex:"),
+        ShaderStage::Object => objc::sel(c"setObjectBuffer:offset:atIndex:"),
+        ShaderStage::Compute => objc::sel(c"setBuffer:offset:atIndex:"),
+    };
+    // SAFETY: Caller supplies a live encoder of the matching family.
+    unsafe {
+        type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, usize, usize);
+        let send: Fn = std::mem::transmute(objc::msg_send_entry());
+        send(enc, selector, buffer, offset, index);
+    }
+}
+
+/// `-[MTLRenderCommandEncoder setVertex|Fragment|Mesh|ObjectBytes:length:atIndex:]`.
+unsafe fn msg_send_set_stage_bytes(
+    enc: objc::Id,
+    stage: ShaderStage,
+    bytes: *const u8,
+    len: usize,
+    index: usize,
+) {
+    let selector = match stage {
+        ShaderStage::Vertex => objc::sel(c"setVertexBytes:length:atIndex:"),
+        ShaderStage::Fragment => objc::sel(c"setFragmentBytes:length:atIndex:"),
+        ShaderStage::Mesh => objc::sel(c"setMeshBytes:length:atIndex:"),
+        ShaderStage::Object => objc::sel(c"setObjectBytes:length:atIndex:"),
+        ShaderStage::Compute => objc::sel(c"setBytes:length:atIndex:"),
+    };
+    // SAFETY: Caller supplies a live encoder and `bytes` readable for `len`.
+    unsafe {
+        type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, *const c_void, usize, usize);
+        let send: Fn = std::mem::transmute(objc::msg_send_entry());
+        send(enc, selector, bytes.cast(), len, index);
     }
 }
 
