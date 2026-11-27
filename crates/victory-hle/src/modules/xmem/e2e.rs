@@ -36,6 +36,10 @@
 //!
 //! The harness owns the secret file and the share directory; nothing here
 //! prints the secret. No title is launched.
+//!
+//! One test is hermetic: it commits a whole `XMemVirtualAlloc` region the way
+//! the title's allocator does, resolves a buffer sub-range of it through the
+//! installed GPU resolver, and needs no launcher, host or GPU.
 
 use super::{PAGE, PAGES_64K};
 
@@ -47,7 +51,10 @@ use victory_metal::wire::{
 };
 use victory_metal::{GuestIpcClient, GuestIpcError};
 
-use windows_sys::Win32::System::Memory::{FlushViewOfFile, MEM_RESERVE, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    FlushViewOfFile, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+    VirtualFree, VirtualQuery,
+};
 
 /// One 64 KiB page of dwords: the dispatched range.
 const WORDS: usize = PAGE / 4;
@@ -843,4 +850,159 @@ fn wine_guest_draws_and_computes_through_native_frame_gate() {
     );
     drop(compute_lease);
     drop(graphics_lease);
+}
+
+/// The title's own GPU-memory allocator commits a whole region through
+/// `XMemVirtualAlloc` (no 64 KiB placeholder, no physical-page section), then
+/// hands buffers inside it to `IASetVertexBuffers`/`IASetIndexBuffer`. Before
+/// this fix such a region never reached the share table, so every vertex and
+/// index buffer in it refused as `no shared xmem range` (Boot #18b, the
+/// 0x147a…/0x147b… runs).
+///
+/// This is that path, without a title or a GPU: commit, write, resolve a
+/// sub-range through the installed GPU resolver, and check the bytes are at
+/// the resolved offset in the share file. A reserved-only region is still
+/// refused by name, and a large reservation creates no file at all.
+#[test]
+fn a_committed_xmem_region_resolves_a_buffer_subrange_and_a_reservation_stays_unbacked() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let _share = share::test_directory(directory.path());
+    share::install_for_test();
+    let before = share::live();
+
+    // A large reservation owns address space only: no share file, however big
+    // it is. (A 64 KiB placeholder, the title's physical-page heap shape.)
+    let reserved = super::XMemVirtualAlloc(
+        std::ptr::null_mut(),
+        256 << 20,
+        MEM_RESERVE | PAGES_64K,
+        0,
+        PAGE_READWRITE,
+    );
+    assert!(!reserved.is_null(), "the reservation failed");
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("the share directory")
+            .count(),
+        0,
+        "a reservation must not create a share file"
+    );
+    assert_eq!(share::live(), before, "a reservation must not back a section");
+
+    // The title allocator's commit: one whole committed region, readable and
+    // writable at the returned address, no placeholder and no page section.
+    let size = 4 * PAGE;
+    let at = super::XMemVirtualAlloc(
+        std::ptr::null_mut(),
+        size,
+        MEM_RESERVE | MEM_COMMIT | PAGES_64K,
+        0,
+        PAGE_READWRITE,
+    );
+    assert!(!at.is_null(), "the committed region failed");
+    // SAFETY: a plain data structure filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    assert_ne!(
+        // SAFETY: `at` is a live allocation and `info` is writable.
+        unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) },
+        0,
+        "VirtualQuery failed"
+    );
+    assert_eq!(info.State, MEM_COMMIT, "the region must stay committed");
+    assert_eq!(
+        info.Protect & 0xff,
+        PAGE_READWRITE,
+        "the region must keep its protection"
+    );
+    assert_eq!(
+        share::live(),
+        before + 1,
+        "the committed region must get exactly one share section"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("the share directory")
+            .count(),
+        1,
+        "the committed region must create exactly one share file"
+    );
+
+    // The title writes a vertex buffer at a page-misaligned offset of it.
+    let payload: Vec<u8> = (0..0x400).map(|index| (index * 7 + 3) as u8).collect();
+    let buffer = at.cast::<u8>().wrapping_add(PAGE + 0x40);
+    // SAFETY: `[PAGE + 0x40, PAGE + 0x40 + payload.len())` is inside the
+    // committed, writable region.
+    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), buffer, payload.len()) };
+
+    // The GPU resolver answers the exact page window, not the whole region.
+    let resolver = victory_gpu::native_metal::bindings::resolver()
+        .expect("device creation installs the share resolver");
+    let range = resolver
+        .resolve(buffer as u64, payload.len() as u64)
+        .expect("a committed region must resolve to host-visible backing");
+    assert_ne!(range.allocation_id, 0, "the allocation id is zero");
+    assert_eq!(
+        range.byte_offset,
+        PAGE as u64,
+        "the buffer's own page is the window"
+    );
+    assert_eq!(range.size, PAGE as u64, "only the buffer's page");
+
+    // The bytes are already in that file at the exact offset the binding
+    // names: the guest write and the host read are one mapping.
+    let path = directory
+        .path()
+        .join(format!("{:016x}.bin", range.allocation_id));
+    assert_eq!(
+        std::fs::metadata(&path).expect("the share file").len(),
+        size as u64,
+        "the file is the commit, not a larger reservation"
+    );
+    let bytes = std::fs::read(&path).expect("the share file bytes");
+    let start = range.byte_offset as usize + 0x40;
+    assert_eq!(&bytes[start..start + payload.len()], &payload[..]);
+
+    // A genuinely uncommitted page (the reservation above) is still refused
+    // by name, never given a fabricated window.
+    let error = resolver
+        .resolve(reserved as u64, 0x10)
+        .expect_err("an uncommitted page must not resolve");
+    assert_eq!(
+        error,
+        victory_gpu::native_metal::bindings::ResolveError::Unmapped {
+            address: reserved as u64,
+            len: 0x10,
+        }
+    );
+    assert!(
+        error.to_string().contains("no shared xmem range"),
+        "the refusal keeps its name: {error}"
+    );
+
+    // The pin bookkeeping is the normal one: resolve, retain, retire.
+    let token = resolver.retain(&range).expect("the range retains");
+    resolver.retire(token).expect("the range retires");
+
+    // Unmap through the existing physical-page path, which must return the
+    // share view to a placeholder, then release both host regions.
+    assert_eq!(
+        super::XMemMapPhysicalPages(at, 4, std::ptr::null()),
+        at,
+        "unmapping the share view failed"
+    );
+    // SAFETY: the placeholder left by the unmap, and the reservation.
+    unsafe {
+        assert_ne!(VirtualFree(at, 0, MEM_RELEASE), 0, "releasing the region failed");
+        assert_ne!(
+            VirtualFree(reserved, 0, MEM_RELEASE),
+            0,
+            "releasing the reservation failed"
+        );
+    }
+    assert_eq!(
+        share::live(),
+        before,
+        "unmapping and releasing drop the share section"
+    );
+    share::uninstall_for_test();
 }

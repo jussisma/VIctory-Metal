@@ -189,15 +189,46 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null()
-        && victory_gpu::alias_buffers()
+    // A whole committed region the title can hand to a buffer must have a
+    // host-visible range: a title allocator's `XMemVirtualAlloc` commit is
+    // host memory, but it never went through a physical-page section, so the
+    // share table has no range for it and its buffers are refused as
+    // `no shared xmem range` (Boot #18b, 0x147a…/0x147b…). The allocation
+    // above already succeeded and keeps its address, size, state and
+    // protection; the share path only swaps its backing for a share file of
+    // exactly the committed size. Reservations stay reserved and create no
+    // file.
+    //
+    // Which backing applies is the session's choice, unchanged for the
+    // reference path: with a share directory configured (the Metal launcher
+    // sets one) the native host reads the file, so the region is shared; with
+    // none, the Rosetta/D3DMetal alias keeps owning it as before.
+    let committed = !at.is_null()
         && kind & MEM_COMMIT != 0
-        && kind & MEM_RESERVE_PLACEHOLDER == 0
+        && kind & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER) == 0
         && protect == PAGE_READWRITE
         && (at as usize).is_multiple_of(PAGE)
         && size >= PAGE
-        && size.is_multiple_of(PAGE)
-    {
+        && size.is_multiple_of(PAGE);
+    if committed && share::configured() {
+        let backing = share::back_committed_region(at as usize, size);
+        let registered = backing == share::CommittedBacking::Shared;
+        tracing::debug!(
+            size,
+            kind = format_args!("{kind:#x}"),
+            at = format_args!("{:#x}", at as usize),
+            registered,
+            "XMemVirtualAlloc committed region"
+        );
+        if backing == share::CommittedBacking::Lost {
+            tracing::warn!(
+                size,
+                at = format_args!("{:#x}", at as usize),
+                "XMemVirtualAlloc: the host region could not be restored after remapping failed"
+            );
+            return std::ptr::null_mut();
+        }
+    } else if committed && victory_gpu::alias_buffers() {
         victory_gpu::alias_region(at as usize, size, false);
     }
     if base.is_null() {

@@ -12,10 +12,10 @@
 //! be cleaned up by the harness. Files are named `{id:016x}.bin`, where the
 //! id is monotonic and never reused. [`Backing::generation`] is fixed at 1
 //! for this first protocol, so a stale id can never name a new allocation.
-//! The directory is resolved once per process, at the first section creation,
-//! so a session that sets it before D3D12 device creation needs no later
-//! lookup. Tests (and only tests) re-read it so one can set or clear the
-//! variable between sections.
+//! The directory is resolved once per process, at the first section creation
+//! or the first committed region, so a session that sets it before D3D12
+//! device creation needs no later lookup. Tests (and only tests) re-read it so
+//! one can set or clear the variable between sections.
 //!
 //! Unset (or empty), the provider is off and the pagefile path is unchanged.
 //! A configured provider that cannot create or map its file falls back to the
@@ -54,6 +54,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(not(test))]
 use std::sync::OnceLock;
+
+use windows_sys::Win32::System::Memory::{
+    MapViewOfFile3, MEM_COMMIT, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::{PAGE, Section};
 
@@ -775,6 +782,16 @@ fn next_id() -> Option<u64> {
         .ok()
 }
 
+/// Whether a share directory is configured for this session.
+///
+/// The Metal launcher sets [`DIRECTORY`] before the title runs; a reference
+/// session leaves it unset. A non-test build resolves it once, at the first
+/// section creation (or the first committed region), so every later call sees
+/// the same answer.
+pub(crate) fn configured() -> bool {
+    directory().is_some()
+}
+
 /// Backs a new physical-page section of `size` bytes with a file in the
 /// configured directory and maps it.
 ///
@@ -846,6 +863,155 @@ fn create_file(directory: &Path, size: usize) -> Result<(u64, File, PathBuf), Fa
         }
     }
     Err(Failure::Exhausted)
+}
+
+/// How a freshly committed host region was left by
+/// [`back_committed_region`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommittedBacking {
+    /// A share view covers the region now; the resolver finds it.
+    Shared,
+    /// The provider is off, the region is already tracked, or the share path
+    /// could not serve it: the caller's host allocation is untouched.
+    Unchanged,
+    /// The share path released the host region and could not restore it: the
+    /// caller must not return `at`.
+    Lost,
+}
+
+/// Backs a freshly committed host region with a share file, in place, without
+/// changing its address, size, state or protection.
+///
+/// The caller has just obtained `[at, at + size)` from the host as committed
+/// readable/writable memory and has not returned it to the guest yet: that is
+/// the one moment the region can be swapped for a view of a share file without
+/// moving the address or losing bytes. A reservation is not a commit and never
+/// reaches this function, so a large reservation creates no file; only the
+/// bytes actually committed get one.
+///
+/// On the share path the region is released, a placeholder is reserved at the
+/// same address, a view of a new section file is mapped over it and the view
+/// is registered in the page table so [`resolve_guest_range`] can answer a
+/// buffer sub-range. If any step fails the anonymous commit is restored at the
+/// same address and [`CommittedBacking::Unchanged`] is returned; only a failed
+/// restore is [`CommittedBacking::Lost`].
+///
+/// This is additive: it never reinterprets `MEM_RESERVE`/`MEM_COMMIT` or the
+/// placeholder flags, and it runs only after the caller's own host allocation
+/// has already succeeded.
+pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking {
+    install_if_metal();
+    if at == 0
+        || size < PAGE
+        || !at.is_multiple_of(PAGE)
+        || !size.is_multiple_of(PAGE)
+        || directory().is_none()
+    {
+        return CommittedBacking::Unchanged;
+    }
+    let Some(end) = at.checked_add(size) else {
+        return CommittedBacking::Unchanged;
+    };
+    // A title may reuse an address it already maps: never disturb a tracked
+    // view there.
+    if overlaps(&super::physical(), at, end) {
+        return CommittedBacking::Unchanged;
+    }
+    let Ok(section) = section(size) else {
+        // The provider could not create the file or mapping: the host
+        // allocation stands exactly as it was.
+        return CommittedBacking::Unchanged;
+    };
+    // SAFETY: `at` is the base of the fresh host allocation this call made and
+    // has not returned to the guest; nothing else references it.
+    if unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) } == 0 {
+        discard(section);
+        return CommittedBacking::Unchanged;
+    }
+    // SAFETY: `[at, at + size)` is free address space just released.
+    let placeholder = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            at as *const c_void,
+            size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if placeholder as usize != at {
+        discard(section);
+        return restore_or_lost(at, size);
+    }
+    // SAFETY: the placeholder above, replaced by a view of our own section.
+    let view = unsafe {
+        MapViewOfFile3(
+            section.handle,
+            GetCurrentProcess(),
+            at as *const c_void,
+            0,
+            size,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if view.Value as usize != at {
+        // SAFETY: the placeholder above; release it before restoring.
+        unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+        discard(section);
+        return restore_or_lost(at, size);
+    }
+    // The bytes at these addresses are new (a zeroed commit): pages the GPU
+    // side guarded for the old contents are stale.
+    victory_gpu::title_memory_remapped(at, size);
+    super::physical()
+        .views
+        .insert(at, (size, super::Slice { section, index: 0 }));
+    CommittedBacking::Shared
+}
+
+/// Whether a tracked view overlaps `[at, at + size)`.
+fn overlaps(physical: &super::Physical, at: usize, end: usize) -> bool {
+    physical
+        .views
+        .range(..end)
+        .next_back()
+        .is_some_and(|(base, (size, _))| base.saturating_add(*size) > at)
+}
+
+/// Restores the anonymous commit the caller's allocation had, in place.
+fn restore_or_lost(at: usize, size: usize) -> CommittedBacking {
+    // SAFETY: `[at, at + size)` was just released; restoring the same commit
+    // the caller's call already returned.
+    let restored = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            at as *const c_void,
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if restored as usize == at {
+        CommittedBacking::Unchanged
+    } else {
+        CommittedBacking::Lost
+    }
+}
+
+/// Drops a section that was never mapped and removes its share file: nothing
+/// can have leased it.
+fn discard(section: Arc<Section>) {
+    let path = section.share.as_ref().map(|backing| backing.path.clone());
+    drop(section);
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Resolves the guest byte range `[at, at + len)` to a share file, offset and
@@ -1130,10 +1296,36 @@ fn install_for_backend(backend: GpuBackend) {
 /// Drops the one install and its resolver, so an install test can start from
 /// a known state. Tests run with `--test-threads=1`.
 #[cfg(test)]
-fn uninstall_for_test() {
+pub(crate) fn uninstall_for_test() {
     let _guard = crate::modules::lock(&INSTALL_LOCK);
     INSTALLED.store(false, Ordering::Release);
     let _ = bindings::clear_resolver();
+}
+
+/// Installs the resolver for the Metal backend from a test.
+#[cfg(test)]
+pub(crate) fn install_for_test() {
+    install_for_backend(GpuBackend::Metal);
+}
+
+/// Makes this thread's provider use `directory` until the guard drops,
+/// restoring the previous override. Only tests can move the provider between
+/// sessions; a non-test build resolves the directory once, before the title
+/// runs.
+#[cfg(test)]
+pub(crate) fn test_directory(directory: &Path) -> TestDirectory {
+    let previous = DIRECTORY_OVERRIDE.with(|slot| slot.replace(Some(Some(directory.to_path_buf()))));
+    TestDirectory(previous)
+}
+
+#[cfg(test)]
+pub(crate) struct TestDirectory(Option<Option<PathBuf>>);
+
+#[cfg(test)]
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        DIRECTORY_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
 }
 
 #[cfg(test)]
