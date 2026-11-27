@@ -15,11 +15,14 @@
 //! flushed before it accepts:
 //!
 //! ```text
-//! victory-metal-host: ready port=<n> pid=<pid> compute_pipeline=<id> graphics_pipeline=<id>
+//! victory-metal-host: ready port=<n> pid=<pid> compute_pipeline=<id> graphics_pipeline=<id>[ window=WxH] headless=<0|1>
 //! ```
 //!
 //! The pipeline ids are `0` unless the built-in pipelines were registered
-//! (`--frame-gate` or `--aaa-frame`).
+//! (`--frame-gate` or `--aaa-frame`). `window=` is present only when a native
+//! window was opened; `headless=1` then means no window was opened. Both are
+//! appended after the original fields, so existing `key=value` parsers keep
+//! working.
 //!
 //! A failure prints exactly one `victory-metal-host: error <reason>` line and
 //! exits non-zero. Usage errors exit `2`; runtime failures exit `1`.
@@ -28,8 +31,8 @@
 //!
 //! ```text
 //! victory-metal-host --secret-hex <64 hex> [--port <0|n>] [--once]
-//!                    [--frame-gate] [--aaa-frame] [--telemetry-json <path>]
-//!                    [--share-dir <path>] [--help]
+//!                    [--frame-gate] [--aaa-frame] [--window|--headless]
+//!                    [--telemetry-json <path>] [--share-dir <path>] [--help]
 //! ```
 //!
 //! `--port 0` selects an ephemeral loopback port. `--once` serves one session
@@ -95,6 +98,8 @@ usage: victory-metal-host (--secret-hex <hex> | --secret-file <path>) [options]
   --window                   open an NSWindow and present the registered
                              surface with a CAMetalLayer (also enabled by
                              VICTORY_METAL_WINDOW=1 or <width>x<height>)
+  --headless                 force headless presentation (the default), even if
+                             VICTORY_METAL_WINDOW is set; conflicts with --window
   --telemetry-json <path>    write session telemetry JSON on shutdown
   -h, --help
 
@@ -211,6 +216,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut frame_gate = false;
     let mut aaa_frame = false;
     let mut window = false;
+    let mut headless = false;
     let mut telemetry_json = None;
 
     let mut args = env::args().skip(1);
@@ -249,6 +255,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 frame_gate = true;
             }
             "--window" => window = true,
+            "--headless" => headless = true,
             "--telemetry-json" => {
                 telemetry_json = Some(PathBuf::from(next_value(&mut args, "--telemetry-json")?));
             }
@@ -263,20 +270,29 @@ fn parse_args() -> Result<Option<Args>, String> {
             .map(PathBuf::from)
     });
 
-    // `--window` opens the default geometry; `VICTORY_METAL_WINDOW` may still
-    // select a size. Without `--window`, a window is opened only when the
-    // environment asks for one, so the headless default is unchanged.
-    let window = match (window, WindowConfig::from_env()) {
-        (_, Some(Err(()))) => {
-            return Err(format!(
-                "invalid {} value",
-                victory_metal::macos::window::WINDOW_ENV
-            ));
+    if window && headless {
+        return Err("--window conflicts with --headless".to_string());
+    }
+
+    // `--headless` is explicit and wins over `VICTORY_METAL_WINDOW`; otherwise
+    // `--window` opens the default geometry, and `VICTORY_METAL_WINDOW` may
+    // still select a size. Without either flag, a window is opened only when
+    // the environment asks for one, so the headless default is unchanged.
+    let window = if headless {
+        None
+    } else {
+        match (window, WindowConfig::from_env()) {
+            (_, Some(Err(()))) => {
+                return Err(format!(
+                    "invalid {} value",
+                    victory_metal::macos::window::WINDOW_ENV
+                ));
+            }
+            (true, Some(Ok(config))) => Some(config),
+            (true, None) => Some(WindowConfig::default()),
+            (false, Some(Ok(config))) => Some(config),
+            (false, None) => None,
         }
-        (true, Some(Ok(config))) => Some(config),
-        (true, None) => Some(WindowConfig::default()),
-        (false, Some(Ok(config))) => Some(config),
-        (false, None) => None,
     };
 
     Ok(Some(Args {
@@ -338,6 +354,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 use victory_metal::fence_page::FencePageMapping;
+#[cfg(target_os = "macos")]
 use victory_metal::ipc_host::{BatchExecutor, HostSecret, IpcHost, PipelineStageLibrary};
 #[cfg(target_os = "macos")]
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat};
@@ -1059,8 +1076,13 @@ fn run(args: Args) -> Result<(), String> {
     let window_field = args.window.as_ref().map_or_else(String::new, |config| {
         format!(" window={}x{}", config.width, config.height)
     });
+    let headless_field = if args.window.is_none() {
+        " headless=1"
+    } else {
+        " headless=0"
+    };
     println!(
-        "victory-metal-host: ready port={port} pid={} compute_pipeline={compute_pipeline} graphics_pipeline={graphics_pipeline}{window_field}",
+        "victory-metal-host: ready port={port} pid={} compute_pipeline={compute_pipeline} graphics_pipeline={graphics_pipeline}{window_field}{headless_field}",
         process::id()
     );
     io::stdout()
