@@ -1523,3 +1523,86 @@ Every number comes from a run in this workspace on the Apple M4 Max.
   registration failures per run still come from buffers in that memory.
 - **No draw, no dispatch, no non-black pixel.** Frames are presented and blank;
   no loading screen, title screen or 3D frame is claimed.
+
+## Cycle 12 — serialized pipeline channel, canonical texture types, live title draw progression
+
+Base `0045347f`; ADRs **041** (dedicated transaction-isolated pipeline connection),
+**042** (canonical `MTLTextureType` mapping and at-address textures), **043**
+(exact `XMemVirtualAlloc` reserve/commit semantics — implemented, then **reverted**
+after the title asserted; see 12.4) and **044** (per-entry kinds in a mixed
+descriptor table).
+
+### 12.1 What changed
+
+- `victory_metal_host` serves concurrent loopback sessions; `victory-gpu` opens a
+  dedicated, mutex-serialized pipeline connection, so a translation can never
+  consume a render reply. Every pipeline error carries a bounded ≤256-byte preview
+  of what the host sent, so a "1-byte rejection" now names itself. `--once` serves
+  the whole guest (render session on the main thread — AppKit is main-thread-only —
+  plus the pipeline session on a supervisor thread), which is what made the channel
+  usable in a real boot.
+- The nine `MTLTextureType` constants are canonical (`Cube=5`, `CubeArray=6`,
+  `3D=7`, `2DMSArray=8`); one table is used by the descriptor, the view plan and
+  texture creation. Proven on the M4 Max GPU: a 33×33×33 FP16 UAV volume is created
+  as `MTLTextureType3D` and viewed (exit 0).
+- At-address target textures register again and resource creation never fails on a
+  host registration gap (the C11 `e4ef01cf` behaviour, re-applied on the fixed enum).
+- The four trivial draw-list refusals (`IASetIndexBuffer(null)`,
+  `IASetPrimitiveTopology`, `SetPixelShaderDepthOrder`, `SetShadingRate`) are named
+  state changes with counters, not refusals.
+- The host's stdio converter worker now always receives `--converter`, captures its
+  bounded stderr, and the refusal carries that text.
+
+### 12.2 Boot #13 → #14 → #17 (windowed, frame probe on)
+
+| | #13 | #14 | #17 (final) |
+|---|---|---|---|
+| D3DMetal attempts / fallback | 0 / 0 | 0 / 0 | **0 / 0** |
+| host submissions accepted / refused | 66 / 0 | 0 / 0 | **4223 / 0** (final run 5157 presents) |
+| host frames presented | 66 | 0 | **5157** |
+| registered buffers / psos | 0 / 0 | 0 / 0 | **112 / 0** |
+| pipeline attempts / created / refused | 3 / 0 / 3 | 0 / 0 / 0 | **6 / 0 / 6** |
+| pipeline refusal class | host-translation (1-byte) | — | **converter worker exited** (named, with its stderr) |
+| host p50 / p95 / p99 ms | 0.009 / 0.013 / 1.114 | — | **0.016 / 0.032 / 0.038** |
+| `non_black_pixels` / `unique_luma_buckets` | 0 / 1 | 0 / 1 | **0 / 1** |
+| `fallback_clear` | 1 | 1 | **1** |
+
+The surface is still the fallback clear and `frame_crc` is unchanged, so **no
+non-black title, loading-screen or 3D frame is claimed**. What did change is that
+the title now runs continuously (4223 submissions, no crash) instead of dying at
+66 frames, and the VP3 pipeline frame finally reaches the host over its own
+connection.
+
+### 12.3 Counts at the integration head
+
+- `victory-metal` lib **331 passed / 0 failed / 7 ignored** plus every integration
+  binary; `victory-gpu` **354 / 0 / 1**; `victory-shader` **254 / 0 / 2**;
+  Wine `victory-hle` **187 / 0 / 1** (`--test-threads=1`; four tests fail only under
+  the harness's parallel default, which is pre-existing process-global contention).
+- Win64 `diag` build exit 0; `victory-metal` all-targets, `victory-gpu`
+  (diagnostics) and `victory-hle` Windows checks exit 0; x86_64
+  `victory-irconverter` exit 0.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.827 / p95 0.917 / p99 0.945 ms,
+  1,205.6 FPS, checksum unchanged.
+- `git diff --check` clean; no surviving process after any boot.
+
+### 12.4 Remaining gaps (honest)
+
+- **The converter worker dies on a real job.** It starts with `--converter <path>`
+  (its banner proves the argument reaches it), then exits while serving the first
+  real vertex/compute stage: the only x86_64 `libmetalirconverter.dylib` is
+  exercised under Rosetta and produces no stderr before dying. Every pipeline is
+  therefore refused for a named reason and no PSO is created. Capturing the child's
+  exit status/signal and either fixing the Rosetta path or exploring a native
+  conversion path is the highest-leverage Cycle 13 change.
+- **`XMemVirtualAlloc` backing is still absent.** Both ADR-043 attempts make the
+  title assert at its first `CreateAtAddress` (guest VA in the low heap, before the
+  xmem hooks are installed) and the crash handler then faults on a page reported as
+  "reserved, never committed". Reverted again to keep the boot alive; the assertion
+  needs to be identified from the title's own memory-init path, not guessed.
+- **112 buffers register, but vertex/index ranges still refuse.** The new naming
+  separates "heap has no host-visible backing" from "no shared xmem range"; the
+  remaining blocker is the missing backing above.
+- **`DrawIndexed` after an explicit null unbind is refused by name (18×).** Correct
+  per D3D12, but it drops draws the title expects; it needs a per-list decision in
+  Cycle 13.
