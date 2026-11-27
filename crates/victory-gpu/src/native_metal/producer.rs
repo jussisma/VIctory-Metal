@@ -457,6 +457,33 @@ impl ProducerError {
         }
     }
 
+    /// The static submission-refusal reason this variant is counted under.
+    ///
+    /// The names come from the fixed
+    /// [`telemetry::SUBMIT_REFUSAL_NAMES`](crate::native_metal::telemetry::SUBMIT_REFUSAL_NAMES)
+    /// table, so a refused submission is never counted without one: a
+    /// `ReplySequenceMismatch` is the sequence-mismatch reason and a
+    /// `SinkRejected` reply is the host-refused one, everything else keeps its
+    /// own `producer_*` name.
+    pub const fn submit_refusal_name(&self) -> &'static str {
+        use crate::native_metal::telemetry::submit_refusals as names;
+        match self {
+            Self::InvalidResource { .. } => names::PRODUCER_INVALID_RESOURCE,
+            Self::InvalidListIdentity => names::PRODUCER_INVALID_LIST_IDENTITY,
+            Self::Unsupported { .. } => names::PRODUCER_UNSUPPORTED,
+            Self::Unregistered { .. } => names::PRODUCER_UNREGISTERED,
+            Self::Unresolved { .. } => names::PRODUCER_UNRESOLVED,
+            Self::MissingPipeline { .. } => names::PRODUCER_MISSING_PIPELINE,
+            Self::NoRenderTargets { .. } => names::PRODUCER_NO_RENDER_TARGETS,
+            Self::TooManyColorAttachments(_) => names::PRODUCER_TOO_MANY_COLOR_ATTACHMENTS,
+            Self::TooManyBarriers(_) => names::PRODUCER_TOO_MANY_BARRIERS,
+            Self::TooManyCommands(_) => names::PRODUCER_TOO_MANY_COMMANDS,
+            Self::SequenceExhausted => names::PRODUCER_SEQUENCE_EXHAUSTED,
+            Self::ReplySequenceMismatch { .. } => names::SEQUENCE_MISMATCH,
+            Self::SinkRejected { .. } => names::HOST_REFUSED,
+        }
+    }
+
     /// The D3D12 HRESULT the guest entry point returns to the title.
     ///
     /// Unsupported operations are `E_NOTIMPL` (`0x8000_4001`), everything
@@ -3724,6 +3751,71 @@ mod tests {
         let mut sink = RecordingSink::with_status(ReplyStatus::AlreadyExecuted);
         let error = producer.submit(&mut sink).expect_err("refused reply");
         assert!(matches!(error, ProducerError::SinkRejected { .. }));
+    }
+
+    /// Every `ProducerError` variant names a static submission-refusal reason
+    /// from the fixed table: a producer refusal can never be counted bare.
+    #[test]
+    fn every_producer_error_names_a_submit_refusal_reason() {
+        use crate::native_metal::telemetry::submit_refusal_index;
+
+        let variant = |error: &ProducerError| error.submit_refusal_name();
+        let errors = [
+            ProducerError::InvalidResource { operation: "test" },
+            ProducerError::InvalidListIdentity,
+            ProducerError::unsupported("test"),
+            ProducerError::unsupported_opcode("test", 7),
+            ProducerError::unregistered("test"),
+            ProducerError::unresolved("test"),
+            ProducerError::MissingPipeline { stage: "compute" },
+            ProducerError::NoRenderTargets { operation: "test" },
+            ProducerError::TooManyColorAttachments(9),
+            ProducerError::TooManyBarriers(9),
+            ProducerError::TooManyCommands(9),
+            ProducerError::SequenceExhausted,
+            ProducerError::ReplySequenceMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            ProducerError::SinkRejected {
+                sequence: 1,
+                status: ReplyStatus::ExecutionFailed,
+            },
+        ];
+
+        let mut names: Vec<&'static str> = errors.iter().map(&variant).collect();
+        for name in &names {
+            assert!(
+                submit_refusal_index(name).is_some(),
+                "{name} is not in SUBMIT_REFUSAL_NAMES"
+            );
+        }
+        // Every variant keeps its own name, except the two whose refusal is not
+        // a producer-class one: a sequence mismatch and a host-rejected reply.
+        assert_eq!(
+            variant(&ProducerError::ReplySequenceMismatch {
+                expected: 1,
+                actual: 2
+            }),
+            crate::native_metal::telemetry::submit_refusals::SEQUENCE_MISMATCH
+        );
+        assert_eq!(
+            variant(&ProducerError::SinkRejected {
+                sequence: 1,
+                status: ReplyStatus::ExecutionFailed,
+            }),
+            crate::native_metal::telemetry::submit_refusals::HOST_REFUSED
+        );
+        names.retain(|name| !name.starts_with("producer_"));
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            vec![
+                crate::native_metal::telemetry::submit_refusals::HOST_REFUSED,
+                crate::native_metal::telemetry::submit_refusals::SEQUENCE_MISMATCH,
+            ]
+        );
     }
 
     #[test]

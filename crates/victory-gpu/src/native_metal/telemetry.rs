@@ -9,6 +9,15 @@
 //! the frame line, so a heap the native path cannot serve is never a silent
 //! skip.
 //!
+//! # Named submission refusals
+//!
+//! [`FrameTelemetry::note_submit_refused`] takes a static reason from the fixed
+//! [`SUBMIT_REFUSAL_NAMES`] table and moves the refusal total and its named
+//! histogram in one call, so `submits=n/m ok/refused` can never appear beside
+//! an empty `named_submit_refusals`. The reasons are session totals: a boot's
+//! one refusal keeps its name after any window reset. An empty batch is not a
+//! submission and is never counted as a refused one.
+//!
 //! # What one sample is
 //!
 //! [`FrameTelemetry::record_frame`] records one `ExecuteCommandLists` batch:
@@ -622,6 +631,110 @@ impl HeapBindCensus {
     }
 }
 
+/// The static reasons a native submission is refused under.
+///
+/// A submission refusal is counted under exactly one of these names in the same
+/// call that moves the refusal total, so a boot can never report a bare
+/// `submits=n/m ok/refused` beside an empty reason list. The table is fixed:
+/// [`SUBMIT_REFUSAL_NAMES`] is the only set the histogram holds, and an
+/// unregistered name is counted under [`UNKNOWN`] instead of growing it.
+pub mod submit_refusals {
+    /// No Wire v3 client is attached: no endpoint is configured, or the
+    /// configured endpoint refused the session.
+    pub const NO_CLIENT: &str = "no_client";
+    /// The batch carried no submission at all (the list closed with nothing).
+    pub const NO_COMMAND_BUFFER: &str = "no_command_buffer";
+    /// The batch's submissions carried no commands.
+    pub const EMPTY_STREAM: &str = "empty_stream";
+    /// The canonical v3 codec refused the submission before it was carried.
+    pub const ENCODE: &str = "encode";
+    /// The transport failed while carrying the batch on a live session.
+    pub const TRANSPORT: &str = "transport";
+    /// The host answered a status other than `Ok`.
+    pub const HOST_REFUSED: &str = "host_refused";
+    /// The host answered a different sequence than the one sent.
+    pub const SEQUENCE_MISMATCH: &str = "sequence_mismatch";
+    /// The present half reached the submission counter.
+    pub const PRESENT_REFUSED: &str = "present_refused";
+    /// `ProducerError::InvalidResource`.
+    pub const PRODUCER_INVALID_RESOURCE: &str = "producer_invalid_resource";
+    /// `ProducerError::InvalidListIdentity`.
+    pub const PRODUCER_INVALID_LIST_IDENTITY: &str = "producer_invalid_list_identity";
+    /// `ProducerError::Unsupported`.
+    pub const PRODUCER_UNSUPPORTED: &str = "producer_unsupported";
+    /// `ProducerError::Unregistered`.
+    pub const PRODUCER_UNREGISTERED: &str = "producer_unregistered";
+    /// `ProducerError::Unresolved`.
+    pub const PRODUCER_UNRESOLVED: &str = "producer_unresolved";
+    /// `ProducerError::MissingPipeline`.
+    pub const PRODUCER_MISSING_PIPELINE: &str = "producer_missing_pipeline";
+    /// `ProducerError::NoRenderTargets`.
+    pub const PRODUCER_NO_RENDER_TARGETS: &str = "producer_no_render_targets";
+    /// `ProducerError::TooManyColorAttachments`.
+    pub const PRODUCER_TOO_MANY_COLOR_ATTACHMENTS: &str = "producer_too_many_color_attachments";
+    /// `ProducerError::TooManyBarriers`.
+    pub const PRODUCER_TOO_MANY_BARRIERS: &str = "producer_too_many_barriers";
+    /// `ProducerError::TooManyCommands`.
+    pub const PRODUCER_TOO_MANY_COMMANDS: &str = "producer_too_many_commands";
+    /// `ProducerError::SequenceExhausted`.
+    pub const PRODUCER_SEQUENCE_EXHAUSTED: &str = "producer_sequence_exhausted";
+    /// A refusal whose reason is not in [`SUBMIT_REFUSAL_NAMES`].
+    pub const UNKNOWN: &str = "unknown_reason";
+}
+
+/// The fixed set of submission-refusal names, in a stable order.
+///
+/// A refusal can only be counted under one of these, so the histogram never
+/// grows and its contents do not depend on the order submissions failed in.
+pub const SUBMIT_REFUSAL_NAMES: &[&str] = &[
+    submit_refusals::NO_CLIENT,
+    submit_refusals::NO_COMMAND_BUFFER,
+    submit_refusals::EMPTY_STREAM,
+    submit_refusals::ENCODE,
+    submit_refusals::TRANSPORT,
+    submit_refusals::HOST_REFUSED,
+    submit_refusals::SEQUENCE_MISMATCH,
+    submit_refusals::PRESENT_REFUSED,
+    submit_refusals::PRODUCER_INVALID_RESOURCE,
+    submit_refusals::PRODUCER_INVALID_LIST_IDENTITY,
+    submit_refusals::PRODUCER_UNSUPPORTED,
+    submit_refusals::PRODUCER_UNREGISTERED,
+    submit_refusals::PRODUCER_UNRESOLVED,
+    submit_refusals::PRODUCER_MISSING_PIPELINE,
+    submit_refusals::PRODUCER_NO_RENDER_TARGETS,
+    submit_refusals::PRODUCER_TOO_MANY_COLOR_ATTACHMENTS,
+    submit_refusals::PRODUCER_TOO_MANY_BARRIERS,
+    submit_refusals::PRODUCER_TOO_MANY_COMMANDS,
+    submit_refusals::PRODUCER_SEQUENCE_EXHAUSTED,
+    submit_refusals::UNKNOWN,
+];
+
+/// The histogram slot for `reason`, if it is one of [`SUBMIT_REFUSAL_NAMES`].
+pub(crate) fn submit_refusal_index(reason: &str) -> Option<usize> {
+    SUBMIT_REFUSAL_NAMES.iter().position(|&known| known == reason)
+}
+
+/// The table name a submission refusal is counted under.
+///
+/// An unregistered reason is a caller bug, not a new class: it is logged once
+/// and counted under [`submit_refusals::UNKNOWN`], so the refusal total always
+/// equals the sum of the named histogram and no count is ever bare.
+fn submit_refusal_name(reason: &'static str) -> &'static str {
+    match submit_refusal_index(reason) {
+        Some(index) => SUBMIT_REFUSAL_NAMES[index],
+        None => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    reason,
+                    "an unregistered submission refusal reason was counted under its fallback name"
+                );
+            });
+            submit_refusals::UNKNOWN
+        }
+    }
+}
+
 /// The window and histogram one [`FrameTelemetry`] keeps.
 #[derive(Debug, Default)]
 struct Window {
@@ -640,6 +753,12 @@ pub struct FrameTelemetry {
     submits_ok: AtomicU64,
     /// Native submissions the transport or the host refused.
     submits_refused: AtomicU64,
+    /// Native submission refusals by the static reason they happened for.
+    ///
+    /// Every increment of [`Self::submits_refused`] writes one entry here in
+    /// the same call, so a boot can never report a bare refusal count. Session
+    /// totals: like the submit counters, they survive a window reset.
+    named_submit_refusals: Mutex<BTreeMap<&'static str, u64>>,
     /// Frames the installed native presenter accepted.
     presents_ok: AtomicU64,
     /// Frames the native presenter (or its absence) refused.
@@ -858,8 +977,26 @@ impl FrameTelemetry {
     }
 
     /// A native submission batch the transport or host refused.
-    pub fn note_submit_refused(&self) {
+    ///
+    /// `reason` is one of [`SUBMIT_REFUSAL_NAMES`]: the count and its name move
+    /// together, so a refusal can never be counted without one. An empty batch
+    /// is not a submission at all and must not be counted here.
+    pub fn note_submit_refused(&self, reason: &'static str) {
+        let reason = submit_refusal_name(reason);
         self.submits_refused.fetch_add(1, Ordering::Relaxed);
+        let mut refusals = self
+            .named_submit_refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *refusals.entry(reason).or_insert(0) += 1;
+    }
+
+    /// Native submission refusals by static reason (only the reasons seen).
+    pub fn named_submit_refusal_histogram(&self) -> BTreeMap<&'static str, u64> {
+        self.named_submit_refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// A frame the installed native presenter accepted.
@@ -1073,6 +1210,7 @@ impl FrameTelemetry {
             call_failures: self.call_failures.count(),
             first_call_failure: self.call_failures.first(),
             heaps: self.heap_bindings(),
+            named_submit_refusals: self.named_submit_refusal_histogram(),
         }
     }
 
@@ -1081,7 +1219,9 @@ impl FrameTelemetry {
     /// The hard fallback counter is deliberately not cleared: it is an
     /// invariant for the whole session, not window state. The heap-binding
     /// audit is a session total too, so the last bound set survives a frame
-    /// line that had no `SetDescriptorHeaps` call.
+    /// line that had no `SetDescriptorHeaps` call. The named submission
+    /// refusals are session totals for the same reason: the reason a boot's
+    /// refusal happened for must not be lost to the next window.
     pub fn snapshot_and_reset(&self) -> TelemetrySnapshot {
         let snapshot = self.snapshot();
         {
@@ -1103,7 +1243,9 @@ impl FrameTelemetry {
     /// Clears the window and histograms (never the fallback counter).
     ///
     /// Submit and present counters are session totals and survive a reset too,
-    /// as do the pipeline and heap-binding censuses.
+    /// as do their named submission-refusal reasons, the pipeline and
+    /// heap-binding censuses. A refusal counted in an early window therefore
+    /// keeps its name for the rest of the boot.
     pub fn reset(&self) {
         let mut window = self.lock();
         window.frames.clear();
@@ -1180,6 +1322,10 @@ pub struct TelemetrySnapshot {
     /// The descriptor-heap binding audit (session totals: a heap bound in an
     /// early frame stays counted after a window reset).
     pub heaps: HeapBindingSnapshot,
+    /// Native submission refusals by static reason (session totals: a refusal
+    /// in an early window stays counted, so the reason of the boot's one
+    /// refusal is never lost to a later reset).
+    pub named_submit_refusals: BTreeMap<&'static str, u64>,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -1245,8 +1391,31 @@ impl std::fmt::Display for TelemetrySnapshot {
             )?,
             None => write!(f, " first_call_failure=none hr=0x0")?,
         }
+        write!(
+            f,
+            "{}",
+            name_count_list(&self.named_submit_refusals, "named_submit_refusals")
+        )?;
         Ok(())
     }
+}
+
+/// One `, name=[key=count; ...]` field for the frame line, empty list included.
+fn name_count_list(counts: &BTreeMap<&'static str, u64>, name: &str) -> String {
+    if counts.is_empty() {
+        return format!(", {name}=[]");
+    }
+    let mut text = format!(", {name}=[");
+    for (index, (key, count)) in counts.iter().enumerate() {
+        if index > 0 {
+            text.push_str("; ");
+        }
+        text.push_str(key);
+        text.push('=');
+        text.push_str(&count.to_string());
+    }
+    text.push(']');
+    text
 }
 
 /// One `, name=[opcode:count ...]` field for the frame line.
@@ -1495,9 +1664,9 @@ pub fn note_submit_ok() {
     global().note_submit_ok();
 }
 
-/// Records one refused native submission batch.
-pub fn note_submit_refused() {
-    global().note_submit_refused();
+/// Records one refused native submission batch under its static reason.
+pub fn note_submit_refused(reason: &'static str) {
+    global().note_submit_refused(reason);
 }
 
 /// Records one accepted native present.
@@ -1945,7 +2114,7 @@ mod tests {
         telemetry.note_unsupported_opcode(Some(44));
         telemetry.note_unsupported_opcode(None);
         telemetry.note_submit_ok();
-        telemetry.note_submit_refused();
+        telemetry.note_submit_refused(submit_refusals::HOST_REFUSED);
         telemetry.note_present_ok();
         telemetry.note_present_refused();
         telemetry.note_present_refused();
@@ -2185,5 +2354,119 @@ mod tests {
         let snapshot = snapshot_and_reset();
         assert_eq!(snapshot.frames, 2);
         assert_eq!(global().window_len(), 0);
+    }
+
+    /// Every reason in the fixed table is countable under its own name: no
+    /// reason shares a bucket and none is a bare count.
+    #[test]
+    fn every_submit_refusal_reason_is_counted_under_its_own_name() {
+        for &reason in SUBMIT_REFUSAL_NAMES {
+            let telemetry = telemetry();
+            telemetry.note_submit_refused(reason);
+            telemetry.note_submit_refused(reason);
+
+            let (ok, refused) = telemetry.submit_counts();
+            assert_eq!((ok, refused), (0, 2), "{reason}");
+            assert_eq!(
+                telemetry.named_submit_refusal_histogram(),
+                BTreeMap::from([(reason, 2)]),
+                "{reason} must keep its own bucket"
+            );
+            let line = telemetry.snapshot().to_string();
+            assert!(line.contains("submits=0/2"), "{reason}: {line}");
+            assert!(
+                line.contains(&format!("named_submit_refusals=[{reason}=2]")),
+                "{reason}: {line}"
+            );
+            assert!(!line.contains('\n'), "one line: {line}");
+        }
+    }
+
+    /// The histogram is bounded: a name outside the table is counted under the
+    /// fixed fallback slot, so the table never grows and the refusal total
+    /// always has a name.
+    #[test]
+    fn an_unregistered_submit_refusal_reason_uses_the_fixed_fallback() {
+        const NOT_IN_THE_TABLE: &str = "not_a_submit_refusal_reason";
+
+        let telemetry = telemetry();
+        telemetry.note_submit_refused(NOT_IN_THE_TABLE);
+
+        let histogram = telemetry.named_submit_refusal_histogram();
+        assert_eq!(
+            histogram,
+            BTreeMap::from([(submit_refusals::UNKNOWN, 1)]),
+            "the unknown name is not a new bucket"
+        );
+        assert!(
+            histogram.keys().all(|reason| submit_refusal_index(reason).is_some()),
+            "every key is a table name: {histogram:?}"
+        );
+        assert_eq!(telemetry.submit_counts().1, 1);
+        assert!(
+            telemetry
+                .snapshot()
+                .to_string()
+                .contains("named_submit_refusals=[unknown_reason=1]"),
+            "{}",
+            telemetry.snapshot()
+        );
+    }
+
+    /// The named refusal histogram is a session total: a window reset keeps it,
+    /// so an early refusal's reason is still on the boot's last frame line.
+    #[test]
+    fn named_submit_refusals_survive_a_window_reset() {
+        let telemetry = telemetry();
+        telemetry.note_submit_refused(submit_refusals::TRANSPORT);
+        telemetry.record_frame_at(0, 10, 0, 0, 0, None);
+
+        let first = telemetry.snapshot_and_reset();
+        assert_eq!(
+            first.named_submit_refusals,
+            BTreeMap::from([(submit_refusals::TRANSPORT, 1)])
+        );
+
+        telemetry.reset();
+        let after = telemetry.snapshot();
+        assert_eq!((after.submits_ok, after.submits_refused), (0, 1));
+        assert_eq!(
+            after.named_submit_refusals,
+            BTreeMap::from([(submit_refusals::TRANSPORT, 1)]),
+            "the reason outlives the window it was counted in"
+        );
+        assert!(after.to_string().contains("named_submit_refusals=[transport=1]"));
+    }
+
+    /// The new field is appended: every existing field keeps its position on
+    /// the frame line.
+    #[test]
+    fn the_frame_line_keeps_its_existing_field_order() {
+        let line = telemetry().snapshot().to_string();
+        let order = [
+            "native frame:",
+            "fallback=",
+            "submits=",
+            "presents=",
+            "registered=",
+            "compute_unbound=",
+            "pipeline_attempts=",
+            "heaps_bound=",
+            "opcodes=",
+            "refusals=",
+            "named_refusals=",
+            "host_errors=",
+            "call_failures=",
+            "first_call_failure=",
+            "named_submit_refusals=",
+        ];
+        let mut from = 0;
+        for field in order {
+            let found = line[from..]
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} missing or out of order in {line}"));
+            from += found;
+        }
+        assert!(line.ends_with("named_submit_refusals=[]"), "{line}");
     }
 }
