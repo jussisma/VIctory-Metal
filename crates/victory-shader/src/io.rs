@@ -256,6 +256,21 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
             (loaded, &[][..], &[][..])
         }
+        // Amplification: a thread-group dispatch like compute, with no
+        // per-vertex or output signature; its payload is the record's LDS.
+        (StageIo::As(a), HwStage::As) => {
+            let (ids, info) = a.compute.system_sgprs();
+            let mut loaded: Vec<(Reg, Input)> = (0..a.compute.thread_id_vgprs())
+                .map(|c| (Reg::V(c), Input::ThreadIdInGroup(c)))
+                .collect();
+            for (c, s) in ids.into_iter().enumerate() {
+                if let Some(s) = s {
+                    loaded.push((Reg::S(s), Input::GroupId(c as u8)));
+                }
+            }
+            loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
+            (loaded, &[][..], &[][..])
+        }
         (StageIo::Ms(ms), HwStage::Ms) => {
             let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
             // The group input holds the same value in every lane only as the
@@ -311,6 +326,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::As(a) => Some(a.compute.initialized_sgprs()),
             StageIo::Ps { .. } => {
                 let user = native
                     .layout

@@ -680,12 +680,12 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::As
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or amplification program",
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -872,6 +872,17 @@ fn emit_pruned(
     // `lower_pruned` repeats the check for direct lowering.
     if let Some(refusal) = options.refusal() {
         return Err(refusal);
+    }
+    // An amplification program's payload and mesh dispatch grid have no DXIL
+    // form yet. Its FSSM record shares the compute slot, so lowering it on
+    // the compute path would silently drop the payload and the dispatch (a
+    // miscompile). Refuse it by name instead; identification is complete and
+    // the rest of an AS+MS+PS set translates.
+    if input.native.stage == HwStage::As {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an amplification (object) program",
+        });
     }
     let EmitInput {
         c,
@@ -1116,7 +1127,104 @@ mod tests {
     fn mesh_bytes(dxil: &[u8]) -> Option<u32> {
         mesh_outputs(dxil).map(|o| o.bytes())
     }
-    use crate::native::{ComputeIo, StageIo};
+    use crate::native::{AmplificationIo, ComputeIo, StageIo};
+
+    /// An amplification program with a dispatch grid and payload memory; its
+    /// code is just `s_endpgm`.
+    fn amplification_native() -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::As,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::As(AmplificationIo {
+                compute: ComputeIo {
+                    rsrc2: 0,
+                    threads: [8, 1, 1],
+                },
+                payload_bytes: 256,
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_amplification_program_fails_closed() {
+        let native = amplification_native();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let err = emit(&c, &native, &p, &st, &io, &res).unwrap_err();
+        // Named as amplification, never lowered on the compute path its FSSM
+        // record slot shares.
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0,
+                what: "an amplification (object) program",
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_waves_without_host_wave32_is_refused_for_every_stage() {
+        // One compute-shaped program supplies the IR; the options refusal
+        // runs before any stage-specific work.
+        let base = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&base.patched_code(), base.wave64, base.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &base.layout, base.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &base).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Vs,
+            HwStage::Ps,
+            HwStage::Cs,
+            HwStage::Ms,
+            HwStage::As,
+        ] {
+            let mut native = base.clone();
+            native.stage = stage;
+            let err = emit_with(
+                &c,
+                &native,
+                &p,
+                &st,
+                &io,
+                &res,
+                Options {
+                    narrow_waves: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ShaderError::Options(NARROW_WAVES_WITHOUT_HOST_WAVE32),
+                "{stage:?}"
+            );
+        }
+    }
 
     #[test]
     fn indexed_move_initializes_an_input_before_its_first_use() {
