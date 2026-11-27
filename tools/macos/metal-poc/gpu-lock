@@ -1,0 +1,410 @@
+#!/bin/sh
+# ADR-032: PID-verified exclusive GPU lock for the metal-poc harnesses.
+#
+#     gpu-lock [--lock DIR] [--wait SEC] [--status] -- <command...>
+#
+# Protocol
+#   * acquisition is a single atomic `mkdir` of DIR;
+#   * the owner record DIR/owner holds "<pid> <epoch>", written by the acquirer
+#     immediately after it wins the mkdir;
+#   * a lock whose recorded PID is no longer running (`kill -0` fails) is stale
+#     and is reclaimed by the next acquirer. Reclaim is serialised by the
+#     DIR/.reclaim mutex and re-reads the owner record before it removes
+#     anything, so a reclaimer can never delete a live holder's record: while
+#     DIR exists no other process can become its owner;
+#   * a lock directory with no readable owner record is treated as a racer while
+#     it is younger than one minute, and as a crashed creator after that;
+#   * a live holder is waited for, up to --wait seconds (default 900). The
+#     acquirer then fails with exit 75. A live holder is never bypassed and
+#     never starved by a steal;
+#   * a lock whose owner is this process or one of its ancestors is re-entrant:
+#     the command runs under that ancestor's ownership and this process never
+#     releases it. So `gpu-lock -- gpu-lock -- cmd` on one directory cannot
+#     stall on, or steal, its own wrapper's lock;
+#   * the lock is released on EXIT/INT/TERM/HUP and only by the process that
+#     created it; the wrapped command is signalled and reaped before release;
+#   * nothing outside DIR is ever removed, and no PID this run did not start is
+#     ever signalled: `pkill`/`killall` and global name matching are not used.
+#
+# `--status` prints one line and never acquires, reclaims or removes anything:
+#   exit 0 -> free, exit 3 -> held by a live PID, exit 4 -> stale.
+#
+# Environment: VICTORY_GPU_LOCK overrides the default lock directory.
+#
+# Known limit: PID reuse can make a dead holder look alive; the acquirer then
+# fails at the wait deadline (75) instead of stealing the lock. That is the safe
+# direction and is bounded.
+set -eu
+
+PROG="gpu-lock"
+DEFAULT_LOCK="/tmp/victory-gpu.lock"
+LOCK="${VICTORY_GPU_LOCK:-$DEFAULT_LOCK}"
+WAIT_SECONDS=900
+STATUS_ONLY=0
+LOCK_OWNED=0
+LOCK_INHERITED=0
+CHILD_PID=""
+RECLAIM_MUTEX=".reclaim"
+
+EXIT_USAGE=2
+EXIT_STATUS_HELD=3
+EXIT_STATUS_STALE=4
+EXIT_BUSY=75
+
+note() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+die() {
+    note "$*"
+    exit "$EXIT_USAGE"
+}
+
+usage() {
+    cat <<'USAGE'
+usage: gpu-lock [--lock DIR] [--wait SEC] [--status] -- <command...>
+
+  --lock DIR    lock directory (default: $VICTORY_GPU_LOCK or /tmp/victory-gpu.lock)
+  --lock=DIR
+  --wait SEC    wait up to SEC seconds for a live holder (default: 900)
+  --wait=SEC
+  --status      report free/held/stale without acquiring
+  --            end of options; the rest is the command to run under the lock
+
+exit codes: 0 success or free, 2 usage, 3 status=held, 4 status=stale,
+            75 lock held by a live PID after the wait, otherwise the command's
+            own exit status.
+USAGE
+}
+
+now() {
+    date +%s
+}
+
+is_uint() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+# True when DIR exists and its mtime is at least one minute old.
+# `date -r` gives seconds resolution; BSD `find -mmin` rounds up, so it would
+# call a one-second-old directory "one minute old" and reclaim a live racer.
+older_than_minute() {
+    [ -n "${1:-}" ] || return 1
+    [ -d "$1" ] || return 1
+    _om_mtime="$(date -r "$1" +%s 2>/dev/null || true)"
+    case "$_om_mtime" in
+        ''|*[!0-9]*)
+            # No usable `date -r`: fall back to find's minute resolution but
+            # demand more than one minute, so a fresh racer is never reclaimed.
+            [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]
+            return $?
+            ;;
+    esac
+    [ $(( $(now) - _om_mtime )) -ge 60 ]
+}
+
+# Print the recorded owner PID, or nothing when the record is absent,
+# unreadable, or not a PID. Always succeeds.
+owner_pid() {
+    _op_line=""
+    if [ -f "$LOCK/owner" ]; then
+        _op_line="$(cat "$LOCK/owner" 2>/dev/null || true)"
+    fi
+    _op_pid="${_op_line%% *}"
+    case "$_op_pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    printf '%s\n' "$_op_pid"
+}
+
+# Print the recorded owner epoch, or nothing.
+owner_epoch() {
+    _oe_line=""
+    if [ -f "$LOCK/owner" ]; then
+        _oe_line="$(cat "$LOCK/owner" 2>/dev/null || true)"
+    fi
+    _oe_epoch="${_oe_line#* }"
+    case "$_oe_epoch" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    printf '%s\n' "$_oe_epoch"
+}
+
+pid_alive() {
+    [ -n "${1:-}" ] || return 1
+    kill -0 "$1" 2>/dev/null
+}
+
+# True when PID is this process or one of its ancestors. Used to make nesting
+# safe: a wrapper that already holds the lock is not a competitor.
+self_or_ancestor() {
+    _sa_want="${1:-}"
+    [ -n "$_sa_want" ] || return 1
+    _sa_cur="$$"
+    _sa_guard=0
+    while [ "$_sa_guard" -lt 64 ]; do
+        if [ "$_sa_cur" = "$_sa_want" ]; then
+            return 0
+        fi
+        [ "$_sa_cur" -gt 1 ] || return 1
+        _sa_cur="$(ps -o ppid= -p "$_sa_cur" 2>/dev/null | tr -d ' ')"
+        case "$_sa_cur" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        _sa_guard=$((_sa_guard + 1))
+    done
+    return 1
+}
+
+write_owner() {
+    printf '%s %s\n' "$$" "$(now)" >"$LOCK/owner"
+}
+
+# Remove a stale lock directory. Returns 0 only when this call removed it.
+# The DIR/.reclaim mutex makes the remove safe against a concurrent acquirer:
+# a new owner can only appear after DIR is gone, so after the mutex is held the
+# only owner record that can exist is the stale one we re-read here.
+reclaim_stale() {
+    if ! mkdir "$LOCK/$RECLAIM_MUTEX" 2>/dev/null; then
+        # A crashed reclaimer can leave the mutex behind. Only a mutex older
+        # than a minute on an already-stale lock is removed, so a live
+        # reclaimer (which completes in milliseconds) is never disturbed.
+        if older_than_minute "$LOCK/$RECLAIM_MUTEX"; then
+            rmdir "$LOCK/$RECLAIM_MUTEX" 2>/dev/null || true
+            mkdir "$LOCK/$RECLAIM_MUTEX" 2>/dev/null || return 1
+        else
+            return 1
+        fi
+    fi
+    _rs_pid="$(owner_pid)"
+    if [ -n "$_rs_pid" ] && pid_alive "$_rs_pid"; then
+        # Defensive: a live owner cannot coexist with our mutex, but never
+        # remove a lock that belongs to a running process.
+        rmdir "$LOCK/$RECLAIM_MUTEX" 2>/dev/null || true
+        return 1
+    fi
+    if [ -n "$_rs_pid" ]; then
+        note "reclaiming stale lock $LOCK: recorded pid $_rs_pid is not running"
+    else
+        note "reclaiming stale lock $LOCK: no readable owner record"
+    fi
+    rm -f "$LOCK/owner" 2>/dev/null || true
+    rmdir "$LOCK/$RECLAIM_MUTEX" 2>/dev/null || true
+    rmdir "$LOCK" 2>/dev/null || true
+    [ ! -d "$LOCK" ]
+}
+
+# Acquire the lock or return 75 once the wait budget is spent.
+acquire_lock() {
+    _al_deadline=$(( $(now) + WAIT_SECONDS ))
+    _al_noent=0
+    while :; do
+        if mkdir "$LOCK" 2>/dev/null; then
+            if ! write_owner; then
+                rmdir "$LOCK" 2>/dev/null || true
+                note "cannot write the owner record in $LOCK"
+                return 2
+            fi
+            LOCK_OWNED=1
+            return 0
+        fi
+        if [ ! -d "$LOCK" ]; then
+            if [ -e "$LOCK" ]; then
+                note "lock path $LOCK exists but is not a directory"
+                return 2
+            fi
+            # mkdir failed and nothing is there: either a racer removed the
+            # directory in this instant, or the parent is missing/unwritable.
+            # Retry briefly, then fail instead of spinning for --wait.
+            _al_noent=$((_al_noent + 1))
+            if [ "$_al_noent" -ge 5 ]; then
+                note "cannot create the lock directory $LOCK (missing or unwritable parent)"
+                return 2
+            fi
+            sleep 0.1
+            continue
+        fi
+        _al_noent=0
+        _al_pid="$(owner_pid)"
+        _al_stale=0
+        if [ -n "$_al_pid" ]; then
+            if pid_alive "$_al_pid"; then
+                if self_or_ancestor "$_al_pid"; then
+                    # Re-entrant: an ancestor (for example an outer gpu-lock)
+                    # already holds this lock and will release it. Run under
+                    # that ownership instead of waiting on it, and never
+                    # release a lock this process did not create.
+                    note "lock $LOCK is already held by ancestor pid $_al_pid; running nested"
+                    LOCK_INHERITED=1
+                    return 0
+                fi
+            else
+                _al_stale=1
+            fi
+        elif older_than_minute "$LOCK"; then
+            _al_stale=1
+        fi
+        if [ "$_al_stale" = 1 ]; then
+            if reclaim_stale; then
+                continue
+            fi
+        fi
+        if [ "$(now)" -ge "$_al_deadline" ]; then
+            note "lock $LOCK is held by pid ${_al_pid:-unknown}; gave up after ${WAIT_SECONDS}s"
+            return "$EXIT_BUSY"
+        fi
+        sleep 0.2
+    done
+}
+
+# Remove the lock only when this process created it. Safe to call repeatedly.
+release_lock() {
+    [ "$LOCK_OWNED" = 1 ] || return 0
+    LOCK_OWNED=0
+    _rl_pid="$(owner_pid)"
+    if [ "$_rl_pid" != "$$" ]; then
+        # Not our record any more: leave the directory alone.
+        return 0
+    fi
+    rm -f "$LOCK/owner" 2>/dev/null || true
+    rmdir "$LOCK" 2>/dev/null || true
+}
+
+# Report state without touching anything. Returns 0 free, 3 held, 4 stale.
+print_status() {
+    if [ ! -d "$LOCK" ]; then
+        if [ -e "$LOCK" ]; then
+            printf 'gpu-lock: status=invalid lock=%s reason=not-a-directory\n' "$LOCK"
+            return "$EXIT_USAGE"
+        fi
+        printf 'gpu-lock: status=free lock=%s\n' "$LOCK"
+        return 0
+    fi
+    _ps_pid="$(owner_pid)"
+    _ps_epoch="$(owner_epoch)"
+    if [ -z "$_ps_pid" ]; then
+        if older_than_minute "$LOCK"; then
+            printf 'gpu-lock: status=stale lock=%s pid=unknown reason=no-owner\n' "$LOCK"
+            return "$EXIT_STATUS_STALE"
+        fi
+        printf 'gpu-lock: status=held lock=%s pid=unknown reason=owner-missing\n' "$LOCK"
+        return "$EXIT_STATUS_HELD"
+    fi
+    if pid_alive "$_ps_pid"; then
+        printf 'gpu-lock: status=held lock=%s pid=%s since=%s\n' "$LOCK" "$_ps_pid" "${_ps_epoch:-unknown}"
+        return "$EXIT_STATUS_HELD"
+    fi
+    printf 'gpu-lock: status=stale lock=%s pid=%s since=%s\n' "$LOCK" "$_ps_pid" "${_ps_epoch:-unknown}"
+    return "$EXIT_STATUS_STALE"
+}
+
+# Forward the signal to the child this run started, bound the wait, then exit so
+# the EXIT trap releases the lock.
+on_signal() {
+    _os_sig="$1"
+    _os_code="$2"
+    if [ -n "${CHILD_PID:-}" ]; then
+        kill "-$_os_sig" "$CHILD_PID" 2>/dev/null || true
+        _os_t=0
+        while [ "$_os_t" -lt 50 ] && kill -0 "$CHILD_PID" 2>/dev/null; do
+            sleep 0.1
+            _os_t=$((_os_t + 1))
+        done
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            kill -KILL "$CHILD_PID" 2>/dev/null || true
+        fi
+        wait "$CHILD_PID" 2>/dev/null || true
+        CHILD_PID=""
+    fi
+    exit "$_os_code"
+}
+
+# --- Argument parsing ------------------------------------------------------
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --lock)
+            [ "$#" -ge 2 ] || die "--lock requires a directory"
+            LOCK="$2"
+            shift 2
+            ;;
+        --lock=*)
+            LOCK="${1#--lock=}"
+            shift
+            ;;
+        --wait)
+            [ "$#" -ge 2 ] || die "--wait requires a number of seconds"
+            WAIT_SECONDS="$2"
+            shift 2
+            ;;
+        --wait=*)
+            WAIT_SECONDS="${1#--wait=}"
+            shift
+            ;;
+        --status)
+            STATUS_ONLY=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            die "unknown option: $1 (see --help)"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+is_uint "$WAIT_SECONDS" || die "--wait needs a whole number of seconds, got: $WAIT_SECONDS"
+[ -n "$LOCK" ] || die "--lock needs a non-empty directory"
+case "$LOCK" in
+    /|.|..) die "refusing to use $LOCK as a lock directory" ;;
+esac
+
+# --- Status mode -----------------------------------------------------------
+if [ "$STATUS_ONLY" = 1 ]; then
+    [ "$#" -eq 0 ] || die "--status does not take a command"
+    if print_status; then
+        exit 0
+    else
+        exit $?
+    fi
+fi
+
+if [ "$#" -eq 0 ]; then
+    usage >&2
+    exit "$EXIT_USAGE"
+fi
+
+# --- Locked execution ------------------------------------------------------
+# On a signal, stop the child this run started before releasing the lock so the
+# GPU is never handed to another harness while this one still runs. release
+# itself happens in the EXIT trap, and only for an owned lock.
+trap release_lock EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
+
+_acq_rc=0
+acquire_lock || _acq_rc=$?
+if [ "$_acq_rc" -ne 0 ]; then
+    exit "$_acq_rc"
+fi
+
+"$@" &
+CHILD_PID=$!
+_run_rc=0
+wait "$CHILD_PID" 2>/dev/null || _run_rc=$?
+# The child is reaped: forget the PID immediately so a trap can never signal a
+# recycled one.
+CHILD_PID=""
+exit "$_run_rc"

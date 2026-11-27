@@ -5,6 +5,12 @@
 #   1. a child that ignores SIGTERM is escalated to SIGKILL and reaped;
 #   2. a lock directory this run created is removed exactly once, and a lock it
 #      did not create is left alone;
+#   2b. a lock whose recorded PID is dead is reclaimed once and released;
+#   2c. a live holder gets a bounded wait and exit 75, never a steal;
+#   2d. a fresh ownerless directory is treated as a racer, not reclaimed;
+#   2e. an aged unreadable owner record is reclaimed;
+#   2f. concurrent helper acquirers never share the critical section;
+#   2g. a re-entrant acquire reuses an ancestor's lock without releasing it;
 #   3. a simulated mid-run `exit 1` still reaps the child, removes the lock and
 #      preserves exit 1;
 #   4. the dedicated orphan-survivor exit code 13 (and that 12 is preserved);
@@ -83,6 +89,171 @@ if [ ! -d "$TMP/foreign.lock" ]; then
 fi
 rmdir "$TMP/foreign.lock"
 pass "owned lock removed once; foreign lock preserved"
+
+# --- 2b. A recorded PID that is not running is reclaimed -------------------
+(
+    . "$HELPER"
+    stale="$TMP/stale.lock"
+    mkdir "$stale"
+    sh -c 'exit 0' &
+    dead_pid=$!
+    wait "$dead_pid" 2>/dev/null || true
+    printf '%s %s\n' "$dead_pid" "$(date +%s)" >"$stale/owner"
+    VICTORY_HYGIENE_LOCK_WAIT=5
+    victory_hygiene_lock_acquire "$stale" || fail "acquire did not reclaim a dead-PID lock"
+    if [ "$VICTORY_HYGIENE_LOCK_OWNED" != 1 ]; then
+        fail "reclaim did not record ownership"
+    fi
+    recorded="$(cut -d' ' -f1 "$stale/owner" 2>/dev/null || true)"
+    if [ "$recorded" != "$$" ]; then
+        fail "owner record was not rewritten with our PID (got '$recorded')"
+    fi
+    victory_hygiene_lock_release
+    if [ -d "$stale" ]; then
+        fail "reclaimed lock was not released"
+    fi
+) || fail "stale-PID reclaim test failed"
+pass "dead-PID lock reclaimed once and released"
+
+# --- 2c. A live holder gets a bounded wait, not a steal --------------------
+(
+    . "$HELPER"
+    held="$TMP/held.lock"
+    sh -c 'exec sleep 60' &
+    holder=$!
+    mkdir "$held"
+    printf '%s %s\n' "$holder" "$(date +%s)" >"$held/owner"
+    VICTORY_HYGIENE_LOCK_WAIT=1
+    started="$(date +%s)"
+    rc=0
+    victory_hygiene_lock_acquire "$held" || rc=$?
+    elapsed=$(( $(date +%s) - started ))
+    if [ "$rc" -eq 0 ]; then
+        fail "acquire succeeded against a live holder"
+    fi
+    if [ "$rc" -ne 75 ]; then
+        fail "acquire against a live holder returned $rc, expected 75"
+    fi
+    if [ "$elapsed" -lt 1 ]; then
+        fail "bounded wait returned after ${elapsed}s, before its bound"
+    fi
+    if [ "$elapsed" -gt 15 ]; then
+        fail "bounded wait lasted ${elapsed}s, far past its 1s bound"
+    fi
+    if [ ! -d "$held" ]; then
+        fail "a failed acquire removed the live holder's lock"
+    fi
+    kill -KILL "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -f "$held/owner"
+    rmdir "$held"
+) || fail "bounded-wait test failed"
+pass "live holder: bounded wait then exit 75; lock preserved"
+
+# --- 2d. A fresh ownerless directory is a racer, not a stale lock ----------
+(
+    . "$HELPER"
+    racer="$TMP/racer.lock"
+    mkdir "$racer"
+    VICTORY_HYGIENE_LOCK_WAIT=1
+    rc=0
+    victory_hygiene_lock_acquire "$racer" || rc=$?
+    if [ "$rc" -ne 75 ]; then
+        fail "fresh ownerless lock returned $rc, expected 75 (wait, do not reclaim)"
+    fi
+    if [ ! -d "$racer" ]; then
+        fail "a fresh ownerless lock was reclaimed from a racer"
+    fi
+    rmdir "$racer"
+) || fail "fresh ownerless-racer test failed"
+pass "fresh ownerless lock waited on, never reclaimed"
+
+# --- 2e. An aged unreadable owner record is reclaimed ----------------------
+(
+    . "$HELPER"
+    aged="$TMP/aged.lock"
+    mkdir "$aged"
+    printf 'not-a-pid\n' >"$aged/owner"
+    touch -t 202001010000 "$aged"
+    VICTORY_HYGIENE_LOCK_WAIT=5
+    victory_hygiene_lock_acquire "$aged" || fail "acquire did not reclaim an aged unreadable owner"
+    victory_hygiene_lock_release
+    if [ -d "$aged" ]; then
+        fail "aged ownerless lock was not released"
+    fi
+) || fail "aged unreadable-owner test failed"
+pass "aged unreadable owner record reclaimed"
+
+# --- 2f. Concurrent helper acquisitions never share the critical section ---
+cat >"$TMP/lock-worker.sh" <<'EOS'
+#!/bin/sh
+set -eu
+helper_dir="$1"
+lock_dir="$2"
+sentinel="$3"
+log="$4"
+. "$helper_dir/process-hygiene.sh"
+VICTORY_HYGIENE_LOCK_WAIT=60
+victory_hygiene_lock_acquire "$lock_dir" || exit 90
+rc=0
+if [ -e "$sentinel" ]; then
+    printf 'COLLISION\n' >>"$log"
+    rc=9
+else
+    : >"$sentinel"
+    sleep 0.3
+    rm -f "$sentinel"
+fi
+victory_hygiene_lock_release
+exit "$rc"
+EOS
+worker_pids=""
+w=0
+while [ "$w" -lt 6 ]; do
+    sh "$TMP/lock-worker.sh" "$HERE" "$TMP/mutex.lock" "$TMP/mutex.sentinel" "$TMP/mutex.log" &
+    worker_pids="$worker_pids $!"
+    w=$((w + 1))
+done
+mutex_failed=0
+for w_pid in $worker_pids; do
+    w_rc=0
+    wait "$w_pid" 2>/dev/null || w_rc=$?
+    if [ "$w_rc" -ne 0 ]; then
+        echo "test-process-hygiene: lock worker $w_pid exited $w_rc" >&2
+        mutex_failed=1
+    fi
+done
+[ "$mutex_failed" -eq 0 ] || fail "a concurrent helper acquirer did not complete cleanly"
+if [ -s "$TMP/mutex.log" ]; then
+    fail "two helper acquirers were inside the critical section together"
+fi
+if [ -d "$TMP/mutex.lock" ]; then
+    fail "the helper lock survived the concurrency test"
+fi
+pass "6 concurrent helper acquirers serialised with no overlap"
+
+# --- 2g. Re-entrant acquire reuses an ancestor's lock, never releases it ---
+(
+    . "$HELPER"
+    nested="$TMP/nested.lock"
+    mkdir "$nested"
+    printf '%s %s\n' "$$" "$(date +%s)" >"$nested/owner"
+    VICTORY_HYGIENE_LOCK_WAIT=5
+    victory_hygiene_lock_acquire "$nested" || fail "re-entrant acquire failed"
+    if [ "$VICTORY_HYGIENE_LOCK_INHERITED" != 1 ]; then
+        fail "re-entrant acquire did not mark the lock inherited"
+    fi
+    if [ "$VICTORY_HYGIENE_LOCK_OWNED" = 1 ]; then
+        fail "re-entrant acquire claimed ownership of an ancestor's lock"
+    fi
+    victory_hygiene_lock_release
+    if [ ! -d "$nested" ]; then
+        fail "re-entrant release removed the ancestor's lock"
+    fi
+    rm -f "$nested/owner"
+    rmdir "$nested"
+) || fail "re-entrant lock test failed"
+pass "re-entrant acquire reuses an ancestor's lock and never releases it"
 
 # --- 3. Simulated mid-run `exit 1` still reaps and preserves status ---------
 cat >"$TMP/midrun.sh" <<'EOS'
