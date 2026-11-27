@@ -5,6 +5,136 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(any(windows, test))]
+use victory_gpu::backend::GpuBackend;
+
+/// `VICTORY_METAL_SURFACE`: the swapchain surface the native presenter installs.
+#[cfg(windows)]
+const SURFACE_ENV: &str = "VICTORY_METAL_SURFACE";
+
+/// What the native preflight sees in the environment.
+///
+/// `None` from [`metal_preflight`] means the backend is not `metal`, so the
+/// start-up path is exactly the one before ADR-030.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetalPreflight {
+    /// Resolved `host:port`, or `None` when neither the explicit endpoint nor
+    /// the implicit ADR-016 port is configured.
+    endpoint: Option<String>,
+    share_dir: bool,
+    fence_page: bool,
+    surface: bool,
+}
+
+/// A field the native path cannot run without.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetalField {
+    Endpoint,
+    ShareDir,
+    FencePage,
+}
+
+#[cfg(any(windows, test))]
+impl MetalField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::ShareDir => "share_dir",
+            Self::FencePage => "fence_page",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl MetalPreflight {
+    /// The one structured line printed before any title code runs.
+    fn line(&self) -> String {
+        let state = |present: bool| if present { "set" } else { "missing" };
+        format!(
+            "METAL_PREFLIGHT backend=metal endpoint={} share_dir={} fence_page={} surface={}",
+            self.endpoint.as_deref().unwrap_or("none"),
+            state(self.share_dir),
+            state(self.fence_page),
+            state(self.surface),
+        )
+    }
+
+    /// The first field the native path cannot run without.
+    fn missing(&self) -> Option<MetalField> {
+        if self.endpoint.is_none() {
+            Some(MetalField::Endpoint)
+        } else if !self.share_dir {
+            Some(MetalField::ShareDir)
+        } else if !self.fence_page {
+            Some(MetalField::FencePage)
+        } else {
+            None
+        }
+    }
+}
+
+/// Decides the native preflight from raw environment values without touching
+/// the process environment, the GPU or the title.
+///
+/// `backend` is `VICTORY_BACKEND`; `endpoint`/`port` are the explicit and the
+/// ADR-016 implicit endpoint; `share_dir` and `fence_page` are the launcher's
+/// paths; `surface` is the optional `VICTORY_METAL_SURFACE` id. The launcher
+/// sets the explicit fence-page path, so the preflight requires it: the guest
+/// then never reaches the first submission with a bare share directory.
+#[cfg(any(windows, test))]
+fn metal_preflight(
+    backend: Option<&str>,
+    endpoint: Option<&str>,
+    port: Option<&str>,
+    share_dir: Option<&str>,
+    fence_page: Option<&str>,
+    surface: Option<&str>,
+) -> Option<MetalPreflight> {
+    if GpuBackend::parse(backend) != GpuBackend::Metal {
+        return None;
+    }
+    let endpoint = match non_empty(endpoint) {
+        Some(endpoint) => Some(endpoint.to_owned()),
+        // The client resolves a bare port to the loopback endpoint; accept the
+        // same configuration here instead of rejecting a valid ADR-016 setup.
+        None => non_empty(port).map(|port| format!("127.0.0.1:{port}")),
+    };
+    let surface = non_empty(surface)
+        .and_then(|id| id.parse::<u64>().ok())
+        .is_some_and(|id| id != 0);
+    Some(MetalPreflight {
+        endpoint,
+        share_dir: non_empty(share_dir).is_some(),
+        fence_page: non_empty(fence_page).is_some(),
+        surface,
+    })
+}
+
+/// A trimmed, non-empty value, or `None`.
+#[cfg(any(windows, test))]
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+/// Reads the preflight inputs from the process environment.
+#[cfg(windows)]
+fn preflight_from_env() -> Option<MetalPreflight> {
+    use victory_gpu::native_metal::client::{BACKEND_ENV, ENDPOINT_ENV, PORT_ENV};
+    use victory_gpu::native_metal::fence_page_guest::{FENCE_PAGE_ENV, SHARE_DIR_ENV};
+
+    let read = |name: &str| std::env::var(name).ok();
+    metal_preflight(
+        read(BACKEND_ENV).as_deref(),
+        read(ENDPOINT_ENV).as_deref(),
+        read(PORT_ENV).as_deref(),
+        read(SHARE_DIR_ENV).as_deref(),
+        read(FENCE_PAGE_ENV).as_deref(),
+        read(SURFACE_ENV).as_deref(),
+    )
+}
+
+#[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
 #[cfg(any(windows, test))]
@@ -49,6 +179,16 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        // ADR-030: with the native backend selected, say what it will use and
+        // stop before the title is loaded when the transport is incomplete.
+        // There is no silent D3D12/D3DMetal fallback to fall into later.
+        if let Some(preflight) = preflight_from_env() {
+            println!("{}", preflight.line());
+            if let Some(field) = preflight.missing() {
+                println!("METAL_PREFLIGHT_ERROR {}", field.name());
+                return Ok(2);
+            }
+        }
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -703,6 +843,121 @@ mod cpu_check_tests {
     #[test]
     fn skip_env_var_bypasses_missing_avx2() {
         assert!(check_cpu_features_with(false, Some("1")).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod metal_preflight_tests {
+    use super::{MetalField, MetalPreflight, metal_preflight};
+
+    fn decide(
+        backend: Option<&str>,
+        endpoint: Option<&str>,
+        share: Option<&str>,
+        fence: Option<&str>,
+        surface: Option<&str>,
+    ) -> Option<MetalPreflight> {
+        metal_preflight(backend, endpoint, None, share, fence, surface)
+    }
+
+    fn complete() -> MetalPreflight {
+        decide(
+            Some("metal"),
+            Some("127.0.0.1:47654"),
+            Some(r"Z:\tmp\share"),
+            Some(r"Z:\tmp\share\gpu-fence.v1.page"),
+            Some("1"),
+        )
+        .expect("metal selects the native preflight")
+    }
+
+    #[test]
+    fn unset_and_d3d12_keep_the_existing_startup() {
+        for backend in [None, Some(""), Some("d3d12"), Some("D3D12"), Some("vulkan")] {
+            assert_eq!(decide(backend, None, None, None, None), None);
+        }
+    }
+
+    #[test]
+    fn a_complete_metal_environment_is_ready() {
+        let preflight = complete();
+        assert_eq!(preflight.missing(), None);
+        assert_eq!(
+            preflight.line(),
+            "METAL_PREFLIGHT backend=metal endpoint=127.0.0.1:47654 \
+             share_dir=set fence_page=set surface=set"
+        );
+    }
+
+    #[test]
+    fn each_required_metal_field_is_reported() {
+        let cases = [
+            (None, Some("share"), Some("fence"), MetalField::Endpoint),
+            (
+                Some("127.0.0.1:1"),
+                None,
+                Some("fence"),
+                MetalField::ShareDir,
+            ),
+            (
+                Some("127.0.0.1:1"),
+                Some("share"),
+                None,
+                MetalField::FencePage,
+            ),
+        ];
+        for (endpoint, share, fence, missing) in cases {
+            let preflight = decide(Some("metal"), endpoint, share, fence, Some("1"))
+                .expect("metal selects the native preflight");
+            assert_eq!(preflight.missing(), Some(missing), "{preflight:?}");
+            assert_eq!(
+                missing.name(),
+                match missing {
+                    MetalField::Endpoint => "endpoint",
+                    MetalField::ShareDir => "share_dir",
+                    MetalField::FencePage => "fence_page",
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_surface_is_reported_but_not_fatal() {
+        let preflight = decide(
+            Some("metal"),
+            Some("127.0.0.1:1"),
+            Some("share"),
+            Some("fence"),
+            None,
+        )
+        .expect("metal selects the native preflight");
+        assert_eq!(preflight.missing(), None);
+        assert!(preflight.line().ends_with("surface=missing"));
+        // `VICTORY_METAL_SURFACE=0` means no surface, as the presenter reads it.
+        let zero = decide(
+            Some("metal"),
+            Some("127.0.0.1:1"),
+            Some("share"),
+            Some("fence"),
+            Some("0"),
+        )
+        .expect("metal selects the native preflight");
+        assert_eq!(zero, preflight);
+    }
+
+    #[test]
+    fn the_implicit_port_names_the_loopback_endpoint() {
+        let preflight = metal_preflight(
+            Some("metal"),
+            None,
+            Some("47654"),
+            Some("share"),
+            Some("fence"),
+            None,
+        )
+        .expect("metal selects the native preflight");
+        assert_eq!(preflight.endpoint.as_deref(), Some("127.0.0.1:47654"));
+        assert_eq!(preflight.missing(), None);
     }
 }
 

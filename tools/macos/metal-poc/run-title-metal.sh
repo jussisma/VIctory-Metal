@@ -12,7 +12,7 @@
 #
 # Usage:
 #   run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep]
-#                      -- <exe> [guest args...]
+#                      [--print-env] -- <exe> [guest args...]
 #
 #   --window    pass `--window` to the host so the native window presents
 #   --headless  force headless (default); refuses together with --window
@@ -20,6 +20,10 @@
 #   --out DIR   directory for guest.log, host.log, telemetry.json, summary.txt
 #               (default: a fresh mktemp directory, printed on exit)
 #   --keep      keep the isolated session directory (share dir, wineprefix)
+#   --print-env print the resolved endpoint, share dir and fence page as
+#               `LAUNCH_ENV key=value` lines before the guest starts. The
+#               session secret is never printed. ADR-031's wrapper reads them
+#               for its own summary; other callers do not need the flag.
 #
 # Environment overrides are honoured where they are meaningful (WINE, DXC_DIR,
 # TOOLCHAIN_ROOT, VICTORY_METAL_IRCONVERTER, VICTORY_FRAME_WARMUP,
@@ -57,13 +61,14 @@ export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
 usage() {
     cat <<'USAGE'
-usage: run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep] -- <exe> [guest args...]
+usage: run-title-metal.sh [--window|--headless] [--frames N] [--out DIR] [--keep] [--print-env] -- <exe> [guest args...]
 
   --window      open the native window and present the guest's surface
   --headless    force headless presentation (default); conflicts with --window
   --frames N    diagnostic frame count (exported as VICTORY_FRAME_MEASURED)
   --out DIR     keep guest.log, host.log, telemetry.json and summary.txt here
   --keep        keep the isolated session directory (share dir, wineprefix)
+  --print-env   print LAUNCH_ENV endpoint/share_dir/fence_page lines
   -h, --help
 USAGE
 }
@@ -74,6 +79,7 @@ HEADLESS_SET=0
 FRAMES=""
 OUT=""
 KEEP=0
+PRINT_ENV=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -99,6 +105,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --keep)
             KEEP=1
+            shift
+            ;;
+        --print-env)
+            PRINT_ENV=1
             shift
             ;;
         -h|--help)
@@ -708,6 +718,15 @@ export VICTORY_METAL_SHARE_DIR="$(winpath "$SHARE")"
 export VICTORY_METAL_FENCE_PAGE="$(winpath "$FENCE_PAGE")"
 export VICTORY_FRAME_MEASURED="${FRAMES:-${VICTORY_FRAME_MEASURED:-120}}"
 export VICTORY_FRAME_WARMUP="${VICTORY_FRAME_WARMUP:-20}"
+
+# ADR-031's wrapper reads these resolved values for its own summary. The
+# session secret is deliberately not part of this block.
+if [ "$PRINT_ENV" = 1 ]; then
+    echo "LAUNCH_ENV backend=metal"
+    echo "LAUNCH_ENV endpoint=127.0.0.1:$PORT"
+    echo "LAUNCH_ENV share_dir=$SHARE"
+    echo "LAUNCH_ENV fence_page=$FENCE_PAGE"
+fi
 
 if [ "$GATE_MODE" = 1 ]; then
     export VICTORY_LIVE_GATE=1
