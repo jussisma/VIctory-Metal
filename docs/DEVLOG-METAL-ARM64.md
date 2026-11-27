@@ -39,6 +39,9 @@ tracked tree.
 | 01 | 2026-11-26 | `1da600cf` → `25fe0caf` | Native device, wire v2, ring, present, first Wine→ARM64 synthetic frame | PASS (synthetic only) |
 | 02 | 2026-11-26 | `25fe0caf` → `5d4875c0` | Wire v3 stateful stream, mixed encoder, root-signature ABI, mesh census | PARTIAL (mesh draw refused) |
 | 03 | 2026-11-26 → 2026-11-27 | `5d4875c0` → `210df67c` | Mesh pipeline, packed mesh pair on hardware, production `submit_v3` slice, wave64 bucket lowering | PARTIAL (production sink disconnected) |
+| 04 | 2026-11-27 | `210df67c` → `79a5e039` | Async fence page, resource/PSO registries, `ExecuteIndirect`+blit, shader pool/archive, live client, AAA synthetic gate | PASS (synthetic AAA-shaped) |
+| 05 | 2026-11-27 | `79a5e039` → `11b2fa66` | Live D3D12 device/lists/fences/present, guest-owned PSOs, per-stage libraries, native window | PASS (live gate, 120 frames) |
+| 06 | 2026-11-27 | `11b2fa66` → cycle-06 head | Multi-entry tables, AS+MS+PS, in-pass indirect mesh, fail-closed wave64, bounded xmem GC, core render states, one-command launcher | PASS (pre-boot gate, see 6.3) |
 
 Base and head values: `1da600cf` and `210df67c` from
 `integration.base` / `integration.head` in ../.swarm/state.json. `25fe0caf` is
@@ -741,3 +744,211 @@ tools/macos/metal-poc/live-d3d12-gate.sh
   the census is the 35-program corpus above (11 refusals on a 32-lane host).
 - **xmem registry growth**: one `Retired` entry per submission that ever
   retained a range; bounded-memory design is still open.
+
+## Cycle 06 — pre-boot AAA hardening: multi-entry tables, object+mesh+pixel, in-pass indirect mesh, fail-closed wave64, bounded xmem GC, core render states, one-command launcher
+
+Base `11b2fa66` (`cycle-05`). Scaffold `6c6e20b7` reserves `macos/state.rs` and
+`victory-gpu/src/native_metal/state.rs` as owner modules and raises the v3
+`SetDescriptorTable` cap from the frozen v2 16 to `MAX_DESCRIPTOR_BINDINGS_V3`
+(32) in both the compute and graphics prepare paths. The integration head is the
+commit this section lands on; local annotated tag `cycle-06` marks it. Every
+number below comes from a command run in this workspace on Apple M4 Max; a number
+or behaviour that could not be observed is labelled as such.
+
+### 6.1 Decisions (ADR-023…026)
+
+- **ADR-023 — multi-entry descriptor tables.** A D3D12 root descriptor table binds
+  1..=32 homogeneous CBV, SRV or UAV descriptors (and sampler tables where the
+  guest can carry them). The guest enumerates live consecutive slots from the
+  table base at the kind's real increment (views 32 B, samplers 16 B) and stops at
+  the first empty, unresolvable, mixed-kind or off-end slot; the host binds the
+  enumerated prefix as one argument-buffer table under the pipeline's reflection
+  offsets with bulk `MTLResidencySet` residency. More than 32 entries is
+  `OverCap{count}` — never a silent truncation.
+- **ADR-024 — Amplification/Object + Mesh + Pixel and in-pass indirect mesh.** The
+  optional object stage joins the `VPS1`/`VPS2` registration (`converter_stage()`
+  6, wire code 3, `from_name("amplification")`) and maps to
+  `MTLMeshRenderPipelineDescriptor.objectFunction`, `payloadMemoryLength` and
+  `maxTotalThreadsPerObjectThreadgroup`. `ExecuteIndirect` for `DispatchMesh`
+  records inside the open `BeginRenderPass`..`EndRenderPass` instead of refusing
+  an open pass; a following graphics draw re-emits its pipeline into the same
+  pass.
+- **ADR-025 — fail-closed `narrow_waves` and bounded xmem retirement.**
+  `narrow_waves && !host_wave32` refuses at `lower::lower_pruned` (and again at
+  the public `Options` boundary) with one explicit message, so the silent
+  zero-high-ballot-dword lowering is unreachable; Apple Silicon Metal lowering
+  always sets `host_wave32`. The `xmem::share` registry evicts retired submission
+  rows deterministically (ascending id, `Retired` rows only) to a capacity
+  (default 4096, `VICTORY_XMEM_RETIRED_CAPACITY`), keeps a monotonic retired
+  watermark so an evicted id can never resurrect a range, and the retire queue
+  exposes capacity/`high_watermark`/`try_push`/`refusals`.
+- **ADR-026 — AAA core render state and the turnkey launcher.** Wire v3 opcodes
+  46..=53 carry blend, depth-stencil, rasterizer, stencil ref, blend factor,
+  `ClearRenderTargetView`, `ClearDepthStencilView` and `CopyBufferToTexture`. The
+  host bakes blend into the pipeline and the depth state into a cached
+  `MTLDepthStencilState`, applies cull/winding/fill/depth bias per encoder,
+  folds an explicit clear into the next continuation pass load action (never a
+  dropped clear), and performs the pitched upload as
+  `copyFromBuffer:sourceBytesPerRow:sourceBytesPerImage:...`. `run-title-metal.sh`
+  turns the diagnostics into one command.
+
+### 6.2 Chronology of the work
+
+| Step | Commit | Evidence |
+|---|---|---|
+| scaffold | `6c6e20b7` | owner modules reserved; v3 descriptor-table cap 16 → 32 |
+| C6-WAVE64-FAIL-CLOSED | `06dab3d1` | refusal at `emit/lower.rs` `lower_pruned` + `emit/mod.rs`; 35/35 corpus programs refused with one reason each (13 mask, 7 LDS, 7 reduction, 4 first-lane, 4 lane-read); supported pair unchanged 24 translated / 11 refused; `victory-shader` 248 / 0 / 2; M4 Max `wave_lower_gpu` 5 passed incl. both-halves mask/ballot |
+| C6-XMEM-BOUNDED-GC | `333461f3` | deterministic eviction + watermark; capacity 4096 (env-overridable); retire queue capacity/high-watermark/`try_push`; Wine `victory-hle` 180 passed / 1 ignored (pre-existing display test); stress `cycles=10000 peak=64 capacity=64 watermark=20936`; evicted id refused as `Retired`, id above watermark `UnknownSubmission` |
+| C6-MULTI-ENTRY-TABLES | `29ac5fea` | guest enumeration 1/2/4/32 admit, 33rd `OverCap`; M4 Max one submission with 4 CBV + 4 SRV + 4 UAV + root constants: target `[100,200,255,255]`, UAV words per entry `[0,4,0,8]`…`[30,16,60,32]`, builder extents 4×8 B and 4×24 B, 7 residency allocations; fixed the host rejecting unaligned opaque `gpuResourceID`s |
+| C6-OBJECT-MESH-PIPELINE | `5d802a58` | `[Mesh, Object, Pixel]` `VPS1` flags `0b11`, object threadgroup `[1,1,1]`, payload 1024 B; `[Object, Mesh, Pixel]` refused as `HostCannotRegister`; M4 Max: 8 object threads, odd culled, 4 payloads drawn = 112 exact px; `victory-gpu` serial 208 / 0 / 1 |
+| C6-INDIRECT-MESH-IN-PASS | `713e4d1b` | producer opens the pass for indirect mesh; compute-written count 1 → 64 px (`0x0fcebc438a043e25`), count 2 → 128 px (`0x60094f9b132ff125`) equal to direct `DispatchMesh` (`diff = 0`); record buffer written only by the GPU; `indirect_gpu` 4 passed; producer tests 26 → 29 |
+| C6-AAA-RENDER-STATES | `e34744b9`+`a1fd12b5` | wire opcodes 46..=53 and host state modules; see 6.3 for the two root causes of the vanishing draw and the restored proof; `render_states_gpu` 1/1, `submit_v3_bindings_gpu` 3/3, `indirect_gpu` 4/4 |
+| C6-TITLE-LAUNCHER | `c91686de` | `tools/macos/metal-poc/run-title-metal.sh` (942 lines) + host `--headless`/ready-line fields; headless exit 0, 120 measured frames, p50 0.395 / p95 0.766 / p99 0.779 ms, 2153.76 FPS, guest `frames_ok=140`, `d3dmetal_fallback_count=0`, teardown with no leaked process; window mode vsync-limited 61.18 FPS; `--window --headless` exit 2 |
+| orchestrator fix | `11f0c0d8` | the macOS-only `ipc_host` import in `bin/metal-worker.rs` is gated so Windows `--all-targets` checks compile (pre-existing failure surfaced by C6-TITLE-LAUNCHER) |
+| C6-AAA-PREBOOT-GATE | `826a0f37` | `crates/victory-gpu/tests/aaa_preboot_gate.rs` (1710 lines) + `tools/macos/metal-poc/aaa-preboot-gate.sh` (719 lines); two serialized 120-frame runs, exit 12 / PARTIAL because three integrated host gaps are observed and named rather than skipped (see 6.3 and 6.6) |
+
+### 6.3 Measured evidence
+
+**Render-state root causes (C6-AAA-RENDER-STATES).** The blend submission
+rendered no fragments whenever a `SetRasterizerState` command was present, even
+with the rasterizer selector bodies neutered. Two real defects, both in
+`macos/state.rs`:
+
+1. `MTLTriangleFillMode` constants were inverted (`Lines = 0`, `Fill = 1`), so
+   `FillMode::Solid` called `setTriangleFillMode:` with line fill; almost no
+   fragments landed. Corrected to `Fill = 0`, `Lines = 1`, and the unit test that
+   locked the wrong values was fixed with it.
+2. D3D12 colour write masks were passed straight to `MTLColorWriteMask`, whose bit
+   order is reversed (D3D12 `R=1,G=2,B=4,A=8`; Metal `R=8,G=4,B=2,A=1`), so mask
+   `0b0101` blacked the second target. A translation helper now maps the mask
+   (`0b0101 → 0b1010`) and is unit-tested.
+
+The bisection had also disabled `setDepthBias:slopeScale:clamp:`; that emission is
+restored. `CopyBufferToTexture` carried no destination handle, so the host could
+never resolve the upload target; the opcode now carries
+`destination_allocation_id`/`destination_generation`. Converted texture descriptor
+tables are encoded from `gpuResourceID` directly because those ids are opaque and
+not address-aligned.
+
+**Render-state proof (M4 Max, debug, serialized).** Submission 1 (pipeline
+compiled with blending, explicit `ClearRenderTargetView`/`ClearDepthStencilView`,
+wire blend + depth state): target 0 all `[255,0,255,255]`, target 1 all
+`[255,255,0,255]`. Submission 2 (depth test Less, back-face culling, depth bias):
+`(8,8)` green, `(56,8)` cyan (biased quad wins at equal z), `(8,56)` yellow,
+`(56,56)` blue (far quad survives; clockwise quad culled). Submission 3: target 0
+all `[0,255,0,255]` and target 1 all `[0,0,255,255]`, i.e. the pitched-uploaded
+4×4 texture sampled at `(1,1)` and `(2,2)` with a 0xAA-poisoned source and
+`blit_encoders=1`.
+
+**Wave64 fail-closed.** 35/35 corpus programs refuse the unsound pair with one
+reason each; the supported pair is unchanged. On hardware the 64-lane fixture
+reports live mask 64 and a high ballot dword of `0xff`, so both halves execute.
+
+**Bounded xmem GC.** 10,000 alloc/use/unmap/retire cycles under Wine with the
+registry capacity deliberately set to 64: peak map 64, watermark 20936, the live
+pin's range and lease held every cycle, evicted id 2 refused as `Retired`.
+
+**AAA pre-boot gate.** `tools/macos/metal-poc/aaa-preboot-gate.sh`, two
+serialized runs, 1280×720, warmup 20, 120 measured frames, dev profile, exit 12
+(`status=PARTIAL`). Run 1: p50 **0.829 ms**, p95 0.929, p99 0.956, **1193.56
+FPS**; run 2: p50 0.839, p95 0.928, p99 0.971, 1194.57 FPS. Present checksum
+`17274905532806365283` (`0xefbccb0e435a8063`) identical in both runs. 120/120
+frames measured, 140/140 guest frames ok, 140 presents, 280 submissions ok and
+one refused (the replay), replay `AlreadyExecuted` with the sentinel unchanged,
+`d3dmetal_fallback_count=0`, guest D3DMetal module 0, unsupported-opcode
+histogram empty, fence timeouts 0, registration failures 0, `compute_unbound` 0,
+`PROCESS_CHECK host=0 guest=0 leaks=0`.
+
+Observed in both runs: device/queue/fence, 4 textures, guest PSO ids (mesh 1,
+compute 2, graphics 3); compute culling writes mesh counts
+(`compute_mesh_counts_after=1,1,1,49374` with the `0xC0DE` marker, 140/140 linkage
+frames); in-pass `ExecuteIndirectDispatchMesh` with the
+compute → barrier → indirect → direct order checked; AS+MS+PS payload
+(`object_payload_after=3,1,49374`, `mesh_pixels=64,512,000` =
+140×(320×720+640×360)); depth test (`far_pixels=0`, `near_pixels=32,256,000`);
+back-face culling (`cull_pixels=0`, `middle_pixels=0`); explicit MRT+depth clears
+spliced every frame; pitched `CopyBufferToTexture` (row pitch 256, 4×4) every
+frame; bounded xmem churn 10,000 cycles with peak retired rows **4096** at the
+4096 capacity.
+
+Not observed, and the reason the gate is PARTIAL rather than PASS:
+
+1. **UAV table entry 1.** A count==2 UAV table binds entry 0 (`uav0=11`) but entry
+   1 stays 0 (`uav1=0`, expected 22). The host binds one converted array; the
+   second entry does not reach the shader. Candidate sites:
+   `macos/bindings.rs:186` (8-byte `Unspecified` stride),
+   `device.rs:3276-3311` (`abi_table_kind`/`with_descriptor_table_kinds`).
+2. **SRV texture tables.** Reflection `Type=Table` maps to
+   `DescriptorTableKind::Unspecified` (`macos/bindings.rs:365-376`), and
+   `macos/device.rs:3199` only takes the texture path for kind `Texture`, so a
+   guest texture handle resolves as a buffer range (`device.rs:2904`); the gate
+   binds two SRV buffers instead. The pitched upload is proven by its copy into
+   the presented target, not by sampling.
+3. **Alpha blending with a guest PSO.** `check_blend_state`
+   (`macos/device.rs:5007-5034`) refuses an enabled wire blend state for
+   content-hashed v2 pipelines, because those compile without blending. Depth,
+   cull and clears are real; an alpha-blended draw is not claimed.
+
+The launcher's independent rectangle model does not reproduce the host checksum;
+the measured checksum is exact and stable but is not an independently predicted
+image. It is reported as informational, not as a pass criterion.
+
+### 6.4 Counts (integration head)
+
+- Compiled: Win64 `diag` `victory`; `victory-metal`/`victory-hle`/`victory-gpu`
+  Windows all-targets; x86_64 `victory-irconverter`.
+- Compiled: Win64 `diag` `victory` (exit 0); `victory-metal`/`victory-hle`/
+  `victory-gpu` (diagnostics) Windows all-targets (exit 0); x86_64
+  `victory-irconverter` binary (exit 0).
+- CPU-tested at head `9a6477f1`, serialized: `victory-metal` **325 passed /
+  0 failed / 33 ignored** across 26 test binaries (lib 278 / 5 ignored, the rest
+  hardware-gated); `victory-shader` **251 / 0 / 3**; `victory-gpu` **229 / 0 / 1**;
+  `victory-hle` under Wine **183 / 0 / 2** (lib 180 / 1 pre-existing display test).
+- GPU-verified on M4 Max, serialized with `/tmp/victory-gpu.lock` and
+  `--test-threads=1`: 16 hardware tests across 7 binaries — `render_states_gpu`
+  1, `multi_entry_tables_gpu` 1, `object_mesh_gpu` 1, `indirect_mesh_gpu` 1,
+  `wave_lower_gpu` 5, `submit_v3_bindings_gpu` 3, `indirect_gpu` 4 — plus the
+  two-run pre-boot gate.
+
+### 6.5 Reproduce
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cd VIctory-Metal
+cargo build --locked --profile diag --target x86_64-pc-windows-gnullvm --package victory --features diagnostics
+cargo test --locked -p victory-metal --target aarch64-apple-darwin --lib -- --test-threads=1
+cargo test --locked -p victory-shader --target aarch64-apple-darwin
+cargo test --locked -p victory-gpu --target aarch64-apple-darwin -- --test-threads=1
+tools/macos/test-wine.sh -p victory-hle -- --test-threads=1
+cargo test --locked -p victory-metal --target aarch64-apple-darwin --test render_states_gpu -- --ignored --test-threads=1
+tools/macos/metal-poc/run-title-metal.sh --headless --frames 120 -- <win64-exe> [args...]
+```
+
+### 6.6 Remaining gaps (honest)
+
+- **No title binary has run.** The gate drives the real `victory-gpu` D3D12 entry
+  points through the launcher, but not a retail title; no proprietary asset was
+  used. Geometry, materials and streaming on a title frame remain unproven, and
+  the ≥30 FPS game gate is still unmet.
+- **The pre-boot gate is PARTIAL, not PASS.** Three integration gaps are observed
+  in the merged code and named above: multi-entry UAV tables stop after entry 0,
+  SRV tables never take the texture path, and an enabled blend state is refused
+  for content-hashed guest pipelines. A title that uses multi-entry tables or
+  alpha blending will hit them on frame 1, so a first live boot is a diagnostics
+  run, not an acceptance run, until they are fixed.
+- **The new render-state opcodes have no guest D3D12 entry point yet.** Blend,
+  depth-stencil, rasterizer, clears and pitched upload are reachable through Wire
+  v3 and proven on the host, but `victory-gpu`'s `OMSet*`/`Clear*`/upload
+  entry points still record into `ignored_state` (owned by `list.rs`). A title
+  will not exercise them until that wiring lands.
+- **Sampler descriptor tables** are refused end to end: the host builder supports
+  them, the guest has no sampler-registration route.
+- **Guest texture-SRV tables** stop as unresolvable; textures do not yet travel as
+  buffer ranges.
+- **Object-stage conversion** is exercised through hand-authored MSL, not through
+  console DXIL: `victory-shader` has no amplification `HwStage` yet.
+- **Retire queue capacity is a soft bound** when the front fence never completes;
+  `device.rs` still uses `push` (which retains and counts) rather than `try_push`
+  backpressure.
+- **`victory-gpu` parallel execution** has pre-existing global-state races in
+  `native_metal::queue` tests; every suite here is run with `--test-threads=1`.
