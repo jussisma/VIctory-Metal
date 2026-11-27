@@ -33,6 +33,42 @@
 //! - `flush` closes the pass and returns one submission with the next
 //!   session-wide sequence; a pass never spans two submissions.
 //!
+//! # Clears
+//!
+//! `ClearRenderTargetView` and `ClearDepthStencilView` name a descriptor's
+//! resource, not a currently bound slot: D3D12 lets a title clear a target
+//! before it binds one, and lets it clear a target it never draws into. The
+//! producer therefore never drops a clear and never refuses one just because
+//! the target is not bound yet. It keeps clears by [`ResourceId`] (allocation
+//! plus generation) and lowers each one at the first point where the wire can
+//! express it in recording order:
+//!
+//! - A clear for a target that a later `OMSetRenderTargets` binds becomes that
+//!   attachment's `LoadOp::Clear`/`StoreOp::Store`, and is removed from the
+//!   pending set, so binding the same target again does not clear it twice.
+//!   A second clear before the bind replaces the first: the last value is the
+//!   target's content when the pass opens.
+//! - A clear for a target that is never bound is encoded as its own
+//!   single-attachment render pass (`BeginRenderPass` with
+//!   `LoadOp::Clear`/`StoreOp::Store`, no draws, `EndRenderPass`) before the
+//!   next draw, dispatch, copy, barrier, present or `flush` that would
+//!   otherwise be encoded first.
+//! - A clear issued while a pass is already open closes that pass (its
+//!   attachments are stored), encodes the clear as that standalone pass, and
+//!   leaves the same attachment set recorded; the next draw reopens it with
+//!   `LoadOp::Load`. Nothing is reordered and nothing is dropped, even when no
+//!   draw follows. `EndRenderPass` therefore resets the recorded load actions:
+//!   a pass that already ran loads its attachments when it is reopened.
+//! - A recorded attachment cleared but never drawn still clears: `flush`
+//!   materialises the recorded pass (`BeginRenderPass` + `EndRenderPass`) so
+//!   its clear load action executes.
+//! - Depth/stencil clears take the same path. The wire requires 1..=8 colour
+//!   attachments in every pass, so a depth-only clear uses the first recorded
+//!   colour attachment as a load/store anchor (the depth attachment must match
+//!   its size). A depth clear with no colour attachment to anchor its pass
+//!   cannot be expressed and is refused by name at the point it would have
+//!   been encoded; that refusal fails `Close` instead of dropping the clear.
+//!
 //! # Failure
 //!
 //! Anything the producer cannot express returns
@@ -504,6 +540,25 @@ struct PassState {
     depth_stencil: Option<DepthStencilAttachment>,
 }
 
+/// A clear recorded before a pass can carry it.
+///
+/// Keyed by [`ResourceId`] in recording order: a later clear of the same
+/// resource replaces the earlier one, because only the value at the time the
+/// clear executes is observable. Clears of different resources are independent,
+/// so their relative order does not change the result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingClear {
+    Color {
+        resource: ResourceId,
+        clear_color: [f64; 4],
+    },
+    Depth {
+        resource: ResourceId,
+        clear_depth: Option<f32>,
+        clear_stencil: Option<u32>,
+    },
+}
+
 /// Graphics state kept across draws, emitted in a fixed order.
 #[derive(Debug, Default)]
 struct GraphicsState {
@@ -570,6 +625,7 @@ pub struct MetalProducer {
     identity: ListIdentity,
     pass: PassState,
     pass_open: bool,
+    pending_clears: Vec<PendingClear>,
     graphics: GraphicsState,
     dirty: GraphicsDirty,
     compute_pipeline: Option<u64>,
@@ -590,6 +646,7 @@ impl MetalProducer {
             identity: checked_identity(list_id, list_generation)?,
             pass: PassState::default(),
             pass_open: false,
+            pending_clears: Vec::new(),
             graphics: GraphicsState::default(),
             dirty: GraphicsDirty::default(),
             compute_pipeline: None,
@@ -628,6 +685,7 @@ impl MetalProducer {
         self.pass_open = false;
         self.pass.colors.clear();
         self.pass.depth_stencil = None;
+        self.pending_clears.clear();
         self.emitted_compute_pipeline = None;
         self.emitted_mesh_pipeline = None;
     }
@@ -655,6 +713,11 @@ impl MetalProducer {
     /// the same attachments does not split an open pass; different
     /// attachments (or a different depth target) do.
     ///
+    /// A clear recorded before this call for one of the attachments becomes
+    /// that attachment's load action (see the module's clears section). A
+    /// recorded set that never opened still owes its clears, so they are
+    /// encoded before the new attachments replace it.
+    ///
     /// An empty `colors` slice unbinds the targets and closes any open pass.
     pub fn set_render_targets(
         &mut self,
@@ -677,8 +740,8 @@ impl MetalProducer {
             }
         }
 
-        let next: Vec<ColorAttachment> = colors.iter().map(RenderTarget::attachment).collect();
-        let next_depth = depth.map(|depth| depth.attachment());
+        let mut next: Vec<ColorAttachment> = colors.iter().map(RenderTarget::attachment).collect();
+        let mut next_depth = depth.map(|depth| depth.attachment());
 
         if self.pass_open {
             if !same_attachments(
@@ -693,8 +756,13 @@ impl MetalProducer {
                 // actions were latched when it opened.
                 return Ok(());
             }
+        } else {
+            // The recorded set is about to be replaced. A clear it carries and
+            // never executed still has to happen.
+            self.materialize_latent_clear()?;
         }
 
+        self.apply_pending_clears(&mut next, &mut next_depth);
         self.pass.colors = next;
         self.pass.depth_stencil = next_depth;
         Ok(())
@@ -721,42 +789,69 @@ impl MetalProducer {
         }
         self.push(CommandV3::EndRenderPass)?;
         self.pass_open = false;
+        // The pass stored its attachments. A later pass over the same set loads
+        // them instead of repeating the clear its load action already applied.
+        for color in &mut self.pass.colors {
+            color.load = LoadOp::Load;
+        }
+        if let Some(depth) = &mut self.pass.depth_stencil {
+            depth.depth_load = LoadOp::Load;
+            depth.stencil_load = LoadOp::Load;
+        }
         Ok(())
     }
 
-    /// `ClearRenderTargetView`: makes the bound target clear when its pass
-    /// opens. A clear after the pass opened is refused: Metal expresses it as
-    /// the pass's load action, not a separate command.
+    /// `ClearRenderTargetView`: clears `target`, whether or not it is bound.
+    ///
+    /// A target already recorded for the pass folds the clear into that pass's
+    /// load action. A clear inside an open pass closes it and is encoded as its
+    /// own pass (see the module's clears section). A target that is not
+    /// recorded at all is remembered until a bind applies it or the stream
+    /// reaches a point where it is encoded as a standalone clear pass.
     pub fn clear_render_target(
         &mut self,
         target: ResourceId,
         clear_color: [f32; 4],
     ) -> Result<(), ProducerError> {
         ResourceId::new(target.allocation_id, target.generation)?;
-        if self.pass_open {
-            return Err(ProducerError::unsupported_opcode(
-                "ClearRenderTargetView inside a recorded pass",
-                OP_BEGIN_RENDER_PASS,
-            ));
-        }
-        for color in &mut self.pass.colors {
-            if color.allocation_id == target.allocation_id && color.generation == target.generation
-            {
+        let clear_color = clear_color.map(f64::from);
+        let bound = self.pass.colors.iter().position(|color| {
+            color.allocation_id == target.allocation_id && color.generation == target.generation
+        });
+        match bound {
+            Some(_) if self.pass_open => {
+                // The target is an attachment of the pass that is already
+                // recording: close it, encode the clear, and let the next draw
+                // reopen the same attachments with `LoadOp::Load`.
+                self.close_pass()?;
+                self.push_color_clear_pass(target, clear_color)
+            }
+            Some(index) => {
+                let color = &mut self.pass.colors[index];
                 color.load = LoadOp::Clear;
                 color.store = StoreOp::Store;
-                color.clear_color = clear_color.map(f64::from);
-                return Ok(());
+                color.clear_color = clear_color;
+                Ok(())
+            }
+            None => {
+                if self.pass_open {
+                    self.close_pass()?;
+                }
+                self.record_pending_color(target, clear_color);
+                Ok(())
             }
         }
-        Err(ProducerError::unsupported_opcode(
-            "ClearRenderTargetView before OMSetRenderTargets",
-            OP_BEGIN_RENDER_PASS,
-        ))
     }
 
-    /// `ClearDepthStencilView`: makes the bound depth target clear when its
-    /// pass opens. `clear_depth` and `clear_stencil` follow the D3D12 clear
-    /// flags.
+    /// `ClearDepthStencilView`: clears the depth and/or stencil plane of
+    /// `target`, whether or not it is bound.
+    ///
+    /// `clear_depth` and `clear_stencil` follow the D3D12 clear flags. A target
+    /// that is the recorded depth attachment folds the clear into the pass's
+    /// load actions; a clear inside an open pass closes it and is encoded as
+    /// its own pass; any other target is remembered and applied on bind or
+    /// encoded later. That later pass needs a colour attachment to anchor it,
+    /// because the wire has no depth-only pass.
     pub fn clear_depth_stencil(
         &mut self,
         target: ResourceId,
@@ -768,36 +863,45 @@ impl MetalProducer {
         if !clear_depth && !clear_stencil {
             return Ok(());
         }
+        ResourceId::new(target.allocation_id, target.generation)?;
+        let bound = self.pass.depth_stencil.is_some_and(|attachment| {
+            attachment.allocation_id == target.allocation_id
+                && attachment.generation == target.generation
+        });
+        if bound && !self.pass_open {
+            let attachment = self
+                .pass
+                .depth_stencil
+                .as_mut()
+                .expect("the target is the recorded depth attachment");
+            if clear_depth {
+                attachment.depth_load = LoadOp::Clear;
+                attachment.depth_store = StoreOp::Store;
+                attachment.clear_depth = depth;
+            }
+            if clear_stencil {
+                attachment.stencil_load = LoadOp::Clear;
+                attachment.stencil_store = StoreOp::Store;
+                attachment.clear_stencil = u32::from(stencil);
+            }
+            return Ok(());
+        }
+        if bound {
+            self.close_pass()?;
+            return self.push_depth_clear_pass(
+                target,
+                clear_depth.then_some(depth),
+                clear_stencil.then_some(u32::from(stencil)),
+            );
+        }
         if self.pass_open {
-            return Err(ProducerError::unsupported_opcode(
-                "ClearDepthStencilView inside a recorded pass",
-                OP_BEGIN_RENDER_PASS,
-            ));
+            self.close_pass()?;
         }
-        let Some(attachment) = self.pass.depth_stencil.as_mut() else {
-            return Err(ProducerError::unsupported_opcode(
-                "ClearDepthStencilView with no depth attachment bound",
-                OP_BEGIN_RENDER_PASS,
-            ));
-        };
-        if attachment.allocation_id != target.allocation_id
-            || attachment.generation != target.generation
-        {
-            return Err(ProducerError::unsupported_opcode(
-                "ClearDepthStencilView of an unbound depth target",
-                OP_BEGIN_RENDER_PASS,
-            ));
-        }
-        if clear_depth {
-            attachment.depth_load = LoadOp::Clear;
-            attachment.depth_store = StoreOp::Store;
-            attachment.clear_depth = depth;
-        }
-        if clear_stencil {
-            attachment.stencil_load = LoadOp::Clear;
-            attachment.stencil_store = StoreOp::Store;
-            attachment.clear_stencil = u32::from(stencil);
-        }
+        self.record_pending_depth(
+            target,
+            clear_depth.then_some(depth),
+            clear_stencil.then_some(u32::from(stencil)),
+        );
         Ok(())
     }
 
@@ -1366,6 +1470,7 @@ impl MetalProducer {
         let Some(pipeline_id) = self.compute_pipeline else {
             return Err(ProducerError::MissingPipeline { stage: "compute" });
         };
+        self.flush_pending_clears()?;
         self.close_pass()?;
         if self.emitted_compute_pipeline != Some(pipeline_id) {
             self.push(CommandV3::SetComputePipeline(PipelineRef { pipeline_id }))?;
@@ -1404,6 +1509,7 @@ impl MetalProducer {
                 OP_DISPATCH_3D,
             ));
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         if self.emitted_compute_pipeline != Some(pipeline_id) {
             self.push(CommandV3::SetComputePipeline(PipelineRef { pipeline_id }))?;
@@ -1530,6 +1636,7 @@ impl MetalProducer {
                 OP_COPY_BUFFER,
             ));
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::CopyBuffer(CopyBuffer {
             src_allocation_id: src.allocation_id,
@@ -1564,6 +1671,7 @@ impl MetalProducer {
                 OP_COPY_TEXTURE,
             ));
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::CopyTexture(CopyTexture {
             src_allocation_id: src.allocation_id,
@@ -1600,6 +1708,7 @@ impl MetalProducer {
                 OP_COPY_TEXTURE_REGION,
             ));
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::CopyTextureRegion(WireCopyTextureRegion {
             src,
@@ -1619,6 +1728,7 @@ impl MetalProducer {
     ) -> Result<(), ProducerError> {
         ResourceId::new(src.allocation_id, src.generation)?;
         ResourceId::new(dst.allocation_id, dst.generation)?;
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::ResolveSubresource(WireResolveSubresource {
             src,
@@ -1643,6 +1753,7 @@ impl MetalProducer {
                 ));
             }
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::ResourceBarrier(ResourceBarrier {
             entries: entries.to_vec(),
@@ -1662,6 +1773,7 @@ impl MetalProducer {
                 OP_PRESENT,
             ));
         }
+        self.flush_pending_clears()?;
         self.close_pass()?;
         self.push(CommandV3::Present(Present {
             surface_id,
@@ -1689,20 +1801,17 @@ impl MetalProducer {
     /// The submission carries the next session-wide sequence, so every
     /// flush is strictly increasing across lists. An empty stream still
     /// consumes its sequence.
+    ///
+    /// Clears that no draw or bind consumed are encoded here too: a recorded
+    /// pass whose clear never ran is materialised, and a clear of a target that
+    /// was never bound becomes its own pass.
     pub fn flush(&mut self) -> Result<SubmissionV3, ProducerError> {
-        self.close_pass()?;
         self.ensure_room(0)?;
+        self.close_pass()?;
+        self.materialize_latent_clear()?;
+        self.flush_pending_clears()?;
         let sequence = next_sequence()?;
         let commands = std::mem::take(&mut self.commands);
-        // A clear latched for this submission happened; a later submission
-        // that reuses the same attachments loads them.
-        for color in &mut self.pass.colors {
-            color.load = LoadOp::Load;
-        }
-        if let Some(depth) = &mut self.pass.depth_stencil {
-            depth.depth_load = LoadOp::Load;
-            depth.stencil_load = LoadOp::Load;
-        }
         self.emitted_compute_pipeline = None;
         self.emitted_mesh_pipeline = None;
         self.dirty = GraphicsDirty::all(&self.graphics);
@@ -1745,6 +1854,242 @@ impl MetalProducer {
             .ok_or(ProducerError::MissingPipeline { stage: "graphics" })
     }
 
+    /// Applies the clear of any attachment `next` binds and forgets it.
+    fn apply_pending_clears(
+        &mut self,
+        colors: &mut [ColorAttachment],
+        depth: &mut Option<DepthStencilAttachment>,
+    ) {
+        for color in colors.iter_mut() {
+            let Some(index) = self.pending_clears.iter().position(|clear| {
+                matches!(
+                    clear,
+                    PendingClear::Color { resource, .. }
+                        if resource.allocation_id == color.allocation_id
+                            && resource.generation == color.generation
+                )
+            }) else {
+                continue;
+            };
+            let PendingClear::Color { clear_color, .. } = self.pending_clears.remove(index) else {
+                continue;
+            };
+            color.load = LoadOp::Clear;
+            color.store = StoreOp::Store;
+            color.clear_color = clear_color;
+        }
+        let Some(depth) = depth.as_mut() else {
+            return;
+        };
+        let Some(index) = self.pending_clears.iter().position(|clear| {
+            matches!(
+                clear,
+                PendingClear::Depth { resource, .. }
+                    if resource.allocation_id == depth.allocation_id
+                        && resource.generation == depth.generation
+            )
+        }) else {
+            return;
+        };
+        let PendingClear::Depth {
+            clear_depth,
+            clear_stencil,
+            ..
+        } = self.pending_clears.remove(index)
+        else {
+            return;
+        };
+        if let Some(value) = clear_depth {
+            depth.depth_load = LoadOp::Clear;
+            depth.depth_store = StoreOp::Store;
+            depth.clear_depth = value;
+        }
+        if let Some(value) = clear_stencil {
+            depth.stencil_load = LoadOp::Clear;
+            depth.stencil_store = StoreOp::Store;
+            depth.clear_stencil = value;
+        }
+    }
+
+    /// Remembers a colour clear until a bind consumes it; the last one wins.
+    fn record_pending_color(&mut self, resource: ResourceId, clear_color: [f64; 4]) {
+        self.pending_clears.retain(|clear| {
+            !matches!(clear, PendingClear::Color { resource: pending, .. } if *pending == resource)
+        });
+        self.pending_clears.push(PendingClear::Color {
+            resource,
+            clear_color,
+        });
+    }
+
+    /// Remembers a depth/stencil clear until a bind consumes it.
+    ///
+    /// Clears of the two planes merge, so clearing depth and then stencil
+    /// before the bind clears both.
+    fn record_pending_depth(
+        &mut self,
+        resource: ResourceId,
+        clear_depth: Option<f32>,
+        clear_stencil: Option<u32>,
+    ) {
+        let mut merged_depth = clear_depth;
+        let mut merged_stencil = clear_stencil;
+        self.pending_clears.retain(|clear| match clear {
+            PendingClear::Depth {
+                resource: pending,
+                clear_depth,
+                clear_stencil,
+            } if *pending == resource => {
+                merged_depth = merged_depth.or(*clear_depth);
+                merged_stencil = merged_stencil.or(*clear_stencil);
+                false
+            }
+            _ => true,
+        });
+        self.pending_clears.push(PendingClear::Depth {
+            resource,
+            clear_depth: merged_depth,
+            clear_stencil: merged_stencil,
+        });
+    }
+
+    /// Encodes one standalone, single-attachment colour clear pass.
+    fn push_color_clear_pass(
+        &mut self,
+        resource: ResourceId,
+        clear_color: [f64; 4],
+    ) -> Result<(), ProducerError> {
+        let attachment = ColorAttachment {
+            allocation_id: resource.allocation_id,
+            generation: resource.generation,
+            mip_level: 0,
+            slice: 0,
+            load: LoadOp::Clear,
+            store: StoreOp::Store,
+            clear_color,
+        };
+        self.push(CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![attachment],
+            depth_stencil: None,
+        }))?;
+        self.push(CommandV3::EndRenderPass)
+    }
+
+    /// Encodes one standalone depth/stencil clear pass.
+    ///
+    /// The wire has no depth-only pass, so the clear rides on a render pass
+    /// whose single colour attachment is the first recorded target: it is
+    /// loaded and stored unchanged. The depth attachment must match its size,
+    /// as it would in the pass the title recorded it for.
+    fn push_depth_clear_pass(
+        &mut self,
+        resource: ResourceId,
+        clear_depth: Option<f32>,
+        clear_stencil: Option<u32>,
+    ) -> Result<(), ProducerError> {
+        let Some(anchor) = self.pass.colors.first().copied() else {
+            return Err(ProducerError::unsupported_opcode(
+                "ClearDepthStencilView: no colour attachment to anchor the clear pass",
+                OP_BEGIN_RENDER_PASS,
+            ));
+        };
+        let color = ColorAttachment {
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+            ..anchor
+        };
+        let depth = DepthStencilAttachment {
+            allocation_id: resource.allocation_id,
+            generation: resource.generation,
+            mip_level: 0,
+            slice: 0,
+            depth_load: if clear_depth.is_some() {
+                LoadOp::Clear
+            } else {
+                LoadOp::Load
+            },
+            depth_store: StoreOp::Store,
+            clear_depth: clear_depth.unwrap_or(1.0),
+            stencil_load: if clear_stencil.is_some() {
+                LoadOp::Clear
+            } else {
+                LoadOp::Load
+            },
+            stencil_store: StoreOp::Store,
+            clear_stencil: clear_stencil.unwrap_or(0),
+        };
+        self.push(CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![color],
+            depth_stencil: Some(depth),
+        }))?;
+        self.push(CommandV3::EndRenderPass)
+    }
+
+    /// Encodes every clear that no bind consumed, in recording order.
+    ///
+    /// Called before any work that would otherwise be encoded first and at
+    /// `flush`, so a clear is never moved after a later command. The depth
+    /// check runs before this appends anything: a call that cannot be expressed
+    /// leaves no partial stream.
+    fn flush_pending_clears(&mut self) -> Result<(), ProducerError> {
+        if self.pending_clears.is_empty() {
+            return Ok(());
+        }
+        if self.pass.colors.is_empty()
+            && self
+                .pending_clears
+                .iter()
+                .any(|clear| matches!(clear, PendingClear::Depth { .. }))
+        {
+            return Err(ProducerError::unsupported_opcode(
+                "ClearDepthStencilView: no colour attachment to anchor the clear pass",
+                OP_BEGIN_RENDER_PASS,
+            ));
+        }
+        self.close_pass()?;
+        self.ensure_room(self.pending_clears.len().saturating_mul(2))?;
+        let pending = std::mem::take(&mut self.pending_clears);
+        for clear in pending {
+            match clear {
+                PendingClear::Color {
+                    resource,
+                    clear_color,
+                } => self.push_color_clear_pass(resource, clear_color)?,
+                PendingClear::Depth {
+                    resource,
+                    clear_depth,
+                    clear_stencil,
+                } => self.push_depth_clear_pass(resource, clear_depth, clear_stencil)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Encodes the recorded pass when a clear it carries never got to run.
+    ///
+    /// A recorded attachment keeps `LoadOp::Clear` only while the pass never
+    /// opened: `close_pass` resets a pass that ran to `Load`. Opening and
+    /// immediately closing the recorded set therefore executes exactly the
+    /// clears that are still owed, with no draws.
+    fn materialize_latent_clear(&mut self) -> Result<(), ProducerError> {
+        if self.pass_open || self.pass.colors.is_empty() {
+            return Ok(());
+        }
+        let color_clear = self
+            .pass
+            .colors
+            .iter()
+            .any(|color| color.load == LoadOp::Clear);
+        let depth_clear = self.pass.depth_stencil.is_some_and(|depth| {
+            depth.depth_load == LoadOp::Clear || depth.stencil_load == LoadOp::Clear
+        });
+        if !color_clear && !depth_clear {
+            return Ok(());
+        }
+        self.open_pass("Clear (no following draw)")?;
+        self.close_pass()
+    }
+
     fn open_pass(&mut self, operation: &'static str) -> Result<(), ProducerError> {
         if self.pass_open {
             return Ok(());
@@ -1753,6 +2098,9 @@ impl MetalProducer {
             return Err(ProducerError::NoRenderTargets { operation });
         }
         self.ensure_room(1 + graphics_state_count(&self.graphics))?;
+        // A clear that no attachment consumed must execute before this pass's
+        // work, never after it.
+        self.flush_pending_clears()?;
         self.commands
             .push(CommandV3::BeginRenderPass(BeginRenderPass {
                 colors: self.pass.colors.clone(),
@@ -2584,6 +2932,487 @@ mod tests {
         assert_eq!(begins.len(), 2);
         assert_eq!(begins[0].colors[0].allocation_id, 0x1000);
         assert_eq!(begins[1].colors[0].allocation_id, 0x6000);
+    }
+
+    /// The colour attachments of the passes in `commands`, by load action.
+    fn passes(commands: &[CommandV3]) -> Vec<&BeginRenderPass> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                CommandV3::BeginRenderPass(pass) => Some(pass),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many encoded passes clear at least one colour attachment.
+    fn clear_passes(commands: &[CommandV3]) -> usize {
+        passes(commands)
+            .into_iter()
+            .filter(|pass| pass.colors.iter().any(|color| color.load == LoadOp::Clear))
+            .count()
+    }
+
+    /// `ClearRenderTargetView` names a descriptor, not a bound slot: a title may
+    /// clear before `OMSetRenderTargets`. The clear becomes the pass's load
+    /// action and the command list carries no separate clear pass.
+    #[test]
+    fn a_clear_before_the_bind_clears_only_that_pass() {
+        let mut producer = MetalProducer::new(30, 1).expect("producer");
+        let clear_color = [0.25, 0.5, 0.75, 1.0];
+        producer
+            .clear_render_target(resource(0x1000), clear_color)
+            .expect("a clear before the bind is expressible");
+        assert!(
+            producer.commands().is_empty(),
+            "a pending clear records no command yet"
+        );
+
+        producer
+            .set_render_targets(&[RenderTarget::new(resource(0x1000))], None)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes.len(), 1, "the clear folds into the draw's pass");
+        assert_eq!(
+            clear_passes(&submission.commands),
+            1,
+            "exactly one clear pass: {opcodes:?}"
+        );
+        assert_eq!(passes[0].colors.len(), 1);
+        assert_eq!(passes[0].colors[0].allocation_id, 0x1000);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Clear);
+        assert_eq!(passes[0].colors[0].store, StoreOp::Store);
+        assert_eq!(passes[0].colors[0].clear_color, clear_color.map(f64::from));
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A clear whose target is never bound and never drawn still takes effect:
+    /// it is encoded once as a single-attachment clear pass at flush.
+    #[test]
+    fn a_clear_with_no_bind_and_no_draw_is_still_encoded_once() {
+        let mut producer = MetalProducer::new(31, 1).expect("producer");
+        producer
+            .clear_render_target(resource(0x1100), [1.0, 0.0, 0.0, 1.0])
+            .expect("pending clear");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OP_BEGIN_RENDER_PASS, OP_END_RENDER_PASS],
+            "one standalone clear pass, no draws"
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].colors.len(), 1);
+        assert_eq!(passes[0].colors[0].allocation_id, 0x1100);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Clear);
+        assert_eq!(passes[0].colors[0].store, StoreOp::Store);
+        assert_eq!(
+            passes[0].colors[0].clear_color,
+            [1.0, 0.0, 0.0, 1.0].map(f64::from)
+        );
+        assert!(passes[0].depth_stencil.is_none());
+        assert_eq!(clear_passes(&submission.commands), 1);
+
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A clear issued while the target is already in an open pass closes that
+    /// pass, encodes the clear as its own pass, and the next draw reopens the
+    /// same attachment with `LoadOp::Load`. The clear is never dropped and never
+    /// moves after the draw that follows it.
+    #[test]
+    fn a_clear_inside_an_open_pass_is_encoded_as_its_own_pass() {
+        let mut producer = MetalProducer::new(32, 1).expect("producer");
+        let target = resource(0x1000);
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+        assert!(producer.has_open_pass(), "the draw opened the pass");
+
+        producer
+            .clear_render_target(target, [0.0, 1.0, 0.0, 1.0])
+            .expect("an in-pass clear is expressible");
+        assert!(
+            !producer.has_open_pass(),
+            "the pass closes so the clear keeps its place in the stream"
+        );
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ],
+            "draw, standalone clear, then the reopened draw"
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes.len(), 3);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Load);
+        assert_eq!(passes[1].colors[0].allocation_id, 0x1000);
+        assert_eq!(passes[1].colors[0].load, LoadOp::Clear);
+        assert_eq!(passes[1].colors[0].store, StoreOp::Store);
+        assert_eq!(
+            passes[1].colors[0].clear_color,
+            [0.0, 1.0, 0.0, 1.0].map(f64::from)
+        );
+        assert_eq!(
+            passes[2].colors[0].load,
+            LoadOp::Load,
+            "the reopened pass loads the cleared content"
+        );
+        assert_eq!(
+            clear_passes(&submission.commands),
+            1,
+            "the clear is encoded once: {opcodes:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// Clearing and binding the same target twice applies each recorded clear
+    /// exactly once: a pending clear is consumed by the bind that uses it and
+    /// is not re-emitted as a standalone pass.
+    #[test]
+    fn clearing_and_binding_the_same_target_twice_clears_once_per_clear() {
+        let mut producer = MetalProducer::new(33, 1).expect("producer");
+        let target = resource(0x1200);
+        producer
+            .clear_render_target(target, [1.0, 0.0, 0.0, 1.0])
+            .expect("pending red clear");
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("first bind");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+
+        producer
+            .clear_render_target(target, [0.0, 0.0, 1.0, 1.0])
+            .expect("in-pass blue clear");
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("second bind");
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes.len(), 3);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Clear);
+        assert_eq!(
+            passes[0].colors[0].clear_color,
+            [1.0, 0.0, 0.0, 1.0].map(f64::from)
+        );
+        assert_eq!(passes[1].colors[0].load, LoadOp::Clear);
+        assert_eq!(
+            passes[1].colors[0].clear_color,
+            [0.0, 0.0, 1.0, 1.0].map(f64::from)
+        );
+        assert_eq!(passes[2].colors[0].load, LoadOp::Load);
+        assert_eq!(
+            clear_passes(&submission.commands),
+            2,
+            "one clear per recorded clear, not one per bind: {opcodes:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A single clear must survive a bind that replaces the recorded set: the
+    /// clear is materialised when the second bind arrives, and the draw that
+    /// follows loads the cleared content instead of clearing it again.
+    #[test]
+    fn one_clear_bound_twice_clears_once() {
+        let mut producer = MetalProducer::new(37, 1).expect("producer");
+        let target = resource(0x1300);
+        producer
+            .clear_render_target(target, [0.0, 0.5, 1.0, 1.0])
+            .expect("pending clear");
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("first bind");
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("second bind");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ],
+            "the clear is encoded once, then the draw's pass loads it"
+        );
+        assert_eq!(
+            clear_passes(&submission.commands),
+            1,
+            "binding the target twice must not clear it twice"
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Clear);
+        assert_eq!(passes[1].colors[0].load, LoadOp::Load);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// `ClearDepthStencilView` before the bind clears the depth/stencil planes
+    /// through the pass's load actions, like the colour clear.
+    #[test]
+    fn a_depth_clear_before_the_bind_clears_the_pass() {
+        let mut producer = MetalProducer::new(34, 1).expect("producer");
+        producer
+            .clear_depth_stencil(resource(0x3000), true, 0.25, true, 9)
+            .expect("a depth clear before the bind is expressible");
+        assert!(producer.commands().is_empty());
+        producer
+            .set_render_targets(
+                &[RenderTarget::new(resource(0x1000))],
+                Some(DepthTarget::new(resource(0x3000))),
+            )
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        let depth = passes(&submission.commands)[0]
+            .depth_stencil
+            .expect("the pass keeps its depth attachment");
+        assert_eq!(depth.allocation_id, 0x3000);
+        assert_eq!(depth.depth_load, LoadOp::Clear);
+        assert_eq!(depth.depth_store, StoreOp::Store);
+        assert_eq!(depth.clear_depth, 0.25);
+        assert_eq!(depth.stencil_load, LoadOp::Clear);
+        assert_eq!(depth.stencil_store, StoreOp::Store);
+        assert_eq!(depth.clear_stencil, 9);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A depth/stencil clear inside an open pass closes it and is encoded as
+    /// its own pass, anchored on the pass's first colour attachment (the wire
+    /// has no depth-only pass).
+    #[test]
+    fn a_depth_clear_inside_an_open_pass_is_encoded_as_its_own_pass() {
+        let mut producer = MetalProducer::new(35, 1).expect("producer");
+        producer
+            .set_render_targets(
+                &[RenderTarget::new(resource(0x1000))],
+                Some(DepthTarget::new(resource(0x3000))),
+            )
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+        producer
+            .clear_depth_stencil(resource(0x3000), true, 1.0, false, 0)
+            .expect("an in-pass depth clear is expressible");
+        assert!(!producer.has_open_pass());
+        record_draw(&mut producer);
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+            ]
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes.len(), 3);
+        assert_eq!(passes[1].colors.len(), 1);
+        assert_eq!(passes[1].colors[0].allocation_id, 0x1000);
+        assert_eq!(
+            passes[1].colors[0].load,
+            LoadOp::Load,
+            "the anchor colour is preserved"
+        );
+        assert_eq!(passes[1].colors[0].store, StoreOp::Store);
+        let depth = passes[1]
+            .depth_stencil
+            .expect("the clear pass carries the depth target");
+        assert_eq!(depth.allocation_id, 0x3000);
+        assert_eq!(depth.depth_load, LoadOp::Clear);
+        assert_eq!(depth.depth_store, StoreOp::Store);
+        assert_eq!(
+            depth.stencil_load,
+            LoadOp::Load,
+            "only the flagged plane clears"
+        );
+        let reopened = passes[2]
+            .depth_stencil
+            .expect("the reopened pass keeps its depth attachment");
+        assert_eq!(reopened.depth_load, LoadOp::Load);
+        assert_eq!(reopened.stencil_load, LoadOp::Load);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// The wire requires 1..=8 colour attachments in every pass, so a depth
+    /// clear that has no colour attachment to anchor its pass is refused by
+    /// name at the point it would be encoded, not dropped.
+    #[test]
+    fn a_depth_clear_with_no_colour_attachment_is_refused_by_name() {
+        let mut producer = MetalProducer::new(36, 1).expect("producer");
+        producer
+            .clear_depth_stencil(resource(0x3000), true, 1.0, false, 0)
+            .expect("the clear is remembered until the stream needs it");
+        assert!(producer.commands().is_empty());
+
+        let error = producer
+            .flush()
+            .expect_err("the wire has no depth-only pass to carry the clear");
+        assert_eq!(
+            error,
+            ProducerError::Unsupported {
+                operation: "ClearDepthStencilView: no colour attachment to anchor the clear pass",
+                opcode: Some(OP_BEGIN_RENDER_PASS),
+            }
+        );
+        assert!(
+            producer.commands().is_empty(),
+            "a refused clear leaves no partial stream"
+        );
+    }
+
+    /// A clear inside an open pass is not dropped when no draw follows: it is
+    /// already encoded as its own pass and only the previous pass had to close.
+    #[test]
+    fn a_clear_inside_an_open_pass_with_no_following_draw_still_clears() {
+        let mut producer = MetalProducer::new(38, 1).expect("producer");
+        let target = resource(0x1400);
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        record_draw(&mut producer);
+        producer
+            .clear_render_target(target, [0.5, 0.5, 0.5, 1.0])
+            .expect("in-pass clear");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OP_BEGIN_RENDER_PASS,
+                OP_SET_GRAPHICS_PIPELINE,
+                OP_DRAW_INDEXED_INSTANCED,
+                OP_END_RENDER_PASS,
+                OP_BEGIN_RENDER_PASS,
+                OP_END_RENDER_PASS,
+            ],
+            "the clear is encoded even though no draw follows it"
+        );
+        let passes = passes(&submission.commands);
+        assert_eq!(passes[1].colors[0].load, LoadOp::Clear);
+        assert_eq!(
+            passes[1].colors[0].clear_color,
+            [0.5, 0.5, 0.5, 1.0].map(f64::from)
+        );
+        assert_eq!(clear_passes(&submission.commands), 1);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
+    }
+
+    /// A recorded attachment cleared but never drawn still clears at flush, and
+    /// the pass is emitted exactly once.
+    #[test]
+    fn a_clear_of_a_bound_target_with_no_draw_is_encoded_once() {
+        let mut producer = MetalProducer::new(39, 1).expect("producer");
+        let target = resource(0x1500);
+        producer
+            .set_render_targets(&[RenderTarget::new(target)], None)
+            .expect("render targets");
+        producer
+            .clear_render_target(target, [0.0, 0.0, 0.0, 1.0])
+            .expect("recorded clear");
+
+        let submission = producer.flush().expect("flush");
+        let opcodes: Vec<u16> = submission.commands.iter().map(CommandV3::opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OP_BEGIN_RENDER_PASS, OP_END_RENDER_PASS]
+        );
+        assert_eq!(clear_passes(&submission.commands), 1);
+        let passes = passes(&submission.commands);
+        assert_eq!(passes[0].colors[0].allocation_id, 0x1500);
+        assert_eq!(passes[0].colors[0].load, LoadOp::Clear);
+        assert_eq!(passes[0].colors[0].store, StoreOp::Store);
+        #[cfg(target_os = "macos")]
+        assert_host_planner_accepts(&submission.commands);
     }
 
     #[test]
