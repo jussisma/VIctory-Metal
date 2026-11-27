@@ -631,6 +631,53 @@ fn container_of(shader: &Shader) -> Vec<u8> {
     bytes
 }
 
+/// The versioned root-signature witness for `programs` (ADR-048), when every
+/// program is exactly its stage's standalone `victory_shader` translation.
+///
+/// The native Metal path has no D3D12 device, so the signature the converter is
+/// told about is built by `victory_shader::emit`'s single description and
+/// serialized purely (`to_versioned_blob`); the D3DMetal reference path builds
+/// the same description and hands it to `D3D12SerializeVersionedRootSignature`.
+/// A stage whose program came from `translate_linked` (pruned outputs, different
+/// signature) or whose translation is unavailable yields no witness: a missing
+/// signature is honest, a stale one is not.
+#[cfg(windows)]
+fn native_root_signature(
+    this: This,
+    programs: &[crate::native_metal::pso::StageProgram],
+) -> Option<Vec<u8>> {
+    use crate::native_metal::pso::PipelineStage;
+    use victory_shader::emit::{
+        SignatureFlags, translated_pipeline_root_signature,
+    };
+    let p = pipeline(this);
+    let compute = programs
+        .iter()
+        .all(|program| program.stage == PipelineStage::Compute);
+    let mut hosts = Vec::with_capacity(programs.len());
+    for program in programs {
+        let shader = p
+            .shaders
+            .iter()
+            .find(|shader| PipelineStage::from_name(shader.stage) == Some(program.stage))?;
+        let translated = shader.translated()?;
+        if translated.host.dxil.as_slice() != program.dxil.as_slice() {
+            return None;
+        }
+        hosts.push(&translated.host);
+    }
+    let signature = translated_pipeline_root_signature(
+        &hosts,
+        SignatureFlags {
+            allow_input_assembler_input_layout: !compute,
+            cbv_srv_uav_heap_directly_indexed: true,
+            sampler_heap_directly_indexed: true,
+        },
+    )
+    .ok()?;
+    signature.to_versioned_blob().ok()
+}
+
 /// Every stage name `this` carries, including the ones the native path cannot
 /// register.
 #[cfg(windows)]
@@ -739,11 +786,39 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
         },
         None => None,
     };
+    // ADR-048: the translated root signature travels with the registration so
+    // the ARM64 host's converter sees the same parameter layout the translated
+    // shaders were emitted for. It is only sent when every stage program is the
+    // stage's own standalone translation: a linked mesh/pixel pair has pruned
+    // outputs and a different signature, so no witness is better than a stale
+    // one.
+    let witness = native_root_signature(this, &programs);
     let details = crate::native_metal::pso::PipelineDetails {
         state: state_blob.as_deref().unwrap_or(&[]),
+        root_signature: witness.as_deref().unwrap_or(&[]),
         ..crate::native_metal::pso::PipelineDetails::default()
     };
-    match crate::native_metal::pso::register_with_details(&programs, &details) {
+    let registered = match crate::native_metal::pso::register_with_details(&programs, &details) {
+        // A witness the converter refuses is dropped once and the registration
+        // retried without it, so a signature the converter cannot parse never
+        // costs the boot its pipelines.
+        Err(crate::native_metal::pso::PipelineError::HostTranslation(reason))
+            if witness.is_some() && reason.to_ascii_lowercase().contains("root signature") =>
+        {
+            tracing::warn!(
+                pipeline = ?this,
+                reason = %reason,
+                "the host refused the translated root signature; registering without it"
+            );
+            let plain = crate::native_metal::pso::PipelineDetails {
+                state: details.state,
+                ..crate::native_metal::pso::PipelineDetails::default()
+            };
+            crate::native_metal::pso::register_with_details(&programs, &plain)
+        }
+        other => other,
+    };
+    match registered {
         Ok((id, serving)) => {
             if serving.warm {
                 crate::native_metal::telemetry::note_pool_warm();
