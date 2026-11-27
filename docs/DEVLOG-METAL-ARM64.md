@@ -1147,9 +1147,12 @@ the host decodes eleven.
 - Win64 `diag` build exit 0; `victory-metal`/`victory-hle` Windows all-targets and
   `victory-gpu` (diagnostics) all-targets exit 0; Win64 `victory-irconverter`
   exit 0.
-- `aaa-preboot-gate.sh --runs 1` exit 0, `status=PASS`, `not_observed=none`,
-  `d3dmetal_fallback_count=0`, checksum `11527919792119713699` unchanged,
-  p50 0.931 ms (measured while three workers were compiling).
+- `aaa-preboot-gate.sh --runs 1` exit 0 at the integration head, `status=PASS`,
+  `not_observed=none`, `d3dmetal_fallback_count=0`; checksum
+  `11527919792119713699` unchanged; p50 0.839 / p95 0.977 / p99 1.082 ms,
+  1179.95 FPS. An earlier run of the same gate at the Wave 8A head measured
+  p50 0.931 ms while three workers were compiling; both exited 0 with the same
+  checksum.
 
 ### 8.5 Remaining gaps (honest)
 
