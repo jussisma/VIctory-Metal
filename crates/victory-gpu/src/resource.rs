@@ -2650,6 +2650,34 @@ fn texture_registration_codes(
     Ok((dimension, format, usage))
 }
 
+/// The share window a buffer's guest range resolves to, through `resolver`.
+///
+/// The window is the provider's page-rounded span for exactly the bytes the
+/// resource occupies inside the title's mapping. A buffer placed inside a
+/// larger committed region therefore resolves to its own sub-range, never to
+/// the whole region; a range the guest only reserved stays the provider's named
+/// refusal (`the range is reserved but not committed`), never a fabricated
+/// window. The debug line names the window a binding will use, so a boot can
+/// tell a refused buffer from one registered at the wrong offset.
+#[cfg(any(windows, test))]
+fn resolve_buffer_range(
+    resolver: &dyn crate::native_metal::bindings::GuestRangeResolver,
+    address: u64,
+    len: u64,
+) -> Result<crate::native_metal::bindings::GuestRange, crate::native_metal::bindings::ResolveError>
+{
+    let range = resolver.resolve(address, len)?;
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        allocation = range.allocation_id,
+        byte_offset = range.byte_offset,
+        size = range.size,
+        "a buffer resolves to a share window"
+    );
+    Ok(range)
+}
+
 /// The host registration of one buffer, made at creation (kind 2).
 ///
 /// The share allocation id comes from the `GuestRangeResolver` seam (the HLE's
@@ -2678,7 +2706,7 @@ fn register_native_buffer(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
     };
     let address = resource.data() as u64;
     let len = desc.width.max(1);
-    let range = match resolver.resolve(address, len) {
+    let range = match resolve_buffer_range(resolver.as_ref(), address, len) {
         Ok(range) => range,
         Err(error) => {
             telemetry::note_registration_failure();
@@ -4993,5 +5021,68 @@ mod tests {
         assert!(lines.iter().any(|line| line == &reserved_row), "{lines:?}");
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
+    /// ADR-045: a buffer placed inside a larger committed region resolves to
+    /// the window covering exactly its own bytes, not the whole region, and a
+    /// range the guest only reserved is the provider's named refusal. This is
+    /// the seam `register_native_buffer` resolves through, without a device.
+    #[test]
+    fn a_buffer_inside_a_larger_committed_region_resolves_its_own_window() {
+        use crate::native_metal::bindings::{GuestRange, GuestRangeResolver, ResolveError};
+
+        /// A title region: `committed` bytes are readable from `base`; the rest
+        /// of the reservation is only reserved.
+        struct Region {
+            base: u64,
+            committed: u64,
+        }
+
+        impl GuestRangeResolver for Region {
+            fn resolve(&self, address: u64, len: u64) -> Result<GuestRange, ResolveError> {
+                let offset = address
+                    .checked_sub(self.base)
+                    .ok_or(ResolveError::Unmapped { address, len })?;
+                if offset.checked_add(len).is_none_or(|end| end > self.committed) {
+                    return Err(ResolveError::Invalid(
+                        "the range is reserved but not committed",
+                    ));
+                }
+                Ok(GuestRange {
+                    allocation_id: 7,
+                    generation: 1,
+                    byte_offset: offset & !(KIB_64 - 1),
+                    size: len.checked_next_multiple_of(KIB_64).unwrap_or(len),
+                })
+            }
+
+            fn retain(&self, _: &GuestRange) -> Result<u64, ResolveError> {
+                Ok(1)
+            }
+
+            fn retire(&self, _: u64) -> Result<(), ResolveError> {
+                Ok(())
+            }
+        }
+
+        let region = Region { base: 0x1_4a58_0000, committed: 8 << 20 };
+        // The shape Boot #17 reports: 384 KiB of a vertex/index heap, 2 MiB into
+        // a committed region.
+        let address = region.base + (2 << 20);
+        let range = resolve_buffer_range(&region, address, 384 << 10)
+            .expect("a committed sub-range must resolve");
+        assert_eq!(range.allocation_id, 7);
+        assert_eq!(range.byte_offset, 2 << 20, "the window starts at the buffer");
+        assert_eq!(range.size, 384 << 10, "only the buffer's own bytes");
+
+        // The reservation's tail is only reserved: refused by name.
+        match resolve_buffer_range(&region, region.base + (8 << 20), 4096) {
+            Err(ResolveError::Invalid(reason)) => {
+                assert!(reason.contains("reserved but not committed"), "{reason}");
+            }
+            other => panic!("an uncommitted range resolved: {other:?}"),
+        }
+        // A buffer crossing the commit's end is refused, never truncated.
+        assert!(resolve_buffer_range(&region, region.base + (8 << 20) - 4096, 8192).is_err());
     }
 }
