@@ -231,6 +231,25 @@ pub(crate) fn take_submissions(this: This) -> Vec<crate::native_metal::producer:
     metal.as_mut().map(|metal| metal.take()).unwrap_or_default()
 }
 
+/// Calls the native producer refused on this list so far.
+///
+/// A refused list submits nothing: `Close` returns the first refusal's
+/// HRESULT and the batch the queue would carry is empty. The count lets the
+/// queue attribute such a frame instead of reporting a silent gap; the refused
+/// opcode itself is not retained anywhere readable (it lives in `MetalList`'s
+/// private `failed` field), so the telemetry histogram cannot name it yet.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn metal_failures(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+    metal.as_ref().map(|metal| metal.failures()).unwrap_or(0)
+}
+
 /// The guest backing pins this list's native bindings hold, for the queue to
 /// retire ([`crate::native_metal::bindings::GuestRangeResolver::retire`])
 /// after the GPU completion that ran them.

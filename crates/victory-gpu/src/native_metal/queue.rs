@@ -21,20 +21,27 @@
 //! and returns the host's reply status; a replayed list's
 //! [`ReplyStatus::AlreadyExecuted`] is surfaced, never re-sent.
 //!
-//! [`V3Sink`] is the transport seam. The bridge task plugs a real IPC sink in;
-//! until then [`DisconnectedSink`] makes the missing transport an explicit
-//! `E_FAIL` instead of a silent D3D12/D3DMetal fallback.
+//! [`V3Sink`] is the transport seam. [`NativeSink`] starts
+//! [`DisconnectedSink`] and becomes [`Live`](NativeSink::Live) on the first
+//! submission once `VICTORY_METAL_ENDPOINT` and `VICTORY_METAL_SECRET` are
+//! configured ([`WireV3Client`]). With no endpoint the missing transport stays
+//! an explicit `E_FAIL` instead of a silent D3D12/D3DMetal fallback.
 //!
 //! The present half is [`NativePresenter`], which wraps a [`NativeSwapchain`]
 //! and the host [`SurfacePresenter`]. The queue entry points look it up with
-//! [`present_registered`]; nothing here opens a window, a socket or a device.
+//! [`present_registered`]; nothing here opens a window or a device (the live
+//! sink is the one socket, and only when it is configured).
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use victory_metal::wire::{ListIdentity, ReplyStatus, WireError};
 use victory_metal::wire_v3::{SubmissionV3, encode_submission_v3};
 
 use crate::backend::GpuBackend;
+use crate::native_metal::client::{LiveConfig, WireV3Client};
+#[cfg(feature = "diagnostics")]
+use crate::native_metal::present::guard_native_only;
 use crate::native_metal::present::{
     InFlightFrame, NativeSwapchain, PresentError, PresentedSurface, SurfacePresenter,
     present_surface,
@@ -156,6 +163,44 @@ impl V3Sink for DisconnectedSink {
     }
 }
 
+/// The session's transport: the explicit stub, or a live Wire v3 client.
+///
+/// The queue starts [`Disconnected`](Self::Disconnected) so a process without
+/// a configured host never opens a socket; [`native_queue_install_client`]
+/// (and the lazy connect on the first submission) replaces it with a live
+/// [`WireV3Client`]. There is no third state and no other backend.
+#[derive(Debug)]
+pub enum NativeSink {
+    /// No host bridge is connected: every send is an explicit `E_FAIL`.
+    Disconnected(DisconnectedSink),
+    /// One authenticated Wire v3 session with the ARM64 host.
+    Live(WireV3Client),
+}
+
+impl NativeSink {
+    /// Whether a live host session is installed.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+
+    /// The live client, when one is installed.
+    pub fn client_mut(&mut self) -> Option<&mut WireV3Client> {
+        match self {
+            Self::Live(client) => Some(client),
+            Self::Disconnected(_) => None,
+        }
+    }
+}
+
+impl V3Sink for NativeSink {
+    fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+        match self {
+            Self::Disconnected(sink) => sink.send(bytes),
+            Self::Live(client) => client.send(bytes),
+        }
+    }
+}
+
 /// The ordered outbound queue for one guest session.
 ///
 /// Submissions keep the order a closed list produced them in; nothing is
@@ -263,13 +308,64 @@ impl<S: V3Sink> NativeQueue<S> {
         &mut self,
         submissions: &[SubmissionV3],
     ) -> Result<ReplyStatus, NativeQueueError> {
+        self.submit_measured(submissions)
+            .map(|(status, _timing)| status)
+    }
+
+    /// [`Self::submit`], also reporting where the batch spent its time.
+    ///
+    /// The reply rule is identical (the first status that is not `Ok`, else
+    /// `Ok`): encoding and the transport pump are timed separately so the
+    /// frame telemetry can attribute them, and nothing about ordering,
+    /// coalescing or the retry rule changes.
+    pub fn submit_measured(
+        &mut self,
+        submissions: &[SubmissionV3],
+    ) -> Result<(ReplyStatus, SubmitTiming), NativeQueueError> {
+        let started = Instant::now();
         self.enqueue(submissions)?;
+        let encode_us = micros(started.elapsed());
+
+        let started = Instant::now();
         let statuses = self.flush()?;
-        Ok(statuses
+        let submit_us = micros(started.elapsed());
+
+        let status = statuses
             .into_iter()
             .find(|status| *status != ReplyStatus::Ok)
-            .unwrap_or(ReplyStatus::Ok))
+            .unwrap_or(ReplyStatus::Ok);
+        Ok((
+            status,
+            SubmitTiming {
+                encode_us,
+                submit_us,
+            },
+        ))
     }
+
+    /// Installs `sink`, dropping every unsent frame and the sent counter.
+    ///
+    /// This is session teardown and test isolation, never the submission path:
+    /// the live path reports a refused batch and leaves its frames queued
+    /// ([`Self::flush`]).
+    pub fn reset(&mut self, sink: S) {
+        self.sink = sink;
+        self.outbound.clear();
+        self.sent = 0;
+    }
+}
+
+/// Where one submission batch spent its guest-side time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubmitTiming {
+    /// Canonical v3 encoding of the batch, in microseconds.
+    pub encode_us: u64,
+    /// Handing every frame to the sink, in microseconds.
+    pub submit_us: u64,
+}
+
+fn micros(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// What one `ExecuteCommandLists` batch did.
@@ -296,24 +392,159 @@ pub fn dispatch<S: V3Sink>(
     queue: &mut NativeQueue<S>,
     submissions: &[SubmissionV3],
 ) -> Result<NativeDispatch, NativeQueueError> {
+    dispatch_measured(backend, queue, submissions).map(|(dispatch, _timing)| dispatch)
+}
+
+/// [`dispatch`], also reporting the batch's timing when it went native.
+///
+/// The D3D12 branch returns `None` and touches neither the queue nor the
+/// telemetry; only the Metal branch reports a [`SubmitTiming`], which is what
+/// the frame telemetry records.
+pub fn dispatch_measured<S: V3Sink>(
+    backend: GpuBackend,
+    queue: &mut NativeQueue<S>,
+    submissions: &[SubmissionV3],
+) -> Result<(NativeDispatch, Option<SubmitTiming>), NativeQueueError> {
     match backend {
-        GpuBackend::D3d12 => Ok(NativeDispatch::Host),
+        GpuBackend::D3d12 => Ok((NativeDispatch::Host, None)),
         GpuBackend::Metal => {
-            let status = queue.submit(submissions)?;
-            Ok(NativeDispatch::Native {
-                status,
-                submissions: submissions.len(),
-            })
+            let (status, timing) = queue.submit_measured(submissions)?;
+            Ok((
+                NativeDispatch::Native {
+                    status,
+                    submissions: submissions.len(),
+                },
+                Some(timing),
+            ))
         }
     }
 }
 
-/// The session's native queue (not connected until the bridge task lands).
-#[cfg(windows)]
-fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<DisconnectedSink>> {
-    static QUEUE: std::sync::Mutex<NativeQueue<DisconnectedSink>> =
-        std::sync::Mutex::new(NativeQueue::new(DisconnectedSink));
+/// The session's native queue. It starts disconnected and connects lazily.
+#[cfg(any(windows, test))]
+fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<NativeSink>> {
+    static QUEUE: std::sync::Mutex<NativeQueue<NativeSink>> =
+        std::sync::Mutex::new(NativeQueue::new(NativeSink::Disconnected(DisconnectedSink)));
     QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the session queue holds a live Wire v3 host session.
+#[cfg(any(windows, test))]
+pub fn native_queue_is_live() -> bool {
+    native_queue().sink().is_live()
+}
+
+/// Installs an authenticated client as the session queue's transport.
+///
+/// Replaces whatever the queue held (the lazy connect and the daemon task both
+/// use it); frames already queued keep their order and go out over `client`.
+#[cfg(any(windows, test))]
+pub fn native_queue_install_client(client: WireV3Client) {
+    *native_queue().sink_mut() = NativeSink::Live(client);
+}
+
+/// Drops the session queue's sink and every unsent frame (teardown, tests).
+#[cfg(any(windows, test))]
+pub fn native_queue_reset() {
+    native_queue().reset(NativeSink::Disconnected(DisconnectedSink));
+}
+
+/// Connects the session queue on first use, if the environment names a host.
+///
+/// Returns whether the queue is live. A configuration that does not parse is
+/// logged without the secret and leaves the queue disconnected, so submissions
+/// keep failing explicitly instead of silently succeeding.
+#[cfg(any(windows, test))]
+pub fn native_queue_connect_from_env() -> bool {
+    match ensure_live(LiveConfig::from_env) {
+        Ok(live) => live,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "VICTORY_BACKEND=metal: the Wire v3 host endpoint is configured but unusable"
+            );
+            false
+        }
+    }
+}
+
+/// Connects the session queue through `config`, once.
+///
+/// `Ok(true)` means a live sink is installed, `Ok(false)` that no endpoint is
+/// configured (the queue stays disconnected and fails explicitly), and `Err`
+/// that a configured endpoint refused the session.
+#[cfg(any(windows, test))]
+fn ensure_live<F>(config: F) -> Result<bool, NativeQueueError>
+where
+    F: FnOnce() -> Option<Result<LiveConfig, crate::native_metal::client::TransportError>>,
+{
+    if native_queue_is_live() {
+        return Ok(true);
+    }
+    let Some(config) = config() else {
+        return Ok(false);
+    };
+    let config = config.map_err(|error| {
+        NativeQueueError::Transport(format!("the Wire v3 configuration is invalid: {error}"))
+    })?;
+    // The connect happens outside the queue lock: it may block for the whole
+    // connect timeout, and no submission may wait behind it.
+    let client = config.connect().map_err(|error| {
+        NativeQueueError::Transport(format!("the Wire v3 host bridge did not connect: {error}"))
+    })?;
+    native_queue_install_client(client);
+    Ok(true)
+}
+
+/// Carries one `ExecuteCommandLists` batch over the native queue.
+///
+/// `record_us` is the guest time spent draining the finished lists' recorded
+/// submissions; it is reported with the batch's own encode and transport time.
+/// The Metal path records one frame sample, including a frame the producer
+/// refused for an unsupported opcode (that is what the histogram counts). A
+/// transport failure records nothing: no frame reached the host.
+#[cfg(any(windows, test))]
+pub fn submit_recorded_batch(
+    submissions: &[SubmissionV3],
+    record_us: u64,
+) -> Result<NativeDispatch, NativeQueueError> {
+    // The backend decision was made by `crate::queue::execute` before it
+    // called the native path, so the environment is the only gate left.
+    if let Err(error) = ensure_live(LiveConfig::from_env) {
+        tracing::warn!(%error, "VICTORY_BACKEND=metal: the native queue has no live sink");
+    }
+
+    let mut queue = native_queue();
+    let outcome = dispatch_measured(GpuBackend::Metal, &mut queue, submissions);
+    drop(queue);
+
+    match outcome {
+        Ok((dispatch, timing)) => {
+            if let Some(timing) = timing {
+                // `gpu_us` is 0: the kind 5 reply carries a status only, and no
+                // shared completion-fence page is published yet
+                // (`WireV3Client::completed_fence` is `None`).
+                crate::native_metal::telemetry::record_frame(
+                    record_us,
+                    timing.submit_us,
+                    timing.encode_us,
+                    0,
+                    None,
+                );
+            }
+            Ok(dispatch)
+        }
+        Err(error) => {
+            if let NativeQueueError::Producer(ProducerError::Unsupported {
+                opcode: Some(opcode),
+                ..
+            }) = &error
+            {
+                crate::native_metal::telemetry::record_frame(record_us, 0, 0, 0, Some(*opcode));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// `ExecuteCommandLists` under `VICTORY_BACKEND=metal`.
@@ -321,7 +552,8 @@ fn native_queue() -> std::sync::MutexGuard<'static, NativeQueue<DisconnectedSink
 /// Drains each title list's finished Wire v3 submissions (in list order, and
 /// in each list's recorded order) into the native queue. Host D3D12 work is
 /// never enqueued on this path: an empty list or a refused batch is logged and
-/// surfaced through the queue, with no fallback.
+/// surfaced through the queue, with no fallback. The first batch also connects
+/// the session when `VICTORY_METAL_ENDPOINT`/`VICTORY_METAL_SECRET` are set.
 #[cfg(windows)]
 pub fn execute_native(count: u32, lists: *const crate::object::This) {
     if count == 0 || lists.is_null() {
@@ -329,10 +561,23 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
     }
     // SAFETY: the title passes `count` lists, as `queue::execute` documents.
     let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-    let mut queue = native_queue();
     for &list in lists {
+        let started = Instant::now();
         let submissions = crate::list::take_submissions(list);
-        match dispatch(GpuBackend::Metal, &mut queue, &submissions) {
+        // Guest time spent draining the finished list, reported as the frame's
+        // record phase: the title's own recording happens in the list calls.
+        let record_us = micros(started.elapsed());
+        if submissions.is_empty() {
+            let failures = crate::list::metal_failures(list);
+            if failures > 0 {
+                tracing::debug!(
+                    failures,
+                    "native list refused calls and carried no submission; the queue reports the \
+                     refusal the title will see at Close"
+                );
+            }
+        }
+        match submit_recorded_batch(&submissions, record_us) {
             Ok(NativeDispatch::Native {
                 status,
                 submissions: carried,
@@ -390,12 +635,22 @@ impl NativePresenter {
     /// shortcut: the host completion channel is not connected yet, so the
     /// accepted frame is finished at once; otherwise the second present would
     /// be refused as [`PresentError::FrameInFlight`].
+    ///
+    /// With the `diagnostics` feature the end of every present runs the strict
+    /// zero-D3DMetal guard ([`guard_native_only`]) and writes the frame
+    /// telemetry window as one line. A tripped guard refuses the frame
+    /// explicitly; it is never logged and shown.
     pub fn present(&mut self) -> Result<PresentedSurface, NativeQueueError> {
         let step = self
             .swapchain
             .present_step(self.swapchain.sync_interval().as_wire())?;
         let frame = present_surface(&mut self.swapchain, step, &mut *self.presenter)?;
         self.swapchain.finish_present()?;
+        #[cfg(feature = "diagnostics")]
+        {
+            guard_native_only(crate::native_metal::telemetry::global())?;
+            crate::native_metal::telemetry::log_frame();
+        }
         Ok(frame)
     }
 
@@ -453,9 +708,19 @@ pub fn present_registered() -> Result<PresentedSurface, NativeQueueError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
 
     use victory_metal::wire_v3::{CommandV3, Present, decode_submission_v3};
+
+    use crate::native_metal::client::{ENVELOPE_LEN, KIND_ACK, KIND_AUTH, KIND_SUBMISSION_V3};
+    use crate::native_metal::telemetry;
+
+    const SECRET: [u8; 32] = [0x5a; 32];
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// A sink that keeps every frame and answers from a script.
     #[derive(Debug, Default)]
@@ -649,5 +914,256 @@ mod tests {
         );
         let _ = take_present();
         assert_eq!(present_registered(), Err(NativeQueueError::NoSwapchain));
+    }
+
+    // ------------------------------------------------------------ live sink
+
+    /// A loopback host that authenticates one peer, answers `statuses` in
+    /// order and reports every carried submission.
+    struct TestHost {
+        port: u16,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TestHost {
+        fn spawn(statuses: Vec<ReplyStatus>) -> (Self, Receiver<SubmissionV3>) {
+            let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("listener address").port();
+            let (sender, receiver) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept the guest");
+                stream
+                    .set_read_timeout(Some(TEST_TIMEOUT))
+                    .expect("server read timeout");
+                let (kind, payload) = read_frame(&mut stream);
+                assert_eq!(kind, KIND_AUTH, "the first frame must authenticate");
+                assert_eq!(payload, SECRET, "the hello must carry the exact secret");
+                write_frame(&mut stream, KIND_ACK, &[0]);
+
+                for status in statuses {
+                    let (kind, payload) = read_frame(&mut stream);
+                    assert_eq!(kind, KIND_SUBMISSION_V3);
+                    let inner = decode_submission_v3(&payload[16..]).expect("carried v3 frame");
+                    sender.send(inner).expect("report the submission");
+                    let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
+                        sequence: u32::from_le_bytes([
+                            payload[6], payload[7], payload[8], payload[9],
+                        ]),
+                        status,
+                    })
+                    .expect("reply encodes");
+                    write_frame(&mut stream, KIND_SUBMISSION_V3, &reply);
+                }
+            });
+            (
+                Self {
+                    port,
+                    handle: Some(handle),
+                },
+                receiver,
+            )
+        }
+
+        fn endpoint(&self) -> String {
+            format!("127.0.0.1:{}", self.port)
+        }
+
+        fn config(&self) -> LiveConfig {
+            LiveConfig::parse(Some(&self.endpoint()), Some(&"5a".repeat(32)))
+                .expect("both variables present")
+                .expect("well-formed configuration")
+        }
+    }
+
+    impl Drop for TestHost {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_frame(stream: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+        let mut envelope = [0u8; ENVELOPE_LEN];
+        stream
+            .read_exact(&mut envelope)
+            .expect("server frame header");
+        let kind = envelope[0];
+        let length = u32::from_le_bytes(envelope[1..].try_into().expect("four bytes")) as usize;
+        let mut payload = vec![0u8; length];
+        stream
+            .read_exact(&mut payload)
+            .expect("server frame payload");
+        (kind, payload)
+    }
+
+    fn write_frame(stream: &mut std::net::TcpStream, kind: u8, payload: &[u8]) {
+        let length = u32::try_from(payload.len()).expect("payload fits u32");
+        stream.write_all(&[kind]).expect("server kind");
+        stream
+            .write_all(&length.to_le_bytes())
+            .expect("server length");
+        stream.write_all(payload).expect("server payload");
+        stream.flush().expect("server flush");
+    }
+
+    /// A sink that refuses the first `failures` sends and then records frames.
+    #[derive(Debug, Default)]
+    struct FlakySink {
+        failures: usize,
+        frames: Vec<Vec<u8>>,
+    }
+
+    impl V3Sink for FlakySink {
+        fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(NativeQueueError::Transport("test refusal".to_string()));
+            }
+            self.frames.push(bytes.to_vec());
+            Ok(ReplyStatus::Ok)
+        }
+    }
+
+    /// A configured endpoint connects on the first submission, carries the
+    /// batch over one authenticated socket, and records one native frame with
+    /// no D3DMetal fallback.
+    #[test]
+    fn a_configured_endpoint_connects_lazily_and_carries_the_batch() {
+        native_queue_reset();
+        telemetry::global().reset();
+        let (host, carried) = TestHost::spawn(vec![ReplyStatus::Ok]);
+        assert!(!native_queue_is_live(), "a reset queue starts disconnected");
+
+        let config = host.config();
+        assert_eq!(ensure_live(|| Some(Ok(config))), Ok(true));
+        assert!(native_queue_is_live(), "the first submission connected");
+
+        let batch = submission(31, 300, 4);
+        assert_eq!(
+            submit_recorded_batch(std::slice::from_ref(&batch), 9),
+            Ok(NativeDispatch::Native {
+                status: ReplyStatus::Ok,
+                submissions: 1,
+            })
+        );
+        assert_eq!(
+            carried
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("host saw the frame"),
+            batch,
+            "the submission reached the real socket unchanged"
+        );
+
+        assert_eq!(telemetry::global().recorded_frames(), 1);
+        assert_eq!(
+            telemetry::global().d3dmetal_fallback_count(),
+            0,
+            "the native path never records a D3DMetal fallback"
+        );
+        assert_eq!(telemetry::global().assert_no_fallback(), Ok(()));
+
+        native_queue_reset();
+        assert!(!native_queue_is_live());
+    }
+
+    /// With no endpoint configured the queue keeps today's explicit transport
+    /// failure: nothing connects, nothing is recorded, the frame stays queued.
+    #[test]
+    fn without_an_endpoint_the_queue_fails_explicitly() {
+        native_queue_reset();
+        telemetry::global().reset();
+        assert_eq!(ensure_live(|| None), Ok(false));
+        assert!(!native_queue_is_live());
+
+        let error = submit_recorded_batch(&[submission(32, 301, 5)], 7)
+            .expect_err("no host means no success");
+        assert!(
+            matches!(&error, NativeQueueError::Transport(why) if why.contains("not connected")),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(
+            telemetry::global().recorded_frames(),
+            0,
+            "a frame that never reached the host is not a native frame"
+        );
+        assert_eq!(
+            native_queue().pending(),
+            1,
+            "the refused frame is still queued, not dropped"
+        );
+        native_queue_reset();
+        assert_eq!(native_queue().pending(), 0);
+    }
+
+    /// A refused send leaves the batch at the front of the queue, intact and
+    /// unsent; the next flush carries exactly those bytes once.
+    #[test]
+    fn a_refused_send_leaves_the_outbound_frame_intact() {
+        let mut queue = NativeQueue::new(FlakySink {
+            failures: 1,
+            frames: Vec::new(),
+        });
+        let batch = submission(33, 302, 6);
+        assert!(matches!(
+            queue.submit(std::slice::from_ref(&batch)),
+            Err(NativeQueueError::Transport(_))
+        ));
+        assert_eq!(queue.pending(), 1, "the failed frame stays queued");
+        assert_eq!(queue.sent(), 0, "nothing was counted as sent");
+        assert!(queue.sink().frames.is_empty());
+
+        assert_eq!(queue.flush(), Ok(vec![ReplyStatus::Ok]));
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(queue.sent(), 1);
+        assert_eq!(
+            decode_submission_v3(&queue.sink().frames[0]).expect("canonical v3"),
+            batch,
+            "the bytes that finally went out are the bytes that were refused"
+        );
+    }
+
+    /// A live sink's `AlreadyExecuted` still reaches the caller and is not
+    /// retried: the queue holds nothing to send again.
+    #[test]
+    fn a_live_already_executed_reply_is_surfaced_once() {
+        native_queue_reset();
+        let (host, carried) = TestHost::spawn(vec![ReplyStatus::AlreadyExecuted]);
+        let config = host.config();
+        assert_eq!(ensure_live(|| Some(Ok(config))), Ok(true));
+
+        assert_eq!(
+            submit_recorded_batch(&[submission(34, 303, 7)], 1),
+            Ok(NativeDispatch::Native {
+                status: ReplyStatus::AlreadyExecuted,
+                submissions: 1,
+            })
+        );
+        let _ = carried.recv_timeout(TEST_TIMEOUT).expect("one frame");
+        assert_eq!(native_queue().pending(), 0, "nothing is retried");
+        native_queue_reset();
+    }
+
+    /// The D3D12 backend touches neither the native queue nor the telemetry
+    /// counters: no encode, no sink call, no frame sample.
+    #[test]
+    fn the_d3d12_backend_leaves_the_queue_and_telemetry_untouched() {
+        native_queue_reset();
+        telemetry::global().reset();
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        let before = telemetry::global().snapshot();
+
+        let (dispatch, timing) =
+            dispatch_measured(GpuBackend::D3d12, &mut queue, &[submission(35, 304, 8)])
+                .expect("the host path never fails on the native queue");
+        assert_eq!(dispatch, NativeDispatch::Host);
+        assert_eq!(timing, None, "the host path reports no native timing");
+
+        assert_eq!(queue.sink().frames.len(), 0);
+        assert_eq!(queue.sent(), 0);
+        assert!(queue.is_empty());
+        assert_eq!(telemetry::global().snapshot(), before);
+        assert!(!native_queue_is_live());
     }
 }
