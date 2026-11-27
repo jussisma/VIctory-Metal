@@ -56,6 +56,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(windows)]
+use victory_metal::compiler_pool::PoolConfig;
 use victory_metal::compiler_pool::{
     CompileJob, CompiledShader, CompilerPool, PoolError, PoolStats,
 };
@@ -1150,11 +1152,80 @@ pub fn encode_abi(stages: &[(u8, &str)]) -> Vec<u8> {
     out
 }
 
+/// The environment variable that names the converter's `--stdio` worker.
+///
+/// ADR-038 has the macOS launcher export it for `victory_metal_host`; it is
+/// host-only and must not reach the Win64 guest.
+#[cfg(any(windows, test))]
+const WORKER_ENV: &str = "VICTORY_IRCONVERTER_WORKER";
+
+/// Whether the Win64 guest could ever run `path` as its converter worker.
+///
+/// ADR-038 keeps the converter worker and `libmetalirconverter.dylib` on the
+/// macOS host. A guest that inherits `VICTORY_IRCONVERTER_WORKER` must ignore
+/// the macOS binary (a Mach-O path under `/` or `Z:\`): the child would die
+/// immediately, which surfaces as `Translation` and hides the fact that no
+/// converter can run in this process. Only a Windows `.exe` outside the macOS
+/// root qualifies; ignoring everything else keeps the pool cache-only so a cold
+/// stage is `ConverterUnavailable` and selects the VP3 host-translation path.
+#[cfg(any(windows, test))]
+fn guest_can_run_worker(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let macos_root = text.starts_with('/')
+        || text
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Z:"));
+    let windows_exe = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    windows_exe && !macos_root
+}
+
+/// Resolves the pool's worker program.
+///
+/// `guest` is `true` in the Win64 guest (`cfg(windows)`). There an inherited
+/// macOS worker path is ignored with an explicit warning, so the pool stays
+/// cache-only and the caller sees `ConverterUnavailable`, not `Translation`.
+/// The macOS host keeps accepting the same path; the split lives in the
+/// launcher and this is its defence in depth (ADR-038).
+#[cfg(any(windows, test))]
+fn resolve_worker_program(guest: bool) -> Option<PathBuf> {
+    let program = std::env::var_os(WORKER_ENV)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())?;
+    if guest && !guest_can_run_worker(&program) {
+        tracing::warn!(
+            worker = %program.display(),
+            "VICTORY_IRCONVERTER_WORKER names a macOS converter (ADR-038); the Win64 guest ignores it and stays cache-only"
+        );
+        return None;
+    }
+    Some(program)
+}
+
+/// Builds the process-wide pool.
+///
+/// The macOS host keeps [`CompilerPool::from_env`]'s resolution, including the
+/// `victory-irconverter` sibling fallback. The Win64 guest resolves through
+/// [`resolve_worker_program`] instead: it can only run a Windows worker and
+/// must not start the host-only macOS binary the launcher exports (ADR-038).
+fn build_pool() -> CompilerPool {
+    #[cfg(windows)]
+    {
+        CompilerPool::new(PoolConfig::from_env(), resolve_worker_program(true))
+    }
+    #[cfg(not(windows))]
+    {
+        CompilerPool::from_env()
+    }
+}
+
 /// The process-wide pool. One pool means one persistent worker set for the
 /// whole run (ADR-018); it is created from the environment on first use.
 fn pool() -> &'static CompilerPool {
     static POOL: OnceLock<CompilerPool> = OnceLock::new();
-    POOL.get_or_init(CompilerPool::from_env)
+    POOL.get_or_init(build_pool)
 }
 
 /// The pool's statistics before and after one translation, so a caller can say
@@ -1301,9 +1372,10 @@ pub fn pool_stats() -> PoolStats {
 /// The worker program the pool will start, when one is configured.
 ///
 /// The pool resolves it from `VICTORY_IRCONVERTER_WORKER` or the
-/// `victory-irconverter` sibling of this executable. The Win64 guest has
-/// neither (the converter and its worker are macOS builds), so this is `None`
-/// there and every cold translation is explicit.
+/// `victory-irconverter` sibling of this executable. The Win64 guest can run
+/// neither (the converter and its worker are macOS builds), so it ignores an
+/// inherited macOS `VICTORY_IRCONVERTER_WORKER` (ADR-038) and this is `None`
+/// there: every cold translation is then explicit.
 pub fn pool_worker_program() -> Option<PathBuf> {
     pool().worker_program().map(Path::to_path_buf)
 }
@@ -1337,6 +1409,11 @@ pub fn pool_worker_jobs() -> Vec<u64> {
 }
 
 /// Maps a pool failure onto the PSO path's explicit error vocabulary.
+///
+/// A pool with no worker program is the environmental case: nothing in this
+/// process can translate, so the refusal is [`PipelineError::ConverterUnavailable`]
+/// (which selects the VP3 host-translation path) and not a translation failure.
+/// A worker that did start and failed keeps [`PipelineError::Translation`].
 fn translate_error(error: PoolError) -> PipelineError {
     match error {
         PoolError::NoWorkerProgram => PipelineError::ConverterUnavailable(error.to_string()),
@@ -2833,5 +2910,86 @@ mod tests {
             matches!(error, PipelineError::ConverterUnavailable(_)),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// ADR-038 defence in depth: if the Win64 guest still inherits the host's
+    /// macOS converter worker, it ignores it. The pool built that way has no
+    /// worker, so a cold stage is `ConverterUnavailable` (which selects the VP3
+    /// host-translation path) instead of `Translation` from a macOS child that
+    /// cannot start. The same path stays acceptable to the macOS host.
+    #[test]
+    fn a_guest_ignores_an_inherited_macos_converter_worker() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let macos_worker = std::env::current_exe().expect("the test executable exists");
+        assert!(
+            !macos_worker
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")),
+            "the fixture must look like the host's macOS worker: {}",
+            macos_worker.display()
+        );
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::set_var(WORKER_ENV, &macos_worker);
+        }
+
+        assert_eq!(
+            resolve_worker_program(false),
+            Some(macos_worker.clone()),
+            "the macOS host keeps the launcher's worker"
+        );
+        assert_eq!(
+            resolve_worker_program(true),
+            None,
+            "the Win64 guest must ignore a macOS worker path"
+        );
+
+        let pool = CompilerPool::new(
+            victory_metal::compiler_pool::PoolConfig {
+                cache_dir: None,
+                ..victory_metal::compiler_pool::PoolConfig::default()
+            },
+            resolve_worker_program(true),
+        );
+        assert!(
+            pool.worker_program().is_none(),
+            "the guest started no worker"
+        );
+        let dxil = b"guest-ignores-a-macos-worker";
+        let job = CompileJob {
+            id: 0x5eed_c0de,
+            stage: PipelineStage::Compute.converter_stage(),
+            entry: "main",
+            dxil: &dxil[..],
+        };
+        let error = pool
+            .compile_with_reflection(&job)
+            .expect_err("a cache-only pool cannot answer a cold job");
+        assert!(
+            matches!(
+                translate_error(error),
+                PipelineError::ConverterUnavailable(_)
+            ),
+            "the environmental case must select host translation"
+        );
+
+        // SAFETY: the test holds `ENV_LOCK` and runs with `--test-threads=1`.
+        unsafe {
+            std::env::remove_var(WORKER_ENV);
+        }
+    }
+
+    #[test]
+    fn a_windows_executable_path_is_accepted_by_name() {
+        assert!(!guest_can_run_worker(Path::new("/Users/x/victory-irconverter")));
+        assert!(!guest_can_run_worker(Path::new(
+            "Z:\\Users\\x\\victory-irconverter"
+        )));
+        assert!(!guest_can_run_worker(Path::new(
+            "Z:\\Users\\x\\victory-irconverter.exe"
+        )));
+        assert!(guest_can_run_worker(Path::new(
+            "C:\\tools\\victory-irconverter.exe"
+        )));
     }
 }

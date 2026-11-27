@@ -25,7 +25,9 @@
 #      guest failure, a host setup failure that happens after WORK exists, the
 #      internal guest timeout and a signal whose cleanup is interrupted by a
 #      second signal (driven with a private GPU lock and WINE stubs);
-#   8. `sh -n` parses both launchers, the hygiene helper and this test.
+#   8. ADR-038: the host-only converter variables reach victory_metal_host and
+#      never the Wine guest even when they are exported by the caller;
+#   9. `sh -n` parses both launchers, the hygiene helper and this test.
 #
 # Usage: sh tools/macos/metal-poc/test-launcher-session.sh
 set -eu
@@ -392,7 +394,81 @@ unset VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE VICTORY_BACKEND WINE
 reset_tmp
 pass "real launcher: guest failure, host setup failure, timeout and double signal all remove the session"
 
-# --- 8. Every launcher and helper parses under `sh -n` --------------------
+# --- 8. ADR-038: converter paths reach the host, never the guest -----------
+# `victory-metal.sh` exports the macOS converter worker and dylib for
+# `victory_metal_host` (ADR-038). The launcher must keep them for the host and
+# unset them before Wine: a guest that inherits a macOS worker path builds a
+# pool whose child cannot start and refuses the pipeline as `Translation`
+# instead of `ConverterUnavailable`, so the VP3 host-translation path is never
+# reached. The recording host stub proves it saw both variables; the recording
+# WINE stub proves the guest saw neither. No daemon, no GPU, no title.
+mkdir -p "$BASE/locks"
+VICTORY_GPU_LOCK="$BASE/locks/gpu.lock"
+VICTORY_HYGIENE_GRACE=1
+export VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE
+
+HOST_ENV_OUT="$BASE/host-converter-env.txt"
+GUEST_ENV_OUT="$BASE/guest-converter-env.txt"
+WORKER_STUB="$BASE/irconverter-stub"
+CONV_STUB="$BASE/libmetalirconverter.dylib"
+printf '#!/bin/sh\nexit 0\n' >"$WORKER_STUB"
+chmod +x "$WORKER_STUB"
+: >"$CONV_STUB"
+
+cat >"$TARGET/aarch64-apple-darwin/debug/victory_metal_host" <<EOS
+#!/bin/sh
+# Recording stand-in for victory_metal_host: captures the ADR-038 converter
+# environment, writes minimal clean telemetry and reports ready.
+telemetry=""
+while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+        --telemetry-json)
+            telemetry="\$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+printf 'worker=%s\nconverter=%s\n' "\${VICTORY_IRCONVERTER_WORKER:-}" "\${VICTORY_METAL_IRCONVERTER:-}" >"$HOST_ENV_OUT"
+if [ -n "\$telemetry" ]; then
+    printf '{"d3dmetal_fallback_count":0,"d3dmetal_images":[],"d3dmetal_loaded":false}\n' >"\$telemetry"
+fi
+echo 'victory-metal-host: ready port=1'
+exit 0
+EOS
+chmod +x "$TARGET/aarch64-apple-darwin/debug/victory_metal_host"
+
+cat >"$BASE/wine-record-env.sh" <<EOS
+#!/bin/sh
+printf 'worker=%s\nconverter=%s\n' "\${VICTORY_IRCONVERTER_WORKER:-}" "\${VICTORY_METAL_IRCONVERTER:-}" >"$GUEST_ENV_OUT"
+exit 0
+EOS
+chmod +x "$BASE/wine-record-env.sh"
+
+VICTORY_IRCONVERTER_WORKER="$WORKER_STUB"
+VICTORY_METAL_IRCONVERTER="$CONV_STUB"
+VICTORY_BACKEND=metal
+WINE="$BASE/wine-record-env.sh"
+export VICTORY_IRCONVERTER_WORKER VICTORY_METAL_IRCONVERTER VICTORY_BACKEND WINE
+run_runner real-converter-env --headless -- "$BASE/guest.exe"
+expect_rc 0 "converter environment split"
+grep -Fqx -- "worker=$WORKER_STUB" "$HOST_ENV_OUT" \
+    || fail "victory_metal_host did not inherit VICTORY_IRCONVERTER_WORKER"
+grep -Fqx -- "converter=$CONV_STUB" "$HOST_ENV_OUT" \
+    || fail "victory_metal_host did not inherit VICTORY_METAL_IRCONVERTER"
+grep -Fqx -- 'worker=' "$GUEST_ENV_OUT" \
+    || fail "the Wine guest inherited VICTORY_IRCONVERTER_WORKER"
+grep -Fqx -- 'converter=' "$GUEST_ENV_OUT" \
+    || fail "the Wine guest inherited VICTORY_METAL_IRCONVERTER"
+expect_zero_sessions "converter environment split"
+unset VICTORY_IRCONVERTER_WORKER VICTORY_METAL_IRCONVERTER VICTORY_BACKEND
+unset VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE WINE
+reset_tmp
+pass "ADR-038 converter variables reach the host and never the guest"
+
+# --- 9. Every launcher and helper parses under `sh -n` --------------------
 for script in "$WRAPPER" "$RUNNER" "$HERE/process-hygiene.sh" "$0"; do
     sh -n "$script" || fail "sh -n failed: $script"
 done
