@@ -571,15 +571,21 @@ impl Daemon {
         command
             .arg("--stdio")
             .arg("--converter")
-            .arg(converter_path())
+            .arg(converter_path());
+        for arg in extra {
+            command.arg(arg);
+        }
+        Self::from_command(command, reflection_frames)
+    }
+
+    /// Starts a supervisor from an arbitrary command (hermetic stub runners).
+    fn from_command(mut command: Command, reflection_frames: bool) -> Self {
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if reflection_frames {
             command.env("VICTORY_IRCONVERTER_STDIO_REFLECTION", "1");
-        }
-        for arg in extra {
-            command.arg(arg);
         }
         let mut child = command.spawn().expect("spawn --stdio worker");
         let stdin = child.stdin.take().expect("worker stdin");
@@ -1112,8 +1118,11 @@ fn four_stages_translate_concurrently_without_cross_talk() {
     );
 }
 
-/// Cold vs warm throughput on one persistent worker, then a fresh pool over the
-/// same warm cache. The first job pays Rosetta/dylib startup; the rest reuse it.
+/// Cold vs warm throughput on one persistent supervisor, then a fresh pool over
+/// the same warm cache. Since per-job isolation re-execs a short-lived
+/// conversion child, every job pays that child's Rosetta start; what must hold
+/// is that one supervisor serves all 16 jobs without a restart and that a warm
+/// cache never wakes a worker.
 #[test]
 fn cold_and_warm_throughput_amortise_rosetta_startup() {
     assert!(pool_stdio_enabled());
@@ -1152,15 +1161,17 @@ fn cold_and_warm_throughput_amortise_rosetta_startup() {
     let subsequent_avg = timings[0]
         .subsequent_avg_micros()
         .expect("15 subsequent jobs");
+    // ADR-045/C13 moved conversion into a short-lived child per job, so the
+    // first job is no longer expected to dominate later ones: the supervisor
+    // start is the only one-time cost and each job pays its child's start.
+    // The regression this test guards is the one that mattered in Boot #17:
+    // one process start per job at the *pool* level (worker_starts == 1),
+    // which is asserted above. Keep a generous wall-clock ceiling so a hung
+    // or serialized conversion still fails.
+    assert!(first > 0, "the first job must have a measured duration");
     assert!(
-        first > subsequent_avg.saturating_mul(2),
-        "first job ({first} us) must pay startup and be far slower than the \
-         subsequent average ({subsequent_avg} us)"
-    );
-    let subsequent_max = cold[1..].iter().copied().max().unwrap_or(0);
-    assert!(
-        first > subsequent_max,
-        "job 2..N ({subsequent_max} us max) must all beat job 1 ({first} us)"
+        cold.iter().all(|&micros| micros < 5_000_000),
+        "a single conversion must not take seconds: {cold:?}"
     );
 
     let warm = run_jobs(&pool, &jobs);
@@ -1305,7 +1316,7 @@ done
         })
         .expect_err("a dead worker must fail the job");
     assert!(
-        matches!(err, PoolError::WorkerExited { job_id: 2 }),
+        matches!(err, PoolError::WorkerExited { job_id: 2, .. }),
         "unexpected crash error: {err:?}"
     );
 
@@ -1325,6 +1336,248 @@ done
     assert_eq!(
         stats.worker_jobs, 3,
         "three frames reached a worker; the middle one died on it"
+    );
+}
+
+/// Writes an executable stub job runner for the supervisor's per-job child.
+///
+/// The supervisor re-execs this instead of `--convert-one`, so the crash
+/// containment can be exercised without a converter, Rosetta, or GPU.
+fn write_stub_runner(dir: &Path) -> PathBuf {
+    let path = dir.join("stub-job-runner.sh");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+# The supervisor writes the DXIL on stdin; the stub never converts it.
+cat >/dev/null 2>&1 || true
+entry=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--entry" ]; then entry="$arg"; fi
+    prev="$arg"
+done
+case "$entry" in
+    crash)
+        echo 'stub converter aborting at /Users/private/libmetalirconverter.dylib' >&2
+        kill -SEGV $$
+        ;;
+    boom)
+        echo 'stub converter refused at /tmp/private/secret.dylib' >&2
+        exit 7
+        ;;
+    *)
+        # Private child frame: status 0, stage 8, 8-byte metallib, 2-byte JSON.
+        printf 'VMCONV 0 8 8 2\n'
+        printf 'MTLBstub{}'
+        ;;
+esac
+"#,
+    )
+    .expect("write stub job runner");
+    let mut permissions = std::fs::metadata(&path).expect("stat stub runner").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod stub runner");
+    path
+}
+
+/// A supervisor (the host binary, not the x86_64 worker) whose per-job child
+/// is the stub runner and whose `--converter` is an inert regular file.
+fn stub_supervisor(runner: &Path, converter: &Path) -> Daemon {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_victory-irconverter"));
+    command
+        .arg("--stdio")
+        .arg("--converter")
+        .arg(converter)
+        .arg("--job-runner")
+        .arg(runner);
+    Daemon::from_command(command, true)
+}
+
+/// A conversion child that dies by SIGSEGV is reported as a named failure and
+/// the supervisor answers the next job with matching ids.
+#[test]
+fn supervisor_survives_a_signal_killed_conversion_child() {
+    let dir = TempDir::new("child-signal");
+    let runner = write_stub_runner(dir.path());
+    let converter = dir.path().join("converter-placeholder.dylib");
+    std::fs::write(&converter, b"not a dylib").expect("write converter placeholder");
+    let mut daemon = stub_supervisor(&runner, &converter);
+
+    daemon.send(11, 22, CS_STAGE, "crash", b"dxil");
+    let failed = daemon.recv();
+    assert_eq!((failed.seq, failed.id), (11, 22), "ids must be echoed");
+    assert_ne!(failed.status, 0, "a dead child must not be a success");
+    assert!(failed.reflection.is_empty(), "a failure carries no reflection");
+    let reason = String::from_utf8(failed.payload).expect("failure reason is UTF-8");
+    assert!(
+        reason.contains("converter child died: signal 11"),
+        "the reason must name the signal: {reason}"
+    );
+    assert!(
+        reason.contains("<path>") && !reason.contains("/Users") && !reason.contains("/tmp"),
+        "the child's absolute paths must be scrubbed: {reason}"
+    );
+    assert!(
+        reason.len() <= 1024,
+        "the failure reason must stay bounded: {}",
+        reason.len()
+    );
+
+    // The supervisor stayed in step on stdin: the next job is served by the
+    // same process and echoes its own ids.
+    daemon.send(33, 44, CS_STAGE, "ok", b"dxil");
+    let ok = daemon.recv();
+    assert_eq!((ok.seq, ok.id), (33, 44));
+    assert_eq!(ok.status, 0, "{:?}", ok.payload);
+    assert_eq!(ok.payload, b"MTLBstub");
+    assert_eq!(ok.reflection, b"{}");
+    assert!(ok.reflection_frame, "the pool's switch selects VMRES2");
+    assert!(daemon.finish().success(), "clean EOF exits 0");
+}
+
+/// A conversion child that exits nonzero with stderr text yields that text,
+/// bounded and scrubbed, and the supervisor keeps serving.
+#[test]
+fn supervisor_reports_a_nonzero_child_exit_and_its_stderr() {
+    let dir = TempDir::new("child-exit");
+    let runner = write_stub_runner(dir.path());
+    let converter = dir.path().join("converter-placeholder.dylib");
+    std::fs::write(&converter, b"not a dylib").expect("write converter placeholder");
+    let mut daemon = stub_supervisor(&runner, &converter);
+
+    daemon.send(5, 6, CS_STAGE, "boom", b"dxil");
+    let failed = daemon.recv();
+    assert_eq!((failed.seq, failed.id), (5, 6));
+    assert_ne!(failed.status, 0);
+    let reason = String::from_utf8(failed.payload).expect("failure reason is UTF-8");
+    assert!(
+        reason.contains("converter child died: exit code 7"),
+        "the reason must name the exit code: {reason}"
+    );
+    assert!(
+        reason.contains("stub converter refused"),
+        "the child's stderr tail must survive: {reason}"
+    );
+    assert!(
+        !reason.contains("/tmp") && reason.contains("<path>"),
+        "the stderr path must be scrubbed: {reason}"
+    );
+
+    daemon.send(7, 8, CS_STAGE, "ok", b"dxil");
+    let ok = daemon.recv();
+    assert_eq!((ok.seq, ok.id), (7, 8));
+    assert_eq!(ok.status, 0);
+    assert!(daemon.finish().success());
+}
+
+/// Two jobs in a row on one supervisor both answer with their own seq/id.
+#[test]
+fn supervisor_answers_two_jobs_in_a_row_with_matching_ids() {
+    let dir = TempDir::new("two-jobs");
+    let runner = write_stub_runner(dir.path());
+    let converter = dir.path().join("converter-placeholder.dylib");
+    std::fs::write(&converter, b"not a dylib").expect("write converter placeholder");
+    let mut daemon = stub_supervisor(&runner, &converter);
+
+    for (seq, id, entry) in [(100u64, 200u64, "first"), (101, 201, "second")] {
+        daemon.send(seq, id, CS_STAGE, entry, b"payload");
+        let response = daemon.recv();
+        assert_eq!((response.seq, response.id), (seq, id));
+        assert_eq!(response.status, 0, "{entry}: {:?}", response.payload);
+        assert_eq!(response.payload, b"MTLBstub");
+        assert_eq!(response.reflection, b"{}");
+    }
+    assert!(daemon.finish().success());
+}
+
+/// The real `--convert-one` re-exec path: a placeholder converter fails the
+/// conversion cleanly in the child, the supervisor answers a bounded nonzero
+/// frame, and the next job is still served.
+#[test]
+fn supervisor_re_execs_the_real_conversion_child_and_keeps_serving() {
+    let dir = TempDir::new("real-child");
+    let converter = dir.path().join("converter-placeholder.dylib");
+    std::fs::write(&converter, b"not a dylib").expect("write converter placeholder");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_victory-irconverter"));
+    command
+        .arg("--stdio")
+        .arg("--converter")
+        .arg(&converter);
+    let mut daemon = Daemon::from_command(command, true);
+
+    daemon.send(1, 2, CS_STAGE, "main", b"dxil");
+    let failed = daemon.recv();
+    assert_eq!((failed.seq, failed.id), (1, 2));
+    assert_ne!(failed.status, 0, "a non-library converter must fail");
+    let reason = String::from_utf8(failed.payload).expect("failure reason is UTF-8");
+    assert!(
+        reason.contains("conversion failed"),
+        "the child's converter error must survive: {reason}"
+    );
+    assert!(
+        reason.len() <= 1024,
+        "the failure reason must stay bounded: {}",
+        reason.len()
+    );
+
+    // Same supervisor, same in-step stdin: a second job still gets an answer.
+    daemon.send(3, 4, CS_STAGE, "main", b"dxil");
+    let again = daemon.recv();
+    assert_eq!((again.seq, again.id), (3, 4));
+    assert_ne!(again.status, 0);
+    assert!(daemon.finish().success());
+}
+
+/// End-to-end through the pool: two conversions fail inside the re-exec'd child,
+/// the supervisor answers both with a bounded reason, and the pool reports one
+/// process start and zero restarts.
+#[test]
+fn pool_keeps_one_supervisor_across_failed_conversions() {
+    let dir = TempDir::new("pool-child-failures");
+    let placeholder = dir.path().join("converter-placeholder.dylib");
+    std::fs::write(&placeholder, b"not a dylib").expect("write converter placeholder");
+    let _env = EnvGuard::set("VICTORY_METAL_IRCONVERTER", &placeholder);
+    let pool = CompilerPool::new(
+        PoolConfig {
+            workers: 1,
+            queue_depth: 2,
+            job_timeout: Duration::from_secs(30),
+            cache_dir: None,
+            converter_version: "victory-metal-test/child-failure/1".to_string(),
+        },
+        Some(worker_path()),
+    );
+    let dxil = unhex(CS_DXIL_HEX);
+    for id in 1..=2u64 {
+        let err = pool
+            .compile_with_reflection(&CompileJob {
+                id,
+                stage: CS_STAGE,
+                entry: "main",
+                dxil: &dxil,
+            })
+            .expect_err("a placeholder converter must fail the job");
+        match err {
+            PoolError::WorkerFailed { job_id, message, .. } => {
+                assert_eq!(job_id, id);
+                assert!(
+                    message.contains("conversion failed"),
+                    "the child's converter error must reach the pool: {message}"
+                );
+                assert!(message.len() <= 1024, "reason must be bounded: {message}");
+            }
+            other => panic!("expected a supervisor-reported WorkerFailed, saw {other:?}"),
+        }
+    }
+    let stats = pool.stats();
+    assert_eq!(stats.worker_starts, 1, "one supervisor for both failures");
+    assert_eq!(stats.worker_restarts, 0, "a failed conversion is not a crash");
+    assert_eq!(stats.worker_jobs, 2);
+    assert_eq!(stats.errors, 2);
+    assert!(
+        pool.last_worker_stderr()
+            .is_some_and(|text| text.contains("conversion failed")),
+        "the pool's diagnostic channel must carry the reason"
     );
 }
 
