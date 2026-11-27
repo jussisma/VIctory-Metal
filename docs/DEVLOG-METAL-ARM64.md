@@ -952,3 +952,110 @@ tools/macos/metal-poc/run-title-metal.sh --headless --frames 120 -- <win64-exe> 
   backpressure.
 - **`victory-gpu` parallel execution** has pre-existing global-state races in
   `native_metal::queue` tests; every suite here is run with `--test-threads=1`.
+
+## Cycle 07 — pre-boot gate PASS: 24-byte converter tables, guest texture/sampler tables, blended content-hashed PSOs, amplification identification, hard retire bound
+
+The Cycle 06 gate was PARTIAL with three named frame-1 gaps (multi-entry UAV
+tables, SRV texture tables, blend on content-hashed guest PSOs). Cycle 07 closed
+those three, added the two remaining hardenings, and turned the gate into a
+zero-gap contract: `tools/macos/metal-poc/aaa-preboot-gate.sh --runs 2` exits 0
+with `not_observed=none` on both 120-frame runs.
+
+### 7.1 What changed
+
+- **Converter descriptor tables (ADR-027).** `metal-objdump` of the converted
+  gate shader shows `%struct__desc = { i8 addrspace(1)*,
+  %struct._texture_buffer_1d_t addrspace(1)*, i64 }` and entry 1 at byte offset
+  `+24`; the host wrote 8-byte addresses, so `uav1` read zeroes. Address tables
+  (CBV/SRV/UAV/`Unspecified`) now emit 24-byte `{device_address,0,0}`,
+  textures `{gpuResourceID,gpuResourceID,0}` and samplers `{gpuResourceID,0,0}`.
+  The old 8-byte shape existed only in a hand-written fixture.
+- **Typed wire tables and guest texture/sampler binding (ADR-028).**
+  `DescriptorTableV3` entries are tagged buffer/texture/sampler; buffer entries
+  keep the old encoding. `victory-gpu` enumerates a heap range by its real kind,
+  registers textures on first bind and samplers by content (kind 10, bounded
+  256, no eviction) with idempotent handles. Host-side residency attaches every
+  referenced texture/sampler; an unregistered handle is a typed refusal before
+  any encoder.
+- **Render state inside content-hashed PSOs (ADR-029).** `PipelineState` emits
+  VPS1 byte-for-byte when no render state is present and VPS2 when it is; blend,
+  alpha-to-coverage, depth/stencil and rasterizer state are encoded
+  deterministically into the blob, which is part of the BLAKE3 key. Two PSOs
+  that differ only in blending are `PipelineId(1)` and `PipelineId(2)`; the
+  identical registration is reused. VPS1 blobs still decode to defaults.
+- **Amplification stage.** `HwStage::As` exists, AS+MS+PS containers parse
+  without a stage refusal and AS is never read as GS/CS. The record slot is a
+  documented fallback (compute slot +x60, selected by the kind-14 program
+  header) because no shipped AS FSSM payload exists in the repository. Native
+  AS lowering still fails closed by name; the converter path is what is proven.
+- **Hard retire bound.** `RetireQueue` capacity is now a hard bound; the device
+  pins only through `try_push`, waits on the oldest committed command buffer,
+  publishes the completion, drains and retries within `MAX_BACKPRESSURE_WAITS`.
+  A never-completing fence returns `MetalError::Backpressure` instead of growing
+  the queue or hanging.
+- **Process hygiene.** A shared `process-hygiene.sh` gives every metal-poc script
+  tracked PIDs, TERM→KILL escalation, ownership-proven reaping and an orphan
+  assertion (exit 13), with a hermetic self-test.
+- **Host defect found by the gate.** `DaemonExecutor` and `FrameGateExecutor` did
+  not forward `BatchExecutor::register_sampler` (trait default refuses), so the
+  guest sampler table was refused by the daemon while the bare transport
+  accepted it. Same defect class as Cycle 05's five missing delegations.
+
+### 7.2 Gate evidence (Apple M4 Max, both runs PASS)
+
+```text
+run1 status=PASS frames=120 p50=0.825 p95=0.891 p99=0.947 ms fps=1205.78
+run2 status=PASS frames=120 p50=0.822 p95=0.903 p99=0.960 ms fps=1201.21
+checksum both runs = 11527919792119713699   not_observed=none
+uav0=11 uav1=22
+mesh counts = 1,1,1,49374        payload = 3,85,49374,112
+AS+MS+PS = 4 of 8 payloads, 112 px exact; count sweep 1->64, 2->128, direct=128
+clear=[0,0,255,255] copy=[0,255,0,255]/[255,0,255,255] upload=[255,255,255,255]
+srv=[10,20,30,255],[40,50,60,255]   blend=[128,0,128,128] (VPS2 id 5)
+xmem 10000 cycles peak=4096/4096; retire pins=24 cap=4 peak=4 waits=5 released=24
+fence_waits=140 timeouts=0 d3dmetal_fallback=0 guest_module=0 unsupported=none
+teardown: zero victory_metal_host / victory-irconverter / wine survivors
+```
+
+### 7.3 Counts (integration head)
+
+- Win64 `diag` `victory` build exit 0 (35 s); `victory-metal`, `victory-hle`,
+  `victory-gpu` (diagnostics) Windows all-targets exit 0; Win64
+  `victory-irconverter` exit 0.
+- `victory-metal` lib **284 passed / 0 failed / 5 ignored**;
+  `victory-shader` **254 / 0 / 2** (+ integration 3 / 0 / 1);
+  `victory-gpu` **237 / 0 / 1**; `victory-hle` under Wine **183 / 0 / 2**.
+- GPU, serialized: `retire_backpressure_gpu` 2, `object_mesh_gpu` 2,
+  `multi_entry_tables_gpu` 2, `srv_texture_table_gpu` 1, `render_states_gpu`
+  1 (legacy `#[ignore]` proof re-run: 1), plus the two-run gate.
+
+### 7.4 Reproduce
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cd VIctory-Metal
+cargo test --locked -p victory-metal --target aarch64-apple-darwin --lib -- --test-threads=1
+cargo test --locked -p victory-shader --target aarch64-apple-darwin -- --test-threads=1
+cargo test --locked -p victory-gpu --target aarch64-apple-darwin --lib -- --test-threads=1
+tools/macos/test-wine.sh -p victory-hle -- --test-threads=1
+tools/macos/metal-poc/aaa-preboot-gate.sh --runs 2   # exit 0 required
+```
+
+### 7.5 Remaining gaps (honest)
+
+- **No title binary has run.** The gate drives the real `victory-gpu` D3D12
+  entry points, not a retail title. Geometry, materials, streaming and ≥30 FPS
+  on a world sequence remain unproven; no proprietary asset was used.
+- **Native amplification lowering fails closed.** AS is identified, parsed and
+  resource-tracked, and the converter path draws exact pixels, but
+  `victory-shader` refuses to lower an AS program to DXIL because payload
+  writes and the mesh grid have no DXIL form yet. The record-slot rule is a
+  documented fallback, unverified against a shipped AS payload.
+- **The measured checksum is synthetic.** `11527919792119713699` identifies this
+  gate frame, not a game frame.
+- **Logic-op blending and depth bounds** are not representable in Metal and are
+  explicitly omitted rather than approximated.
+- **Guest texture bytes** are uploaded by the gate through `CopyBufferToTexture`;
+  a sampled guest texture with no upload samples its cleared contents.
+- **Retire capacity** is a hard bound only where the device pins through
+  `push_backpressure`; `RetireQueue::push` remains as documented legacy.
