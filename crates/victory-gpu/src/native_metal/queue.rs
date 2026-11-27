@@ -1232,6 +1232,18 @@ mod tests {
     const SECRET: [u8; 32] = [0x5a; 32];
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    /// Serialises the tests that drive the process-global queue, presenter,
+    /// fence sequence and telemetry. Those are one instance per process by
+    /// design (`native_queue`, `PRESENT`, `LAST_SEQUENCE`, `pending_signals`),
+    /// and the tests exercise the real entry points rather than injected
+    /// instances, so a scoped lock is the only way to stop one test's reset or
+    /// installed client from changing another's expectations. Tests that use a
+    /// private `NativeQueue` or `RecordingSink` do not take it.
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     /// A sink that keeps every frame and answers from a script.
     #[derive(Debug, Default)]
     struct RecordingSink {
@@ -1395,6 +1407,7 @@ mod tests {
     /// explicit error.
     #[test]
     fn the_queue_presents_into_the_installed_native_swapchain() {
+        let _serial = serialized();
         let _ = take_present();
         assert_eq!(present_registered(), Err(NativeQueueError::NoSwapchain));
 
@@ -1541,6 +1554,7 @@ mod tests {
     /// no D3DMetal fallback.
     #[test]
     fn a_configured_endpoint_connects_lazily_and_carries_the_batch() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         let (host, carried) = TestHost::spawn(vec![ReplyStatus::Ok]);
@@ -1582,6 +1596,7 @@ mod tests {
     /// failure: nothing connects, nothing is recorded, the frame stays queued.
     #[test]
     fn without_an_endpoint_the_queue_fails_explicitly() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         assert_eq!(ensure_live(|| None), Ok(false));
@@ -1638,6 +1653,7 @@ mod tests {
     /// retried: the queue holds nothing to send again.
     #[test]
     fn a_live_already_executed_reply_is_surfaced_once() {
+        let _serial = serialized();
         native_queue_reset();
         let (host, carried) = TestHost::spawn(vec![ReplyStatus::AlreadyExecuted]);
         let config = host.config();
@@ -1659,6 +1675,7 @@ mod tests {
     /// counters: no encode, no sink call, no frame sample.
     #[test]
     fn the_d3d12_backend_leaves_the_queue_and_telemetry_untouched() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         let mut queue = NativeQueue::new(RecordingSink::default());
@@ -1722,6 +1739,7 @@ mod tests {
     /// IPC round trip.
     #[test]
     fn the_shared_page_gates_signals_with_one_atomic_read() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         super::LAST_SEQUENCE.store(7, Ordering::Release);
@@ -1782,6 +1800,7 @@ mod tests {
     /// already run the batch, so a signal completes immediately.
     #[test]
     fn without_a_page_a_signal_completes_after_the_synchronous_reply() {
+        let _serial = serialized();
         native_queue_reset();
         let mut fence = std::ptr::null();
         assert_eq!(
@@ -1808,6 +1827,7 @@ mod tests {
     /// presenter error.
     #[test]
     fn the_wire_presenter_registers_the_surface_and_carries_a_present() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         let _ = take_present();
@@ -1873,6 +1893,7 @@ mod tests {
     /// counted as a refused present.
     #[test]
     fn a_refused_surface_registration_refuses_the_present() {
+        let _serial = serialized();
         native_queue_reset();
         telemetry::global().reset();
         let _ = take_present();

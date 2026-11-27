@@ -34,13 +34,28 @@
 //! Metal pipeline object per key; repeated registration returns the existing
 //! handle and counts the reuse.
 //!
-//! The byte blob passed as `state` is the seam for the future D3D12 state
-//! translation. It is parsed with [`PipelineState::decode`] for graphics and
-//! mesh pipelines (attachment formats, fragment/object entry points and mesh
-//! threadgroup budgets) and is opaque for compute. A metallib that does not
-//! load, an entry point that does not exist, or an entry point whose
+//! The byte blob passed as `state` is the seam for the D3D12 state translation.
+//! It is parsed with [`PipelineState::decode`] for graphics and mesh pipelines
+//! (attachment formats, fragment/object entry points, mesh threadgroup budgets
+//! and — from `VPS2` on — blend, depth/stencil and rasterizer state) and is
+//! opaque for compute. A `VPS1` blob keeps the pre-`VPS2` meaning: every
+//! render-state field is its default. A metallib that does not load, an entry
+//! point that does not exist, or an entry point whose
 //! `MTLFunction.functionType` does not match the requested stage is always an
 //! explicit error: the registry never substitutes a different entry point.
+//!
+//! # Pipeline state versus encoder state
+//!
+//! Metal bakes per-attachment blending (enable, factors, operations, write
+//! mask) and alpha-to-coverage into `MTLRenderPipelineState`, so those
+//! [`PipelineState`] fields are applied to the descriptor this module builds.
+//! Cull mode, fill mode, front-face winding and depth bias are
+//! `MTLRenderCommandEncoder` state and stay on the Cycle 06 encoder path
+//! (`macos::state::apply_rasterizer`). Depth/stencil comparison state is a
+//! separate cached `MTLDepthStencilState` bound per draw; the encoded values
+//! participate in the content key so two pipelines that differ only in depth
+//! test or stencil operations are distinct, while `macos::device` keeps binding
+//! its existing content-hashed depth state.
 //! [`PipelineRegistry::register_graphics_stages`] and
 //! [`PipelineRegistry::register_mesh_stages`] take one [`StageLibrary`] per
 //! stage, so a persistent compiler that emits one metallib per stage registers
@@ -54,6 +69,11 @@ use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::render::PixelFormat;
 use crate::transport::MetalError;
+use crate::wire_v3::{
+    BlendAttachment, BlendFactor, BlendOperation, BlendState, CompareFunction, CullMode,
+    DepthStencilState, FillMode, FrontFaceWinding, RasterizerState, StencilFaceState,
+    StencilOperation,
+};
 
 /// `MTLTextureType1D`.
 const MTL_TEXTURE_TYPE_1D: usize = 0;
@@ -1365,9 +1385,22 @@ fn push_length_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
 ///
 /// Compute pipelines treat their `state` bytes as opaque; graphics and mesh
 /// pipelines decode them with [`Self::decode`]. The encoding starts with
-/// `VPS1` and is length-checked, so a malformed blob is rejected before Metal
-/// sees a descriptor.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `VPS1` or `VPS2` and is length-checked, so a malformed blob is rejected
+/// before Metal sees a descriptor.
+///
+/// A `VPS1` blob carries only the attachment/entry/mesh shape; it decodes with
+/// every render-state field `None`, exactly the state a pipeline had before
+/// `VPS2`. A `VPS2` blob appends the D3D12 render state in a fixed order:
+/// per-attachment blend, depth/stencil and rasterizer. The render-state enums
+/// are the D3D12-valued wire enums, so the guest and the host share one
+/// mapping (`victory-gpu/src/native_metal/state.rs`).
+///
+/// D3D12 logic-op blending and depth bounds have no Metal equivalent and are
+/// not encoded; the arithmetic blend path and the encoder-side depth state keep
+/// their Cycle 06 behaviour. Depth/stencil and rasterizer values are encoded so
+/// they change the content key; only blend is baked into the pipeline
+/// descriptor here (see the module note for the pipeline/encoder split).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PipelineState {
     /// Colour attachment formats in slot order (`0..=8`).
     pub color_formats: Vec<TextureFormat>,
@@ -1385,13 +1418,38 @@ pub struct PipelineState {
     pub payload_memory_length: u32,
     /// `maxTotalThreadgroupsPerMeshGrid`, `0` for the descriptor default.
     pub max_total_threadgroups_per_mesh_grid: u32,
+    /// Per-attachment blend state baked into the render pipeline descriptor.
+    pub blend: Option<BlendState>,
+    /// Depth/stencil comparison state carried in the content key.
+    pub depth_stencil: Option<DepthStencilState>,
+    /// Rasterizer state carried in the content key (cycle 06 encoder state).
+    pub rasterizer: Option<RasterizerState>,
 }
+
+/// Render-state section flag: a [`BlendState`] follows.
+const RENDER_SECTION_BLEND: u8 = 1;
+/// Render-state section flag: a [`DepthStencilState`] follows.
+const RENDER_SECTION_DEPTH_STENCIL: u8 = 2;
+/// Render-state section flag: a [`RasterizerState`] follows.
+const RENDER_SECTION_RASTERIZER: u8 = 4;
+/// Every bit the render-state section defines.
+const RENDER_SECTION_KNOWN: u8 = RENDER_SECTION_BLEND
+    | RENDER_SECTION_DEPTH_STENCIL
+    | RENDER_SECTION_RASTERIZER;
 
 impl PipelineState {
     /// Serialises this state into the versioned `state` blob.
+    ///
+    /// A state with no blend, depth/stencil or rasterizer field is byte-for-byte
+    /// the historical `VPS1` encoding. Any render state appends a `VPS2`
+    /// section in one fixed order, so the bytes (and therefore the BLAKE3 key)
+    /// change whenever any encoded state changes.
     pub fn encode(&self, stage: PipelineStage) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(b"VPS1");
+        let has_render_state = self.blend.is_some()
+            || self.depth_stencil.is_some()
+            || self.rasterizer.is_some();
+        let mut out = Vec::with_capacity(if has_render_state { 192 } else { 64 });
+        out.extend_from_slice(if has_render_state { b"VPS2" } else { b"VPS1" });
         out.push(stage.code());
         out.push(u8::try_from(self.color_formats.len()).expect("colour format count exceeds u8"));
         for format in &self.color_formats {
@@ -1426,10 +1484,56 @@ impl PipelineState {
                 .to_le_bytes(),
         );
         out.extend_from_slice(&self.max_total_threadgroups_per_mesh_grid.to_le_bytes());
+        if has_render_state {
+            self.encode_render_state(&mut out);
+        }
         out
     }
 
-    /// Parses a `VPS1` state blob, requiring it to belong to `stage`.
+    /// Appends the `VPS2` render-state section.
+    fn encode_render_state(&self, out: &mut Vec<u8>) {
+        let mut flags = 0u8;
+        if self.blend.is_some() {
+            flags |= RENDER_SECTION_BLEND;
+        }
+        if self.depth_stencil.is_some() {
+            flags |= RENDER_SECTION_DEPTH_STENCIL;
+        }
+        if self.rasterizer.is_some() {
+            flags |= RENDER_SECTION_RASTERIZER;
+        }
+        out.push(flags);
+        if let Some(blend) = self.blend.as_ref() {
+            out.push(u8::from(blend.independent_blend));
+            out.push(u8::from(blend.alpha_to_coverage));
+            out.push(
+                u8::try_from(blend.attachments.len())
+                    .expect("blend attachment count exceeds u8"),
+            );
+            for attachment in &blend.attachments {
+                push_blend_attachment(out, attachment);
+            }
+        }
+        if let Some(depth) = self.depth_stencil.as_ref() {
+            out.push(u8::from(depth.depth_enable));
+            out.push(u8::from(depth.depth_write));
+            push_u16(out, depth.depth_func.code());
+            out.push(u8::from(depth.stencil_enable));
+            push_stencil_face(out, &depth.front);
+            push_stencil_face(out, &depth.back);
+        }
+        if let Some(raster) = self.rasterizer.as_ref() {
+            push_u16(out, raster.fill.code());
+            push_u16(out, raster.cull.code());
+            push_u16(out, raster.front_face.code());
+            out.extend_from_slice(&raster.depth_bias.to_le_bytes());
+            out.extend_from_slice(&raster.slope_scaled_depth_bias.to_bits().to_le_bytes());
+            out.extend_from_slice(&raster.depth_bias_clamp.to_bits().to_le_bytes());
+            out.push(u8::from(raster.depth_clip));
+        }
+    }
+
+    /// Parses a `VPS1` or `VPS2` state blob, requiring it to belong to `stage`.
     ///
     /// The stage byte is part of the encoding, so a mesh blob passed to the
     /// graphics registration path is rejected instead of silently accepted.
@@ -1442,12 +1546,18 @@ impl PipelineState {
         Self::decode(bytes)
     }
 
-    /// Parses a `VPS1` state blob and validates its bounds.
+    /// Parses a state blob and validates its bounds.
+    ///
+    /// `VPS1` is accepted byte-compatibly: every render-state field decodes to
+    /// `None`. A truncated or malformed `VPS2` section is a typed
+    /// [`RegistryError::InvalidState`], never a panic.
     pub fn decode(bytes: &[u8]) -> Result<Self, RegistryError> {
         let mut reader = BlobReader::new(bytes);
-        if reader.take(4)? != b"VPS1" {
-            return Err(RegistryError::InvalidState("bad magic"));
-        }
+        let version = match reader.take(4)? {
+            b"VPS1" => 1,
+            b"VPS2" => 2,
+            _ => return Err(RegistryError::InvalidState("bad magic")),
+        };
         let stage = reader.u8()?;
         if PipelineStage::from_code(stage).is_none() {
             return Err(RegistryError::InvalidState("unknown stage"));
@@ -1489,6 +1599,11 @@ impl PipelineState {
         }
         let payload_memory_length = u32::from(reader.u16()?);
         let max_total_threadgroups_per_mesh_grid = reader.u32()?;
+        let (blend, depth_stencil, rasterizer) = if version >= 2 {
+            decode_render_state(&mut reader)?
+        } else {
+            (None, None, None)
+        };
         if !reader.is_empty() {
             return Err(RegistryError::InvalidState("trailing bytes"));
         }
@@ -1501,8 +1616,187 @@ impl PipelineState {
             object_threadgroup,
             payload_memory_length,
             max_total_threadgroups_per_mesh_grid,
+            blend,
+            depth_stencil,
+            rasterizer,
         })
     }
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_blend_attachment(out: &mut Vec<u8>, attachment: &BlendAttachment) {
+    out.push(u8::from(attachment.enable));
+    push_u16(out, attachment.src_color.code());
+    push_u16(out, attachment.dst_color.code());
+    push_u16(out, attachment.color_op.code());
+    push_u16(out, attachment.src_alpha.code());
+    push_u16(out, attachment.dst_alpha.code());
+    push_u16(out, attachment.alpha_op.code());
+    out.push(attachment.write_mask);
+}
+
+fn push_stencil_face(out: &mut Vec<u8>, face: &StencilFaceState) {
+    push_u16(out, face.fail.code());
+    push_u16(out, face.depth_fail.code());
+    push_u16(out, face.pass.code());
+    push_u16(out, face.func.code());
+    out.push(face.read_mask);
+    out.push(face.write_mask);
+}
+
+fn decode_render_state(
+    reader: &mut BlobReader<'_>,
+) -> Result<
+    (
+        Option<BlendState>,
+        Option<DepthStencilState>,
+        Option<RasterizerState>,
+    ),
+    RegistryError,
+> {
+    let flags = reader.u8()?;
+    if flags & !RENDER_SECTION_KNOWN != 0 {
+        return Err(RegistryError::InvalidState(
+            "unknown render-state section flag",
+        ));
+    }
+    let blend = if flags & RENDER_SECTION_BLEND != 0 {
+        Some(decode_blend_state(reader)?)
+    } else {
+        None
+    };
+    let depth_stencil = if flags & RENDER_SECTION_DEPTH_STENCIL != 0 {
+        Some(decode_depth_stencil_state(reader)?)
+    } else {
+        None
+    };
+    let rasterizer = if flags & RENDER_SECTION_RASTERIZER != 0 {
+        Some(decode_rasterizer_state(reader)?)
+    } else {
+        None
+    };
+    Ok((blend, depth_stencil, rasterizer))
+}
+
+fn decode_blend_state(reader: &mut BlobReader<'_>) -> Result<BlendState, RegistryError> {
+    let independent_blend = decode_bool(reader, "blend independent flag")?;
+    let alpha_to_coverage = decode_bool(reader, "alpha-to-coverage flag")?;
+    let count = usize::from(reader.u8()?);
+    if count == 0 || count > 8 {
+        return Err(RegistryError::InvalidState(
+            "blend attachment count is not 1..=8",
+        ));
+    }
+    let mut attachments = Vec::with_capacity(count);
+    for _ in 0..count {
+        attachments.push(BlendAttachment {
+            enable: decode_bool(reader, "blend enable flag")?,
+            src_color: decode_blend_factor(reader)?,
+            dst_color: decode_blend_factor(reader)?,
+            color_op: decode_blend_operation(reader)?,
+            src_alpha: decode_blend_factor(reader)?,
+            dst_alpha: decode_blend_factor(reader)?,
+            alpha_op: decode_blend_operation(reader)?,
+            write_mask: reader.u8()?,
+        });
+    }
+    Ok(BlendState {
+        independent_blend,
+        alpha_to_coverage,
+        attachments,
+    })
+}
+
+fn decode_depth_stencil_state(
+    reader: &mut BlobReader<'_>,
+) -> Result<DepthStencilState, RegistryError> {
+    let depth_enable = decode_bool(reader, "depth enable flag")?;
+    let depth_write = decode_bool(reader, "depth write flag")?;
+    let depth_func = decode_compare_function(reader)?;
+    let stencil_enable = decode_bool(reader, "stencil enable flag")?;
+    let front = decode_stencil_face(reader)?;
+    let back = decode_stencil_face(reader)?;
+    Ok(DepthStencilState {
+        depth_enable,
+        depth_write,
+        depth_func,
+        stencil_enable,
+        front,
+        back,
+    })
+}
+
+fn decode_stencil_face(reader: &mut BlobReader<'_>) -> Result<StencilFaceState, RegistryError> {
+    Ok(StencilFaceState {
+        fail: decode_stencil_operation(reader)?,
+        depth_fail: decode_stencil_operation(reader)?,
+        pass: decode_stencil_operation(reader)?,
+        func: decode_compare_function(reader)?,
+        read_mask: reader.u8()?,
+        write_mask: reader.u8()?,
+    })
+}
+
+fn decode_rasterizer_state(
+    reader: &mut BlobReader<'_>,
+) -> Result<RasterizerState, RegistryError> {
+    Ok(RasterizerState {
+        fill: decode_fill_mode(reader)?,
+        cull: decode_cull_mode(reader)?,
+        front_face: decode_winding(reader)?,
+        depth_bias: reader.u32()? as i32,
+        slope_scaled_depth_bias: f32::from_bits(reader.u32()?),
+        depth_bias_clamp: f32::from_bits(reader.u32()?),
+        depth_clip: decode_bool(reader, "depth-clip flag")?,
+    })
+}
+
+fn decode_bool(reader: &mut BlobReader<'_>, field: &'static str) -> Result<bool, RegistryError> {
+    match reader.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RegistryError::InvalidState(field)),
+    }
+}
+
+fn decode_blend_factor(reader: &mut BlobReader<'_>) -> Result<BlendFactor, RegistryError> {
+    BlendFactor::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown blend factor code"))
+}
+
+fn decode_blend_operation(reader: &mut BlobReader<'_>) -> Result<BlendOperation, RegistryError> {
+    BlendOperation::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown blend operation code"))
+}
+
+fn decode_compare_function(reader: &mut BlobReader<'_>) -> Result<CompareFunction, RegistryError> {
+    CompareFunction::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown comparison function code"))
+}
+
+fn decode_stencil_operation(
+    reader: &mut BlobReader<'_>,
+) -> Result<StencilOperation, RegistryError> {
+    StencilOperation::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown stencil operation code"))
+}
+
+fn decode_fill_mode(reader: &mut BlobReader<'_>) -> Result<FillMode, RegistryError> {
+    FillMode::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown fill mode code"))
+}
+
+fn decode_cull_mode(reader: &mut BlobReader<'_>) -> Result<CullMode, RegistryError> {
+    CullMode::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown cull mode code"))
+}
+
+fn decode_winding(reader: &mut BlobReader<'_>) -> Result<FrontFaceWinding, RegistryError> {
+    FrontFaceWinding::from_code(reader.u16()?)
+        .map_err(|_| RegistryError::InvalidState("unknown front-face winding code"))
 }
 
 fn push_u16_string(out: &mut Vec<u8>, text: &str) {
@@ -2018,6 +2312,22 @@ fn require_entries(state: &PipelineState, stage: PipelineStage) -> Result<(), Re
             "depth attachment must be a depth format",
         ));
     }
+    if let Some(blend) = state.blend.as_ref() {
+        if blend.attachments.is_empty() || blend.attachments.len() > 8 {
+            return Err(RegistryError::InvalidState(
+                "blend state needs 1..=8 render-target entries",
+            ));
+        }
+        // D3D12 always carries eight entries and uses the first
+        // `NumRenderTargets`; a guest state may therefore carry more entries
+        // than the pipeline has colour attachments. Fewer is a real error: a
+        // target with no entry would silently lose its blend state.
+        if blend.independent_blend && blend.attachments.len() < state.color_formats.len() {
+            return Err(RegistryError::InvalidState(
+                "independent blend needs an entry for every colour attachment",
+            ));
+        }
+    }
     if state.fragment_entry.as_deref().is_none_or(str::is_empty) {
         return Err(RegistryError::InvalidState(
             "graphics/mesh pipelines need a fragment entry point",
@@ -2460,6 +2770,33 @@ fn set_attachment_formats(
                 attachment,
                 objc::sel(c"setPixelFormat:"),
                 pixel_format.mtl_pixel_format(),
+            );
+            // Blending is pipeline state in Metal. The shared
+            // (`IndependentBlendEnable = FALSE`) form applies entry 0 to every
+            // target, exactly like D3D12. `apply_blend_attachment` is the one
+            // D3D12 -> MTLBlendFactor/Operation/mask mapping (macos::state).
+            if let Some(blend) = state.blend.as_ref() {
+                let entry = if blend.independent_blend {
+                    blend.attachments.get(index)
+                } else {
+                    blend.attachments.first()
+                };
+                if let Some(entry) = entry {
+                    crate::macos::state::apply_blend_attachment(attachment, entry)?;
+                }
+            }
+        }
+    }
+    if state
+        .blend
+        .as_ref()
+        .is_some_and(|blend| blend.alpha_to_coverage)
+    {
+        unsafe {
+            objc::msg_send_void_u8(
+                descriptor,
+                objc::sel(c"setAlphaToCoverageEnabled:"),
+                1,
             );
         }
     }
@@ -3133,6 +3470,54 @@ mod tests {
         assert_ne!(split_a, split_b);
     }
 
+    fn test_blend(enable: bool, src: BlendFactor, dst: BlendFactor) -> BlendState {
+        BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: vec![BlendAttachment {
+                enable,
+                src_color: src,
+                dst_color: dst,
+                color_op: BlendOperation::Add,
+                src_alpha: BlendFactor::One,
+                dst_alpha: BlendFactor::Zero,
+                alpha_op: BlendOperation::Add,
+                write_mask: 0x0f,
+            }],
+        }
+    }
+
+    fn test_depth_stencil() -> DepthStencilState {
+        let face = StencilFaceState {
+            fail: StencilOperation::Keep,
+            depth_fail: StencilOperation::IncrSat,
+            pass: StencilOperation::Replace,
+            func: CompareFunction::LessEqual,
+            read_mask: 0x7f,
+            write_mask: 0x0f,
+        };
+        DepthStencilState {
+            depth_enable: true,
+            depth_write: true,
+            depth_func: CompareFunction::Less,
+            stencil_enable: true,
+            front: face,
+            back: face,
+        }
+    }
+
+    fn test_rasterizer() -> RasterizerState {
+        RasterizerState {
+            fill: FillMode::Wireframe,
+            cull: CullMode::Front,
+            front_face: FrontFaceWinding::CounterClockwise,
+            depth_bias: -8,
+            slope_scaled_depth_bias: 2.5,
+            depth_bias_clamp: 0.25,
+            depth_clip: false,
+        }
+    }
+
     #[test]
     fn pipeline_state_round_trips_and_rejects_malformed_blobs() {
         let state = PipelineState {
@@ -3144,6 +3529,9 @@ mod tests {
             object_threadgroup: [8, 1, 1],
             payload_memory_length: 128,
             max_total_threadgroups_per_mesh_grid: 4,
+            blend: Some(test_blend(true, BlendFactor::SrcAlpha, BlendFactor::InvSrcAlpha)),
+            depth_stencil: Some(test_depth_stencil()),
+            rasterizer: Some(test_rasterizer()),
         };
         let encoded = state.encode(PipelineStage::Mesh);
         assert_eq!(PipelineState::decode(&encoded).unwrap(), state);
@@ -3155,7 +3543,7 @@ mod tests {
             PipelineState::decode_for(&encoded, PipelineStage::Graphics),
             Err(RegistryError::InvalidState(_))
         ));
-        assert_eq!(encoded[..4], *b"VPS1");
+        assert_eq!(encoded[..4], *b"VPS2");
 
         let mut truncated = encoded.clone();
         truncated.pop();
@@ -3163,6 +3551,16 @@ mod tests {
             PipelineState::decode(&truncated),
             Err(RegistryError::InvalidState(_))
         ));
+        // Every prefix of a VPS2 blob is a typed error, never a panic.
+        for cut in 0..encoded.len() {
+            assert!(
+                matches!(
+                    PipelineState::decode(&encoded[..cut]),
+                    Err(RegistryError::InvalidState(_))
+                ),
+                "a {cut}-byte VPS2 prefix must be rejected"
+            );
+        }
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -3185,11 +3583,24 @@ mod tests {
             Err(RegistryError::InvalidState(_))
         ));
 
+        // A VPS1 blob is still accepted and means the scaffold's default state.
+        let v1 = PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            depth_format: Some(TextureFormat::Depth32Float),
+            fragment_entry: Some("fs_main".to_string()),
+            ..PipelineState::default()
+        }
+        .encode(PipelineStage::Graphics);
+        assert_eq!(v1[..4], *b"VPS1");
+        let decoded_v1 = PipelineState::decode(&v1).expect("VPS1 stays decodable");
+        assert!(decoded_v1.blend.is_none());
+        assert!(decoded_v1.depth_stencil.is_none());
+        assert!(decoded_v1.rasterizer.is_none());
+
         let empty = PipelineState::default();
-        assert_eq!(
-            PipelineState::decode(&empty.encode(PipelineStage::Compute)).unwrap(),
-            empty
-        );
+        let empty_bytes = empty.encode(PipelineStage::Compute);
+        assert_eq!(empty_bytes[..4], *b"VPS1");
+        assert_eq!(PipelineState::decode(&empty_bytes).unwrap(), empty);
     }
 
     #[test]
@@ -3323,5 +3734,144 @@ mod tests {
             .destroy(7)
             .expect("registered texture must destroy");
         assert!(registry.get(7).is_none());
+    }
+
+    /// Compiles a tiny vertex/fragment metallib, or `None` without Apple's
+    /// offline Metal toolchain (the test then skips instead of pretending).
+    fn compile_graphics_library() -> Option<Vec<u8>> {
+        use std::process::Command;
+        let tool = |name: &str| -> Option<std::path::PathBuf> {
+            let output = Command::new("xcrun").args(["-f", name]).output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8(output.stdout).ok()?;
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then(|| std::path::PathBuf::from(text))
+        };
+        let metal = tool("metal")?;
+        let metallib = tool("metallib")?;
+        let dir = std::env::temp_dir().join(format!(
+            "victory-registry-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let source = dir.join("state.metal");
+        let air = dir.join("state.air");
+        let library = dir.join("state.metallib");
+        std::fs::write(
+            &source,
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 vs_main(uint vid [[vertex_id]]) { return float4(0.0, 0.0, 0.0, 1.0); }
+fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
+"#,
+        )
+        .ok()?;
+        let compiled = Command::new(metal)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&air)
+            .output()
+            .ok()?;
+        if !compiled.status.success() {
+            eprintln!(
+                "SKIP: metal -c failed: {}",
+                String::from_utf8_lossy(&compiled.stderr).trim()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        let linked = Command::new(metallib)
+            .arg(&air)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .ok()?;
+        if !linked.status.success() {
+            eprintln!(
+                "SKIP: metallib failed: {}",
+                String::from_utf8_lossy(&linked.stderr).trim()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        let bytes = std::fs::read(&library).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    /// ADR-029: the content key covers the render state, so two blend states
+    /// create two pipelines and the identical registration is reused.
+    #[test]
+    fn pipeline_registry_creates_on_blend_change_and_reuses_identical_state() {
+        let Some(library) = compile_graphics_library() else {
+            eprintln!("SKIP: Apple Metal toolchain not installed");
+            return;
+        };
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let mut registry = PipelineRegistry::new(&transport).expect("registry");
+        let colors = vec![TextureFormat::Rgba8Unorm];
+        let make_state = |blend: BlendState| {
+            PipelineState {
+                color_formats: colors.clone(),
+                fragment_entry: Some("fs_main".to_string()),
+                blend: Some(blend),
+                ..PipelineState::default()
+            }
+            .encode(PipelineStage::Graphics)
+        };
+        let additive = BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: vec![BlendAttachment {
+                enable: true,
+                src_color: BlendFactor::SrcAlpha,
+                dst_color: BlendFactor::InvSrcAlpha,
+                color_op: BlendOperation::Add,
+                src_alpha: BlendFactor::One,
+                dst_alpha: BlendFactor::Zero,
+                alpha_op: BlendOperation::Add,
+                write_mask: 0x0f,
+            }],
+        };
+        let disabled = BlendState {
+            independent_blend: false,
+            alpha_to_coverage: false,
+            attachments: vec![BlendAttachment {
+                enable: false,
+                src_color: BlendFactor::One,
+                dst_color: BlendFactor::Zero,
+                color_op: BlendOperation::Add,
+                src_alpha: BlendFactor::One,
+                dst_alpha: BlendFactor::Zero,
+                alpha_op: BlendOperation::Add,
+                write_mask: 0x0f,
+            }],
+        };
+        let state_a = make_state(additive);
+        let key_a = PipelineKey::from_parts(&library, "vs_main", PipelineStage::Graphics, &state_a);
+        let first = registry
+            .register_graphics(key_a.clone(), &library, "vs_main", &state_a)
+            .expect("the blended pipeline registers");
+        let reused = registry
+            .register_graphics(key_a.clone(), &library, "vs_main", &state_a)
+            .expect("the identical registration reuses the pipeline");
+        assert_eq!(first, reused, "identical state shares one pipeline id");
+        assert_eq!(registry.created_count(), 1);
+        assert_eq!(registry.reuse_count(), 1);
+
+        let state_b = make_state(disabled);
+        let key_b = PipelineKey::from_parts(&library, "vs_main", PipelineStage::Graphics, &state_b);
+        assert_ne!(key_a.digest(), key_b.digest());
+        let second = registry
+            .register_graphics(key_b, &library, "vs_main", &state_b)
+            .expect("the disabled pipeline registers");
+        assert_ne!(first, second, "a different blend state is a different PSO id");
+        assert_eq!(registry.created_count(), 2);
+        assert_eq!(registry.reuse_count(), 1);
     }
 }

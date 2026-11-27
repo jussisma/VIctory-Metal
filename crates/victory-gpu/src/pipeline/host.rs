@@ -266,6 +266,120 @@ impl GraphicsState {
         )
     }
 
+    /// The pipeline's guest render state as the `VPS2` blob the host decodes.
+    ///
+    /// Blend, depth/stencil and rasterizer are converted with the one D3D12 ->
+    /// wire mapping in [`crate::native_metal::state`]; the encoding order is
+    /// fixed in [`crate::native_metal::pso`], so the content key changes
+    /// whenever any of them changes. `mesh` selects the mesh state shape (the
+    /// object entry and mesh budgets); `fragment_entry` must be the pixel
+    /// stage's entry.
+    pub(crate) fn pipeline_state(
+        &self,
+        fragment_entry: &str,
+        object_entry: Option<&str>,
+        mesh: bool,
+    ) -> Result<Vec<u8>, crate::native_metal::state::GuestStateError> {
+        use crate::native_metal::{pso, state as native_state};
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let mut colors = Vec::with_capacity(count.max(1));
+        for index in 0..count {
+            colors.push(
+                pso::color_format_code(self.targets.RTFormats[index].0 as u32)
+                    .unwrap_or(pso::DEFAULT_COLOR_FORMAT),
+            );
+        }
+        if colors.is_empty() {
+            colors.push(pso::DEFAULT_COLOR_FORMAT);
+        }
+        let depth = pso::depth_format_code(self.depth_format.0 as u32);
+        let blend = native_state::blend_state(&self.blend_desc())?;
+        let depth_stencil = native_state::depth_stencil_state(&self.depth_desc())?;
+        let rasterizer = native_state::rasterizer_state(&self.raster_desc())?;
+        Ok(if mesh {
+            pso::encode_mesh_state_for_with_render(
+                &colors,
+                fragment_entry,
+                object_entry,
+                pso::DEFAULT_MESH_THREADGROUP,
+                if object_entry.is_some() {
+                    pso::DEFAULT_OBJECT_THREADGROUP
+                } else {
+                    [1, 1, 1]
+                },
+                if object_entry.is_some() {
+                    pso::DEFAULT_PAYLOAD_MEMORY_LENGTH
+                } else {
+                    0
+                },
+                depth,
+                Some(&blend),
+                Some(&depth_stencil),
+                Some(&rasterizer),
+            )
+        } else {
+            pso::encode_graphics_state_with_render(
+                &colors,
+                fragment_entry,
+                depth,
+                Some(&blend),
+                Some(&depth_stencil),
+                Some(&rasterizer),
+            )
+        })
+    }
+
+    fn blend_desc(&self) -> crate::native_metal::state::BlendDesc {
+        use crate::native_metal::state::{BlendDesc, RenderTargetBlend};
+        BlendDesc {
+            alpha_to_coverage: self.blend.AlphaToCoverageEnable.as_bool(),
+            independent_blend: self.blend.IndependentBlendEnable.as_bool(),
+            render_target: self.blend.RenderTarget.map(|target| RenderTargetBlend {
+                blend_enable: target.BlendEnable.as_bool(),
+                src_blend: target.SrcBlend.0 as u32,
+                dest_blend: target.DestBlend.0 as u32,
+                blend_op: target.BlendOp.0 as u32,
+                src_blend_alpha: target.SrcBlendAlpha.0 as u32,
+                dest_blend_alpha: target.DestBlendAlpha.0 as u32,
+                blend_op_alpha: target.BlendOpAlpha.0 as u32,
+                write_mask: target.RenderTargetWriteMask,
+            }),
+        }
+    }
+
+    fn depth_desc(&self) -> crate::native_metal::state::DepthStencilDesc {
+        use crate::native_metal::state::{DepthStencilDesc, StencilOpDesc};
+        let face = |desc: &D3D12_DEPTH_STENCILOP_DESC| StencilOpDesc {
+            fail_op: desc.StencilFailOp.0 as u32,
+            depth_fail_op: desc.StencilDepthFailOp.0 as u32,
+            pass_op: desc.StencilPassOp.0 as u32,
+            func: desc.StencilFunc.0 as u32,
+        };
+        DepthStencilDesc {
+            depth_enable: self.depth.DepthEnable.as_bool(),
+            depth_write: self.depth.DepthWriteMask.0 == D3D12_DEPTH_WRITE_MASK_ALL.0,
+            depth_func: self.depth.DepthFunc.0 as u32,
+            stencil_enable: self.depth.StencilEnable.as_bool(),
+            stencil_read_mask: self.depth.StencilReadMask,
+            stencil_write_mask: self.depth.StencilWriteMask,
+            front_face: face(&self.depth.FrontFace),
+            back_face: face(&self.depth.BackFace),
+        }
+    }
+
+    fn raster_desc(&self) -> crate::native_metal::state::RasterizerDesc {
+        use crate::native_metal::state::RasterizerDesc;
+        RasterizerDesc {
+            fill_mode: self.rasterizer.FillMode.0 as u32,
+            cull_mode: self.rasterizer.CullMode.0 as u32,
+            front_counter_clockwise: self.rasterizer.FrontCounterClockwise.as_bool(),
+            depth_bias: self.rasterizer.DepthBias,
+            depth_bias_clamp: self.rasterizer.DepthBiasClamp,
+            slope_scaled_depth_bias: self.rasterizer.SlopeScaledDepthBias,
+            depth_clip_enable: self.rasterizer.DepthClipEnable.as_bool(),
+        }
+    }
+
     fn depth_with_bounds(&self, host: &crate::host::Host) -> Option<D3D12_DEPTH_STENCIL_DESC1> {
         if !self.depth_bounds {
             return None;

@@ -487,6 +487,46 @@ kernel void vm_archive_scale(device uint *data [[buffer(0)]],
         held: bool,
     }
 
+    /// Whether an ancestor process already holds the harness lock.
+    ///
+    /// The documented validation command runs the whole test binary under
+    /// `sh -c 'while ! mkdir /tmp/victory-gpu.lock ...; cargo test ...'`. The
+    /// test must not wait 300 s for a lock its own invoking harness holds, so
+    /// it walks its process ancestry and treats that lock as already held.
+    /// A lock held by another session is not an ancestor, so the test still
+    /// serialises against it.
+    fn harness_holds_lock(path: &Path) -> bool {
+        let marker = path.to_string_lossy();
+        let mut pid = std::process::id();
+        for _ in 0..16 {
+            let Ok(output) = Command::new("ps")
+                .args(["-o", "ppid=,command=", "-p", &pid.to_string()])
+                .output()
+            else {
+                return false;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            let line = text.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let mut fields = line.splitn(2, char::is_whitespace);
+            let Some(ppid) = fields.next().and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                return false;
+            };
+            let command = fields.next().unwrap_or_default();
+            if command.contains(marker.as_ref()) {
+                return true;
+            }
+            if ppid <= 1 {
+                return false;
+            }
+            pid = ppid;
+        }
+        false
+    }
+
     impl GpuLock {
         fn acquire() -> Self {
             let path = PathBuf::from("/tmp/victory-gpu.lock");
@@ -497,6 +537,12 @@ kernel void vm_archive_scale(device uint *data [[buffer(0)]],
                         return Self { path, held: true };
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // A validation harness that holds the lock already
+                        // serialises this whole test binary; do not deadlock
+                        // against it for 300 s. The harness removes its lock.
+                        if harness_holds_lock(&path) {
+                            return Self { path, held: false };
+                        }
                         assert!(
                             Instant::now() < deadline,
                             "timed out waiting for /tmp/victory-gpu.lock"
