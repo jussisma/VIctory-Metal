@@ -1422,3 +1422,104 @@ gate; the harness now reports the mode in every summary.
   claimed; the probe is the instrument that will say so when it changes.
 - **The headless gate is the title's**, not ours; the harness must run windowed
   to cross it, which is recorded rather than worked around.
+
+## Cycle 11 — the three named gaps closed in code, host translation reached, and the next three named
+
+Base `1dcafcd5` (cycle-10). This cycle implemented the three architectural gaps
+Cycle 10 named precisely, measured each one at runtime, and removed two of them
+from the boot log. The first real pipeline translation still does not complete:
+the wire that carries it desynchronizes its reply. No proprietary binary, asset,
+key, shader or path appears here — counts, codes, categories and timings only.
+Every number comes from a run in this workspace on the Apple M4 Max.
+
+### 11.1 What changed
+
+- **ADR-038 — host-owned Rosetta DXIL translator pool.** `victory_metal_host`
+  owns one bounded `CompilerPool` (`victory-irconverter --stdio`, VMRES2
+  reflection) and the persistent content-hashed disk cache. The guest writes
+  each stage's DXIL to `VICTORY_METAL_SHARE_DIR/stages/<blake3>.bin` (idempotent,
+  up to the 16 MiB stage cap, never through the 64 KiB transport frame) and sends
+  a new `VP3\0` kind 4 frame naming the stage files, entries, pipeline state and
+  an optional root-signature file. The host validates the whole frame before any
+  GPU work, translates uncached stages concurrently, derives the per-stage
+  `PipelineAbi` from the reflection JSON, registers through the existing per-stage
+  registry and replies `(pipeline_id, status, bounded <= 256 B reason)`. Host
+  telemetry gained `pool_status`/`pool_*`, `host_translated_stage_*`,
+  `host_pipeline_translations_ok/refused` and `host_translation_reason`. The
+  launcher exports the converter worker and library paths to the host.
+- **ADR-039 — universal host-visible XMem backing.** Every XMem section now takes
+  the share path in the diagnostics build too (the launcher's guest is a
+  diagnostics build), a size that is not a whole 64 KiB page is rounded up
+  instead of silently downgrading to the pagefile, the directory is resolved once
+  per process, and `share::live()` counts backings. `Section::size` stays the
+  allocation's real size while `map_size` is the padded mapping, so padding never
+  resolves.
+- **ADR-040 — placed views as first-class table entries.** `View::Placed` now
+  decodes the resource dimension, the view's memory address and the buffer
+  union: a placed buffer resolves to `(address, len)` bounded by its footprint, a
+  placed texture resolves to a registered host handle (auto-registering on first
+  use), CBVs resolve from the footprint, and every remaining case is a named
+  refusal. The blanket `a placed view is not a buffer descriptor` is gone.
+- **Boot environment isolation.** The host-only converter variables were reaching
+  the Wine guest, which then tried to run the macOS x86_64 worker; the launcher
+  now unsets them for the guest and the Windows guest ignores a macOS worker path,
+  so a converter-less guest reports `ConverterUnavailable` and takes the host path.
+- **A stale mesh-ABI assertion** (pre-ea88d4cd 8-byte table entries) was corrected
+  to the current 24-byte converter entry; it failed at cycle-10's head as well.
+
+### 11.2 Boot progression (counts only)
+
+| | Boot #10 | Boot #11 | Boot #12b (reverted) | Boot #13 |
+|---|---|---|---|---|
+| head | `1dcafcd5` | 11A | 11A + env + at-address | 11A + env |
+| D3DMetal attempts / fallback | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| submissions ok/refused | 67 / 0 | 68 / 0 | 55 / 0 | 66 / 0 |
+| frames presented | 65 | 67 | 1 | 65 |
+| placed buffer / texture resolved | 0 / 0 | **64 / 0** | 64 / 0 | **64 / 0** |
+| placed-view refusals | 67 | 0 | 0 | **0** |
+| "no host-visible backing" | 201 | 0 | 0 | **0** |
+| heaps bound | 0 | 406 | 394 | 394 |
+| PSO attempts / created / refused | 3 / 0 / 3 | 3 / 0 / 3 | 3 / 0 / 3 | 3 / 0 / 3 |
+| refusal class | `graphics/converter-unavailable` | `graphics/translation` (guest leak) | `graphics/host-translation` | `graphics/host-translation` (1-byte reply) |
+| host-translated stages | 0 | 0 | 0 | 0 |
+| `non_black_pixels` / `unique_luma_buckets` | 0 / 1 | 0 / 1 | 0 / 1 | 0 / 1 |
+| furthest event | first pipelines | placed views + sections resolve | host aborts on a texture descriptor | VP3 reaches the host, reply lost |
+
+`frame_crc` is unchanged (`11712555351105894739`) across every sampled frame in
+#10, #11 and #13: the presented surface is the fallback clear.
+
+### 11.3 Counts at the integration head
+
+- `victory-metal` lib **319 passed / 0 failed / 7 ignored**, all integration
+  test binaries green (mesh live ABI 3/3); `victory-gpu` **336 / 0 / 1**;
+  `victory-shader` **254 / 0 / 2**; `victory-hle` **81 / 0 / 0**.
+- Win64 `diag` build exit 0; `victory-metal`, `victory-hle` and `victory-gpu`
+  (diagnostics) Windows all-targets exit 0; x86_64 `victory-irconverter` exit 0.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.811 / p95 0.898 / p99 0.964 ms,
+  1,221 FPS, checksum unchanged, 283 submits / 1 refused, 140 presents / 0.
+- `git diff --check` clean; no surviving process after any boot; 136 GB free.
+
+### 11.4 Remaining gaps (honest)
+
+- **The VP3 reply is lost, not the translation.** The host answers the pipeline
+  frame with a one-byte rejection, which its decoder only emits when the payload
+  does not start with `VP3\0`, while the guest demonstrably built that payload.
+  The client socket is now shared (`Arc<Mutex<TcpStream>>`) between the pipeline
+  worker and the render thread; request and reply are not serialized as one
+  transaction, so a reply can be consumed out of order. Serializing the
+  write+read pair (or giving the pipeline channel its own connection) is the
+  single highest-leverage Cycle 12 change, and the host's bounded rejection
+  reason must reach the log either way.
+- **A 33x33 fp16 3D target crashes the host.** Registering that volume at
+  creation (usage 3, unordered) makes the host build a
+  `MTLTextureType2DMultisampleArray` with depth 33 and assert in
+  `MTLTextureDescriptor`. The change that exposed it is reverted; the host's
+  dimension/depth mapping for D3 and the multisample decision need fixing before
+  at-address textures can be enabled.
+- **XMem virtual allocations are still not share-backed.** Every guest-memory
+  path was inventoried and the `XMemVirtualAlloc` region path was implemented,
+  but the merged change left a reserved page uncommitted and the title faulted at
+  frame 2 (`read ...: reserved, never committed`). It is reverted; 211
+  registration failures per run still come from buffers in that memory.
+- **No draw, no dispatch, no non-black pixel.** Frames are presented and blank;
+  no loading screen, title screen or 3D frame is claimed.
