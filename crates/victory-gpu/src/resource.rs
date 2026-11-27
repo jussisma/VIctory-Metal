@@ -2126,6 +2126,12 @@ fn texture_registration_codes(
         // back-buffer. Host code 9 decodes to `TextureFormat::Rgba16Float`
         // (`MTLPixelFormatRGBA16Float`, 115).
         10 => 9,
+        // DXGI_FORMAT_R32_UINT and R32_SINT: integer storage/colour targets.
+        // Host codes 10 and 11 decode to `TextureFormat::R32Uint`
+        // (`MTLPixelFormatR32Uint`, 53) and `TextureFormat::R32Sint`
+        // (`MTLPixelFormatR32Sint`, 54).
+        42 => 10,
+        43 => 11,
         _ => return Err("texture registration: format has no host code"),
     };
     Ok((dimension, format, usage))
@@ -2922,6 +2928,36 @@ mod tests {
             ..texture(2560, 1440, 10, 1)
         };
         assert_eq!(native_texture_registration(&desc), Some(Ok((1, 9, 1))));
+    }
+
+    /// Boot #2b's compute-storage target (`DXGI_FORMAT` 42, R32_UINT, a UAV
+    /// target with flags 0x4) maps to kind 8 host code 10; its signed sibling
+    /// 43 (R32_SINT) maps to 11. The existing flags -> usage computation still
+    /// names a 0x4 target a colour attachment (usage 1); the host widens that
+    /// to the storage/colour set for these two formats.
+    #[test]
+    fn an_r32_uint_storage_target_registers_with_host_code_10() {
+        let desc = ResourceDesc {
+            flags: 0x4,
+            ..texture(1280, 720, 42, 1)
+        };
+        assert_eq!(native_texture_registration(&desc), Some(Ok((1, 10, 1))));
+        let signed = ResourceDesc { format: 43, ..desc };
+        assert_eq!(native_texture_registration(&signed), Some(Ok((1, 11, 1))));
+    }
+
+    /// The first-bind path (`texture_table_registration`'s codes) names the
+    /// same formats for a UAV: storage usage 3 with code 10/11. No GPU is
+    /// needed to prove the binding descriptor.
+    #[test]
+    fn an_r32_uint_storage_texture_binds_with_the_same_codes() {
+        let desc = ResourceDesc {
+            flags: 0x4,
+            ..texture(1280, 720, 42, 1)
+        };
+        assert_eq!(texture_registration_codes(&desc, 3), Ok((1, 10, 3)));
+        let signed = ResourceDesc { format: 43, ..desc };
+        assert_eq!(texture_registration_codes(&signed, 3), Ok((1, 11, 3)));
     }
 
     /// A format outside the kind 8 table still refuses explicitly, so no
