@@ -575,7 +575,22 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return match create() {
+            Ok(pso) => {
+                crate::native_metal::pso::note_created(
+                    crate::native_metal::pso::AttemptKind::Library,
+                );
+                Ok(pso)
+            }
+            Err(error) => {
+                crate::native_metal::pso::note_refused(
+                    crate::native_metal::pso::AttemptKind::Library,
+                    crate::native_metal::pso::RefusalClass::LibraryCreate,
+                    &error.to_string(),
+                );
+                Err(error)
+            }
+        };
     };
     library.pipeline(name, load, create)
 }
@@ -611,11 +626,13 @@ impl Shared {
             && let Ok(pso) = load(fresh, PCWSTR(wide.as_ptr()))
         {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            crate::native_metal::pso::note_reused(crate::native_metal::pso::AttemptKind::Library);
             return Ok(pso);
         }
         if let Ok(pso) = load(&self.loads, PCWSTR(wide.as_ptr())) {
             LOADED.fetch_add(1, Ordering::Relaxed);
             self.loaded.fetch_add(1, Ordering::Relaxed);
+            crate::native_metal::pso::note_reused(crate::native_metal::pso::AttemptKind::Library);
             // A new library gets it at the next save (one started meanwhile
             // misses it, and the next run makes it).
             if self.fresh.get().is_some() {
@@ -627,7 +644,22 @@ impl Shared {
         // Compiled outside the lock: compiles take up to seconds.
         #[cfg(feature = "diagnostics")]
         LAST.set(Some((name.to_owned(), false)));
-        let pso = create()?;
+        let pso = match create() {
+            Ok(pso) => {
+                crate::native_metal::pso::note_created(
+                    crate::native_metal::pso::AttemptKind::Library,
+                );
+                pso
+            }
+            Err(error) => {
+                crate::native_metal::pso::note_refused(
+                    crate::native_metal::pso::AttemptKind::Library,
+                    crate::native_metal::pso::RefusalClass::LibraryCreate,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
         MADE.fetch_add(1, Ordering::Relaxed);
         let mut l = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a live pipeline; a name already stored (a description that

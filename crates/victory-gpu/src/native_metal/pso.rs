@@ -52,8 +52,9 @@
 //! for a *native* pipeline: that path keeps feeding the existing draw path it
 //! always fed.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use victory_metal::compiler_pool::{
     CompileJob, CompiledShader, CompilerPool, PoolError, PoolStats,
@@ -201,6 +202,420 @@ impl std::fmt::Display for PipelineError {
 }
 
 impl std::error::Error for PipelineError {}
+
+/// Most bytes of one refusal reason retained in telemetry and logged.
+///
+/// The reason is flattened to one line and truncated on a character boundary,
+/// so a translator or host diagnostic can never flood a boot log.
+pub const MAX_REFUSAL_REASON_BYTES: usize = 200;
+
+/// The pipeline family one creation attempt is counted under.
+///
+/// `Library` is the host pipeline library's own load/create of a PSO (the
+/// D3D12 backing path), kept beside the native registrations so a boot states
+/// whether anything in the pipeline path ran at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttemptKind {
+    /// Vertex+pixel (and any other non-mesh graphics set).
+    Graphics,
+    /// One compute stage.
+    Compute,
+    /// Mesh+pixel, optionally with an object/amplification stage.
+    MeshObject,
+    /// A host pipeline library load or create.
+    Library,
+}
+
+impl AttemptKind {
+    /// The stable name the census buckets and the snapshot line use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Graphics => "graphics",
+            Self::Compute => "compute",
+            Self::MeshObject => "mesh",
+            Self::Library => "library",
+        }
+    }
+}
+
+/// The outcome of one pipeline attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// The host made a new pipeline.
+    Created,
+    /// An identical registration (same stages, metallib and entry) was already
+    /// hosted; the same id is reused and the host is not asked again.
+    Reused,
+    /// The attempt was refused with an explicit reason; the list refuses the
+    /// bind instead of naming a pointer the host cannot resolve.
+    Refused,
+    /// The converter this process needs is not available, so no translation
+    /// could be attempted. Kept apart from [`Self::Refused`]: the failure is
+    /// environmental, not a shader the host rejected.
+    TranslatorUnavailable,
+}
+
+/// The static part of a refusal's bucket name (the kind is the other part).
+///
+/// A bucket is `(kind, class)`, both static strings: two distinct failure
+/// classes never share a bucket, and no title text, path or identifier ever
+/// becomes a key. The dynamic text is kept only as the first bounded reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RefusalClass {
+    /// The container could not be parsed.
+    Container,
+    /// The stage has no DXIL part (a console-only container).
+    NoDxil,
+    /// No converter worker and nothing in the disk cache.
+    ConverterUnavailable,
+    /// The pool failed to translate.
+    Translation,
+    /// No share directory for the metallib the host reads.
+    NoShareDir,
+    /// Writing (or renaming) the metallib failed.
+    Write,
+    /// The host rejected the registration.
+    HostRefused,
+    /// The transport to the host failed.
+    Transport,
+    /// The stage set cannot form one native pipeline.
+    HostCannotRegister,
+    /// The converter reflection is missing or malformed.
+    Reflection,
+    /// The guest render state is not representable as a pipeline state.
+    RenderState,
+    /// The title pipeline carries a stage the native host cannot register.
+    UnsupportedStage,
+    /// The host pipeline library refused to create the PSO.
+    LibraryCreate,
+}
+
+impl RefusalClass {
+    /// The stable name the census buckets use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::NoDxil => "no-dxil",
+            Self::ConverterUnavailable => "converter-unavailable",
+            Self::Translation => "translation",
+            Self::NoShareDir => "no-share-dir",
+            Self::Write => "write",
+            Self::HostRefused => "host-refused",
+            Self::Transport => "transport",
+            Self::HostCannotRegister => "host-cannot-register",
+            Self::Reflection => "reflection",
+            Self::RenderState => "render-state",
+            Self::UnsupportedStage => "unsupported-stage",
+            Self::LibraryCreate => "library-create",
+        }
+    }
+
+    /// The class a [`PipelineError`] belongs to.
+    pub fn of(error: &PipelineError) -> Self {
+        match error {
+            PipelineError::NoDxil(_) => Self::NoDxil,
+            PipelineError::Container(_) => Self::Container,
+            PipelineError::ConverterUnavailable(_) => Self::ConverterUnavailable,
+            PipelineError::Translation(_) => Self::Translation,
+            PipelineError::NoShareDir => Self::NoShareDir,
+            PipelineError::Write(_) => Self::Write,
+            PipelineError::Refused(_) => Self::HostRefused,
+            PipelineError::Transport(_) => Self::Transport,
+            PipelineError::HostCannotRegister { .. } => Self::HostCannotRegister,
+            PipelineError::Reflection(_) => Self::Reflection,
+        }
+    }
+}
+
+/// Attempts, creations and refusals of one pipeline kind (session totals).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindCounts {
+    /// Every attempt counted under the kind.
+    pub attempts: u64,
+    /// Attempts the host made a new pipeline for.
+    pub created: u64,
+    /// Identical registrations answered with the id already hosted.
+    pub reused: u64,
+    /// Attempts refused with an explicit reason.
+    pub refused: u64,
+    /// Attempts that could not reach a translator.
+    pub translator_unavailable: u64,
+}
+
+/// The first refusal of the session, bounded and flattened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstRefusal {
+    /// The kind of the first refused attempt.
+    pub kind: AttemptKind,
+    /// Its static failure class.
+    pub class: RefusalClass,
+    /// Its bounded, single-line reason (at most
+    /// [`MAX_REFUSAL_REASON_BYTES`] bytes, no paths).
+    pub reason: String,
+}
+
+impl FirstRefusal {
+    /// `kind/class`, the stable name of the first refusal.
+    pub fn name(&self) -> String {
+        format!("{}/{}", self.kind.name(), self.class.name())
+    }
+}
+
+/// One point-in-time view of the pipeline-attempt census.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineCensusSnapshot {
+    /// Every pipeline attempt counted since the process started.
+    pub attempts: u64,
+    /// Attempts that made a new host pipeline.
+    pub created: u64,
+    /// Attempts answered by an already-hosted identical pipeline.
+    pub reused: u64,
+    /// Attempts refused with an explicit reason.
+    pub refused: u64,
+    /// Attempts that could not reach a translator.
+    pub translator_unavailable: u64,
+    /// The per-kind counts, in `AttemptKind` order.
+    pub by_kind: BTreeMap<AttemptKind, KindCounts>,
+    /// Refusals by `(kind name, class name)`, in name order.
+    pub refusals: BTreeMap<(&'static str, &'static str), u64>,
+    /// The first refusal of the session, if any.
+    pub first_refusal: Option<FirstRefusal>,
+}
+
+impl PipelineCensusSnapshot {
+    /// The census fields of the `native frame telemetry` snapshot line.
+    ///
+    /// The first three fields are the ones a boot census reads:
+    /// `pipeline_attempts`, `pipeline_created` and `pipeline_refused`. The
+    /// first refusal's name (and its bounded reason) follows, so a boot that
+    /// refused every pipeline names the exact failure instead of showing an
+    /// empty `registered=0 psos` line.
+    pub fn fields(&self) -> String {
+        let mut text = format!(
+            "pipeline_attempts={} pipeline_created={} pipeline_refused={} \
+             pipeline_reused={} pipeline_translator_unavailable={}",
+            self.attempts,
+            self.created,
+            self.refused,
+            self.reused,
+            self.translator_unavailable
+        );
+        text.push_str(" pipeline_by_kind=[");
+        for (index, (kind, counts)) in self.by_kind.iter().enumerate() {
+            if index > 0 {
+                text.push_str("; ");
+            }
+            // attempts/created/reused/refused/unavailable, always in that order.
+            text.push_str(&format!(
+                "{}:{}/{}/{}/{}/{}",
+                kind.name(),
+                counts.attempts,
+                counts.created,
+                counts.reused,
+                counts.refused,
+                counts.translator_unavailable
+            ));
+        }
+        text.push(']');
+        if let Some(first) = &self.first_refusal {
+            text.push_str(&format!(
+                " pipeline_first_refusal={} pipeline_first_refusal_reason=\"{}\"",
+                first.name(),
+                first.reason
+            ));
+        }
+        text
+    }
+}
+
+/// Whether a whitespace-separated token names a file system path.
+///
+/// Host and translator diagnostics sometimes carry a path (`failed to spawn
+/// shader worker /Users/...: ...`); the census must not retain it, so any
+/// token with a path separator is replaced wholesale.
+fn looks_like_path(word: &str) -> bool {
+    word.contains('/') || word.contains('\\')
+}
+
+/// Flattens `text` to one bounded line: controls become spaces, whitespace
+/// runs collapse, path tokens become `<path>`, and the result is truncated on
+/// a character boundary at [`MAX_REFUSAL_REASON_BYTES`].
+///
+/// Empty text becomes a stable placeholder, so a snapshot field never ends in
+/// `reason=""`.
+pub fn bounded_refusal_reason(text: &str) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else if character == '"' {
+                // The snapshot prints the reason inside double quotes; a quote
+                // in the text would end the field early.
+                '\''
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut bounded = String::with_capacity(flattened.len().min(MAX_REFUSAL_REASON_BYTES));
+    'words: for word in flattened.split_whitespace() {
+        let word = if looks_like_path(word) { "<path>" } else { word };
+        if !bounded.is_empty() {
+            if bounded.len() + 1 > MAX_REFUSAL_REASON_BYTES {
+                break;
+            }
+            bounded.push(' ');
+        }
+        for character in word.chars() {
+            if bounded.len() + character.len_utf8() > MAX_REFUSAL_REASON_BYTES {
+                break 'words;
+            }
+            bounded.push(character);
+        }
+    }
+    let bounded = bounded.trim_end();
+    if bounded.is_empty() {
+        "unknown refusal".to_string()
+    } else {
+        bounded.to_string()
+    }
+}
+
+/// The process-wide pipeline-attempt census.
+#[derive(Debug, Default)]
+struct Census {
+    kinds: BTreeMap<AttemptKind, KindCounts>,
+    refusals: BTreeMap<(&'static str, &'static str), u64>,
+    first: Option<FirstRefusal>,
+}
+
+static CENSUS: Mutex<Census> = Mutex::new(Census {
+    kinds: BTreeMap::new(),
+    refusals: BTreeMap::new(),
+    first: None,
+});
+
+impl Census {
+    /// Counts one attempt and, for a refusal, its static bucket and (once) its
+    /// bounded reason.
+    fn record(
+        &mut self,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        class: Option<RefusalClass>,
+        reason: Option<&str>,
+    ) {
+        let counts = self.kinds.entry(kind).or_default();
+        counts.attempts = counts.attempts.saturating_add(1);
+        match outcome {
+            AttemptOutcome::Created => counts.created = counts.created.saturating_add(1),
+            AttemptOutcome::Reused => counts.reused = counts.reused.saturating_add(1),
+            AttemptOutcome::Refused => counts.refused = counts.refused.saturating_add(1),
+            AttemptOutcome::TranslatorUnavailable => {
+                counts.translator_unavailable = counts.translator_unavailable.saturating_add(1)
+            }
+        }
+        if let Some(class) = class {
+            *self
+                .refusals
+                .entry((kind.name(), class.name()))
+                .or_insert(0) += 1;
+            if self.first.is_none() {
+                self.first = Some(FirstRefusal {
+                    kind,
+                    class,
+                    reason: bounded_refusal_reason(reason.unwrap_or_default()),
+                });
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PipelineCensusSnapshot {
+        let mut snapshot = PipelineCensusSnapshot {
+            by_kind: self.kinds.clone(),
+            refusals: self.refusals.clone(),
+            first_refusal: self.first.clone(),
+            ..PipelineCensusSnapshot::default()
+        };
+        for counts in snapshot.by_kind.values() {
+            snapshot.attempts = snapshot.attempts.saturating_add(counts.attempts);
+            snapshot.created = snapshot.created.saturating_add(counts.created);
+            snapshot.reused = snapshot.reused.saturating_add(counts.reused);
+            snapshot.refused = snapshot.refused.saturating_add(counts.refused);
+            snapshot.translator_unavailable = snapshot
+                .translator_unavailable
+                .saturating_add(counts.translator_unavailable);
+        }
+        snapshot
+    }
+}
+
+/// One native pipeline the host made a new object for.
+pub fn note_created(kind: AttemptKind) {
+    CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .record(kind, AttemptOutcome::Created, None, None);
+}
+
+/// One native pipeline answered by an already-hosted identical registration.
+pub fn note_reused(kind: AttemptKind) {
+    CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .record(kind, AttemptOutcome::Reused, None, None);
+}
+
+/// One pipeline attempt refused with an explicit, static failure class.
+pub fn note_refused(kind: AttemptKind, class: RefusalClass, reason: &str) {
+    CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .record(kind, AttemptOutcome::Refused, Some(class), Some(reason));
+}
+
+/// One pipeline attempt that could not reach a translator.
+pub fn note_translator_unavailable(kind: AttemptKind, class: RefusalClass, reason: &str) {
+    CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .record(
+            kind,
+            AttemptOutcome::TranslatorUnavailable,
+            Some(class),
+            Some(reason),
+        );
+}
+
+/// The process-wide pipeline-attempt census (session totals; never reset by a
+/// frame snapshot, so a pipeline made in an early frame stays counted).
+pub fn census() -> PipelineCensusSnapshot {
+    CENSUS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .snapshot()
+}
+
+/// Clears the census (tests only: the counts are session totals in a run).
+#[cfg(test)]
+pub(crate) fn reset_census() {
+    *CENSUS.lock().unwrap_or_else(|error| error.into_inner()) = Census::default();
+}
+
+/// The kind a title pipeline's stage names are counted under.
+pub fn attempt_kind_of_names(names: &[&str]) -> AttemptKind {
+    if names
+        .iter()
+        .any(|name| matches!(*name, "mesh" | "amplification"))
+    {
+        AttemptKind::MeshObject
+    } else if !names.is_empty() && names.iter().all(|name| *name == "compute") {
+        AttemptKind::Compute
+    } else {
+        AttemptKind::Graphics
+    }
+}
 
 /// One pipeline's encoded state, ABI and raw root-signature bytes.
 ///
@@ -991,6 +1406,151 @@ pub fn register_with_details(
     programs: &[StageProgram],
     details: &PipelineDetails<'_>,
 ) -> Result<(u64, PoolServing), PipelineError> {
+    let result = register_with_details_inner(programs, details);
+    record_outcome(
+        attempt_kind_of_programs(programs),
+        result.as_ref().ok().map(|(_, _, outcome)| *outcome),
+        result.as_ref().err(),
+    );
+    result.map(|(id, serving, _)| (id, serving))
+}
+
+/// Records one finished registration in the census: a creation, a reuse, or
+/// the explicit class and bounded reason of a refusal.
+#[cfg(any(windows, test))]
+fn record_outcome(
+    kind: AttemptKind,
+    outcome: Option<AttemptOutcome>,
+    error: Option<&PipelineError>,
+) {
+    let mut census = CENSUS.lock().unwrap_or_else(|failure| failure.into_inner());
+    match (outcome, error) {
+        (Some(outcome), _) => census.record(kind, outcome, None, None),
+        (None, Some(error)) => {
+            let class = RefusalClass::of(error);
+            let outcome = if class == RefusalClass::ConverterUnavailable {
+                AttemptOutcome::TranslatorUnavailable
+            } else {
+                AttemptOutcome::Refused
+            };
+            census.record(kind, outcome, Some(class), Some(&error.to_string()));
+        }
+        (None, None) => {}
+    }
+}
+
+/// The kind a translated stage set is counted under.
+#[cfg(any(windows, test))]
+fn attempt_kind_of_stages(stages: &[(PipelineStage, &[u8], &str)]) -> AttemptKind {
+    if stages
+        .iter()
+        .any(|(stage, _, _)| matches!(stage, PipelineStage::Mesh | PipelineStage::Object))
+    {
+        AttemptKind::MeshObject
+    } else if !stages.is_empty()
+        && stages
+            .iter()
+            .all(|(stage, _, _)| *stage == PipelineStage::Compute)
+    {
+        AttemptKind::Compute
+    } else {
+        AttemptKind::Graphics
+    }
+}
+
+/// The kind a program set is counted under.
+pub fn attempt_kind_of_programs(programs: &[StageProgram]) -> AttemptKind {
+    if programs
+        .iter()
+        .any(|program| matches!(program.stage, PipelineStage::Mesh | PipelineStage::Object))
+    {
+        AttemptKind::MeshObject
+    } else if !programs.is_empty()
+        && programs
+            .iter()
+            .all(|program| program.stage == PipelineStage::Compute)
+    {
+        AttemptKind::Compute
+    } else {
+        AttemptKind::Graphics
+    }
+}
+
+/// The host id one content key already named, if its registration succeeded.
+///
+/// A repeated registration with the same stages, metallib bytes, entries and
+/// state is idempotent: the host registry answers with the object it already
+/// has, so the attempt is counted as a reuse. The registration still goes to
+/// the host (this map is only the census's memory, never an answer the guest
+/// invents): after a reconnect the new host session must be told again.
+#[cfg(any(windows, test))]
+static REGISTERED: Mutex<Option<HashMap<[u8; 32], u64>>> = Mutex::new(None);
+
+/// Remembers `key` as hosted under `id`; the previous id for the same key, if
+/// any (a second registration of one content key is a reuse, not a creation).
+#[cfg(any(windows, test))]
+fn remember(key: [u8; 32], id: u64) -> Option<u64> {
+    REGISTERED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, id)
+}
+
+/// The outcome of one successful host registration: [`AttemptOutcome::Reused`]
+/// when this content key was registered before, [`AttemptOutcome::Created`]
+/// otherwise.
+#[cfg(any(windows, test))]
+fn remember_outcome(key: [u8; 32], id: u64) -> AttemptOutcome {
+    match remember(key, id) {
+        Some(_) => AttemptOutcome::Reused,
+        None => AttemptOutcome::Created,
+    }
+}
+
+/// The content key of one registration: every input the host hashes into a
+/// pipeline, so two registrations share it exactly when the host would.
+///
+/// `details` is `None` for the compute v1 frame, which carries only the
+/// metallib and the entry (`register_pipeline`), so a state blob the v1 path
+/// ignores must not make a different key.
+#[cfg(any(windows, test))]
+fn registration_key(
+    stages: &[PipelineStage],
+    libraries: &[(PipelineStage, &[u8], &str)],
+    details: Option<&PipelineDetails<'_>>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"victory-native-pipeline-registration-v1");
+    hasher.update(
+        &u8::try_from(stages.len())
+            .unwrap_or(u8::MAX)
+            .to_le_bytes(),
+    );
+    for stage in stages {
+        hasher.update(&stage.converter_stage().to_le_bytes());
+    }
+    for (stage, metallib, entry) in libraries {
+        hasher.update(&stage.converter_stage().to_le_bytes());
+        hasher.update(&(metallib.len() as u64).to_le_bytes());
+        hasher.update(metallib);
+        hasher.update(&(entry.len() as u64).to_le_bytes());
+        hasher.update(entry.as_bytes());
+    }
+    if let Some(details) = details {
+        for part in [details.state, details.abi, details.root_signature] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(any(windows, test))]
+fn register_with_details_inner(
+    programs: &[StageProgram],
+    details: &PipelineDetails<'_>,
+) -> Result<(u64, PoolServing, AttemptOutcome), PipelineError> {
     let mut warm = true;
     let mut translated: Vec<(PipelineStage, CompiledShader, &str)> =
         Vec::with_capacity(programs.len());
@@ -1054,8 +1614,8 @@ pub fn register_with_details(
         abi,
         root_signature,
     };
-    let id = register_translated(&stages, &translated_details)?;
-    Ok((id, PoolServing { warm }))
+    let (id, outcome) = register_translated_inner(&stages, &translated_details)?;
+    Ok((id, PoolServing { warm }, outcome))
 }
 
 /// The non-empty bytes the version 2 frame carries next to a `VAB1` ABI.
@@ -1100,6 +1660,22 @@ pub fn register_translated(
     stages: &[(PipelineStage, &[u8], &str)],
     details: &PipelineDetails<'_>,
 ) -> Result<u64, PipelineError> {
+    let result = register_translated_inner(stages, details);
+    record_outcome(
+        attempt_kind_of_stages(stages),
+        result.as_ref().ok().map(|(_, outcome)| *outcome),
+        result.as_ref().err(),
+    );
+    result.map(|(id, _)| id)
+}
+
+/// [`register_translated`] without the census: the outcome (created or reused)
+/// is returned to the one caller that records it.
+#[cfg(any(windows, test))]
+fn register_translated_inner(
+    stages: &[(PipelineStage, &[u8], &str)],
+    details: &PipelineDetails<'_>,
+) -> Result<(u64, AttemptOutcome), PipelineError> {
     let stage_names: Vec<PipelineStage> = stages.iter().map(|(stage, _, _)| *stage).collect();
     let kind = pipeline_kind(&stage_names)?;
     if !details.abi.is_empty() && details.root_signature.is_empty() {
@@ -1109,18 +1685,19 @@ pub fn register_translated(
                 .to_string(),
         ));
     }
-    if kind == PipelineKind::Compute && details.abi.is_empty() {
+    let v1_compute = kind == PipelineKind::Compute && details.abi.is_empty();
+    let key = registration_key(
+        &stage_names,
+        stages,
+        if v1_compute { None } else { Some(details) },
+    );
+    if v1_compute {
         // No reflection was available: keep the original v1 frame. The host
         // binds nothing for this pipeline, which is exactly the old behaviour.
         let (_, metallib, entry) = stages[0];
-        return crate::native_metal::queue::register_pipeline(metallib, entry).map_err(|error| {
-            match error {
-                crate::native_metal::queue::NativeQueueError::Refused(why) => {
-                    PipelineError::Refused(why)
-                }
-                other => PipelineError::Transport(other.to_string()),
-            }
-        });
+        let id = crate::native_metal::queue::register_pipeline(metallib, entry)
+            .map_err(map_queue_error)?;
+        return Ok((id, remember_outcome(key, id)));
     }
     for (stage, metallib, _) in stages {
         if metallib.is_empty() {
@@ -1162,19 +1739,24 @@ pub fn register_translated(
         };
         &state_storage
     };
-    crate::native_metal::queue::register_pipeline_v2(
+    let id = crate::native_metal::queue::register_pipeline_v2(
         kind_code,
         &wire,
         state,
         details.abi,
         details.root_signature,
     )
-    .map_err(|error| match error {
-        crate::native_metal::queue::NativeQueueError::Refused(why) => {
-            PipelineError::Refused(why)
-        }
+    .map_err(map_queue_error)?;
+    Ok((id, remember_outcome(key, id)))
+}
+
+/// Maps a queue failure onto the PSO path's explicit error vocabulary.
+#[cfg(any(windows, test))]
+fn map_queue_error(error: crate::native_metal::queue::NativeQueueError) -> PipelineError {
+    match error {
+        crate::native_metal::queue::NativeQueueError::Refused(why) => PipelineError::Refused(why),
         other => PipelineError::Transport(other.to_string()),
-    })
+    }
 }
 
 /// The native pipeline family a stage set describes.
@@ -1650,5 +2232,217 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read it back"), b"MTLB test bytes");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Every attempt is counted under its kind and outcome, each (kind, class)
+    /// refuses into its own bucket, and the kinds report in a fixed order.
+    #[test]
+    fn pipeline_attempts_are_counted_by_kind_and_outcome() {
+        reset_census();
+        note_created(AttemptKind::Graphics);
+        note_reused(AttemptKind::MeshObject);
+        note_refused(
+            AttemptKind::Compute,
+            RefusalClass::Container,
+            "shader container: bad part",
+        );
+        note_translator_unavailable(
+            AttemptKind::Library,
+            RefusalClass::ConverterUnavailable,
+            "shader pool has no worker program configured",
+        );
+
+        let census = census();
+        assert_eq!(
+            (
+                census.attempts,
+                census.created,
+                census.reused,
+                census.refused,
+                census.translator_unavailable
+            ),
+            (4, 1, 1, 1, 1)
+        );
+        assert_eq!(
+            census.by_kind.keys().copied().collect::<Vec<_>>(),
+            [
+                AttemptKind::Graphics,
+                AttemptKind::Compute,
+                AttemptKind::MeshObject,
+                AttemptKind::Library,
+            ],
+            "the kinds always report in the same order"
+        );
+        assert_eq!(census.by_kind[&AttemptKind::Graphics].created, 1);
+        assert_eq!(census.by_kind[&AttemptKind::Compute].refused, 1);
+        assert_eq!(census.by_kind[&AttemptKind::MeshObject].reused, 1);
+        assert_eq!(
+            census.by_kind[&AttemptKind::Library].translator_unavailable,
+            1
+        );
+        // Distinct classes never share a bucket.
+        assert_eq!(
+            census.refusals,
+            BTreeMap::from([
+                (("compute", "container"), 1),
+                (("library", "converter-unavailable"), 1),
+            ])
+        );
+        let fields = census.fields();
+        for expected in [
+            "pipeline_attempts=4",
+            "pipeline_created=1",
+            "pipeline_refused=1",
+            "pipeline_reused=1",
+            "pipeline_translator_unavailable=1",
+            "pipeline_by_kind=[graphics:1/1/0/0/0; compute:1/0/0/1/0; mesh:1/0/1/0/0; \
+             library:1/0/0/0/1]",
+            "pipeline_first_refusal=compute/container",
+        ] {
+            assert!(fields.contains(expected), "{expected} missing from {fields}");
+        }
+    }
+
+    /// The first refusal is kept once, flattened to one line, and every later
+    /// refusal keeps its own bucket without replacing it.
+    #[test]
+    fn the_first_refusal_is_kept_and_each_class_has_its_own_bucket() {
+        reset_census();
+        note_refused(
+            AttemptKind::Graphics,
+            RefusalClass::UnsupportedStage,
+            "the native host registers vertex, pixel\n\tmesh and compute stages only; \
+             this PSO also carries hull",
+        );
+        note_refused(
+            AttemptKind::Graphics,
+            RefusalClass::NoDxil,
+            "the vertex shader has no DXIL part",
+        );
+
+        let census = census();
+        let first = census.first_refusal.as_ref().expect("the first refusal is kept");
+        assert_eq!(first.kind, AttemptKind::Graphics);
+        assert_eq!(first.class, RefusalClass::UnsupportedStage);
+        assert_eq!(
+            first.reason,
+            "the native host registers vertex, pixel mesh and compute stages only; \
+             this PSO also carries hull"
+        );
+        assert!(!first.reason.contains('\n'), "{}", first.reason);
+        assert!(first.reason.len() <= MAX_REFUSAL_REASON_BYTES);
+        assert_eq!(census.refusals[&("graphics", "unsupported-stage")], 1);
+        assert_eq!(census.refusals[&("graphics", "no-dxil")], 1);
+        assert_eq!(
+            census.first_refusal.as_ref().map(FirstRefusal::name),
+            Some("graphics/unsupported-stage".to_string()),
+            "a later refusal never replaces the first"
+        );
+    }
+
+    /// A refusal reason is one bounded line with no path or title text, and a
+    /// multi-byte character is never cut in half.
+    #[test]
+    fn a_refusal_reason_is_one_bounded_pathless_line() {
+        let reason = bounded_refusal_reason(
+            "failed to spawn shader worker /Users/someone/bin/victory-irconverter: not found",
+        );
+        assert_eq!(
+            reason,
+            "failed to spawn shader worker <path> not found",
+            "a path token is redacted"
+        );
+        assert!(!reason.contains("Users"));
+
+        let multiline = bounded_refusal_reason("line one\n\tline two \"quoted\"");
+        assert_eq!(multiline, "line one line two 'quoted'");
+        assert!(!multiline.contains('\n'));
+
+        let long = bounded_refusal_reason(&"x".repeat(MAX_REFUSAL_REASON_BYTES * 3));
+        assert_eq!(long.len(), MAX_REFUSAL_REASON_BYTES);
+
+        // Two bytes per character: 200 bytes is 100 of them, on a boundary.
+        let multibyte = bounded_refusal_reason(&"é".repeat(MAX_REFUSAL_REASON_BYTES));
+        assert_eq!(multibyte.len(), MAX_REFUSAL_REASON_BYTES);
+        assert!(multibyte.is_char_boundary(multibyte.len()));
+        assert_eq!(multibyte.chars().count(), MAX_REFUSAL_REASON_BYTES / 2);
+
+        assert_eq!(bounded_refusal_reason(" \n\t "), "unknown refusal");
+    }
+
+    /// An identical registration is counted once as a creation and once as a
+    /// reuse, never as a refusal; it is still sent to the host, which answers
+    /// with the object it already has.
+    #[test]
+    fn a_duplicated_registration_is_reused_not_refused() {
+        reset_census();
+        let key = registration_key(&[PipelineStage::Compute], &[], None);
+
+        // The first registration made the pipeline on the host.
+        let first = remember_outcome(key, 77);
+        assert_eq!(first, AttemptOutcome::Created);
+        record_outcome(AttemptKind::Compute, Some(first), None);
+
+        // The identical registration reuses the object the host already has.
+        let second = remember_outcome(key, 77);
+        assert_eq!(second, AttemptOutcome::Reused);
+        record_outcome(AttemptKind::Compute, Some(second), None);
+
+        let census = census();
+        assert_eq!(census.attempts, 2);
+        assert_eq!(census.created, 1);
+        assert_eq!(census.reused, 1);
+        assert_eq!(census.refused, 0);
+        assert_eq!(census.translator_unavailable, 0);
+        assert_eq!(census.by_kind[&AttemptKind::Compute].reused, 1);
+        assert!(census.refusals.is_empty(), "{:?}", census.refusals);
+
+        // Different content is a different key, so it is not taken for a reuse.
+        let other = registration_key(
+            &[PipelineStage::Compute],
+            &[(PipelineStage::Compute, b"MTLB other".as_slice(), "main")],
+            None,
+        );
+        assert_ne!(key, other);
+        assert_eq!(
+            registration_key(
+                &[PipelineStage::Compute],
+                &[(PipelineStage::Compute, b"MTLB compute".as_slice(), "main")],
+                None
+            ),
+            registration_key(
+                &[PipelineStage::Compute],
+                &[(PipelineStage::Compute, b"MTLB compute".as_slice(), "main")],
+                None
+            ),
+            "the same content always makes the same key"
+        );
+    }
+
+    /// Stage names map onto the four census kinds, including the stages the
+    /// native host cannot register (they are still a graphics attempt).
+    #[test]
+    fn stage_names_map_to_the_census_kinds() {
+        assert_eq!(
+            attempt_kind_of_names(&["vertex", "pixel"]),
+            AttemptKind::Graphics
+        );
+        assert_eq!(
+            attempt_kind_of_names(&["vertex", "pixel", "hull"]),
+            AttemptKind::Graphics
+        );
+        assert_eq!(
+            attempt_kind_of_names(&["compute"]),
+            AttemptKind::Compute
+        );
+        assert_eq!(
+            attempt_kind_of_names(&["mesh", "pixel"]),
+            AttemptKind::MeshObject
+        );
+        assert_eq!(
+            attempt_kind_of_names(&["amplification", "mesh", "pixel"]),
+            AttemptKind::MeshObject
+        );
+        assert_eq!(attempt_kind_of_names(&[]), AttemptKind::Graphics);
     }
 }

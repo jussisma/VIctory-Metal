@@ -839,6 +839,7 @@ impl FrameTelemetry {
             pool_warm: self.pool_warm.load(Ordering::Relaxed),
             registration_failures: self.registration_failures.load(Ordering::Relaxed),
             compute_dispatches_without_bindings: self.compute_dispatches_without_bindings(),
+            pipeline_census: crate::native_metal::pso::census(),
             host_errors: self.host_error_count(),
             last_host_error: self.last_host_error(),
             call_failures: self.call_failures.count(),
@@ -933,6 +934,9 @@ pub struct TelemetrySnapshot {
     pub registration_failures: u64,
     /// Compute dispatches recorded with no root view or descriptor table.
     pub compute_dispatches_without_bindings: u64,
+    /// Native pipeline attempts, creations, reuses and refusals by kind
+    /// (session totals: a pipeline made in an early frame stays counted).
+    pub pipeline_census: crate::native_metal::pso::PipelineCensusSnapshot,
     /// Wire v3 error replies that carried a host reason.
     pub host_errors: u64,
     /// The most recent bounded host error, if any.
@@ -973,6 +977,7 @@ impl std::fmt::Display for TelemetrySnapshot {
             self.registration_failures,
             self.compute_dispatches_without_bindings
         )?;
+        write!(f, ", {}", self.pipeline_census.fields())?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))?;
         if self.named_refusals.is_empty() {
@@ -1495,6 +1500,40 @@ mod tests {
             2,
             "the count is a session total, like the submit counters"
         );
+    }
+
+    /// The snapshot names the pipeline-attempt census: how many attempts the
+    /// title made, how many became host pipelines and, when one was refused,
+    /// the static name and bounded reason of the first refusal. A boot can then
+    /// tell "no pipeline asked for yet" from "every request refused".
+    #[test]
+    fn the_snapshot_carries_the_pipeline_attempt_census() {
+        use crate::native_metal::pso;
+
+        pso::reset_census();
+        pso::note_created(pso::AttemptKind::Graphics);
+        pso::note_translator_unavailable(
+            pso::AttemptKind::Compute,
+            pso::RefusalClass::ConverterUnavailable,
+            "shader pool has no worker program configured",
+        );
+
+        let snapshot = telemetry().snapshot();
+        assert_eq!(snapshot.pipeline_census.attempts, 2);
+        assert_eq!(snapshot.pipeline_census.created, 1);
+        assert_eq!(snapshot.pipeline_census.refused, 0);
+        assert_eq!(snapshot.pipeline_census.translator_unavailable, 1);
+        let line = snapshot.to_string();
+        for expected in [
+            "pipeline_attempts=2",
+            "pipeline_created=1",
+            "pipeline_refused=0",
+            "pipeline_translator_unavailable=1",
+            "pipeline_first_refusal=compute/converter-unavailable",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
+        assert!(!line.contains('\n'), "the log line must stay one line: {line}");
     }
 
     #[test]

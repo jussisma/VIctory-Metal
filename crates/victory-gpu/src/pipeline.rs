@@ -615,6 +615,14 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
              stages only; this PSO also carries {}",
             missing.join(", ")
         );
+        // The attempt never reaches the PSO registrant, so its census entry is
+        // recorded here: the boot states that the title asked for a pipeline
+        // this host cannot make, and names the stage.
+        crate::native_metal::pso::note_refused(
+            crate::native_metal::pso::attempt_kind_of_names(&all),
+            crate::native_metal::pso::RefusalClass::UnsupportedStage,
+            &error,
+        );
         crate::native_metal::telemetry::note_registration_failure();
         *cell = Some(Err(error.clone()));
         return Err(error);
@@ -630,6 +638,11 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
     let programs = match programs {
         Ok(programs) => programs,
         Err(error) => {
+            crate::native_metal::pso::note_refused(
+                crate::native_metal::pso::attempt_kind_of_names(&all),
+                crate::native_metal::pso::RefusalClass::of(&error),
+                &error.to_string(),
+            );
             crate::native_metal::telemetry::note_registration_failure();
             let error = error.to_string();
             *cell = Some(Err(error.clone()));
@@ -658,6 +671,11 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
         Some(graphics) => match graphics.pipeline_state(pixel_entry, object_entry, mesh) {
             Ok(state) => Some(state),
             Err(error) => {
+                crate::native_metal::pso::note_refused(
+                    crate::native_metal::pso::attempt_kind_of_names(&all),
+                    crate::native_metal::pso::RefusalClass::RenderState,
+                    &format!("pipeline render state is not representable: {error}"),
+                );
                 crate::native_metal::telemetry::note_registration_failure();
                 let error = format!("pipeline render state is not representable: {error}");
                 tracing::warn!(pipeline = ?this, %error, "native pipeline registration failed");
