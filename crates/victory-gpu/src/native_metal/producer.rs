@@ -153,6 +153,18 @@ impl ResourceId {
     pub fn from_guest_address(address: u64) -> Result<Self, ProducerError> {
         Self::new(address, 1)
     }
+
+    /// The wire identity of a guest range the share resolver resolved.
+    ///
+    /// This is the identity a kind 2 registration and the wire bindings use:
+    /// the share allocation id, never the guest address. Callers register the
+    /// range first (`native_metal::queue::register_resolved_range`), so the host
+    /// validates the same pair the submission names.
+    pub fn from_range(
+        range: &crate::native_metal::bindings::GuestRange,
+    ) -> Result<Self, ProducerError> {
+        Self::new(range.allocation_id, range.generation)
+    }
 }
 
 /// A checked list identity (both fields nonzero).

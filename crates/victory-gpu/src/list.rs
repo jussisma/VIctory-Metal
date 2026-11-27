@@ -321,6 +321,34 @@ fn refuse_unresolved(this: This, why: &'static str, error: impl std::fmt::Displa
     });
 }
 
+/// Maps a lazy first-bind registration refusal to the producer error a copy or
+/// indirect call records.
+///
+/// A missing resolver or an unresolvable range is `ProducerError::unresolved`;
+/// every other refusal (no share backing, a non-increasing id, a host refusal)
+/// is `ProducerError::unregistered`, because the operation is expressible and
+/// only the host-visible backing is missing. Both are `E_FAIL`; the reason is
+/// logged, counted and returned to the title, never skipped or fallen back.
+#[cfg(windows)]
+fn registration_refusal(
+    operation: &'static str,
+    error: crate::native_metal::queue::BufferRegistrationError,
+) -> crate::native_metal::producer::ProducerError {
+    use crate::native_metal::producer::ProducerError;
+    use crate::native_metal::queue::BufferRegistrationError;
+
+    tracing::warn!(%error, "{operation}");
+    match error {
+        BufferRegistrationError::NoResolver | BufferRegistrationError::Unresolved { .. } => {
+            ProducerError::unresolved(operation)
+        }
+        _ => {
+            crate::native_metal::telemetry::note_registration_failure();
+            ProducerError::unregistered(operation)
+        }
+    }
+}
+
 /// Why a compute root buffer view could not be resolved for recording.
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,8 +432,7 @@ fn bind_compute_root_view(this: This, slot: u32, address: u64) {
         return;
     };
     let resolved = match resolve_compute_root_view(&*resolver, slot, address, |allocation_id| {
-        queue::ensure_allocation(allocation_id)
-            .map(|_| ())
+        queue::register_allocation_entry(allocation_id)
             .map_err(|error| error.to_string())
     }) {
         Ok(resolved) => resolved,
@@ -481,7 +508,7 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
         }
     };
     let (view, tokens) = resolved.into_parts();
-    if let Err(error) = crate::native_metal::queue::ensure_allocation(view.allocation_id) {
+    if let Err(error) = crate::native_metal::queue::register_allocation_entry(view.allocation_id) {
         bindings::retire_all(&*resolver, &tokens);
         refuse_unregistered(
             this,
@@ -538,7 +565,7 @@ fn bind_vertex_buffers(this: This, start: u32, views: &[MetalVertexView]) {
             }
         };
         let (entry, mut held) = resolved.into_parts();
-        if let Err(error) = queue::ensure_allocation(entry.allocation_id) {
+        if let Err(error) = queue::register_allocation_entry(entry.allocation_id) {
             bindings::retire_all(&*resolver, &held);
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(
@@ -590,7 +617,7 @@ fn bind_index_buffer(this: This, address: u64, len: u64, format: u32) {
         }
     };
     let (entry, tokens) = resolved.into_parts();
-    if let Err(error) = queue::ensure_allocation(entry.allocation_id) {
+    if let Err(error) = queue::register_allocation_entry(entry.allocation_id) {
         bindings::retire_all(&*resolver, &tokens);
         refuse_unregistered(
             this,
@@ -858,7 +885,9 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         let Some(binding) = entry.as_buffer() else {
             continue;
         };
-        if let Err(error) = crate::native_metal::queue::ensure_allocation(binding.allocation_id) {
+        if let Err(error) =
+            crate::native_metal::queue::register_allocation_entry(binding.allocation_id)
+        {
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(
                 this,
@@ -966,7 +995,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         let Some(binding) = entry.as_buffer() else {
             continue;
         };
-        if let Err(error) = queue::ensure_allocation(binding.allocation_id) {
+        if let Err(error) = queue::register_allocation_entry(binding.allocation_id) {
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(
                 this,
@@ -1678,6 +1707,8 @@ extern "system" fn copy_buffer_region(
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
         with_metal(this, |producer| {
+            use crate::native_metal::queue;
+
             let (src_address, src_size) = crate::resource::buffer_bytes(src).ok_or(
                 crate::native_metal::producer::ProducerError::unsupported(
                     "CopyBufferRegion: source is not a buffer",
@@ -1696,10 +1727,22 @@ extern "system" fn copy_buffer_region(
                     Some(victory_metal::wire_v3::OP_COPY_BUFFER),
                 );
             }
-            let src =
-                crate::native_metal::producer::ResourceId::from_guest_address(src_address as u64)?;
-            let dst =
-                crate::native_metal::producer::ResourceId::from_guest_address(dst_address as u64)?;
+            // Both ranges are resolved and registered before the copy is
+            // recorded: a copy names share allocations, never guest addresses,
+            // and a source or destination the host cannot map is refused by
+            // name (no silent skip, no D3DMetal fallback).
+            let (source, destination) = queue::register_copy_buffers(
+                (src_address as u64, src_size),
+                (dst_address as u64, dst_size),
+            )
+            .map_err(|error| {
+                registration_refusal(
+                    "CopyBufferRegion: a buffer is not registered with the host",
+                    error,
+                )
+            })?;
+            let src = crate::native_metal::producer::ResourceId::from_range(&source)?;
+            let dst = crate::native_metal::producer::ResourceId::from_range(&destination)?;
             producer.copy_buffer(src, src_offset, dst, dst_offset, len)
         });
         return;
@@ -1718,6 +1761,8 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+        use crate::native_metal::queue;
+
         with_metal(this, |producer| {
             if let (Some((to, to_size)), Some((from, from_size))) = (
                 crate::resource::buffer_bytes(dst),
@@ -1730,9 +1775,20 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                         Some(victory_metal::wire_v3::OP_COPY_BUFFER),
                     );
                 }
-                let to = crate::native_metal::producer::ResourceId::from_guest_address(to as u64)?;
-                let from =
-                    crate::native_metal::producer::ResourceId::from_guest_address(from as u64)?;
+                // Register the source and destination before recording; the
+                // returned ranges name the share allocations the wire carries.
+                let (source, destination) = queue::register_copy_buffers(
+                    (from as u64, from_size),
+                    (to as u64, to_size),
+                )
+                .map_err(|error| {
+                    registration_refusal(
+                        "CopyResource: a buffer is not registered with the host",
+                        error,
+                    )
+                })?;
+                let to = crate::native_metal::producer::ResourceId::from_range(&destination)?;
+                let from = crate::native_metal::producer::ResourceId::from_range(&source)?;
                 return producer.copy_buffer(from, 0, to, 0, length);
             }
             producer.refuse(
@@ -1902,9 +1958,6 @@ extern "system" fn copy_texture_region(
                 let (address, size) = crate::resource::buffer_bytes(src.resource).ok_or(
                     copy_refused("CopyTextureRegion: an upload source is not a buffer"),
                 )?;
-                let source = crate::native_metal::producer::ResourceId::from_guest_address(
-                    address as u64,
-                )?;
                 let to = metal_subresource(dst.resource, dst.footprint.offset as u32)?;
                 let to_extent =
                     crate::resource::texture_subresource(dst.resource, dst.footprint.offset as u32)
@@ -1920,6 +1973,19 @@ extern "system" fn copy_texture_region(
                         Some(victory_metal::wire_v3::OP_COPY_BUFFER_TO_TEXTURE),
                     );
                 }
+                // The staging buffer is a guest buffer like any other: resolve
+                // and register its share allocation before the upload names it.
+                let source = crate::native_metal::queue::register_guest_buffer(
+                    address as u64,
+                    size,
+                )
+                .map_err(|error| {
+                    registration_refusal(
+                        "CopyTextureRegion: the upload buffer is not registered with the host",
+                        error,
+                    )
+                })?;
+                let source = crate::native_metal::producer::ResourceId::from_range(&source)?;
                 // SAFETY: the title passes a source box or null.
                 let copy = upload_copy(
                     source,
@@ -3442,8 +3508,7 @@ extern "system" fn execute_indirect(
                     Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
                 );
             }
-            let allocation = ResourceId::from_guest_address(address as u64)?;
-            let count = if count.is_null() {
+            let count_binding = if count.is_null() {
                 None
             } else {
                 let Some((counter, count_size)) = crate::resource::buffer_bytes(count) else {
@@ -3458,13 +3523,36 @@ extern "system" fn execute_indirect(
                         Some(victory_metal::wire_v3::OP_EXECUTE_INDIRECT_DRAW),
                     );
                 }
-                let counter = ResourceId::from_guest_address(counter as u64)?;
-                Some(IndirectCountBuffer {
-                    allocation_id: counter.allocation_id,
-                    generation: counter.generation,
-                    offset: count_offset,
-                })
+                Some((counter as u64, count_size))
             };
+            // The argument buffer (and the optional count buffer) are guest
+            // buffers: resolve and register both, ascending by allocation id,
+            // before the indirect command names them. The wire carries share
+            // allocations, never guest addresses.
+            let mut buffers = vec![(address as u64, size)];
+            if let Some(counter) = count_binding {
+                buffers.push(counter);
+            }
+            let mut resolved = crate::native_metal::queue::register_guest_buffers(&buffers)
+                .map_err(|error| {
+                    registration_refusal(
+                        "ExecuteIndirect: a buffer is not registered with the host",
+                        error,
+                    )
+                })?;
+            let count = match count_binding {
+                None => None,
+                Some(_) => {
+                    let counter = resolved.pop().expect("the count range was resolved");
+                    let counter = ResourceId::from_range(&counter)?;
+                    Some(IndirectCountBuffer {
+                        allocation_id: counter.allocation_id,
+                        generation: counter.generation,
+                        offset: count_offset,
+                    })
+                }
+            };
+            let allocation = ResourceId::from_range(&resolved[0])?;
             let arguments = IndirectArguments {
                 allocation_id: allocation.allocation_id,
                 generation: allocation.generation,

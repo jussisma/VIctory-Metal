@@ -43,6 +43,8 @@ use victory_metal::wire::{ListIdentity, ReplyStatus, WireError};
 use victory_metal::wire_v3::{SubmissionV3, encode_submission_v3};
 
 use crate::backend::GpuBackend;
+#[cfg(any(windows, test, target_os = "macos"))]
+use crate::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
 use crate::native_metal::client::{LiveConfig, WireV3Client};
 #[cfg(feature = "diagnostics")]
 use crate::native_metal::present::guard_native_only;
@@ -811,35 +813,393 @@ pub fn allocation_registered(allocation_id: u64) -> bool {
     }
 }
 
-/// Makes sure the host has `allocation_id` registered, registering it when it
-/// is new (idempotent).
+/// Why a guest buffer's share allocation could not be registered on first
+/// bind.
+///
+/// Every variant is a named refusal: a missing resolver, an unresolvable guest
+/// range, a missing or empty share file, or a kind 2 id the host's strictly
+/// increasing ledger cannot accept. No variant stands for a silent skip, and
+/// none is turned into a D3DMetal fallback.
+#[cfg(any(windows, test, target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferRegistrationError {
+    /// No [`GuestRangeResolver`] is installed in this process.
+    NoResolver,
+    /// The guest address or length cannot name a share range at all.
+    InvalidBinding {
+        /// Guest GPU virtual address the binding named.
+        address: u64,
+        /// Byte length the binding named.
+        len: u64,
+        /// Why the pair cannot be resolved.
+        reason: &'static str,
+    },
+    /// The resolver could not map the guest range to a share allocation.
+    Unresolved {
+        /// Guest GPU virtual address the binding named.
+        address: u64,
+        /// Byte length the binding named.
+        len: u64,
+        /// The resolver's own reason.
+        reason: ResolveError,
+    },
+    /// The resolved range is not a share allocation a kind 2 frame can carry.
+    InvalidRange {
+        /// Allocation id the range named.
+        allocation_id: u64,
+        /// Why the range cannot be registered.
+        reason: &'static str,
+    },
+    /// The session's share directory could not be scanned.
+    ShareDirectory(String),
+    /// The allocation has no `<share dir>/{id:016x}.bin` file.
+    MissingShareBacking {
+        /// Allocation id the resolver named.
+        allocation_id: u64,
+        /// The file the host would open.
+        path: String,
+    },
+    /// The allocation's share file is empty, so no length can be named.
+    EmptyShareBacking {
+        /// Allocation id the resolver named.
+        allocation_id: u64,
+        /// The file the host would open.
+        path: String,
+    },
+    /// The host's kind 2 ledger has already accepted a higher id.
+    ///
+    /// The host refuses (and closes the session on) an id that does not
+    /// increase, so the guest refuses locally instead of sending it.
+    Decreasing {
+        /// Allocation id the registration named.
+        allocation_id: u64,
+        /// The highest id the host accepted so far.
+        last_registered: u64,
+    },
+    /// The registration frame was refused by the host or the transport.
+    Queue(NativeQueueError),
+}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+impl std::fmt::Display for BufferRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoResolver => write!(
+                f,
+                "no guest range resolver: the buffer's share allocation cannot be named"
+            ),
+            Self::InvalidBinding {
+                address,
+                len,
+                reason,
+            } => write!(
+                f,
+                "guest binding 0x{address:x}+{len} cannot name a share allocation: {reason}"
+            ),
+            Self::Unresolved {
+                address,
+                len,
+                reason,
+            } => write!(
+                f,
+                "guest binding 0x{address:x}+{len} does not resolve to a share allocation: {reason}"
+            ),
+            Self::InvalidRange {
+                allocation_id,
+                reason,
+            } => write!(f, "allocation {allocation_id} cannot be registered: {reason}"),
+            Self::ShareDirectory(why) => write!(
+                f,
+                "the session's share directory is unusable: {why}"
+            ),
+            Self::MissingShareBacking {
+                allocation_id,
+                path,
+            } => write!(
+                f,
+                "allocation {allocation_id} has no share file ({path}); the guest never creates \
+                 the host's backing"
+            ),
+            Self::EmptyShareBacking {
+                allocation_id,
+                path,
+            } => write!(f, "allocation {allocation_id}'s share file ({path}) is empty"),
+            Self::Decreasing {
+                allocation_id,
+                last_registered,
+            } => write!(
+                f,
+                "allocation {allocation_id} is below the last host registration \
+                 {last_registered}; the host accepts only increasing kind 2 ids"
+            ),
+            Self::Queue(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+impl std::error::Error for BufferRegistrationError {}
+
+#[cfg(any(windows, test, target_os = "macos"))]
+impl From<BufferRegistrationError> for NativeQueueError {
+    fn from(error: BufferRegistrationError) -> Self {
+        match error {
+            // A host or transport refusal keeps its own shape (`Refused` vs
+            // `Transport`) so the queue's refusal classification still holds.
+            BufferRegistrationError::Queue(error) => error,
+            other => NativeQueueError::Refused(other.to_string()),
+        }
+    }
+}
+
+/// Makes sure the host has `allocation_id` registered, registering it and
+/// every lower id the share directory holds, ascending (idempotent).
+///
+/// This is the entry form of the lazy first-bind path: a descriptor table, root
+/// view, vertex/index buffer or indirect binding that already resolved its
+/// guest range names the share allocation id here. The length always comes from
+/// the share file that id names; nothing is fabricated and there is no size
+/// cap, so a 182 MB heap allocation registers exactly like a 352 B one.
+///
+/// The share directory is scanned on every call, so an allocation whose
+/// `<share dir>/{id:016x}.bin` only appears after an earlier bind is discovered
+/// on the next one; the guest never assumes or creates the host's backing. A
+/// missing file, an empty file, a missing resolver or a non-increasing id is a
+/// named [`BufferRegistrationError`].
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_allocation_entry(allocation_id: u64) -> Result<(), BufferRegistrationError> {
+    if allocation_id == 0 {
+        return Err(BufferRegistrationError::InvalidRange {
+            allocation_id,
+            reason: "a buffer registration needs a nonzero allocation id",
+        });
+    }
+    if session_allocation_registered(allocation_id) {
+        // Idempotent: a second bind of the same allocation issues no frame.
+        return Ok(());
+    }
+    let last_registered = last_registered_allocation();
+    if allocation_id < last_registered {
+        return Err(BufferRegistrationError::Decreasing {
+            allocation_id,
+            last_registered,
+        });
+    }
+    // Discover the session's share files now: an allocation created after an
+    // earlier bind (its file appears later) is registered on this call, and no
+    // cached listing can hide one.
+    let pending = crate::native_metal::pso::shares_up_to(allocation_id)
+        .map_err(BufferRegistrationError::ShareDirectory)?;
+    if !pending.iter().any(|(id, _)| *id == allocation_id) {
+        return Err(share_backing_error(allocation_id));
+    }
+    for (id, byte_len) in pending {
+        if session_allocation_registered(id) {
+            continue;
+        }
+        if id < last_registered {
+            // A file for an older id appeared after the host's ledger passed
+            // it. The kind 2 form cannot carry it and sending a lower id would
+            // close the session, so this is refused by name instead.
+            return Err(BufferRegistrationError::Decreasing {
+                allocation_id: id,
+                last_registered,
+            });
+        }
+        register_buffer(id, byte_len).map_err(BufferRegistrationError::Queue)?;
+    }
+    Ok(())
+}
+
+/// Makes sure the host has `allocation_id` registered (idempotent).
 ///
 /// The id comes from the `GuestRangeResolver` seam and the length from the
 /// share file that id names; nothing is fabricated. Allocations that already
 /// exist at or below the requested id are registered first, ascending, because
 /// the host refuses (and closes the session on) a kind 2 id that does not
-/// increase.
+/// increase. This is [`register_allocation_entry`] with the refusal flattened
+/// into the queue's error type, kept for the create-time registration path.
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn ensure_allocation(allocation_id: u64) -> Result<bool, NativeQueueError> {
-    if allocation_id == 0 {
-        return Err(NativeQueueError::Refused(
-            "a buffer registration needs a nonzero allocation id".to_string(),
-        ));
+    register_allocation_entry(allocation_id)
+        .map(|()| true)
+        .map_err(NativeQueueError::from)
+}
+
+/// The highest allocation id this session's host has accepted (0: none).
+#[cfg(any(windows, test, target_os = "macos"))]
+fn last_registered_allocation() -> u64 {
+    let queue = native_queue();
+    queue
+        .sink()
+        .client()
+        .map(WireV3Client::last_allocation)
+        .unwrap_or(0)
+}
+
+/// Whether the live session registered `allocation_id` with the host.
+///
+/// Unlike [`allocation_registered`] this asks the installed client directly,
+/// so it does not need the endpoint environment once the session is live.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn session_allocation_registered(allocation_id: u64) -> bool {
+    let queue = native_queue();
+    queue
+        .sink()
+        .client()
+        .is_some_and(|client| client.allocation_registered(allocation_id))
+}
+
+/// The named error for an id whose share file the scan did not find.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn share_backing_error(allocation_id: u64) -> BufferRegistrationError {
+    let Some(path) = crate::native_metal::pso::allocation_path(allocation_id) else {
+        return BufferRegistrationError::ShareDirectory(
+            "no VICTORY_METAL_SHARE_DIR: the guest cannot name the allocation's share file"
+                .to_string(),
+        );
+    };
+    let shown = path.display().to_string();
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+            // A present, nonempty file the scan skipped is not a case the 16
+            // hex digit name allows; keep the refusal named either way.
+            BufferRegistrationError::MissingShareBacking {
+                allocation_id,
+                path: shown,
+            }
+        }
+        Ok(_) => BufferRegistrationError::EmptyShareBacking {
+            allocation_id,
+            path: shown,
+        },
+        Err(_) => BufferRegistrationError::MissingShareBacking {
+            allocation_id,
+            path: shown,
+        },
     }
-    if allocation_registered(allocation_id) {
-        return Ok(true);
+}
+
+/// Registers the share allocation one guest buffer address and length name.
+///
+/// A convenience form of [`register_guest_buffers`] for the single-buffer
+/// paths.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_guest_buffer(
+    address: u64,
+    len: u64,
+) -> Result<GuestRange, BufferRegistrationError> {
+    let mut ranges = register_guest_buffers(&[(address, len)])?;
+    Ok(ranges.remove(0))
+}
+
+/// Registers both buffers one buffer copy names, ascending by allocation id.
+///
+/// The returned ranges keep the caller's `(source, destination)` order, so a
+/// copy can build both wire identities from the ranges that were actually
+/// registered.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_copy_buffers(
+    source: (u64, u64),
+    destination: (u64, u64),
+) -> Result<(GuestRange, GuestRange), BufferRegistrationError> {
+    let mut ranges = register_guest_buffers(&[source, destination])?;
+    let destination = ranges.pop().expect("two ranges were resolved");
+    let source = ranges.pop().expect("two ranges were resolved");
+    Ok((source, destination))
+}
+
+/// Registers every share allocation the guest buffers in `ranges` name.
+///
+/// Each `(address, len)` is resolved exactly once through the installed
+/// [`GuestRangeResolver`] (`NoResolver` when none is installed), then the
+/// distinct allocations are registered ascending by id because the host accepts
+/// only increasing kind 2 ids. The returned ranges keep the caller's order, and
+/// a second call for an already registered set issues no frame.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_guest_buffers(
+    ranges: &[(u64, u64)],
+) -> Result<Vec<GuestRange>, BufferRegistrationError> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
     }
-    let pending = crate::native_metal::pso::shares_up_to(allocation_id)
-        .map_err(NativeQueueError::Refused)?;
-    if !pending.iter().any(|(id, _)| *id == allocation_id) {
-        return Err(NativeQueueError::Refused(format!(
-            "allocation {allocation_id} has no share file in the session's share directory"
-        )));
+    let resolver = bindings::resolver().ok_or(BufferRegistrationError::NoResolver)?;
+    let mut resolved = Vec::with_capacity(ranges.len());
+    for &(address, len) in ranges {
+        resolved.push(resolve_guest_buffer(&*resolver, address, len)?);
     }
-    for (id, byte_len) in pending {
-        register_buffer(id, byte_len)?;
+    // Register in ascending allocation order even when the caller named the
+    // source and destination the other way round.
+    let mut order: Vec<usize> = (0..resolved.len()).collect();
+    order.sort_by_key(|&index| resolved[index].allocation_id);
+    for index in order {
+        register_resolved_range(&resolved[index])?;
     }
-    Ok(true)
+    Ok(resolved)
+}
+
+/// Registers the share allocation a range another helper already resolved
+/// names, without resolving (and therefore without pinning) it a second time.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn register_resolved_range(range: &GuestRange) -> Result<(), BufferRegistrationError> {
+    checked_guest_range(range)?;
+    register_allocation_entry(range.allocation_id)
+}
+
+/// Resolves one guest buffer range through `resolver` without pinning it.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn resolve_guest_buffer(
+    resolver: &dyn GuestRangeResolver,
+    address: u64,
+    len: u64,
+) -> Result<GuestRange, BufferRegistrationError> {
+    if address == 0 {
+        return Err(BufferRegistrationError::InvalidBinding {
+            address,
+            len,
+            reason: "the guest address is zero",
+        });
+    }
+    if len == 0 {
+        return Err(BufferRegistrationError::InvalidBinding {
+            address,
+            len,
+            reason: "the guest range is empty",
+        });
+    }
+    let range = resolver
+        .resolve(address, len)
+        .map_err(|reason| BufferRegistrationError::Unresolved {
+            address,
+            len,
+            reason,
+        })?;
+    checked_guest_range(&range)?;
+    Ok(range)
+}
+
+/// Rejects a range no kind 2 registration can name.
+#[cfg(any(windows, test, target_os = "macos"))]
+fn checked_guest_range(range: &GuestRange) -> Result<(), BufferRegistrationError> {
+    if range.allocation_id == 0 {
+        return Err(BufferRegistrationError::InvalidRange {
+            allocation_id: 0,
+            reason: "the resolved range names no share allocation",
+        });
+    }
+    if range.generation != victory_metal::guest_ipc::REGISTRATION_GENERATION {
+        return Err(BufferRegistrationError::InvalidRange {
+            allocation_id: range.allocation_id,
+            reason: "the range's generation is not the host's kind 2 generation",
+        });
+    }
+    if range.size == 0 {
+        return Err(BufferRegistrationError::InvalidRange {
+            allocation_id: range.allocation_id,
+            reason: "the resolved range has no backing bytes",
+        });
+    }
+    Ok(())
 }
 
 /// Registers a translated metallib as a native pipeline (kind 4/129).
@@ -1465,7 +1825,10 @@ mod tests {
     use victory_metal::wire_v3::{CommandV3, Present, decode_submission_v3};
 
     use crate::object::S_OK;
-    use crate::native_metal::client::{ENVELOPE_LEN, KIND_ACK, KIND_AUTH, KIND_SUBMISSION_V3};
+    use crate::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
+    use crate::native_metal::client::{
+        ENVELOPE_LEN, KIND_ACK, KIND_AUTH, KIND_REGISTER, KIND_SUBMISSION_V3,
+    };
     use crate::native_metal::producer::{MetalList, UNASSIGNED_SEQUENCE, reset_sequences};
     use crate::native_metal::telemetry;
 
@@ -2389,5 +2752,501 @@ mod tests {
             1,
             "the refused frame stays at the head of the outbound queue"
         );
+    }
+
+    // ------------------------------------------- lazy first-bind registration
+
+    /// A loopback host that answers authentication and records every kind 2
+    /// allocation registration, acknowledging each one like the real host.
+    struct RegistrationHost {
+        port: u16,
+        handle: Option<JoinHandle<()>>,
+        seen: Receiver<(u64, u64)>,
+    }
+
+    impl RegistrationHost {
+        fn spawn() -> Self {
+            let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("listener address").port();
+            let (sender, seen) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(TEST_TIMEOUT))
+                    .expect("server read timeout");
+                let Some((kind, payload)) = frame_or_eof(&mut stream) else {
+                    return;
+                };
+                assert_eq!(kind, KIND_AUTH, "the first frame must authenticate");
+                assert_eq!(payload, SECRET, "the hello must carry the exact secret");
+                write_frame(&mut stream, KIND_ACK, &[0]);
+                while let Some((kind, payload)) = frame_or_eof(&mut stream) {
+                    match kind {
+                        // The session registered the share directory's fence
+                        // page while connecting.
+                        crate::native_metal::client::KIND_FENCE_PAGE => {
+                            assert_eq!(payload.len(), 8);
+                            write_frame(&mut stream, KIND_ACK, &[0]);
+                        }
+                        KIND_REGISTER => {
+                            assert_eq!(payload.len(), 16, "a kind 2 payload");
+                            let id = u64::from_le_bytes(
+                                payload[0..8].try_into().expect("eight bytes"),
+                            );
+                            let len = u64::from_le_bytes(
+                                payload[8..16].try_into().expect("eight bytes"),
+                            );
+                            sender.send((id, len)).expect("report the registration");
+                            write_frame(&mut stream, KIND_ACK, &[0]);
+                        }
+                        other => panic!("unexpected frame kind {other}"),
+                    }
+                }
+            });
+            Self {
+                port,
+                handle: Some(handle),
+                seen,
+            }
+        }
+
+        fn config(&self) -> LiveConfig {
+            LiveConfig::parse(
+                Some(&format!("127.0.0.1:{}", self.port)),
+                Some(&"5a".repeat(32)),
+            )
+            .expect("both variables present")
+            .expect("well-formed configuration")
+        }
+
+        /// One recorded registration, in arrival order.
+        fn next(&self) -> (u64, u64) {
+            self.seen
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("the host saw the registration")
+        }
+
+        /// Asserts no further registration reaches this session.
+        fn assert_quiet(&self) {
+            assert!(
+                self.seen.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+                "an idempotent bind must issue no registration frame"
+            );
+        }
+    }
+
+    impl Drop for RegistrationHost {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// [`read_frame`] that answers `None` at the end of the session instead of
+    /// panicking, so the fixture thread can end when the client is dropped.
+    fn frame_or_eof(stream: &mut std::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        let mut envelope = [0u8; ENVELOPE_LEN];
+        stream.read_exact(&mut envelope).ok()?;
+        let kind = envelope[0];
+        let length = usize::try_from(u32::from_le_bytes(
+            envelope[1..].try_into().ok()?,
+        ))
+        .ok()?;
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).ok()?;
+        Some((kind, payload))
+    }
+
+    /// A resolver over synthetic guest ranges, `(base, size, allocation id)`.
+    struct RangeMapResolver {
+        ranges: Mutex<Vec<(u64, u64, u64)>>,
+    }
+
+    impl RangeMapResolver {
+        fn new(ranges: &[(u64, u64, u64)]) -> Self {
+            Self {
+                ranges: Mutex::new(ranges.to_vec()),
+            }
+        }
+    }
+
+    impl GuestRangeResolver for RangeMapResolver {
+        fn resolve(&self, address: u64, len: u64) -> Result<GuestRange, ResolveError> {
+            let ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+            for &(base, size, allocation_id) in ranges.iter() {
+                let end = base.saturating_add(size);
+                if address >= base && address.saturating_add(len) <= end {
+                    let pages = size.div_ceil(crate::native_metal::bindings::PAGE)
+                        * crate::native_metal::bindings::PAGE;
+                    return Ok(GuestRange {
+                        allocation_id,
+                        generation: victory_metal::guest_ipc::REGISTRATION_GENERATION,
+                        byte_offset: 0,
+                        size: pages,
+                    });
+                }
+            }
+            Err(ResolveError::Unmapped { address, len })
+        }
+
+        fn retain(&self, _range: &GuestRange) -> Result<u64, ResolveError> {
+            Ok(1)
+        }
+
+        fn retire(&self, _token: u64) -> Result<(), ResolveError> {
+            Ok(())
+        }
+    }
+
+    /// A session-private share directory with one sparse file per allocation.
+    struct ShareDir {
+        directory: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ShareDir {
+        fn install(files: &[(u64, u64)]) -> Self {
+            let directory = tempfile::tempdir().expect("a share directory");
+            for &(id, len) in files {
+                create_share_file(directory.path(), id, len);
+            }
+            let previous = std::env::var_os(crate::native_metal::fence_page_guest::SHARE_DIR_ENV);
+            // SAFETY: the serialized lock keeps every other test in this
+            // module out of the process environment.
+            unsafe {
+                std::env::set_var(
+                    crate::native_metal::fence_page_guest::SHARE_DIR_ENV,
+                    directory.path(),
+                );
+            }
+            Self {
+                directory,
+                previous,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.directory.path()
+        }
+    }
+
+    impl Drop for ShareDir {
+        fn drop(&mut self) {
+            // SAFETY: as in `install`.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(
+                        crate::native_metal::fence_page_guest::SHARE_DIR_ENV,
+                        value,
+                    ),
+                    None => std::env::remove_var(
+                        crate::native_metal::fence_page_guest::SHARE_DIR_ENV,
+                    ),
+                }
+            }
+        }
+    }
+
+    fn create_share_file(directory: &std::path::Path, id: u64, len: u64) {
+        let path = directory.join(format!("{id:016x}.bin"));
+        std::fs::File::create(&path)
+            .and_then(|file| file.set_len(len))
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    }
+
+    const BIG_ALLOCATION: u64 = 182_452_224;
+
+    /// Connects the process-global queue to a fresh registration host.
+    fn live_registration_host() -> RegistrationHost {
+        native_queue_reset();
+        let host = RegistrationHost::spawn();
+        let config = host.config();
+        assert_eq!(ensure_live(|| Some(Ok(config))), Ok(true));
+        assert!(native_queue_is_live());
+        host
+    }
+
+    /// A buffer created before the resolver existed registers on its first
+    /// bind: creation-time failure is not final, and the bind registers the
+    /// allocation once, from the file the resolver names.
+    #[test]
+    fn a_buffer_created_before_the_resolver_registers_on_its_first_bind() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let address = 0x1_0000_0000;
+        let _share = ShareDir::install(&[(1, 352)]);
+        let host = live_registration_host();
+
+        // Creation ran before the HLE installed the resolver: the buffer's
+        // allocation could not be named, so nothing was registered.
+        assert_eq!(
+            register_guest_buffer(address, 352),
+            Err(BufferRegistrationError::NoResolver)
+        );
+        host.assert_quiet();
+
+        // The resolver appears; the first bind is the safety net.
+        bindings::set_resolver(RangeMapResolver::new(&[(address, 352, 1)]));
+        let range = register_guest_buffer(address, 352).expect("the first bind registers");
+        assert_eq!(range.allocation_id, 1);
+        assert_eq!(range.generation, 1);
+        assert_eq!(host.next(), (1, 352), "the whole share file length");
+
+        // Idempotent: a second bind of the same buffer sends no frame.
+        assert_eq!(
+            register_guest_buffer(address, 352).expect("the second bind is a no-op").allocation_id,
+            1
+        );
+        host.assert_quiet();
+        assert!(session_allocation_registered(1));
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// The 182 MB startup heap allocation registers exactly like a small one:
+    /// one kind 2 frame with the whole file length, then none, with no size cap.
+    #[test]
+    fn a_182_mib_allocation_registers_in_one_frame_and_idempotently() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let address = 0x2_0000_0000;
+        let _share = ShareDir::install(&[(1, BIG_ALLOCATION)]);
+        let host = live_registration_host();
+        bindings::set_resolver(RangeMapResolver::new(&[(address, BIG_ALLOCATION, 1)]));
+
+        let range = register_guest_buffer(address, BIG_ALLOCATION).expect("a large allocation");
+        assert_eq!(range.allocation_id, 1);
+        assert_eq!(range.size, BIG_ALLOCATION, "no small-buffer cap");
+        assert_eq!(host.next(), (1, BIG_ALLOCATION));
+
+        assert_eq!(
+            register_guest_buffer(address, BIG_ALLOCATION)
+                .expect("the repeat is a no-op")
+                .allocation_id,
+            1
+        );
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// The six startup buffers created before the resolver register on their
+    /// first bind, ascending by allocation id with their real share lengths;
+    /// the second bind of the whole set issues no frame.
+    #[test]
+    fn six_pre_resolver_buffers_register_ascending_on_one_bind() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let base = 0x3_0000_0000;
+        let stride = 0x1000_0000;
+        let sizes = [BIG_ALLOCATION, 19_680, 19_680, 19_680, 19_680, 352];
+        let files: Vec<(u64, u64)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| (index as u64 + 1, *size))
+            .collect();
+        let _share = ShareDir::install(&files);
+        let host = live_registration_host();
+        let ranges: Vec<(u64, u64, u64)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| (base + index as u64 * stride, *size, index as u64 + 1))
+            .collect();
+        bindings::set_resolver(RangeMapResolver::new(&ranges));
+        let bindings_named: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|(address, size, _)| (*address, *size))
+            .collect();
+
+        // The title's first bind names all six, in its own order.
+        let resolved = register_guest_buffers(&bindings_named).expect("six buffers register");
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|range| range.allocation_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6],
+            "the caller's order is preserved"
+        );
+        for &(id, len) in &files {
+            assert_eq!(host.next(), (id, len), "ascending, exact file length");
+        }
+        host.assert_quiet();
+        for (id, _) in &files {
+            assert!(session_allocation_registered(*id));
+        }
+
+        // The same set again: every id is known, so nothing goes on the wire.
+        register_guest_buffers(&bindings_named).expect("the repeat is a no-op");
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// A share file that appears after an earlier bind is discovered on the
+    /// next bind and registered ascending, once, without re-registering the
+    /// ids the host already accepted.
+    #[test]
+    fn an_allocation_appearing_after_bind_time_registers_once_ascending() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let first = 0x4_0000_0000;
+        let third = 0x4_1000_0000;
+        let fifth = 0x4_2000_0000;
+        let share = ShareDir::install(&[(1, 4096)]);
+        let host = live_registration_host();
+        bindings::set_resolver(RangeMapResolver::new(&[
+            (first, 4096, 1),
+            (third, 4096, 3),
+            (fifth, 4096, 5),
+        ]));
+
+        register_guest_buffer(first, 4096).expect("the first bind registers id 1");
+        assert_eq!(host.next(), (1, 4096));
+
+        // The launcher materialises two later allocations after that bind.
+        create_share_file(share.path(), 3, 8192);
+        create_share_file(share.path(), 5, 8192);
+
+        register_guest_buffer(fifth, 4096).expect("the later bind sweeps up");
+        assert_eq!(host.next(), (3, 8192), "the lower pending id goes first");
+        assert_eq!(host.next(), (5, 8192), "then the requested id");
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// A missing share backing, a missing resolver and an unresolvable range
+    /// are named refusals; none registers an id or sends a frame.
+    #[test]
+    fn missing_backing_and_unresolved_ranges_are_named_refusals() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let address = 0x5_0000_0000;
+        // A share directory with a different allocation only.
+        let share = ShareDir::install(&[(1, 4096)]);
+        let host = live_registration_host();
+
+        assert_eq!(
+            register_guest_buffer(address, 4096),
+            Err(BufferRegistrationError::NoResolver)
+        );
+
+        bindings::set_resolver(RangeMapResolver::new(&[(address, 4096, 9)]));
+        let error = register_guest_buffer(address, 4096).expect_err("no share file for id 9");
+        assert!(
+            matches!(
+                &error,
+                BufferRegistrationError::MissingShareBacking { allocation_id: 9, .. }
+            ),
+            "unexpected error {error:?}"
+        );
+        host.assert_quiet();
+        assert!(!session_allocation_registered(9));
+
+        // An address the resolver does not map.
+        let error = register_guest_buffer(address + 0x10_0000, 4096)
+            .expect_err("an unmapped guest range");
+        assert!(
+            matches!(&error, BufferRegistrationError::Unresolved { .. }),
+            "unexpected error {error:?}"
+        );
+        host.assert_quiet();
+
+        // An empty file cannot name a length either.
+        create_share_file(share.path(), 9, 0);
+        let error = register_guest_buffer(address, 4096).expect_err("an empty share file");
+        assert!(
+            matches!(
+                &error,
+                BufferRegistrationError::EmptyShareBacking { allocation_id: 9, .. }
+            ),
+            "unexpected error {error:?}"
+        );
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// A copy registers both its source and destination, ascending even when
+    /// the source allocation id is the higher one, and the second copy of the
+    /// same buffers sends nothing.
+    #[test]
+    fn a_copy_path_registers_its_source_and_destination() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let source = 0x6_0000_0000;
+        let destination = 0x6_1000_0000;
+        let _share = ShareDir::install(&[(2, 4096), (3, 8192)]);
+        let host = live_registration_host();
+        // The source names the higher id: registration must still ascend.
+        bindings::set_resolver(RangeMapResolver::new(&[
+            (source, 4096, 3),
+            (destination, 4096, 2),
+        ]));
+
+        let (from, to) = register_copy_buffers((source, 4096), (destination, 4096))
+            .expect("both copy buffers register");
+        assert_eq!(from.allocation_id, 3, "the source keeps its own identity");
+        assert_eq!(to.allocation_id, 2, "the destination keeps its own identity");
+        assert_eq!(host.next(), (2, 4096), "the lower id is registered first");
+        assert_eq!(host.next(), (3, 8192), "then the source's id");
+        host.assert_quiet();
+
+        register_copy_buffers((source, 4096), (destination, 4096))
+            .expect("the second copy is a no-op");
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
+    }
+
+    /// A copy that names an id below the host's ledger is refused locally with
+    /// a named error: the host never sees a decreasing kind 2 id (it closes the
+    /// session on one).
+    #[test]
+    fn a_decreasing_registration_is_refused_before_the_wire() {
+        let _serial = serialized();
+        let _ = bindings::clear_resolver();
+        let high = 0x7_0000_0000;
+        let low = 0x7_1000_0000;
+        // Only the higher id exists at first: the initial bind cannot see a
+        // lower file at all.
+        let share = ShareDir::install(&[(7, 8192)]);
+        let host = live_registration_host();
+        bindings::set_resolver(RangeMapResolver::new(&[
+            (high, 4096, 7),
+            (low, 4096, 5),
+        ]));
+
+        register_guest_buffer(high, 4096).expect("the higher id registers");
+        assert_eq!(host.next(), (7, 8192));
+
+        // An older allocation's file appears after the ledger passed its id.
+        create_share_file(share.path(), 5, 4096);
+        let error = register_guest_buffer(low, 4096).expect_err("a lower id cannot register");
+        assert!(
+            matches!(
+                &error,
+                BufferRegistrationError::Decreasing {
+                    allocation_id: 5,
+                    last_registered: 7
+                }
+            ),
+            "unexpected error {error:?}"
+        );
+        host.assert_quiet();
+
+        let _ = bindings::clear_resolver();
+        native_queue_reset();
     }
 }
