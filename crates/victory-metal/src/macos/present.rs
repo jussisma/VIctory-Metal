@@ -117,6 +117,30 @@ fn drawable_format_supported(format: usize) -> bool {
     )
 }
 
+/// Bytes per pixel of a 4-channel format the present path can carry.
+///
+/// `BGRA8Unorm`/`RGBA8Unorm` are 4 bytes; `RGBA16Float` is 8. This is the
+/// multiplier every sample byte offset uses, so an 8-byte format is proven by
+/// the same layout maths as the 4-byte one even though the analyser currently
+/// only reads 8-bit samples.
+fn pixel_format_bytes(format: usize) -> Option<u32> {
+    match format {
+        MTL_PIXEL_FORMAT_BGRA8_UNORM | MTL_PIXEL_FORMAT_RGBA8_UNORM => Some(4),
+        MTL_PIXEL_FORMAT_RGBA16_FLOAT => Some(8),
+        _ => None,
+    }
+}
+
+/// The Metal name of a pixel format the probe reports, for the log line.
+fn pixel_format_name(format: usize) -> &'static str {
+    match format {
+        MTL_PIXEL_FORMAT_BGRA8_UNORM => "bgra8unorm",
+        MTL_PIXEL_FORMAT_RGBA8_UNORM => "rgba8unorm",
+        MTL_PIXEL_FORMAT_RGBA16_FLOAT => "rgba16float",
+        _ => "unknown",
+    }
+}
+
 /// Frame pacing requested for one presented frame.
 ///
 /// This mirrors the guest's present sync interval: `0` is immediate and `1` is
@@ -682,12 +706,27 @@ fn encode_drawable_clear(command_buffer: objc::Id, texture: objc::Id) -> Result<
 //   pixel format are resized to the source's when `present` retargets the layer
 //   (`BGRA8Unorm` or `RGBA8Unorm`; `RGBA16Float` is displayable but not
 //   sampled, and yields `probe_unsupported_pixel_format_115`).
-// - region: 8x8 blocks centred on an 8x8 grid. At 3840x2160 the step is
-//   `3840 / 8 = 480` by `2160 / 8 = 270`, and the last block starts at
-//   `(7 * 480, 7 * 270) = (3360, 1890)`, so every block is inside the texture.
-// - row stride: the source copy is texture-to-texture, so it never sees a row
-//   pitch. The only stride the probe names is the readback of the 64-pixel-wide
-//   staging atlas: `64 * 4 = 256` bytes per row, 64 rows, 16 KiB.
+// - region: 8x8 blocks on an 8x8 grid (the block's top-left pixel is the grid
+//   point; the blocks are not centred). At 3840x2160 the step is
+//   `3840 / 8 = 480` by `2160 / 8 = 270`; the first block starts at `(0, 0)`
+//   and the last at `(7 * 480, 7 * 270) = (3360, 1890)`, so the last block
+//   spans `x 3360..=3367`, `y 1890..=1897`, inside the texture.
+// - byte offsets for the boot's real BGRA8 4K surface (4 bytes/pixel, row
+//   stride `3840 * 4 = 15_360` bytes, total `3840 * 2160 * 4 = 33_177_600`):
+//   first sample pixel `(0,0)` starts at byte `0`; last sample pixel
+//   `(3360,1890)` starts at `(1890 * 3840 + 3360) * 4 = 29_043_840`; the last
+//   byte actually read from the source is `((1897 * 3840) + 3367) * 4 + 3 =
+//   29_151_391`, so the whole read is inside the surface. For the same extent
+//   as `RGBA16Float` (8 bytes/pixel) the row stride doubles to `30_720`, the
+//   first byte is still `0`, the last sample starts at `58_087_680`, and the
+//   last byte read is `58_302_783` of `66_355_200` total. The analyser reads
+//   8-bit samples only; a 16F drawable is named and refused rather than read
+//   under the wrong stride, and these 16F numbers are pinned by a unit test so
+//   a future 16F path inherits proven offsets.
+// - row stride: the source copy is texture-to-texture, so no source row pitch
+//   is passed to Metal; the stride the probe names is the source's implied
+//   `width * bytes_per_pixel`. The readback stride is the 64-pixel-wide staging
+//   atlas: `64 * 4 = 256` bytes per row, 64 rows, `16_384` bytes total.
 // - format of the readback: the same 4-byte UNORM format as the drawable, read
 //   as `[u8; 4]`; `PixelOrder::Bgra` reorders to canonical RGBA for the report.
 
@@ -812,19 +851,36 @@ pub struct FrameProbeSample {
     /// transparent (all-zero) surface is the diagnostic case this field must
     /// not confuse with a drawn frame.
     pub non_black_pixels: u64,
-    /// Distinct 5-bit luma buckets seen (0..=32).
+    /// Distinct colour classes seen, `0..=33`, derived in the same per-pixel
+    /// pass as [`Self::non_black_pixels`].
+    ///
+    /// Class `0` is "clear": a pixel within `threshold` of the clear value on
+    /// every colour channel. A content pixel contributes class
+    /// `1 + (luma >> 3)`, where luma is the BT.601 luma in `0..=255`; adding
+    /// one keeps a content class distinct from the clear class even when its
+    /// 5-bit luma equals the clear's. Consequently `non_black_pixels == 0`
+    /// implies `unique_luma_buckets <= 1`, and any sample that mixes clear and
+    /// content pixels reports at least `2`. The two fields can never be
+    /// computed from different samples or different channel sets.
     pub unique_luma_buckets: u32,
     /// CRC-64/ECMA-182 over the sampled bytes in row-major order.
     ///
     /// The documented value for an all-zero sample is `0` (init `0`, no final
-    /// XOR, zero bytes leave the register at zero). Any sample with content in
-    /// its colour channels is non-zero: a repeated `0x80` byte, a two-tone
-    /// frame and an opaque black clear all checksum non-zero, and the test
-    /// suite pins those cases. `frame_crc=0` therefore means "the sampled bytes
-    /// were all zero", never "the checksum was not computed"; the min/max/mean
-    /// and `uniform_color` fields say whether that zero sample was a
-    /// transparent surface.
+    /// XOR, zero bytes leave the register at zero). A repeated `0x80` byte, a
+    /// two-tone frame and an opaque black clear all checksum non-zero, and the
+    /// test suite pins those cases. A 64-bit CRC is a linear map with a
+    /// non-empty kernel over a 16 KiB message, so a pathological non-zero
+    /// sample can in principle checksum to `0`; [`Self::nonzero_bytes`] removes
+    /// that ambiguity (`nonzero_bytes == 0` is the only all-zero sample), and
+    /// the min/max/mean and `uniform_color` fields name what was read.
     pub frame_crc: u64,
+    /// Sampled bytes that were not `0x00`, `0..=probe_bytes`.
+    ///
+    /// This is the authoritative all-zero test: `nonzero_bytes == 0` means the
+    /// read bytes were all zero regardless of the CRC, so `frame_crc=0` plus
+    /// `nonzero_bytes=0` names a transparent/zero surface and never an
+    /// uninitialised read or a checksum collision.
+    pub nonzero_bytes: u64,
     /// Number of pixels in this measurement.
     pub probe_pixels: u64,
     /// Per-channel minimum, canonical RGBA.
@@ -853,7 +909,8 @@ pub struct FrameProbeReport {
     pub last_sampled_frame: Option<u64>,
     /// Non-black pixels in the last sample.
     pub non_black_pixels: u64,
-    /// Distinct 5-bit luma buckets in the last sample.
+    /// Distinct colour classes in the last sample (clear class 0, plus one per
+    /// content luma bucket), `0..=33`; see [`FrameProbeSample`].
     pub unique_luma_buckets: u32,
     /// CRC-64/ECMA-182 of the last sample.
     pub frame_crc: u64,
@@ -884,6 +941,41 @@ pub struct FrameProbeReport {
     pub matches_diagnostic_clear: bool,
     /// CPU microseconds spent reading back and analysing the last sample.
     pub sample_cost_us: u64,
+    /// `MTLPixelFormat` of the sampled drawable texture (70, 80 or 115).
+    pub pixel_format: u32,
+    /// The Metal name of [`Self::pixel_format`] (`bgra8unorm`, ...).
+    pub pixel_format_name: String,
+    /// Width in pixels of the sampled texture (the source extent after the
+    /// Wave 13A retarget, not the window size).
+    pub sampled_width: u32,
+    /// Height in pixels of the sampled texture.
+    pub sampled_height: u32,
+    /// Implied source row stride in bytes: `sampled_width * bytes_per_pixel`.
+    pub source_row_bytes: u64,
+    /// Total bytes of the sampled source: `source_row_bytes * sampled_height`.
+    pub source_bytes: u64,
+    /// X of the first sampled pixel (`0` for every layout).
+    pub first_sample_x: u32,
+    /// Y of the first sampled pixel (`0` for every layout).
+    pub first_sample_y: u32,
+    /// Byte offset of the first sampled pixel in the source.
+    pub first_sample_byte: u64,
+    /// X of the last sampled block's top-left pixel.
+    pub last_sample_x: u32,
+    /// Y of the last sampled block's top-left pixel.
+    pub last_sample_y: u32,
+    /// Byte offset of the last sampled block's top-left pixel in the source.
+    pub last_sample_byte: u64,
+    /// Last byte of the last sampled block, inclusive; the end of the source
+    /// byte range the blits actually read.
+    pub source_last_byte: u64,
+    /// Row stride in bytes of the 64-pixel-wide staging atlas
+    /// (`staging_width * bytes_per_pixel`).
+    pub staging_row_bytes: u64,
+    /// Bytes actually read back from the staging atlas (the whole 16 KiB).
+    pub probe_bytes: u64,
+    /// Sampled bytes that were not `0x00`.
+    pub nonzero_bytes: u64,
 }
 
 impl Default for FrameProbeReport {
@@ -907,6 +999,22 @@ impl Default for FrameProbeReport {
             uniform_color: "none".to_string(),
             matches_diagnostic_clear: false,
             sample_cost_us: 0,
+            pixel_format: 0,
+            pixel_format_name: "none".to_string(),
+            sampled_width: 0,
+            sampled_height: 0,
+            source_row_bytes: 0,
+            source_bytes: 0,
+            first_sample_x: 0,
+            first_sample_y: 0,
+            first_sample_byte: 0,
+            last_sample_x: 0,
+            last_sample_y: 0,
+            last_sample_byte: 0,
+            source_last_byte: 0,
+            staging_row_bytes: 0,
+            probe_bytes: 0,
+            nonzero_bytes: 0,
         }
     }
 }
@@ -928,7 +1036,11 @@ impl FrameProbeReport {
              fallback_clear={} probe_every={} failure={failure} \
              min_rgba={},{},{},{} max_rgba={},{},{},{} mean_rgba={},{},{},{} \
              variance={} distinct_sample_values={} uniform_color={} \
-             matches_diagnostic_clear={} sample_cost_us={}",
+             matches_diagnostic_clear={} sample_cost_us={} \
+             pixel_format={} pixel_format_name={} sampled_width={} sampled_height={} \
+             source_row_bytes={} source_bytes={} \
+             first_sample={},{} first_sample_byte={} last_sample={},{} last_sample_byte={} \
+             source_last_byte={} staging_row_bytes={} probe_bytes={} nonzero_bytes={}",
             self.non_black_pixels,
             self.unique_luma_buckets,
             self.frame_crc,
@@ -954,7 +1066,96 @@ impl FrameProbeReport {
             self.uniform_color,
             u8::from(self.matches_diagnostic_clear),
             self.sample_cost_us,
+            self.pixel_format,
+            self.pixel_format_name,
+            self.sampled_width,
+            self.sampled_height,
+            self.source_row_bytes,
+            self.source_bytes,
+            self.first_sample_x,
+            self.first_sample_y,
+            self.first_sample_byte,
+            self.last_sample_x,
+            self.last_sample_y,
+            self.last_sample_byte,
+            self.source_last_byte,
+            self.staging_row_bytes,
+            self.probe_bytes,
+            self.nonzero_bytes,
         )
+    }
+}
+
+/// The proven geometry of one sample: what was read, from where, with what
+/// stride. Computed from the same [`ProbeLayout`] the GPU blit uses, so the
+/// reported numbers cannot drift from the copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProbeGeometry {
+    pixel_format: u32,
+    width: u32,
+    height: u32,
+    source_row_bytes: u64,
+    source_bytes: u64,
+    first_sample_x: u32,
+    first_sample_y: u32,
+    first_sample_byte: u64,
+    last_sample_x: u32,
+    last_sample_y: u32,
+    last_sample_byte: u64,
+    staging_row_bytes: u64,
+    probe_bytes: u64,
+}
+
+impl ProbeGeometry {
+    /// Derives the byte geometry of `layout` for `format`, or `None` when the
+    /// format has no known pixel size.
+    fn new(layout: ProbeLayout, format: usize) -> Option<Self> {
+        let bytes_per_pixel = u64::from(pixel_format_bytes(format)?);
+        let width = layout.source_width;
+        let height = layout.source_height;
+        let source_row_bytes = u64::from(width).checked_mul(bytes_per_pixel)?;
+        let source_bytes = source_row_bytes.checked_mul(u64::from(height))?;
+        let first = layout.block_origin(0, 0, width, height);
+        let last = layout.block_origin(
+            FRAME_PROBE_GRID - 1,
+            FRAME_PROBE_GRID - 1,
+            width,
+            height,
+        );
+        let pixel_byte = |origin: MTLOrigin| {
+            (origin.y as u64)
+                .checked_mul(u64::from(width))?
+                .checked_add(origin.x as u64)?
+                .checked_mul(bytes_per_pixel)
+        };
+        let staging_row_bytes = u64::from(layout.staging_width).checked_mul(bytes_per_pixel)?;
+        let probe_bytes = staging_row_bytes.checked_mul(u64::from(layout.staging_height))?;
+        Some(Self {
+            pixel_format: u32::try_from(format).ok()?,
+            width,
+            height,
+            source_row_bytes,
+            source_bytes,
+            first_sample_x: u32::try_from(first.x).ok()?,
+            first_sample_y: u32::try_from(first.y).ok()?,
+            first_sample_byte: pixel_byte(first)?,
+            last_sample_x: u32::try_from(last.x).ok()?,
+            last_sample_y: u32::try_from(last.y).ok()?,
+            last_sample_byte: pixel_byte(last)?,
+            staging_row_bytes,
+            probe_bytes,
+        })
+    }
+
+    /// The byte offset of the last byte of the last sampled block (inclusive).
+    fn last_sampled_byte_inclusive(layout: ProbeLayout, format: usize) -> Option<u64> {
+        let geometry = Self::new(layout, format)?;
+        let bytes_per_pixel = u64::from(pixel_format_bytes(format)?);
+        geometry
+            .last_sample_byte
+            .checked_add(u64::from(layout.block_height - 1) * geometry.source_row_bytes)?
+            .checked_add(u64::from(layout.block_width) * bytes_per_pixel)?
+            .checked_sub(1)
     }
 }
 
@@ -1096,6 +1297,11 @@ pub fn probe_color_name(sample: &FrameProbeSample) -> String {
 /// content, and comparing it was the Boot #18b bug in which an all-zero
 /// (fully transparent) sample reported `non_black_pixels=4096` with
 /// `frame_crc=0`.
+///
+/// The colour-class count is accumulated in the **same** loop and from the
+/// **same** classification as `non_black_pixels`: a clear pixel contributes
+/// class `0`, a content pixel contributes class `1 + luma_bucket`, so the two
+/// fields can never disagree about which samples they describe.
 pub fn analyze_pixels(
     pixels: &[[u8; 4]],
     order: PixelOrder,
@@ -1103,7 +1309,8 @@ pub fn analyze_pixels(
     threshold: u8,
 ) -> FrameProbeSample {
     let mut non_black_pixels = 0u64;
-    let mut buckets = 0u32;
+    let mut classes = 0u64;
+    let mut nonzero_bytes = 0u64;
     let mut min_rgba = [u8::MAX; 4];
     let mut max_rgba = [0u8; 4];
     let mut sums = [0u64; 4];
@@ -1111,15 +1318,21 @@ pub fn analyze_pixels(
     let clear_rgba = canonical_rgba(clear, order);
     for &pixel in pixels {
         let rgba = canonical_rgba(pixel, order);
-        if rgba
+        let is_content = rgba
             .iter()
             .take(3)
             .zip(clear_rgba.iter().take(3))
-            .any(|(&value, &clear)| value.abs_diff(clear) > threshold)
-        {
+            .any(|(&value, &clear)| value.abs_diff(clear) > threshold);
+        if is_content {
             non_black_pixels += 1;
+            // `+ 1` keeps a content class distinct from the clear class even
+            // when the content's luma bucket equals the clear's. The highest
+            // bit is 32 (luma bucket 31 + 1), so a u64 holds every class.
+            classes |= 1u64 << (luma_bucket(pixel, order) + 1);
+        } else {
+            classes |= 1;
         }
-        buckets |= 1u32 << luma_bucket(pixel, order);
+        nonzero_bytes += pixel.iter().filter(|&&byte| byte != 0).count() as u64;
         for (channel, &value) in rgba.iter().enumerate() {
             min_rgba[channel] = min_rgba[channel].min(value);
             max_rgba[channel] = max_rgba[channel].max(value);
@@ -1153,8 +1366,9 @@ pub fn analyze_pixels(
     };
     FrameProbeSample {
         non_black_pixels,
-        unique_luma_buckets: buckets.count_ones(),
+        unique_luma_buckets: u32::try_from(classes.count_ones()).unwrap_or(u32::MAX),
         frame_crc: frame_crc64(pixels),
+        nonzero_bytes,
         probe_pixels: count,
         min_rgba,
         max_rgba,
@@ -1176,6 +1390,8 @@ pub fn analyze_bgra8(pixels: &[[u8; 4]], clear: [u8; 4], threshold: u8) -> Frame
 /// only the block origins and the staging atlas geometry are computed here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProbeLayout {
+    source_width: u32,
+    source_height: u32,
     block_width: u32,
     block_height: u32,
     step_x: u32,
@@ -1192,6 +1408,8 @@ impl ProbeLayout {
         let block_width = FRAME_PROBE_BLOCK.min(width);
         let block_height = FRAME_PROBE_BLOCK.min(height);
         Some(Self {
+            source_width: width,
+            source_height: height,
             block_width,
             block_height,
             step_x: (width / FRAME_PROBE_GRID).max(1),
@@ -1531,6 +1749,26 @@ impl FrameProbe {
         });
         self.report.sample_cost_us =
             u64::try_from(sample_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.report.pixel_format = u32::try_from(staging.format).unwrap_or(u32::MAX);
+        self.report.pixel_format_name = pixel_format_name(staging.format).to_string();
+        if let Some(geometry) = ProbeGeometry::new(staging.layout, staging.format) {
+            self.report.sampled_width = geometry.width;
+            self.report.sampled_height = geometry.height;
+            self.report.source_row_bytes = geometry.source_row_bytes;
+            self.report.source_bytes = geometry.source_bytes;
+            self.report.first_sample_x = geometry.first_sample_x;
+            self.report.first_sample_y = geometry.first_sample_y;
+            self.report.first_sample_byte = geometry.first_sample_byte;
+            self.report.last_sample_x = geometry.last_sample_x;
+            self.report.last_sample_y = geometry.last_sample_y;
+            self.report.last_sample_byte = geometry.last_sample_byte;
+            self.report.source_last_byte =
+                ProbeGeometry::last_sampled_byte_inclusive(staging.layout, staging.format)
+                    .unwrap_or(0);
+            self.report.staging_row_bytes = geometry.staging_row_bytes;
+            self.report.probe_bytes = geometry.probe_bytes;
+        }
+        self.report.nonzero_bytes = sample.nonzero_bytes;
         drop(command_buffer);
         self.publish();
     }
@@ -1933,6 +2171,38 @@ impl SurfaceImage {
         let rc = unsafe { IOSurfaceUnlock(surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "IOSurfaceUnlock failed");
         pixels
+    }
+
+    /// Test-only: locks the IOSurface for writing and stores `bytes` verbatim.
+    ///
+    /// This lets a hermetic GPU test place a known pixel at a known source
+    /// coordinate, then prove the probe's blit reads exactly that byte. The
+    /// buffer must be exactly `bytes_per_row * height`; production never calls
+    /// this (it is `cfg(test)` and no production code can write surface bytes).
+    #[cfg(test)]
+    fn write_bgra_rows(&self, bytes: &[u8]) {
+        assert_eq!(
+            bytes.len(),
+            self.bytes_per_row * self.height as usize,
+            "write buffer must match the IOSurface layout"
+        );
+        let surface = self.surface.as_ptr();
+        // SAFETY: `surface` is a live IOSurface; option 0 is the read/write
+        // lock, and no GPU work is in flight on this image in the test.
+        let rc = unsafe { IOSurfaceLock(surface, 0, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "IOSurfaceLock(read-write) failed");
+        // SAFETY: The surface is locked for writing and the base address is
+        // valid for `bytes_per_row * height` writable bytes.
+        let base = unsafe { IOSurfaceGetBaseAddress(surface) }.cast::<u8>();
+        assert!(!base.is_null(), "locked IOSurface has no base address");
+        // SAFETY: `base` is the surface's writable backing store and `bytes` is
+        // a distinct, exactly sized allocation.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len());
+        }
+        // SAFETY: Unlocks the same live surface with the same option.
+        let rc = unsafe { IOSurfaceUnlock(surface, 0, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "IOSurfaceUnlock(read-write) failed");
     }
 }
 
@@ -2990,16 +3260,48 @@ mod tests {
         assert_eq!(sample.unique_luma_buckets, 32);
         assert_eq!(sample.probe_pixels, 256);
 
-        // Values 0..=7 share bucket 0; 8 starts bucket 1.
+        // Values 0..=7 share the same 5-bit luma bucket. Measure them as
+        // content (against a mid-grey clear so neither is the clear class) to
+        // pin the class mapping itself.
         let same_bucket = vec![[0, 0, 0, 255], [7, 7, 7, 255]];
+        assert_eq!(luma_bucket(same_bucket[0], PixelOrder::Bgra), 0);
+        assert_eq!(luma_bucket(same_bucket[1], PixelOrder::Bgra), 0);
         assert_eq!(
-            analyze_bgra8(&same_bucket, [0, 0, 0, 255], 0).unique_luma_buckets,
+            analyze_bgra8(&same_bucket, [128, 128, 128, 255], 0).unique_luma_buckets,
             1
         );
         let next_bucket = vec![[7, 7, 7, 255], [8, 8, 8, 255]];
         assert_eq!(
-            analyze_bgra8(&next_bucket, [0, 0, 0, 255], 0).unique_luma_buckets,
+            analyze_bgra8(&next_bucket, [128, 128, 128, 255], 0).unique_luma_buckets,
             2
+        );
+    }
+
+    #[test]
+    fn probe_clear_and_content_buckets_share_one_classification() {
+        // A uniform clear of any colour is exactly one class even when its
+        // luma sits in the middle of the range (the case where "distinct luma
+        // buckets" alone would be meaningless as a content test).
+        for clear in [
+            [0u8, 0, 0, 255],
+            [128, 128, 128, 255],
+            [51, 26, 13, 255],
+        ] {
+            let sample = analyze_bgra8(&vec![clear; 64], clear, FRAME_PROBE_CHANNEL_THRESHOLD);
+            assert_eq!(sample.non_black_pixels, 0);
+            assert_eq!(sample.unique_luma_buckets, 1);
+            assert_eq!(sample.distinct_sample_values, 1);
+        }
+
+        // One content pixel that stays inside the clear's own luma bucket still
+        // adds a class: the two fields describe the same sample.
+        let mut mixed = vec![[10u8, 20, 30, 255]; 64];
+        mixed[0] = [10, 20, 40, 255]; // +10 blue > threshold 8
+        let sample = analyze_bgra8(&mixed, [10, 20, 30, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.non_black_pixels, 1);
+        assert_eq!(
+            sample.unique_luma_buckets, 2,
+            "a clear class plus any content class is at least two"
         );
     }
 
@@ -3066,6 +3368,22 @@ mod tests {
             uniform_color: "swatch_0d1a33".to_string(),
             matches_diagnostic_clear: true,
             sample_cost_us: 42,
+            pixel_format: 80,
+            pixel_format_name: "bgra8unorm".to_string(),
+            sampled_width: 3840,
+            sampled_height: 2160,
+            source_row_bytes: 15_360,
+            source_bytes: 33_177_600,
+            first_sample_x: 0,
+            first_sample_y: 0,
+            first_sample_byte: 0,
+            last_sample_x: 3360,
+            last_sample_y: 1890,
+            last_sample_byte: 29_043_840,
+            source_last_byte: 29_151_391,
+            staging_row_bytes: 256,
+            probe_bytes: 16_384,
+            nonzero_bytes: 16_384,
         };
         let line = report.log_line();
         assert!(line.starts_with("frame_probe="), "{line}");
@@ -3087,6 +3405,20 @@ mod tests {
             "uniform_color=swatch_0d1a33",
             "matches_diagnostic_clear=1",
             "sample_cost_us=42",
+            "pixel_format=80",
+            "pixel_format_name=bgra8unorm",
+            "sampled_width=3840",
+            "sampled_height=2160",
+            "source_row_bytes=15360",
+            "source_bytes=33177600",
+            "first_sample=0,0",
+            "first_sample_byte=0",
+            "last_sample=3360,1890",
+            "last_sample_byte=29043840",
+            "source_last_byte=29151391",
+            "staging_row_bytes=256",
+            "probe_bytes=16384",
+            "nonzero_bytes=16384",
         ] {
             assert!(line.contains(expected), "{line} must contain {expected}");
         }
@@ -3120,6 +3452,10 @@ mod tests {
         assert_eq!(sample.mean_rgba, [0, 0, 0, 0]);
         assert_eq!(sample.max_rgba, [0, 0, 0, 0]);
         assert_eq!(sample.variance, 0);
+        assert_eq!(
+            sample.nonzero_bytes, 0,
+            "all-zero bytes are the authoritative zero case"
+        );
 
         // Opaque black is a different surface: same luma bucket, same RGB
         // minimum, but a name and alpha that tell them apart, and a non-zero
@@ -3128,8 +3464,38 @@ mod tests {
         let sample = analyze_bgra8(&opaque_black, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
         assert_eq!(sample.non_black_pixels, 0);
         assert_ne!(sample.frame_crc, 0, "opaque black has non-zero alpha bytes");
+        assert_eq!(
+            sample.nonzero_bytes, FRAME_PROBE_PIXELS,
+            "opaque black has one non-zero alpha byte per pixel"
+        );
         assert_eq!(probe_color_name(&sample), "black");
         assert_eq!(sample.mean_rgba, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn probe_one_nonzero_pixel_is_counted_and_changes_the_crc() {
+        let all_zero = vec![[0u8; 4]; FRAME_PROBE_PIXELS as usize];
+        let clean = analyze_bgra8(&all_zero, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(clean.non_black_pixels, 0);
+        assert_eq!(clean.frame_crc, 0);
+        assert_eq!(clean.nonzero_bytes, 0);
+
+        // One pixel with a colour channel beyond the threshold: counted, and
+        // the CRC of the bytes read changes.
+        let mut one = all_zero.clone();
+        one[17] = [0, 0, 255, 0];
+        let sample = analyze_bgra8(&one, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.non_black_pixels, 1);
+        assert_eq!(sample.nonzero_bytes, 1);
+        assert_ne!(sample.frame_crc, 0, "one non-zero pixel must change the CRC");
+        assert_ne!(
+            sample.frame_crc, clean.frame_crc,
+            "the CRC is sensitive to the one changed pixel"
+        );
+        assert_eq!(sample.distinct_sample_values, 2);
+        assert_eq!(sample.min_rgba, [0, 0, 0, 0]);
+        assert_eq!(sample.max_rgba, [255, 0, 0, 0]);
+        assert!(sample.variance > 0, "one 255 channel is measurable spread");
     }
 
     #[test]
@@ -3155,6 +3521,16 @@ mod tests {
         assert_eq!(probe_color_name(&sample), "mixed");
         // Half the frame differs from black, all of the white half does.
         assert_eq!(sample.non_black_pixels, 32 * 64);
+        // Black pixels contribute one non-zero byte (alpha); white pixels four.
+        assert_eq!(
+            sample.nonzero_bytes,
+            32 * 64 * 1 + 32 * 64 * 4,
+            "black alpha bytes plus white colour/alpha bytes"
+        );
+        assert!(
+            sample.non_black_pixels > 0 && sample.unique_luma_buckets >= 2,
+            "the content count and the class count describe the same sample"
+        );
     }
 
     #[test]
@@ -3175,6 +3551,21 @@ mod tests {
         assert_ne!(grey_sample.frame_crc, black_sample.frame_crc);
         assert!(grey_sample.non_black_pixels > 0);
         assert_eq!(black_sample.non_black_pixels, 0);
+
+        // Every colour field distinguishes the two uniform surfaces; only the
+        // geometry fields (format, extent, stride) are shared.
+        assert_ne!(grey_sample.min_rgba, black_sample.min_rgba);
+        assert_ne!(grey_sample.max_rgba, black_sample.max_rgba);
+        assert_ne!(
+            grey_sample.nonzero_bytes, black_sample.nonzero_bytes,
+            "mid-grey has three non-zero colour bytes per pixel, black one alpha byte"
+        );
+        assert_eq!(grey_sample.unique_luma_buckets, black_sample.unique_luma_buckets);
+        assert_eq!(grey_sample.unique_luma_buckets, 1);
+        assert_ne!(
+            probe_color_name(&grey_sample),
+            probe_color_name(&black_sample)
+        );
     }
 
     #[test]
@@ -3307,6 +3698,104 @@ mod tests {
         assert!(sample.variance > 0);
         assert!(sample.non_black_pixels > 0);
         assert!(sample.unique_luma_buckets >= 2);
+    }
+
+    /// The byte geometry the probe reports for the boot's real surface. These
+    /// are the numbers in the module documentation and the `frame_probe=` line:
+    /// if an offset here were wrong, the GPU blit would read a different block
+    /// (or outside the texture).
+    #[test]
+    fn probe_geometry_pins_the_4k_bgra8_and_rgba16float_byte_offsets() {
+        let (width, height) = (3840u32, 2160u32);
+        let layout = ProbeLayout::new(width, height).expect("4K layout");
+
+        let bgra8 = ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM)
+            .expect("BGRA8 4K geometry");
+        assert_eq!(bgra8.pixel_format, 80);
+        assert_eq!((bgra8.width, bgra8.height), (3840, 2160));
+        assert_eq!(bgra8.source_row_bytes, 15_360);
+        assert_eq!(bgra8.source_bytes, 33_177_600);
+        assert_eq!((bgra8.first_sample_x, bgra8.first_sample_y), (0, 0));
+        assert_eq!(bgra8.first_sample_byte, 0);
+        assert_eq!((bgra8.last_sample_x, bgra8.last_sample_y), (3360, 1890));
+        assert_eq!(
+            bgra8.last_sample_byte,
+            (1890u64 * 3840 + 3360) * 4,
+            "last sample starts at (1890 * 3840 + 3360) * 4"
+        );
+        assert_eq!(bgra8.last_sample_byte, 29_043_840);
+        assert_eq!(bgra8.staging_row_bytes, 256);
+        assert_eq!(bgra8.probe_bytes, 16_384);
+
+        let last_inclusive =
+            ProbeGeometry::last_sampled_byte_inclusive(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM)
+                .expect("last read byte");
+        assert_eq!(
+            last_inclusive,
+            ((1890u64 + 7) * 3840 + 3360 + 7) * 4 + 3,
+            "last byte of the last 8x8 block"
+        );
+        assert_eq!(last_inclusive, 29_151_391);
+        assert!(
+            last_inclusive < bgra8.source_bytes,
+            "the read must stay inside the 4K BGRA8 surface"
+        );
+
+        // RGBA16Float has the same coordinates and twice the stride; the
+        // analyser does not read it (it fails closed), but a future 16F path
+        // inherits these proven offsets.
+        let rgba16f = ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_RGBA16_FLOAT)
+            .expect("RGBA16Float 4K geometry");
+        assert_eq!(rgba16f.pixel_format, 115);
+        assert_eq!(rgba16f.source_row_bytes, 30_720);
+        assert_eq!(rgba16f.source_bytes, 66_355_200);
+        assert_eq!(rgba16f.first_sample_byte, 0);
+        assert_eq!(rgba16f.last_sample_byte, 58_087_680);
+        let last_16f_inclusive =
+            ProbeGeometry::last_sampled_byte_inclusive(layout, MTL_PIXEL_FORMAT_RGBA16_FLOAT)
+                .expect("last 16F read byte");
+        assert_eq!(last_16f_inclusive, 58_302_783);
+        assert!(last_16f_inclusive < rgba16f.source_bytes);
+        assert_eq!(rgba16f.staging_row_bytes, 512);
+        assert_eq!(rgba16f.probe_bytes, 32_768);
+    }
+
+    /// The boot's real geometry: a 3840x2160 source in a 1280x720 window. The
+    /// probe must use the source extent, never the window's.
+    #[test]
+    fn probe_boot_geometry_samples_the_4k_source_not_the_720p_window() {
+        let (source_w, source_h) = (3840u32, 2160u32);
+        let (window_w, window_h) = (1280u32, 720u32);
+        let source = ProbeLayout::new(source_w, source_h).expect("source layout");
+        let window = ProbeLayout::new(window_w, window_h).expect("window layout");
+        assert_eq!((source.step_x, source.step_y), (480, 270));
+        assert_eq!((window.step_x, window.step_y), (160, 90));
+
+        let geometry =
+            ProbeGeometry::new(source, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("4K geometry");
+        assert_eq!((geometry.width, geometry.height), (3840, 2160));
+        assert_eq!((geometry.last_sample_x, geometry.last_sample_y), (3360, 1890));
+
+        // The last sampled pixel's byte offset is far past the entire window
+        // buffer (1280 * 720 * 4 = 3_686_400 bytes), which is the proof the
+        // probe is reading the source, not the window.
+        let window_bytes = u64::from(window_w) * u64::from(window_h) * 4;
+        assert_eq!(window_bytes, 3_686_400);
+        assert!(
+            geometry.last_sample_byte > window_bytes,
+            "the last sample ({}) must lie beyond the 1280x720 window buffer ({window_bytes})",
+            geometry.last_sample_byte
+        );
+        assert!(geometry.last_sample_byte < geometry.source_bytes);
+
+        // If the layout had been built from the window, the last sample would
+        // be a different pixel inside the window buffer; the probe uses the
+        // source layout's values, not these.
+        let window_geometry =
+            ProbeGeometry::new(window, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("window geometry");
+        assert_eq!((window_geometry.last_sample_x, window_geometry.last_sample_y), (1120, 630));
+        assert_ne!(geometry.last_sample_byte, window_geometry.last_sample_byte);
+        assert_eq!(window_geometry.source_row_bytes, 5_120);
     }
 
     /// Measures the CPU side of one sample: `getBytes` of the 16 KiB atlas plus
@@ -3514,5 +4003,129 @@ mod tests {
         assert_eq!(sample.uniform_rgba, Some([13, 26, 51, 255]));
         assert_eq!(sample.non_black_pixels, 0);
         assert_ne!(sample.frame_crc, 0, "the diagnostic clear is not all-zero bytes");
+
+        // The real blit's geometry is the same one the report names.
+        let geometry = ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM)
+            .expect("4K geometry");
+        assert_eq!((geometry.width, geometry.height), (3840, 2160));
+        assert_eq!(geometry.source_row_bytes, 15_360);
+        assert_eq!(geometry.first_sample_byte, 0);
+        assert_eq!(geometry.last_sample_byte, 29_043_840);
+        assert_eq!(geometry.probe_bytes, 16_384);
+        assert_eq!(sample.nonzero_bytes, FRAME_PROBE_PIXELS * 4);
+    }
+
+    /// Proves the real GPU staging blit at the boot's 3840x2160 extent reads
+    /// the bytes at the computed source offsets: a source with a distinct value
+    /// at every coordinate is written into a shared IOSurface, then the same
+    /// 64-block copy the probe encodes is compared pixel for pixel. A wrong
+    /// offset, a window-sized layout or an out-of-bounds block would show up
+    /// as a mismatch and as fewer than 4096 distinct sample values.
+    #[test]
+    #[ignore = "requires a Metal device: proves the real 4K blit reads the computed offsets"]
+    fn frame_probe_gpu_4k_blit_reads_the_computed_source_offsets() {
+        let (width, height) = (3840u32, 2160u32);
+        let transport = open_transport();
+        let image = create_surface(&transport, width, height);
+        let row_bytes = image.bytes_per_row();
+        let mut source = vec![0u8; row_bytes * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = y * row_bytes + x * 4;
+                source[offset] = (x & 0xff) as u8;
+                source[offset + 1] = (y & 0xff) as u8;
+                source[offset + 2] = (((x >> 8) ^ (y >> 8)) & 0xff) as u8;
+                source[offset + 3] = 0xff;
+            }
+        }
+        image.write_bgra_rows(&source);
+
+        let layout = ProbeLayout::new(width, height).expect("4K layout");
+        let staging = create_probe_staging_texture(
+            transport.device_raw(),
+            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            layout.staging_width,
+            layout.staging_height,
+        )
+        .expect("probe staging texture");
+
+        // SAFETY: both textures are live 4K/64x64 BGRA8 textures, every block
+        // rectangle lies inside the source and the 64x64 atlas, and the
+        // readback buffer is the whole atlas at its 256-byte row pitch.
+        unsafe {
+            let command_buffer =
+                objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer"));
+            assert!(!command_buffer.is_null());
+            let encoder =
+                objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
+            assert!(!encoder.is_null());
+            for grid_y in 0..FRAME_PROBE_GRID {
+                for grid_x in 0..FRAME_PROBE_GRID {
+                    encode_texture_block_copy(
+                        encoder,
+                        image.texture_raw(),
+                        layout.block_origin(grid_x, grid_y, width, height),
+                        layout.block_width,
+                        layout.block_height,
+                        staging.as_raw(),
+                        layout.staging_origin(grid_x, grid_y),
+                    );
+                }
+            }
+            objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
+            objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
+        }
+
+        let mut pixels = vec![[0u8; 4]; 64 * 64];
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc::MTLSize {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+        };
+        // SAFETY: the command buffer completed and `pixels` holds the atlas.
+        unsafe {
+            get_texture_bytes(staging.as_raw(), pixels.as_mut_ptr().cast(), 64 * 4, region);
+        }
+
+        let mut mismatches = 0usize;
+        for grid_y in 0..FRAME_PROBE_GRID {
+            for grid_x in 0..FRAME_PROBE_GRID {
+                let origin = layout.block_origin(grid_x, grid_y, width, height);
+                let staging_origin = layout.staging_origin(grid_x, grid_y);
+                for row in 0..8usize {
+                    for column in 0..8usize {
+                        let source_offset =
+                            (origin.y + row) * row_bytes + (origin.x + column) * 4;
+                        let staging_index = (staging_origin.y + row) * 64
+                            + staging_origin.x
+                            + column;
+                        if pixels[staging_index] != source[source_offset..source_offset + 4] {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "the GPU copy must read the computed source offsets exactly"
+        );
+
+        let sample = analyze_bgra8(&pixels, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
+        assert_eq!(sample.probe_pixels, FRAME_PROBE_PIXELS);
+        assert_eq!(
+            sample.distinct_sample_values, 4096,
+            "a coordinate-keyed 4K source must produce 4096 distinct samples"
+        );
+        assert_ne!(sample.frame_crc, 0);
+        // Every alpha byte is 0xff; some coordinate-derived colour bytes are
+        // legitimately zero, so the exact count is below 4 per pixel.
+        assert!(sample.nonzero_bytes > 0);
+        assert!(sample.non_black_pixels > 0);
+        assert!(sample.unique_luma_buckets >= 2);
     }
 }
