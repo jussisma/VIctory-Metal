@@ -4629,6 +4629,48 @@ mod tests {
         }
     }
 
+    /// A mixed buffer+texture table is recorded as one table and survives the
+    /// wire, so a registered resource sits beside a buffer range without
+    /// dropping either entry.
+    #[test]
+    fn a_mixed_descriptor_table_is_recorded_and_round_trips() {
+        let mut producer = compute_producer(46);
+        let table = DescriptorTableV3 {
+            set: 0,
+            base_register: 1,
+            kind: DescriptorKind::Uav,
+            bindings: vec![
+                DescriptorTableEntryV3::Buffer(BufferBinding {
+                    allocation_id: 0x7000,
+                    generation: 1,
+                    offset: 16,
+                    length: 256,
+                }),
+                DescriptorTableEntryV3::Texture(0x2100),
+            ],
+        };
+        producer
+            .set_compute_descriptor_table(table.clone())
+            .expect("a mixed table is accepted");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+
+        let submission = flush_for_wire(&mut producer);
+        let recorded = submission
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                CommandV3::SetDescriptorTable(recorded) => Some(recorded.clone()),
+                _ => None,
+            })
+            .expect("the table command");
+        assert_eq!(recorded, table, "both entries reached the producer submission");
+
+        let frame = victory_metal::wire_v3::encode_submission_v3(&submission)
+            .expect("a mixed table encodes");
+        let decoded = decode_submission_v3(&frame).expect("a mixed table decodes");
+        assert_eq!(decoded, submission);
+    }
+
     /// A compute descriptor table is recorded at its root slot before the
     /// dispatch; its ranges are the table's, not dispatch bindings.
     #[test]
