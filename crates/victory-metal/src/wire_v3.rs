@@ -172,8 +172,9 @@
 //! | 6 | 2 | base register |
 //! | 8 | 2 | kind (0 = CBV, 1 = SRV, 2 = UAV, 3 = sampler) |
 //! | 10 | 2 | binding count (1 ..= [`MAX_DESCRIPTOR_BINDINGS_V3`]) |
-//! | 12 | 2 | reserved, must be zero |
-//! | 14 | 32 x N | bound buffer ranges, in register order |
+//! | 12 | 2 | entry tag (0 = 32-byte buffer ranges, 1 = 8-byte resource handles) |
+//! | 14 | 32 x N | bound buffer ranges, when the tag is 0 |
+//! | 14 | 8 x N | registered texture/sampler handles, when the tag is 1 |
 //!
 //! Opcode 16 opens a render pass with 1 ..= [`MAX_COLOR_ATTACHMENTS`] color
 //! attachments and one optional depth/stencil attachment:
@@ -784,6 +785,43 @@ pub enum DescriptorKind {
     Sampler,
 }
 
+/// One entry of a version 3 descriptor table.
+///
+/// A buffer entry keeps the resolved `(allocation_id, generation, offset,
+/// length)` range. A texture or sampler entry names a host registration
+/// directly: the handle is the transport-kind-8 texture handle for
+/// [`DescriptorKind::Srv`]/[`DescriptorKind::Uav`] tables, or an
+/// `MTLSamplerState` registration handle for [`DescriptorKind::Sampler`]
+/// tables. Every variant is `Copy`, so a decoded table allocates only its
+/// entry vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorTableEntryV3 {
+    /// A buffer range in the guest allocation registry.
+    Buffer(BufferBinding),
+    /// A registered texture handle (`gpuResourceID` is resolved on the host).
+    Texture(u64),
+    /// A registered sampler-state handle.
+    Sampler(u64),
+}
+
+impl DescriptorTableEntryV3 {
+    /// The buffer range, when this is a buffer entry.
+    pub fn as_buffer(&self) -> Option<&BufferBinding> {
+        match self {
+            Self::Buffer(binding) => Some(binding),
+            Self::Texture(_) | Self::Sampler(_) => None,
+        }
+    }
+
+    /// The registered resource handle, when this is a texture or sampler entry.
+    pub fn resource_handle(&self) -> Option<u64> {
+        match self {
+            Self::Texture(handle) | Self::Sampler(handle) => Some(*handle),
+            Self::Buffer(_) => None,
+        }
+    }
+}
+
 /// A descriptor table binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorTableV3 {
@@ -793,8 +831,8 @@ pub struct DescriptorTableV3 {
     pub base_register: u16,
     /// Register kind.
     pub kind: DescriptorKind,
-    /// Buffers/textures in register order; 1..=MAX_DESCRIPTOR_BINDINGS_V3.
-    pub bindings: Vec<BufferBinding>,
+    /// Table entries in register order; 1..=MAX_DESCRIPTOR_BINDINGS_V3.
+    pub bindings: Vec<DescriptorTableEntryV3>,
 }
 
 /// A root buffer view: a 64-bit GPU address for root SRV/UAV/CBV.
@@ -1550,6 +1588,16 @@ const FRAME_HEADER_LEN: usize = 20;
 const LIST_BLOCK_LEN: usize = 12;
 const KIND_SUBMISSION: u16 = 1;
 const BINDING_LEN: usize = 32;
+const RESOURCE_HANDLE_LEN: usize = 8;
+/// Table-entry encoding tag in the descriptor-table header word at offset 12.
+///
+/// `0` is the legacy buffer-range encoding (32 bytes per entry) and decodes old
+/// frames byte-compatibly. `1` is a resource-handle encoding (8 bytes per
+/// entry) whose meaning is fixed by the table kind: `Srv`/`Uav` entries are
+/// registered texture handles and `Sampler` entries are registered sampler
+/// handles.
+const DESCRIPTOR_ENTRY_BUFFER: u16 = 0;
+const DESCRIPTOR_ENTRY_RESOURCE: u16 = 1;
 const BARRIER_ENTRY_LEN: usize = 40;
 const COLOR_ATTACHMENT_LEN: usize = 56;
 const DEPTH_ATTACHMENT_LEN: usize = 36;
@@ -2326,7 +2374,7 @@ fn read_descriptor_table(
     let base_register = reader.u16()?;
     let kind = descriptor_kind_from_code(reader.u16()?)?;
     let count = usize::from(reader.u16()?);
-    reader.reserved_u16()?;
+    let entry_tag = reader.u16()?;
     if count == 0 {
         return Err(WireError::ZeroDescriptorCount);
     }
@@ -2334,8 +2382,38 @@ fn read_descriptor_table(
         return Err(WireError::TooManyDescriptorBindingsV3(count));
     }
     table.bindings.clear();
-    for _ in 0..count {
-        table.bindings.push(read_binding(reader)?);
+    match entry_tag {
+        DESCRIPTOR_ENTRY_BUFFER => {
+            for _ in 0..count {
+                table
+                    .bindings
+                    .push(DescriptorTableEntryV3::Buffer(read_binding(reader)?));
+            }
+        }
+        DESCRIPTOR_ENTRY_RESOURCE => {
+            let sampler = match kind {
+                DescriptorKind::Srv | DescriptorKind::Uav => false,
+                DescriptorKind::Sampler => true,
+                DescriptorKind::Cbv => return Err(WireError::DescriptorEntryMismatch),
+            };
+            for _ in 0..count {
+                let handle = reader.u64()?;
+                if handle == 0 {
+                    return Err(WireError::ZeroDescriptorHandle);
+                }
+                table.bindings.push(if sampler {
+                    DescriptorTableEntryV3::Sampler(handle)
+                } else {
+                    DescriptorTableEntryV3::Texture(handle)
+                });
+            }
+        }
+        other => {
+            return Err(WireError::InvalidEnumCode {
+                field: "descriptor table entry tag",
+                code: other,
+            });
+        }
     }
     table.set = set;
     table.base_register = base_register;
@@ -3255,17 +3333,70 @@ fn descriptor_table_encoded_len(table: &DescriptorTableV3) -> Result<usize, Wire
         return Err(WireError::ZeroDescriptorCount);
     }
     if table.bindings.len() > MAX_DESCRIPTOR_BINDINGS_V3 {
-        return Err(WireError::TooManyDescriptorBindingsV3(table.bindings.len()));
+        return Err(WireError::TooManyDescriptorBindingsV3(
+            table.bindings.len(),
+        ));
     }
-    for binding in &table.bindings {
-        validate_binding(binding)?;
-    }
+    let entry_len = descriptor_table_entry_len(table)?;
     table
         .bindings
         .len()
-        .checked_mul(BINDING_LEN)
+        .checked_mul(entry_len)
         .and_then(|bindings_len| bindings_len.checked_add(DESCRIPTOR_TABLE_HEADER_LEN))
         .ok_or(WireError::FrameTooLarge)
+}
+
+/// Validates a table's entries and returns the wire encoding tag.
+///
+/// Tables are homogeneous by construction: the three buffer kinds only hold
+/// [`DescriptorTableEntryV3::Buffer`], SRV/UAV tables hold
+/// [`DescriptorTableEntryV3::Texture`], and sampler tables hold
+/// [`DescriptorTableEntryV3::Sampler`]. A mixed table has no wire encoding.
+fn descriptor_table_entry_tag(table: &DescriptorTableV3) -> Result<u16, WireError> {
+    let mut tag = None;
+    for entry in &table.bindings {
+        let entry_tag = match entry {
+            DescriptorTableEntryV3::Buffer(binding) => {
+                validate_binding(binding)?;
+                if matches!(table.kind, DescriptorKind::Sampler) {
+                    return Err(WireError::DescriptorEntryMismatch);
+                }
+                DESCRIPTOR_ENTRY_BUFFER
+            }
+            DescriptorTableEntryV3::Texture(handle) => {
+                if *handle == 0 {
+                    return Err(WireError::ZeroDescriptorHandle);
+                }
+                if !matches!(table.kind, DescriptorKind::Srv | DescriptorKind::Uav) {
+                    return Err(WireError::DescriptorEntryMismatch);
+                }
+                DESCRIPTOR_ENTRY_RESOURCE
+            }
+            DescriptorTableEntryV3::Sampler(handle) => {
+                if *handle == 0 {
+                    return Err(WireError::ZeroDescriptorHandle);
+                }
+                if table.kind != DescriptorKind::Sampler {
+                    return Err(WireError::DescriptorEntryMismatch);
+                }
+                DESCRIPTOR_ENTRY_RESOURCE
+            }
+        };
+        match tag {
+            Some(existing) if existing != entry_tag => {
+                return Err(WireError::DescriptorEntryMismatch);
+            }
+            _ => tag = Some(entry_tag),
+        }
+    }
+    tag.ok_or(WireError::ZeroDescriptorCount)
+}
+
+fn descriptor_table_entry_len(table: &DescriptorTableV3) -> Result<usize, WireError> {
+    match descriptor_table_entry_tag(table)? {
+        DESCRIPTOR_ENTRY_BUFFER => Ok(BINDING_LEN),
+        _ => Ok(RESOURCE_HANDLE_LEN),
+    }
 }
 
 fn begin_render_pass_encoded_len(pass: &BeginRenderPass) -> Result<usize, WireError> {
@@ -3594,7 +3725,7 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             write_u32(out, dispatch.threads_per_group);
             write_u16(out, dispatch.bindings.len() as u16);
             write_u16(out, 0);
-            write_bindings(out, &dispatch.bindings);
+            write_buffer_bindings(out, &dispatch.bindings);
         }
         CommandV3::Dispatch3d(dispatch) => {
             write_u64(out, dispatch.pipeline_id);
@@ -3606,7 +3737,7 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             }
             write_u16(out, dispatch.bindings.len() as u16);
             write_u16(out, 0);
-            write_bindings(out, &dispatch.bindings);
+            write_buffer_bindings(out, &dispatch.bindings);
         }
         CommandV3::DrawIndexed(draw) => {
             write_u32(out, draw.index_count);
@@ -3628,7 +3759,7 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             }
             write_u16(out, dispatch.bindings.len() as u16);
             write_u16(out, 0);
-            write_bindings(out, &dispatch.bindings);
+            write_buffer_bindings(out, &dispatch.bindings);
         }
         CommandV3::ResourceBarrier(barrier) => {
             write_u16(out, barrier.entries.len() as u16);
@@ -3656,8 +3787,21 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
             write_u16(out, table.base_register);
             write_u16(out, descriptor_kind_code(table.kind));
             write_u16(out, table.bindings.len() as u16);
-            write_u16(out, 0);
-            write_bindings(out, &table.bindings);
+            let tag = descriptor_table_entry_tag(table).expect("validated table entry tag");
+            write_u16(out, tag);
+            match tag {
+                DESCRIPTOR_ENTRY_BUFFER => write_table_buffer_bindings(out, &table.bindings),
+                _ => {
+                    for entry in &table.bindings {
+                        write_u64(
+                            out,
+                            entry
+                                .resource_handle()
+                                .expect("resource entry tag matches the entries"),
+                        );
+                    }
+                }
+            }
         }
         CommandV3::BeginRenderPass(pass) => {
             write_u16(out, pass.colors.len() as u16);
@@ -3968,8 +4112,21 @@ fn write_subresource(out: &mut Vec<u8>, subresource: &TextureSubresource) {
     write_u16(out, subresource.slice);
 }
 
-fn write_bindings(out: &mut Vec<u8>, bindings: &[BufferBinding]) {
+fn write_buffer_bindings(out: &mut Vec<u8>, bindings: &[BufferBinding]) {
     for binding in bindings {
+        write_u64(out, binding.allocation_id);
+        write_u32(out, binding.generation);
+        write_u32(out, 0);
+        write_u64(out, binding.offset);
+        write_u64(out, binding.length);
+    }
+}
+
+fn write_table_buffer_bindings(out: &mut Vec<u8>, entries: &[DescriptorTableEntryV3]) {
+    for entry in entries {
+        let binding = entry
+            .as_buffer()
+            .expect("buffer-tagged table holds only buffer entries");
         write_u64(out, binding.allocation_id);
         write_u32(out, binding.generation);
         write_u32(out, 0);
@@ -4234,6 +4391,10 @@ mod tests {
         }
     }
 
+    fn entry(offset: u64) -> DescriptorTableEntryV3 {
+        DescriptorTableEntryV3::Buffer(binding(offset))
+    }
+
     fn vertex_buffer(offset: u64) -> VertexBuffer {
         VertexBuffer {
             allocation_id: 2,
@@ -4401,7 +4562,7 @@ mod tests {
                 set: 2,
                 base_register: 1,
                 kind: DescriptorKind::Srv,
-                bindings: vec![binding(0), binding(65_536)],
+                bindings: vec![entry(0), entry(65_536)],
             }),
             CommandV3::BeginRenderPass(BeginRenderPass {
                 colors: (0..8).map(color).collect(),
@@ -5146,7 +5307,7 @@ mod tests {
             set: 0,
             base_register: 0,
             kind: DescriptorKind::Cbv,
-            bindings: vec![binding(0)],
+            bindings: vec![entry(0)],
         }));
         assert_decode_error(
             &table,
@@ -5207,6 +5368,114 @@ mod tests {
     }
 
     #[test]
+    fn wire_v3_encodes_table_resource_handles_and_keeps_buffer_frames() {
+        // A buffer table keeps the legacy tag 0 and 32-byte entries, so a
+        // frame produced before resource entries existed still decodes.
+        let buffer_frame = single_frame(CommandV3::SetDescriptorTable(DescriptorTableV3 {
+            set: 1,
+            base_register: 2,
+            kind: DescriptorKind::Srv,
+            bindings: vec![entry(0), entry(64)],
+        }));
+        let command = &buffer_frame[COMMAND_START..];
+        assert_eq!(&command[12..14], &DESCRIPTOR_ENTRY_BUFFER.to_le_bytes());
+        assert_eq!(
+            buffer_frame.len(),
+            COMMAND_START + DESCRIPTOR_TABLE_HEADER_LEN + 2 * BINDING_LEN
+        );
+        let decoded = decode_submission_v3(&buffer_frame).expect("buffer table decodes");
+        assert_eq!(
+            decoded.commands[0],
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 1,
+                base_register: 2,
+                kind: DescriptorKind::Srv,
+                bindings: vec![entry(0), entry(64)],
+            })
+        );
+
+        // Texture entries are 8-byte handles behind tag 1.
+        let texture_table = DescriptorTableV3 {
+            set: 3,
+            base_register: 0,
+            kind: DescriptorKind::Srv,
+            bindings: vec![
+                DescriptorTableEntryV3::Texture(0x2100),
+                DescriptorTableEntryV3::Texture(0x2101),
+            ],
+        };
+        let texture_frame = single_frame(CommandV3::SetDescriptorTable(texture_table.clone()));
+        let command = &texture_frame[COMMAND_START..];
+        assert_eq!(&command[12..14], &DESCRIPTOR_ENTRY_RESOURCE.to_le_bytes());
+        assert_eq!(
+            texture_frame.len(),
+            COMMAND_START + DESCRIPTOR_TABLE_HEADER_LEN + 2 * RESOURCE_HANDLE_LEN
+        );
+        assert_eq!(
+            &command[14..22],
+            &0x2100u64.to_le_bytes(),
+            "first texture handle"
+        );
+        assert_eq!(
+            &command[22..30],
+            &0x2101u64.to_le_bytes(),
+            "second texture handle"
+        );
+        assert_eq!(
+            decode_submission_v3(&texture_frame).expect("texture table decodes"),
+            submission_with(vec![CommandV3::SetDescriptorTable(texture_table)])
+        );
+
+        // Sampler entries use the same tag and decode to sampler handles.
+        let sampler_table = DescriptorTableV3 {
+            set: 4,
+            base_register: 1,
+            kind: DescriptorKind::Sampler,
+            bindings: vec![DescriptorTableEntryV3::Sampler(0x3100)],
+        };
+        assert_roundtrip(&submission_with(vec![CommandV3::SetDescriptorTable(
+            sampler_table,
+        )]));
+
+        // A truncated resource frame is refused, never partially decoded.
+        let truncated = &texture_frame[..texture_frame.len() - 1];
+        assert_eq!(
+            decode_submission_v3(truncated),
+            Err(WireError::Truncated),
+            "a short resource entry must be refused"
+        );
+
+        // Zero handles and kind mismatches are encoding errors.
+        assert_encode_error(
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![DescriptorTableEntryV3::Texture(0)],
+            }),
+            WireError::ZeroDescriptorHandle,
+        );
+        assert_encode_error(
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Sampler,
+                bindings: vec![DescriptorTableEntryV3::Texture(0x2100)],
+            }),
+            WireError::DescriptorEntryMismatch,
+        );
+        assert_encode_error(
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Cbv,
+                bindings: vec![entry(0), DescriptorTableEntryV3::Texture(0x2100)],
+            }),
+            WireError::DescriptorEntryMismatch,
+        );
+    }
+
+    #[test]
     fn wire_v3_accepts_boundary_counts_and_rejects_one_more() {
         // 8 color attachments are accepted; 8 is the maximum.
         assert_roundtrip(&submission_with(vec![CommandV3::BeginRenderPass(
@@ -5257,16 +5526,16 @@ mod tests {
             DescriptorTableV3 {
                 set: 0,
                 base_register: 0,
-                kind: DescriptorKind::Sampler,
-                bindings: (0..32).map(binding).collect(),
+                kind: DescriptorKind::Cbv,
+                bindings: (0..32).map(entry).collect(),
             },
         )]));
         assert_encode_error(
             CommandV3::SetDescriptorTable(DescriptorTableV3 {
                 set: 0,
                 base_register: 0,
-                kind: DescriptorKind::Sampler,
-                bindings: vec![binding(0); 33],
+                kind: DescriptorKind::Cbv,
+                bindings: vec![entry(0); 33],
             }),
             WireError::TooManyDescriptorBindingsV3(33),
         );

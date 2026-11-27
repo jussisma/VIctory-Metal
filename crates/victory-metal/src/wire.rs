@@ -716,6 +716,10 @@ pub enum WireError {
     TooManyBlendAttachments(usize),
     /// A depth/stencil clear selected neither the depth nor the stencil plane.
     EmptyClear,
+    /// A version 3 descriptor-table resource entry carried a zero handle.
+    ZeroDescriptorHandle,
+    /// A version 3 descriptor-table entry does not match the table's kind.
+    DescriptorEntryMismatch,
 }
 
 impl fmt::Display for WireError {
@@ -818,6 +822,12 @@ impl fmt::Display for WireError {
                 write!(f, "{count} blend entries exceeds limit 8")
             }
             Self::EmptyClear => write!(f, "clear must select the depth and/or stencil plane"),
+            Self::ZeroDescriptorHandle => {
+                write!(f, "descriptor-table resource handle must be nonzero")
+            }
+            Self::DescriptorEntryMismatch => {
+                write!(f, "descriptor-table entry does not match the table kind")
+            }
         }
     }
 }

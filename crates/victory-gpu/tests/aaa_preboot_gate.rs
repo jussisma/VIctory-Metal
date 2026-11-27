@@ -94,7 +94,7 @@ use victory_gpu::object::{Object, S_OK};
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{
     ClearDepthStencilView, ClearRenderTargetView, CommandV3, CullMode, DescriptorKind,
-    DescriptorTableV3, IndirectArguments, LoadOp, PrimitiveTopology, RootBufferView,
+    DescriptorTableEntryV3, DescriptorTableV3, IndirectArguments, LoadOp, PrimitiveTopology, RootBufferView,
     ScissorRect, TextureSubresource,
 };
 
@@ -996,18 +996,18 @@ fn aaa_preboot_guest_gate() {
         base_register: 0,
         kind: DescriptorKind::Srv,
         bindings: vec![
-            victory_metal::wire::BufferBinding {
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: SRV0_OFFSET,
                 length: 16,
-            },
-            victory_metal::wire::BufferBinding {
+            }),
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: SRV1_OFFSET,
                 length: 16,
-            },
+            }),
         ],
     };
     let uav_table = DescriptorTableV3 {
@@ -1015,18 +1015,18 @@ fn aaa_preboot_guest_gate() {
         base_register: 0,
         kind: DescriptorKind::Uav,
         bindings: vec![
-            victory_metal::wire::BufferBinding {
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: UAV0_OFFSET,
                 length: UAV0_LEN,
-            },
-            victory_metal::wire::BufferBinding {
+            }),
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: UAV1_OFFSET,
                 length: UAV1_LEN,
-            },
+            }),
         ],
     };
     let cbv_table = DescriptorTableV3 {
@@ -1034,18 +1034,18 @@ fn aaa_preboot_guest_gate() {
         base_register: 0,
         kind: DescriptorKind::Cbv,
         bindings: vec![
-            victory_metal::wire::BufferBinding {
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: VIEW0_OFFSET,
                 length: 16,
-            },
-            victory_metal::wire::BufferBinding {
+            }),
+            DescriptorTableEntryV3::Buffer(victory_metal::wire::BufferBinding {
                 allocation_id: ALLOC_ID,
                 generation: ALLOC_GEN,
                 offset: VIEW1_OFFSET,
                 length: 16,
-            },
+            }),
         ],
     };
     // Root constants at the reflection's parameter index 3: xyz is the tint,

@@ -52,7 +52,8 @@ use victory_metal::wire::{
 pub use victory_metal::wire::BarrierEntry;
 use victory_metal::wire_v3::{
     BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture,
-    CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorTableV3,
+    CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorTableEntryV3,
+    DescriptorTableV3,
     DrawIndexedInstanced, DrawInstanced, ExecuteIndirectDispatch, ExecuteIndirectDispatchMesh,
     ExecuteIndirectDraw, ExecuteIndirectDrawIndexed, IndirectArguments,
     IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
@@ -1102,13 +1103,26 @@ impl MetalProducer {
                 OP_DESCRIPTOR_TABLE,
             ));
         }
-        for binding in &table.bindings {
-            ResourceId::new(binding.allocation_id, binding.generation)?;
-            if binding.length == 0 {
-                return Err(ProducerError::unsupported_opcode(
-                    "SetComputeRootDescriptorTable: empty range",
-                    OP_DESCRIPTOR_TABLE,
-                ));
+        for entry in &table.bindings {
+            match entry {
+                DescriptorTableEntryV3::Buffer(binding) => {
+                    ResourceId::new(binding.allocation_id, binding.generation)?;
+                    if binding.length == 0 {
+                        return Err(ProducerError::unsupported_opcode(
+                            "SetComputeRootDescriptorTable: empty range",
+                            OP_DESCRIPTOR_TABLE,
+                        ));
+                    }
+                }
+                DescriptorTableEntryV3::Texture(handle)
+                | DescriptorTableEntryV3::Sampler(handle) => {
+                    if *handle == 0 {
+                        return Err(ProducerError::unsupported_opcode(
+                            "SetComputeRootDescriptorTable: zero resource handle",
+                            OP_DESCRIPTOR_TABLE,
+                        ));
+                    }
+                }
             }
         }
         self.compute_tables
@@ -1144,13 +1158,26 @@ impl MetalProducer {
                 OP_DESCRIPTOR_TABLE,
             ));
         }
-        for binding in &table.bindings {
-            ResourceId::new(binding.allocation_id, binding.generation)?;
-            if binding.length == 0 {
-                return Err(ProducerError::unsupported_opcode(
-                    "SetGraphicsRootDescriptorTable: empty range",
-                    OP_DESCRIPTOR_TABLE,
-                ));
+        for entry in &table.bindings {
+            match entry {
+                DescriptorTableEntryV3::Buffer(binding) => {
+                    ResourceId::new(binding.allocation_id, binding.generation)?;
+                    if binding.length == 0 {
+                        return Err(ProducerError::unsupported_opcode(
+                            "SetGraphicsRootDescriptorTable: empty range",
+                            OP_DESCRIPTOR_TABLE,
+                        ));
+                    }
+                }
+                DescriptorTableEntryV3::Texture(handle)
+                | DescriptorTableEntryV3::Sampler(handle) => {
+                    if *handle == 0 {
+                        return Err(ProducerError::unsupported_opcode(
+                            "SetGraphicsRootDescriptorTable: zero resource handle",
+                            OP_DESCRIPTOR_TABLE,
+                        ));
+                    }
+                }
             }
         }
         let key = (table.set, table.base_register);
@@ -2726,12 +2753,14 @@ mod tests {
                 set: 0,
                 base_register: 2,
                 kind: DescriptorKind::Cbv,
-                bindings: vec![victory_metal::wire::BufferBinding {
-                    allocation_id: 0x40_0000,
-                    generation: 1,
-                    offset: 0,
-                    length: 256,
-                }],
+                bindings: vec![DescriptorTableEntryV3::Buffer(
+                    victory_metal::wire::BufferBinding {
+                        allocation_id: 0x40_0000,
+                        generation: 1,
+                        offset: 0,
+                        length: 256,
+                    },
+                )],
             })
             .expect("descriptor table");
         record_draw(&mut producer);
@@ -3222,12 +3251,12 @@ mod tests {
             set: 1,
             base_register: 1,
             kind: DescriptorKind::Uav,
-            bindings: vec![BufferBinding {
+            bindings: vec![DescriptorTableEntryV3::Buffer(BufferBinding {
                 allocation_id: 0x7000,
                 generation: 1,
                 offset: 16,
                 length: 256,
-            }],
+            })],
         };
         producer
             .set_compute_descriptor_table(table.clone())

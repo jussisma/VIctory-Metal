@@ -26,7 +26,7 @@
 //!
 //! ```text
 //! root CBV / SRV / UAV : field = address of the resource data
-//! table of CBV/SRV/UAV : field = address of [u64 device address; count]
+//! table of CBV/SRV/UAV : field = address of [_Desc { addr, 0, 0 }; count]  (stride 24)
 //! table of textures    : field = address of [_Desc { tex, tex, id }; count]  (stride 24)
 //! table of samplers    : field = address of [_Desc { smp, id, id }; count]    (stride 24)
 //! root constants       : inline bytes at the reflected offset (see below)
@@ -157,35 +157,33 @@ impl ReflectedStage {
 /// Kind of descriptor table stored in one flattened argument-buffer slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorTableKind {
-    /// Table of constant buffer views: `[u64 device address; count]`.
+    /// Table of constant buffer views: 24-byte `{device_address, 0, 0}`.
     ConstantBufferView,
-    /// Table of buffer shader resource views: `[u64 device address; count]`.
+    /// Table of buffer shader resource views: 24-byte `{device_address, 0, 0}`.
     ShaderResourceView,
-    /// Table of unordered access views: `[u64 device address; count]`.
+    /// Table of unordered access views: 24-byte `{device_address, 0, 0}`.
     UnorderedAccessView,
-    /// Table of `Texture2D`-style descriptors: 24-byte `{texture, texture, id}`.
+    /// Table of `Texture2D`-style descriptors: 24-byte `{texture, texture, 0}`.
     Texture,
-    /// Table of sampler states: 24-byte `{sampler, id, id}`.
+    /// Table of sampler states: 24-byte `{sampler, 0, 0}`.
     Sampler,
     /// `"Table"` in reflection without a caller-supplied range type.
     ///
     /// The converter reflection does not say which descriptor range a table
     /// declares. Callers attach the kind in root-signature order with
     /// [`RootSignatureLayout::with_descriptor_table_kinds`]; until then the
-    /// table can still be bound, but with the address-table stride of 8 bytes.
+    /// table can still be bound as the converter's 24-byte resource descriptor.
     Unspecified,
 }
 
 impl DescriptorTableKind {
     /// Default stride of one descriptor of this kind in converted memory.
+    ///
+    /// Every converted table element is a 24-byte descriptor. Address tables
+    /// hold `{device_address, 0, 0}`, texture tables `{id, id, 0}` and sampler
+    /// tables `{id, 0, 0}`; the host writes all three fields.
     pub fn descriptor_bytes(self) -> usize {
-        match self {
-            Self::Texture | Self::Sampler => TEXTURE_DESCRIPTOR_BYTES,
-            Self::ConstantBufferView | Self::ShaderResourceView | Self::UnorderedAccessView => {
-                DEVICE_ADDRESS_BYTES
-            }
-            Self::Unspecified => DEVICE_ADDRESS_BYTES,
-        }
+        TEXTURE_DESCRIPTOR_BYTES
     }
 
     fn is_address_table(self) -> bool {
@@ -864,7 +862,7 @@ pub struct DescriptorTableBinding {
     pub length: u64,
     /// Number of descriptors in the table.
     pub count: u32,
-    /// Stride of one converted descriptor in bytes (8 or 24; see
+    /// Stride of one converted descriptor in bytes (24; see
     /// [`DescriptorTableKind::descriptor_bytes`]).
     pub stride: usize,
 }
@@ -945,7 +943,11 @@ impl DescriptorTableBuilder {
         &self.bytes
     }
 
-    /// Writes one 8-byte device-address descriptor (CBV/SRV/UAV tables).
+    /// Writes one 24-byte resource-address descriptor `{address, 0, 0}`.
+    ///
+    /// The converted AIR names this type `%struct__desc = { i8*, texture*, i64 }`
+    /// and indexes entry `i` at byte offset `i * 24`; the address goes in the
+    /// first pointer slot and both other fields are zero.
     pub fn push_address(&mut self, address: u64) -> Result<(), MetalError> {
         if !self.kind.is_address_table() {
             return Err(MetalError::InvalidArg(
@@ -958,6 +960,8 @@ impl DescriptorTableBuilder {
             ));
         }
         self.bytes.extend_from_slice(&address.to_le_bytes());
+        self.bytes.extend_from_slice(&0u64.to_le_bytes());
+        self.bytes.extend_from_slice(&0u64.to_le_bytes());
         self.count = self.count.saturating_add(1);
         Ok(())
     }
@@ -2127,8 +2131,8 @@ mod tests {
         assert_eq!(valid.extent().expect("exact fit"), 48);
         assert_eq!(
             DescriptorTableBinding {
-                count: 6,
-                stride: 8,
+                count: 2,
+                stride: TEXTURE_DESCRIPTOR_BYTES,
                 ..valid
             }
             .extent()
@@ -2171,13 +2175,17 @@ mod tests {
         addresses.push_address(0x1000).expect("first CBV");
         addresses.push_address(0x2000).expect("second CBV");
         assert_eq!(addresses.count(), 2);
-        assert_eq!(addresses.bytes().len(), 16);
+        assert_eq!(addresses.bytes().len(), 48);
         assert_eq!(&addresses.bytes()[0..8], &0x1000u64.to_le_bytes());
-        assert_eq!(&addresses.bytes()[8..16], &0x2000u64.to_le_bytes());
+        assert_eq!(&addresses.bytes()[8..16], &0u64.to_le_bytes());
+        assert_eq!(&addresses.bytes()[16..24], &0u64.to_le_bytes());
+        assert_eq!(&addresses.bytes()[24..32], &0x2000u64.to_le_bytes());
+        assert_eq!(&addresses.bytes()[32..40], &0u64.to_le_bytes());
+        assert_eq!(&addresses.bytes()[40..48], &0u64.to_le_bytes());
         let table = addresses.binding(0x9000).expect("binding");
         assert_eq!(table.count, 2);
-        assert_eq!(table.stride, 8);
-        assert_eq!(table.extent().expect("extent"), 16);
+        assert_eq!(table.stride, 24);
+        assert_eq!(table.extent().expect("extent"), 48);
 
         let mut textures = DescriptorTableBuilder::new(DescriptorTableKind::Texture);
         textures.push_texture(0x3000).expect("texture");

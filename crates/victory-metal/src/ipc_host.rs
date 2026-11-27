@@ -224,7 +224,9 @@ use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
 };
-use crate::wire_v3::{decode_submission_v3, CommandV3, SubmissionV3, PROTOCOL_VERSION_V3};
+use crate::wire_v3::{
+    decode_submission_v3, CommandV3, DescriptorTableEntryV3, SubmissionV3, PROTOCOL_VERSION_V3,
+};
 
 /// Maximum payload length accepted by the transport envelope.
 pub const MAX_PAYLOAD_LEN: u32 = 65_536;
@@ -1517,7 +1519,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             CommandV3::Dispatch1d(dispatch) => self.bindings_valid(&dispatch.bindings),
             CommandV3::Dispatch3d(dispatch) => self.bindings_valid(&dispatch.bindings),
             CommandV3::DispatchMesh(dispatch) => self.bindings_valid(&dispatch.bindings),
-            CommandV3::SetDescriptorTable(table) => self.bindings_valid(&table.bindings),
+            CommandV3::SetDescriptorTable(table) => self.table_bindings_valid(&table.bindings),
             CommandV3::BeginRenderPass(pass) => {
                 pass.colors
                     .iter()
@@ -1587,6 +1589,27 @@ impl<E: BatchExecutor> IpcHost<E> {
                 binding.offset,
                 binding.length,
             )
+        })
+    }
+
+    /// A v3 table entry is either a registered allocation range or a resource
+    /// handle the host registered out of band.
+    ///
+    /// Texture handles are the kind 8 registrations. Sampler registrations are
+    /// not part of the wire session, so the device's `build_descriptor_table`
+    /// is the authority that refuses an unknown sampler handle before an
+    /// encoder exists; the host accepts it here rather than inventing a second
+    /// sampler registry.
+    fn table_bindings_valid(&self, entries: &[DescriptorTableEntryV3]) -> bool {
+        entries.iter().all(|entry| match entry {
+            DescriptorTableEntryV3::Buffer(binding) => self.range_valid(
+                binding.allocation_id,
+                binding.generation,
+                binding.offset,
+                binding.length,
+            ),
+            DescriptorTableEntryV3::Texture(handle) => self.textures.contains_key(handle),
+            DescriptorTableEntryV3::Sampler(_) => true,
         })
     }
 

@@ -58,7 +58,8 @@ use victory_metal::macos::registry::{
 };
 use victory_metal::wire::{self, BufferBinding, ReplyStatus};
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, DescriptorKind, DescriptorTableV3, LoadOp,
+    BeginRenderPass, ColorAttachment, CommandV3, DescriptorKind, DescriptorTableEntryV3,
+    DescriptorTableV3, LoadOp,
     PipelineRef, RootBufferView, RootConstantsV3, StoreOp, SubmissionV3,
 };
 use victory_shader::emit::{
@@ -989,12 +990,12 @@ fn live_submit_v3_mesh_draw_is_exact() {
                 set: 0,
                 base_register: 0,
                 kind: DescriptorKind::Srv,
-                bindings: vec![BufferBinding {
+                bindings: vec![DescriptorTableEntryV3::Buffer(BufferBinding {
                     allocation_id: 3,
                     generation: 1,
                     offset: 0,
                     length: 16,
-                }],
+                })],
             }),
             // Parameter 1: inline root constants.
             CommandV3::SetRootConstants(RootConstantsV3 {

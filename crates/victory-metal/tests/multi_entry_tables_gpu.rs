@@ -19,7 +19,7 @@
 //!        trap "rmdir /tmp/victory-gpu.lock" EXIT;
 //!        export PATH="/opt/homebrew/opt/rustup/bin:$PATH";
 //!        cargo test --locked -p victory-metal --target aarch64-apple-darwin \
-//!          --test multi_entry_tables_gpu -- --ignored --test-threads=1 --nocapture'
+//!          --test multi_entry_tables_gpu -- --test-threads=1 --nocapture'
 //! ```
 
 #![cfg(target_os = "macos")]
@@ -44,7 +44,8 @@ use victory_metal::macos::registry::{
 };
 use victory_metal::wire::BufferBinding;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, DescriptorKind, DescriptorTableV3, DrawState,
+    BeginRenderPass, ColorAttachment, CommandV3, DescriptorKind, DescriptorTableEntryV3,
+    DescriptorTableV3, DrawState,
     LoadOp, PipelineRef, PrimitiveTopology, RootConstantsV3, ScissorRect, StoreOp, SubmissionV3,
     Viewport,
 };
@@ -76,8 +77,10 @@ const UAV_WORDS: [[u32; 4]; TABLE_ENTRIES] = [
 ///
 /// `TextureEntry` is the converter's 24-byte `{texture, texture, i64}` shape:
 /// the host writes the `gpuResourceID` into both pointer slots and the shader
-/// samples the first. Address tables are arrays of 8-byte device addresses, one
-/// per entry, so each element is a one-pointer struct.
+/// samples the first. Address tables use the same 24-byte resource descriptor
+/// shape (`%struct__desc = { i8*, texture*, i64 }` in converted AIR): the host
+/// writes `{device_address, 0, 0}`, so each entry is a pointer followed by two
+/// reserved 64-bit fields and entry `i` sits at byte offset `i * 24`.
 const MULTI_ENTRY_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -90,10 +93,14 @@ struct TextureEntry {
 
 struct BufferEntry {
     device const float4 *data;
+    long reserved0;
+    long reserved1;
 };
 
 struct UavEntry {
     device float4 *data;
+    long reserved0;
+    long reserved1;
 };
 
 struct BindAbi {
@@ -329,6 +336,13 @@ impl HostPage {
         self.ptr.cast()
     }
 
+    /// The `u32` word at `offset`, after the GPU wrote it.
+    fn word(&self, offset: usize) -> u32 {
+        assert!(offset + 4 <= self.len, "host page read out of bounds");
+        // SAFETY: the offset is inside the allocation and 4-byte aligned.
+        unsafe { self.ptr.cast::<u8>().add(offset).cast::<u32>().read_unaligned() }
+    }
+
     /// The `f32` word at `offset`, after the GPU wrote it.
     fn float(&self, offset: usize) -> f32 {
         assert!(offset + 4 <= self.len, "host page read out of bounds");
@@ -403,12 +417,12 @@ fn assert_resolved_extents() {
         let addresses = addresses.binding(0x8000).expect("address table binding");
         assert_eq!(
             (addresses.count, addresses.stride),
-            (TABLE_ENTRIES as u32, 8),
+            (TABLE_ENTRIES as u32, 24),
             "address table count/stride"
         );
         assert_eq!(
             addresses.extent().expect("address table extent"),
-            TABLE_ENTRIES as u64 * 8,
+            TABLE_ENTRIES as u64 * 24,
         );
     }
 }
@@ -416,7 +430,6 @@ fn assert_resolved_extents() {
 /// Exact-value proof: 4 CBVs + 4 SRV textures + 4 UAVs through three
 /// multi-entry descriptor tables and a root-constants block, one submission.
 #[test]
-#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
 fn multi_entry_cbv_srv_uav_tables_are_exact() {
     let dir = TempDir::new("multi-entry-tables");
     let Some(metallib) = compile_metallib(dir.path(), "multi_entry", MULTI_ENTRY_MSL) else {
@@ -451,6 +464,8 @@ fn multi_entry_cbv_srv_uav_tables_are_exact() {
 
     let mut allocations = HashMap::new();
     for (index, handle) in TEXTURES.iter().enumerate() {
+        // Render-pass attachments still resolve through the submission's
+        // allocation snapshot; table entries name the registry handle directly.
         allocations.insert((index as u64 + 1, 1u32), VmBufferId(*handle));
     }
     allocations.insert((5, 1), VmBufferId(TARGET));
@@ -502,28 +517,28 @@ fn multi_entry_cbv_srv_uav_tables_are_exact() {
         )
         .expect("content-hashed graphics pipeline must register");
 
-    let texture_bindings: Vec<BufferBinding> = (1..=4)
-        .map(|allocation_id| BufferBinding {
-            allocation_id,
-            generation: 1,
-            offset: 0,
-            length: 16,
+    let texture_bindings: Vec<DescriptorTableEntryV3> = TEXTURES
+        .iter()
+        .map(|handle| DescriptorTableEntryV3::Texture(*handle))
+        .collect();
+    let cbv_bindings: Vec<DescriptorTableEntryV3> = (0..TABLE_ENTRIES)
+        .map(|index| {
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: 6,
+                generation: 1,
+                offset: index as u64 * 16,
+                length: 16,
+            })
         })
         .collect();
-    let cbv_bindings: Vec<BufferBinding> = (0..TABLE_ENTRIES)
-        .map(|index| BufferBinding {
-            allocation_id: 6,
-            generation: 1,
-            offset: index as u64 * 16,
-            length: 16,
-        })
-        .collect();
-    let uav_bindings: Vec<BufferBinding> = (0..TABLE_ENTRIES)
-        .map(|index| BufferBinding {
-            allocation_id: 7,
-            generation: 1,
-            offset: index as u64 * 16,
-            length: 16,
+    let uav_bindings: Vec<DescriptorTableEntryV3> = (0..TABLE_ENTRIES)
+        .map(|index| {
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: 7,
+                generation: 1,
+                offset: index as u64 * 16,
+                length: 16,
+            })
         })
         .collect();
 
@@ -654,5 +669,175 @@ fn multi_entry_cbv_srv_uav_tables_are_exact() {
         native,
         allocations_in_set,
         fallback
+    );
+}
+
+/// The AAA gate's UAV-table regression shape: one count==2 UAV table whose
+/// entry 0 writes word 5 and entry 1 writes word 0. Converted AIR loads entry
+/// `i` at byte offset `i * 24`, so entry 1 is at offset 24, not 8.
+const GATE_UAV_TABLE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct UavEntry {
+    device uint *data;
+    long reserved0;
+    long reserved1;
+};
+
+struct GateAbi {
+    device UavEntry *uavs [[id(0)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut gate_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 gate_fragment(constant GateAbi &abi [[buffer(2)]]) {
+    abi.uavs[0].data[5] = 11u;
+    abi.uavs[1].data[0] = 22u;
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+/// The reflected kind is `Unspecified` (what the converter reports for every
+/// table), so this exercises the default 24-byte resource descriptor rather
+/// than a caller-attached UAV kind.
+fn gate_uav_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified),
+            size: 8,
+            register: 0,
+            space: 0,
+        }],
+    )
+    .expect("fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
+}
+
+/// Exact-value proof for the gate's `uav_table_entry1` failure: entry 1 of a
+/// count==2 UAV table must reach the second buffer at its 24-byte descriptor.
+#[test]
+fn uav_table_second_entry_reaches_the_buffer() {
+    let dir = TempDir::new("gate-uav-table");
+    let Some(metallib) = compile_metallib(dir.path(), "gate_uav", GATE_UAV_TABLE_MSL) else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment()),
+        )
+        .expect("target texture must create");
+
+    let uav_page = HostPage::new(16 * 1024);
+    // SAFETY: the page is a live, page-aligned allocation that outlives the
+    // synchronous submission and is unregistered before it drops.
+    let uav_id = unsafe { transport.register_zerocopy(uav_page.raw(), 16 * 1024) }
+        .expect("UAV page must register");
+
+    let mut allocations = HashMap::new();
+    allocations.insert((5, 1), VmBufferId(TARGET));
+    allocations.insert((8, 1), uav_id);
+
+    let pipeline_state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("gate_fragment".to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+
+    const HANDLE: u64 = 0x4100;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "gate_vertex",
+            &pipeline_state,
+            gate_uav_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    // The gate's own offsets: entry 0 at 64, entry 1 at 128 of one allocation.
+    let submission = SubmissionV3 {
+        sequence: 211,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(5, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Uav,
+                bindings: vec![
+                    DescriptorTableEntryV3::Buffer(BufferBinding {
+                        allocation_id: 8,
+                        generation: 1,
+                        offset: 64,
+                        length: 64,
+                    }),
+                    DescriptorTableEntryV3::Buffer(BufferBinding {
+                        allocation_id: 8,
+                        generation: 1,
+                        offset: 128,
+                        length: 16,
+                    }),
+                ],
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, _) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("the gate-shaped UAV table must execute");
+    assert_eq!(
+        reply.status,
+        victory_metal::wire::ReplyStatus::Ok,
+        "gate-shaped UAV submission status"
+    );
+    transport
+        .wait_for_gpu()
+        .expect("the gate-shaped UAV pass should complete");
+
+    let uav0 = uav_page.word(64 + 20);
+    let uav1 = uav_page.word(128);
+    assert_eq!(uav0, 11, "uav0 entry word 5");
+    assert_eq!(uav1, 22, "uav1 entry 1 word 0 (24-byte descriptor)");
+
+    transport
+        .unregister_buffer(uav_id)
+        .expect("unregister the UAV page");
+
+    eprintln!(
+        "gate-shaped UAV table proof on {}: uav0={uav0} uav1={uav1}",
+        info.name_str()
     );
 }
