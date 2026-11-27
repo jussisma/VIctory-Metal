@@ -50,12 +50,17 @@ use victory_metal::wire::{
 pub use victory_metal::wire::BarrierEntry;
 use victory_metal::wire_v3::{
     BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyTexture,
-    DepthStencilAttachment, DescriptorTableV3, DrawIndexedInstanced, DrawInstanced,
+    CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorTableV3,
+    DrawIndexedInstanced, DrawInstanced, ExecuteIndirectDispatch, ExecuteIndirectDispatchMesh,
+    ExecuteIndirectDraw, ExecuteIndirectDrawIndexed, IndirectArguments,
     IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
-    RootBufferView, RootConstantsV3, ScissorRect, StoreOp, VertexBuffer, VertexBufferSet, Viewport,
-    MAX_BARRIERS_V3, MAX_COLOR_ATTACHMENTS, MAX_COMMANDS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
+    ResolveSubresource as WireResolveSubresource, RootBufferView, RootConstantsV3, ScissorRect,
+    StoreOp, TextureSubresource, VertexBuffer, VertexBufferSet, Viewport, MAX_BARRIERS_V3,
+    MAX_COLOR_ATTACHMENTS, MAX_COMMANDS_V3, MAX_INDIRECT_COMMANDS_V3, MAX_ROOT_CONSTANT_BYTES_V3,
     MAX_VERTEX_BUFFERS, OP_BEGIN_RENDER_PASS, OP_COPY_BUFFER, OP_COPY_TEXTURE,
-    OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH, OP_PRESENT, OP_RESOURCE_BARRIER,
+    OP_COPY_TEXTURE_REGION, OP_DESCRIPTOR_TABLE, OP_DISPATCH_3D, OP_DISPATCH_MESH,
+    OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH, OP_EXECUTE_INDIRECT_DRAW,
+    OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_PRESENT, OP_RESOURCE_BARRIER,
     OP_ROOT_CONSTANTS, OP_SET_INDEX_BUFFER, OP_SET_PRIMITIVE_TOPOLOGY, OP_SET_ROOT_BUFFER_VIEW,
     OP_SET_SCISSOR, OP_SET_VIEWPORT, OP_SET_VERTEX_BUFFERS,
 };
@@ -333,6 +338,17 @@ impl ProducerError {
         Self::Unsupported {
             operation,
             opcode: Some(opcode),
+        }
+    }
+
+    /// The wire opcode a refused call needed, when there is one.
+    ///
+    /// The queue records this in the unsupported-call histogram at the moment
+    /// of refusal, so a list that fails `Close` still names its opcode.
+    pub const fn opcode(&self) -> Option<u16> {
+        match self {
+            Self::Unsupported { opcode, .. } => *opcode,
+            _ => None,
         }
     }
 
@@ -1044,6 +1060,143 @@ impl MetalProducer {
         }))
     }
 
+    // -------------------------------------------------------- indirect
+
+    /// Validates one GPU-resident argument range, `stride` bytes per record.
+    fn checked_indirect(
+        arguments: &IndirectArguments,
+        stride: u32,
+        opcode: u16,
+    ) -> Result<(), ProducerError> {
+        ResourceId::new(arguments.allocation_id, arguments.generation)?;
+        if arguments.max_count == 0 || arguments.max_count > MAX_INDIRECT_COMMANDS_V3 {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect: max command count outside 1..=256",
+                opcode,
+            ));
+        }
+        if !arguments.offset.is_multiple_of(4) {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect: argument offset is not 4-byte aligned",
+                opcode,
+            ));
+        }
+        if u64::from(arguments.max_count)
+            .checked_mul(u64::from(stride))
+            .is_none()
+        {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect: argument range overflows",
+                opcode,
+            ));
+        }
+        if let Some(count) = arguments.count {
+            ResourceId::new(count.allocation_id, count.generation)?;
+            if !count.offset.is_multiple_of(4) {
+                return Err(ProducerError::unsupported_opcode(
+                    "ExecuteIndirect: count offset is not 4-byte aligned",
+                    opcode,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `ExecuteIndirect` of a draw signature (record stride 16).
+    pub fn execute_indirect_draw(
+        &mut self,
+        arguments: IndirectArguments,
+    ) -> Result<(), ProducerError> {
+        Self::checked_indirect(&arguments, 16, OP_EXECUTE_INDIRECT_DRAW)?;
+        self.require_graphics_pipeline()?;
+        self.open_pass()?;
+        self.flush_graphics_state()?;
+        self.push(CommandV3::ExecuteIndirectDraw(ExecuteIndirectDraw {
+            arguments,
+        }))
+    }
+
+    /// `ExecuteIndirect` of an indexed draw signature (record stride 20).
+    pub fn execute_indirect_draw_indexed(
+        &mut self,
+        arguments: IndirectArguments,
+    ) -> Result<(), ProducerError> {
+        Self::checked_indirect(&arguments, 20, OP_EXECUTE_INDIRECT_DRAW_INDEXED)?;
+        self.require_graphics_pipeline()?;
+        self.open_pass()?;
+        self.flush_graphics_state()?;
+        self.push(CommandV3::ExecuteIndirectDrawIndexed(
+            ExecuteIndirectDrawIndexed { arguments },
+        ))
+    }
+
+    /// `ExecuteIndirect` of a mesh dispatch signature (record stride 12).
+    ///
+    /// Like [`dispatch_mesh`](Self::dispatch_mesh), the wire expresses this
+    /// outside a render pass; a pass already open is refused, not closed.
+    pub fn execute_indirect_dispatch_mesh(
+        &mut self,
+        pipeline_id: u64,
+        arguments: IndirectArguments,
+    ) -> Result<(), ProducerError> {
+        Self::checked_indirect(&arguments, 12, OP_EXECUTE_INDIRECT_DISPATCH_MESH)?;
+        if pipeline_id == 0 {
+            return Err(ProducerError::InvalidResource {
+                operation: "ExecuteIndirect(mesh)",
+            });
+        }
+        if self.pass_open {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect(mesh) inside a recorded pass",
+                OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+            ));
+        }
+        if self.emitted_mesh_pipeline != Some(pipeline_id) {
+            self.push(CommandV3::SetMeshPipeline(PipelineRef { pipeline_id }))?;
+            self.emitted_mesh_pipeline = Some(pipeline_id);
+        }
+        self.push(CommandV3::ExecuteIndirectDispatchMesh(
+            ExecuteIndirectDispatchMesh {
+                pipeline_id,
+                arguments,
+            },
+        ))
+    }
+
+    /// `ExecuteIndirect` of a compute dispatch signature (record stride 12).
+    pub fn execute_indirect_dispatch(
+        &mut self,
+        arguments: IndirectArguments,
+    ) -> Result<(), ProducerError> {
+        Self::checked_indirect(&arguments, 12, OP_EXECUTE_INDIRECT_DISPATCH)?;
+        let Some(threads_per_group) = self.compute_local_size else {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect(dispatch): compute threadgroup size not set",
+                OP_EXECUTE_INDIRECT_DISPATCH,
+            ));
+        };
+        if threads_per_group.iter().any(|&dimension| dimension == 0) {
+            return Err(ProducerError::unsupported_opcode(
+                "ExecuteIndirect(dispatch): zero threadgroup size",
+                OP_EXECUTE_INDIRECT_DISPATCH,
+            ));
+        }
+        let Some(pipeline_id) = self.compute_pipeline else {
+            return Err(ProducerError::MissingPipeline { stage: "compute" });
+        };
+        self.close_pass()?;
+        if self.emitted_compute_pipeline != Some(pipeline_id) {
+            self.push(CommandV3::SetComputePipeline(PipelineRef { pipeline_id }))?;
+            self.emitted_compute_pipeline = Some(pipeline_id);
+        }
+        self.flush_compute_state()?;
+        self.push(CommandV3::ExecuteIndirectDispatch(ExecuteIndirectDispatch {
+            pipeline_id,
+            arguments,
+            threads_per_group,
+        }))
+    }
+
     // -------------------------------------------------------- dispatches
 
     /// `Dispatch`: the local threadgroup size must be known (set from the
@@ -1121,6 +1274,11 @@ impl MetalProducer {
             group_counts: [x, y, z],
             bindings: Vec::new(),
         }))
+    }
+
+    /// The mesh pipeline selected so far, if any.
+    pub fn mesh_pipeline(&self) -> Option<u64> {
+        self.mesh_pipeline
     }
 
     /// Selects the mesh pipeline used by [`dispatch_mesh`](Self::dispatch_mesh).
@@ -1217,6 +1375,52 @@ impl MetalProducer {
             width,
             height,
             depth,
+        }))
+    }
+
+    /// `CopyTextureRegion` of an explicit texel box between two textures.
+    ///
+    /// Buffer footprints (uploads and readbacks) are not expressible here:
+    /// the caller refuses those with [`OP_COPY_TEXTURE_REGION`].
+    pub fn copy_texture_region(
+        &mut self,
+        src: TextureSubresource,
+        dst: TextureSubresource,
+        src_origin: [u32; 3],
+        dst_origin: [u32; 3],
+        size: [u32; 3],
+    ) -> Result<(), ProducerError> {
+        ResourceId::new(src.allocation_id, src.generation)?;
+        ResourceId::new(dst.allocation_id, dst.generation)?;
+        if size.iter().any(|&extent| extent == 0) {
+            return Err(ProducerError::unsupported_opcode(
+                "CopyTextureRegion: empty extent",
+                OP_COPY_TEXTURE_REGION,
+            ));
+        }
+        self.close_pass()?;
+        self.push(CommandV3::CopyTextureRegion(WireCopyTextureRegion {
+            src,
+            dst,
+            src_origin,
+            dst_origin,
+            size,
+        }))
+    }
+
+    /// `ResolveSubresource`: a multisample source into a single-sample
+    /// target.
+    pub fn resolve_subresource(
+        &mut self,
+        src: TextureSubresource,
+        dst: TextureSubresource,
+    ) -> Result<(), ProducerError> {
+        ResourceId::new(src.allocation_id, src.generation)?;
+        ResourceId::new(dst.allocation_id, dst.generation)?;
+        self.close_pass()?;
+        self.push(CommandV3::ResolveSubresource(WireResolveSubresource {
+            src,
+            dst,
         }))
     }
 
@@ -1660,7 +1864,9 @@ mod tests {
     use super::*;
     use crate::backend::GpuBackend;
     use victory_metal::wire_v3::{
-        OP_DRAW_INDEXED_INSTANCED, OP_END_RENDER_PASS, OP_SET_COMPUTE_PIPELINE,
+        decode_submission_v3, IndirectCountBuffer, OP_DRAW_INDEXED_INSTANCED, OP_END_RENDER_PASS,
+        OP_EXECUTE_INDIRECT_DISPATCH, OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+        OP_EXECUTE_INDIRECT_DRAW, OP_EXECUTE_INDIRECT_DRAW_INDEXED, OP_SET_COMPUTE_PIPELINE,
         OP_SET_GRAPHICS_PIPELINE, OP_SET_MESH_PIPELINE,
     };
 
@@ -2178,5 +2384,149 @@ mod tests {
     fn the_backend_default_remains_d3d12() {
         assert_eq!(GpuBackend::default(), GpuBackend::D3d12);
         assert_eq!(GpuBackend::parse(None), GpuBackend::D3d12);
+    }
+
+    fn arguments(max_count: u32, counted: bool) -> IndirectArguments {
+        IndirectArguments {
+            allocation_id: 0x4000,
+            generation: 1,
+            offset: 0,
+            max_count,
+            count: counted.then_some(IndirectCountBuffer {
+                allocation_id: 0x5000,
+                generation: 1,
+                offset: 0,
+            }),
+        }
+    }
+
+    /// The exercised indirect set becomes the matching v3 commands, with the
+    /// pass opened for draws and the compute group size taken from the
+    /// pipeline state.
+    #[test]
+    fn indirect_draws_and_dispatches_become_their_wire_commands() {
+        let mut producer = MetalProducer::new(9, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer.set_render_targets(&colors, depth).expect("targets");
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        producer
+            .execute_indirect_draw(arguments(4, false))
+            .expect("indirect draw");
+        producer
+            .execute_indirect_draw_indexed(arguments(2, true))
+            .expect("indirect indexed draw");
+        assert!(
+            producer.has_open_pass(),
+            "an indirect draw opens the pass like a draw"
+        );
+
+        producer.end_render_pass().expect("close the draw pass");
+        producer.set_mesh_pipeline(0xa00).expect("mesh pipeline");
+        producer
+            .execute_indirect_dispatch_mesh(0xa00, arguments(3, false))
+            .expect("indirect mesh dispatch");
+        assert!(
+            !producer.has_open_pass(),
+            "mesh execution is outside a pass"
+        );
+
+        producer.set_compute_pipeline(0xb00).expect("compute pipeline");
+        producer
+            .set_compute_threadgroup_size([64, 1, 1])
+            .expect("threadgroup size");
+        producer
+            .execute_indirect_dispatch(arguments(5, false))
+            .expect("indirect dispatch");
+
+        let submission = producer.flush().expect("submission");
+        let indirect: Vec<u16> = submission
+            .commands
+            .iter()
+            .filter_map(|command| {
+                matches!(
+                    command,
+                    CommandV3::ExecuteIndirectDraw(_)
+                        | CommandV3::ExecuteIndirectDrawIndexed(_)
+                        | CommandV3::ExecuteIndirectDispatchMesh(_)
+                        | CommandV3::ExecuteIndirectDispatch(_)
+                )
+                .then_some(command.opcode())
+            })
+            .collect();
+        assert_eq!(
+            indirect,
+            vec![
+                OP_EXECUTE_INDIRECT_DRAW,
+                OP_EXECUTE_INDIRECT_DRAW_INDEXED,
+                OP_EXECUTE_INDIRECT_DISPATCH_MESH,
+                OP_EXECUTE_INDIRECT_DISPATCH,
+            ]
+        );
+        // Every command round-trips through the canonical codec.
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
+    }
+
+    /// An indirect range outside the wire's limits is refused with the
+    /// opcode the histogram names, not clamped or dropped.
+    #[test]
+    fn an_unexpressible_indirect_range_is_refused_with_its_opcode() {
+        let mut producer = MetalProducer::new(10, 1).expect("producer");
+        let (colors, depth) = targets();
+        producer.set_render_targets(&colors, depth).expect("targets");
+        producer.set_pipeline(0x900).expect("graphics pipeline");
+        let error = producer
+            .execute_indirect_draw(arguments(0, false))
+            .expect_err("zero max count is not expressible");
+        assert_eq!(error.opcode(), Some(OP_EXECUTE_INDIRECT_DRAW));
+        let error = producer
+            .execute_indirect_draw(arguments(MAX_INDIRECT_COMMANDS_V3 + 1, false))
+            .expect_err("too many commands");
+        assert_eq!(error.opcode(), Some(OP_EXECUTE_INDIRECT_DRAW));
+        let mut unaligned = arguments(1, false);
+        unaligned.offset = 3;
+        let error = producer
+            .execute_indirect_draw(unaligned)
+            .expect_err("unaligned offset");
+        assert_eq!(error.opcode(), Some(OP_EXECUTE_INDIRECT_DRAW));
+    }
+
+    /// Subresource copies and resolves reach the wire with the mip/slice
+    /// identity the caller named.
+    #[test]
+    fn texture_regions_and_resolves_become_their_wire_commands() {
+        let mut producer = MetalProducer::new(11, 1).expect("producer");
+        let src = TextureSubresource {
+            allocation_id: 0x1000,
+            generation: 1,
+            mip_level: 2,
+            slice: 1,
+        };
+        let dst = TextureSubresource {
+            allocation_id: 0x2000,
+            generation: 1,
+            mip_level: 0,
+            slice: 0,
+        };
+        producer
+            .copy_texture_region(src, dst, [1, 2, 0], [0, 0, 0], [16, 16, 1])
+            .expect("copy region");
+        producer
+            .resolve_subresource(src, dst)
+            .expect("resolve");
+        let submission = producer.flush().expect("submission");
+        assert!(matches!(
+            submission.commands.as_slice(),
+            [
+                CommandV3::CopyTextureRegion(copy),
+                CommandV3::ResolveSubresource(resolve),
+            ] if copy.src == src
+                && copy.dst == dst
+                && copy.size == [16, 16, 1]
+                && resolve.src == src
+                && resolve.dst == dst
+        ));
+        let bytes = MetalProducer::encode(&submission).expect("encode");
+        assert_eq!(decode_submission_v3(&bytes).expect("decode"), submission);
     }
 }

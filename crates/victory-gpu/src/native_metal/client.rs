@@ -72,9 +72,12 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
 use victory_metal::wire::{decode_reply, Reply, ReplyStatus, MAGIC};
 use victory_metal::wire_v3::PROTOCOL_VERSION_V3;
 
+use crate::native_metal::fence_page_guest::GuestFencePage;
 use crate::native_metal::queue::{NativeQueueError, V3Sink};
 
 /// Frame kind of the first, authentication frame (`ipc_host::KIND_AUTH`).
@@ -83,6 +86,20 @@ pub const KIND_AUTH: u8 = 1;
 pub const KIND_SUBMISSION_V3: u8 = 5;
 /// Frame kind of an authentication or registration acknowledgement.
 pub const KIND_ACK: u8 = 128;
+/// Frame kind registering the shared completion fence page (`ipc_host`).
+pub const KIND_FENCE_PAGE: u8 = 6;
+/// Frame kind registering a host texture (`ipc_host`).
+pub const KIND_TEXTURE_REG: u8 = 8;
+/// Frame kind registering a texture as a present surface (`ipc_host`).
+pub const KIND_SURFACE_REG: u8 = 9;
+/// Exact length of a fence page registration payload (`byte_len: u64 LE`).
+pub const FENCE_PAGE_REGISTER_PAYLOAD_LEN: usize = 8;
+/// Exact length of a texture registration payload.
+pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
+/// Exact length of a present-surface registration payload.
+pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
+/// Status byte of an accepted texture or surface registration.
+pub const REGISTRATION_ACCEPTED: u8 = 0;
 /// Magic tag of the version 3 request envelope.
 pub const V3_REQUEST_MAGIC: [u8; 4] = *b"V3RQ";
 /// Fixed header of the version 3 request envelope.
@@ -551,6 +568,16 @@ pub struct WireV3Client {
     stream: Option<TcpStream>,
     reconnects: u32,
     transport_errors: u64,
+    /// The shared completion page, when the guest mapped one and the host
+    /// accepted its registration (transport kind 6).
+    fence_page: Option<GuestFencePage>,
+    /// The page path the session was configured with, re-registered after a
+    /// reconnect (a new host session starts from a cleared page).
+    fence_page_path: Option<std::path::PathBuf>,
+    /// Texture handles registered with the host in this session.
+    textures: BTreeSet<u64>,
+    /// Present surfaces registered with the host in this session.
+    surfaces: BTreeSet<u64>,
 }
 
 impl WireV3Client {
@@ -576,7 +603,33 @@ impl WireV3Client {
         }
     }
 
+    /// Connects with an explicit completion page path (tests and the
+    /// launcher-free host), instead of the one the environment names.
+    pub fn connect_with_fence_page(
+        endpoint: &str,
+        secret: &[u8],
+        timeout: Duration,
+        page: Option<std::path::PathBuf>,
+    ) -> Result<Self, TransportError> {
+        Self::open_with(
+            Endpoint::parse(endpoint)?,
+            Secret::new(secret)?,
+            timeout,
+            page,
+        )
+    }
+
     fn open(endpoint: Endpoint, secret: Secret, timeout: Duration) -> Result<Self, TransportError> {
+        let page = crate::native_metal::fence_page_guest::page_path_from_env();
+        Self::open_with(endpoint, secret, timeout, page)
+    }
+
+    fn open_with(
+        endpoint: Endpoint,
+        secret: Secret,
+        timeout: Duration,
+        page: Option<std::path::PathBuf>,
+    ) -> Result<Self, TransportError> {
         if timeout.is_zero() {
             return Err(TransportError::Timeout {
                 operation: "configure the transport",
@@ -590,9 +643,54 @@ impl WireV3Client {
             stream: None,
             reconnects: 0,
             transport_errors: 0,
+            fence_page: None,
+            fence_page_path: page,
+            textures: BTreeSet::new(),
+            surfaces: BTreeSet::new(),
         };
-        client.stream = Some(client.handshake()?);
+        let mut stream = client.handshake()?;
+        client.register_fence_page(&mut stream, client.fence_page_path.clone());
+        client.stream = Some(stream);
         Ok(client)
+    }
+
+    /// Maps the given shared fence page and registers it (kind 6).
+    ///
+    /// A page that is absent, cannot be mapped, or is refused by the host
+    /// stays `None`: the synchronous kind 5 reply remains the only completion
+    /// signal, and `GetCompletedValue` never fabricates a value from an
+    /// unregistered page.
+    fn register_fence_page(
+        &mut self,
+        stream: &mut TcpStream,
+        path: Option<std::path::PathBuf>,
+    ) {
+        let page = match path {
+            Some(path) => GuestFencePage::open(path),
+            None => GuestFencePage::from_env(),
+        };
+        let Some(page) = page else {
+            return;
+        };
+        let mut payload = [0u8; FENCE_PAGE_REGISTER_PAYLOAD_LEN];
+        payload.copy_from_slice(&crate::native_metal::fence_page_guest::FENCE_PAGE_LEN.to_le_bytes());
+        let status = write_frame(stream, KIND_FENCE_PAGE, &payload, "register fence page", self.timeout)
+            .and_then(|()| read_frame(stream, "register fence page", MAX_PAYLOAD_LEN as usize, self.timeout))
+            .map(|(kind, payload)| (kind, payload));
+        match status {
+            Ok((KIND_ACK, payload)) if payload == [0] => {
+                tracing::info!(path = %page.path().display(), "shared GPU completion page registered");
+                self.fence_page = Some(page);
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    path = %page.path().display(),
+                    "the shared GPU completion page was not registered; the kind 5 reply is the \
+                     only completion signal"
+                );
+            }
+        }
     }
 
     /// The endpoint this client dials.
@@ -674,7 +772,14 @@ impl WireV3Client {
     /// have.
     pub fn reconnect(&mut self) -> Result<(), TransportError> {
         self.close();
-        let stream = self.handshake()?;
+        let mut stream = self.handshake()?;
+        // A new socket is a new host session: the fence page and every
+        // registration belong to the old one and must be made again.
+        self.fence_page = None;
+        self.textures.clear();
+        self.surfaces.clear();
+        let page = self.fence_page_path.clone();
+        self.register_fence_page(&mut stream, page);
         self.stream = Some(stream);
         self.reconnects = self.reconnects.saturating_add(1);
         Ok(())
@@ -687,15 +792,140 @@ impl WireV3Client {
         }
     }
 
-    /// The host's published completion fence, when a shared page exists.
+    /// The host's published completion fence, when a shared page is mapped
+    /// and registered.
     ///
-    /// The transport task has not published a shared fence page yet
-    /// (`victory_metal::fence_page` is still a reserved module with no mapped
-    /// page), so this is `None`: the synchronous kind 5 reply read by
-    /// [`V3Sink::send`] is the only completion signal available. When the page
-    /// lands this becomes one relaxed atomic load, with no IPC round trip.
+    /// This is one `Ordering::Acquire` load of shared memory: no syscall, no
+    /// IPC round trip and no blocking wait. `None` means the page is genuinely
+    /// absent (no `VICTORY_METAL_FENCE_PAGE`/share directory, an unusable
+    /// file, or a registration the host refused), not that completion is
+    /// unknown.
     pub fn completed_fence(&self) -> Option<u64> {
-        None
+        self.fence_page.as_ref().map(GuestFencePage::completed)
+    }
+
+    /// The shared completion page's submitted word, one atomic load.
+    pub fn submitted_fence(&self) -> Option<u64> {
+        self.fence_page.as_ref().map(GuestFencePage::submitted)
+    }
+
+    /// The mapped page, when one is registered.
+    pub fn fence_page(&self) -> Option<&GuestFencePage> {
+        self.fence_page.as_ref()
+    }
+
+    /// Registers one host texture (transport kind 8) and returns whether the
+    /// host accepted it.
+    ///
+    /// The codes are the stable kind 8 codes documented in `ipc_host`: a
+    /// dimension (0 D1, 1 D2, 2 D2Array, 3 cube, 4 cube array, 5 D3), a
+    /// format (0 Rgba8Unorm .. 8 Depth32FloatStencil8) and a usage (0
+    /// sampled, 1 color attachment, 2 depth attachment, 3 UAV). A value
+    /// outside them is refused by the host, which is surfaced here as
+    /// `false`, never retried and never replaced by a fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_texture(
+        &mut self,
+        id: u64,
+        generation: u32,
+        dimension: u8,
+        format: u8,
+        usage: u8,
+        sample_count: u8,
+        width: u32,
+        height: u32,
+        depth: u32,
+        mip_levels: u16,
+        array_layers: u16,
+    ) -> Result<bool, NativeQueueError> {
+        if id == 0 || generation == 0 {
+            return Err(NativeQueueError::Refused(
+                "texture registration needs a nonzero id and generation".to_string(),
+            ));
+        }
+        let mut payload = [0u8; TEXTURE_REG_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&id.to_le_bytes());
+        payload[8..12].copy_from_slice(&generation.to_le_bytes());
+        payload[12] = dimension;
+        payload[13] = format;
+        payload[14] = usage;
+        payload[15] = sample_count;
+        payload[16..20].copy_from_slice(&width.to_le_bytes());
+        payload[20..24].copy_from_slice(&height.to_le_bytes());
+        payload[24..28].copy_from_slice(&depth.to_le_bytes());
+        payload[28..30].copy_from_slice(&mip_levels.to_le_bytes());
+        payload[30..32].copy_from_slice(&array_layers.to_le_bytes());
+        let status = self.registration(KIND_TEXTURE_REG, &payload, "register texture")?;
+        let accepted = status == REGISTRATION_ACCEPTED;
+        if accepted {
+            self.textures.insert(id);
+        }
+        Ok(accepted)
+    }
+
+    /// Registers a texture handle as a present surface (transport kind 9).
+    pub fn register_surface(
+        &mut self,
+        surface_id: u64,
+        texture_id: u64,
+    ) -> Result<bool, NativeQueueError> {
+        let mut payload = [0u8; SURFACE_REG_PAYLOAD_LEN];
+        payload[0..8].copy_from_slice(&surface_id.to_le_bytes());
+        payload[8..16].copy_from_slice(&texture_id.to_le_bytes());
+        let status = self.registration(KIND_SURFACE_REG, &payload, "register surface")?;
+        let accepted = status == REGISTRATION_ACCEPTED;
+        if accepted {
+            self.surfaces.insert(surface_id);
+        }
+        Ok(accepted)
+    }
+
+    /// Whether a texture handle was accepted by this session.
+    pub fn texture_registered(&self, id: u64) -> bool {
+        self.textures.contains(&id)
+    }
+
+    /// Whether a present surface was accepted by this session.
+    pub fn surface_registered(&self, id: u64) -> bool {
+        self.surfaces.contains(&id)
+    }
+
+    /// One registration request/acknowledgement pair on the open stream.
+    fn registration(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        operation: &'static str,
+    ) -> Result<u8, NativeQueueError> {
+        let Some(mut stream) = self.stream.take() else {
+            return Err(NativeQueueError::Transport(
+                TransportError::NotConnected.to_string(),
+            ));
+        };
+        let result = write_frame(&mut stream, kind, payload, operation, self.timeout).and_then(|()| {
+            read_frame(&mut stream, operation, MAX_PAYLOAD_LEN as usize, self.timeout)
+        });
+        match result {
+            Ok((KIND_ACK, status)) if status.len() == 1 => {
+                self.stream = Some(stream);
+                Ok(status[0])
+            }
+            Ok((actual, _)) => {
+                self.stream = Some(stream);
+                Err(NativeQueueError::Transport(
+                    TransportError::UnexpectedKind {
+                        expected: KIND_ACK,
+                        actual,
+                    }
+                    .to_string(),
+                ))
+            }
+            Err(error) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                self.transport_errors = self.transport_errors.saturating_add(1);
+                Err(NativeQueueError::Transport(error.to_string()))
+            }
+        }
     }
 
     /// Builds one kind 5 request from an encoded v3 submission.

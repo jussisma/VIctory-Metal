@@ -389,6 +389,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
+    if crate::backend::metal_selected() {
+        // The value moves when the host has completed the submission it
+        // follows: one atomic load of the shared page, no D3D12 fence.
+        crate::native_metal::queue::signal_native(fence, value);
+        return S_OK;
+    }
+    #[cfg(windows)]
     {
         let mut held = held();
         if held.holds_work(this as usize) {
@@ -636,6 +643,25 @@ extern "system" fn present(
         let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
         #[cfg(feature = "diagnostics")]
         crate::frame::presented();
+        // A title that did not register a surface through the environment
+        // presents its own texture: the first presented resource becomes the
+        // surface, with the id the host registered for its memory.
+        if !crate::native_metal::queue::native_queue_has_presenter() {
+            let found = plane_resources(planes, plane_parameters);
+            let shown = shown_plane(&found);
+            if let Some(&resource) = found.get(shown).and_then(|plane| plane.first())
+                && let Some((memory, _)) = crate::resource::texture_memory(resource)
+                && let Some((width, height)) = crate::resource::texture_extent(resource)
+                && let Err(error) = crate::native_metal::queue::install_wire_present(
+                    memory as u64,
+                    memory as u64,
+                    width,
+                    height,
+                )
+            {
+                tracing::warn!(%error, "the presented resource could not install a native surface");
+            }
+        }
         return match crate::native_metal::queue::present_registered() {
             Ok(presented) => {
                 tracing::debug!(

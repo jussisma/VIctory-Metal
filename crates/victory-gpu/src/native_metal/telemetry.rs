@@ -44,6 +44,9 @@ use std::time::Instant;
 /// How many recent frames the window keeps (all of them, in order).
 pub const WINDOW_FRAMES: usize = 4096;
 
+/// Histogram key for a refused call that has no wire opcode.
+pub const NO_OPCODE: u16 = u16::MAX;
+
 /// One recorded frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameSample {
@@ -141,6 +144,16 @@ pub struct FrameTelemetry {
     window: Mutex<Window>,
     /// Hard counter: only [`Self::note_d3dmetal_fallback`] moves it.
     d3dmetal_fallback_count: AtomicU64,
+    /// Native submissions the host answered `Ok` (or a replay) for.
+    submits_ok: AtomicU64,
+    /// Native submissions the transport or the host refused.
+    submits_refused: AtomicU64,
+    /// Frames the installed native presenter accepted.
+    presents_ok: AtomicU64,
+    /// Frames the native presenter (or its absence) refused.
+    presents_refused: AtomicU64,
+    /// Unsupported producer calls, by the wire opcode they needed.
+    refusals: Mutex<BTreeMap<u16, u64>>,
 }
 
 impl FrameTelemetry {
@@ -271,6 +284,65 @@ impl FrameTelemetry {
         self.d3dmetal_fallback_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one producer refusal by the wire opcode it needed.
+    ///
+    /// Called the moment a recorded call is refused (not at submission time),
+    /// so a list whose `Close` fails still contributes its histogram entry.
+    /// An operation with no wire opcode is logged by the caller and counted
+    /// under [`NO_OPCODE`].
+    pub fn note_unsupported_opcode(&self, opcode: Option<u16>) {
+        let opcode = opcode.unwrap_or(NO_OPCODE);
+        let mut refusals = self
+            .refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *refusals.entry(opcode).or_insert(0) += 1;
+    }
+
+    /// Refusals recorded by opcode ([`NO_OPCODE`] for an unnamed call).
+    pub fn refusal_histogram(&self) -> BTreeMap<u16, u64> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// A native submission batch the host answered successfully.
+    pub fn note_submit_ok(&self) {
+        self.submits_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A native submission batch the transport or host refused.
+    pub fn note_submit_refused(&self) {
+        self.submits_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame the installed native presenter accepted.
+    pub fn note_present_ok(&self) {
+        self.presents_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame the native present path refused (including no swapchain).
+    pub fn note_present_refused(&self) {
+        self.presents_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Successful and refused native submission batches.
+    pub fn submit_counts(&self) -> (u64, u64) {
+        (
+            self.submits_ok.load(Ordering::Relaxed),
+            self.submits_refused.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Accepted and refused native presents.
+    pub fn present_counts(&self) -> (u64, u64) {
+        (
+            self.presents_ok.load(Ordering::Relaxed),
+            self.presents_refused.load(Ordering::Relaxed),
+        )
+    }
+
     /// The strict guard: `Ok` only while no frame fell back to D3DMetal.
     pub fn assert_no_fallback(&self) -> Result<(), TelemetryError> {
         let count = self.d3dmetal_fallback_count();
@@ -283,13 +355,20 @@ impl FrameTelemetry {
 
     /// The window, percentiles and histogram, without resetting anything.
     pub fn snapshot(&self) -> TelemetrySnapshot {
+        let (submits_ok, submits_refused) = self.submit_counts();
+        let (presents_ok, presents_refused) = self.present_counts();
         TelemetrySnapshot {
             frames: self.window_len(),
             recorded: self.recorded_frames(),
             percentiles: self.percentiles(),
             fps: self.fps(),
             opcodes: self.unsupported_opcode_histogram(),
+            refusals: self.refusal_histogram(),
             d3dmetal_fallback_count: self.d3dmetal_fallback_count(),
+            submits_ok,
+            submits_refused,
+            presents_ok,
+            presents_refused,
         }
     }
 
@@ -304,15 +383,25 @@ impl FrameTelemetry {
             window.frames.clear();
             window.opcodes.clear();
         }
+        self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         snapshot
     }
 
-    /// Clears the window and histogram (never the fallback counter).
+    /// Clears the window and histograms (never the fallback counter).
+    ///
+    /// Submit and present counters are session totals and survive a reset too.
     pub fn reset(&self) {
         let mut window = self.lock();
         window.frames.clear();
         window.opcodes.clear();
         window.recorded = 0;
+        self.refusals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Window> {
@@ -335,8 +424,18 @@ pub struct TelemetrySnapshot {
     pub fps: f64,
     /// Unsupported-opcode histogram of the window.
     pub opcodes: BTreeMap<u16, u64>,
+    /// Refused producer calls by opcode ([`NO_OPCODE`] when none applies).
+    pub refusals: BTreeMap<u16, u64>,
     /// The session's hard D3DMetal fallback count.
     pub d3dmetal_fallback_count: u64,
+    /// Native submission batches the host answered successfully.
+    pub submits_ok: u64,
+    /// Native submission batches the transport or host refused.
+    pub submits_refused: u64,
+    /// Frames the native presenter accepted.
+    pub presents_ok: u64,
+    /// Frames the native present path refused.
+    pub presents_refused: u64,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -353,18 +452,36 @@ impl std::fmt::Display for TelemetrySnapshot {
             self.fps,
             self.d3dmetal_fallback_count
         )?;
-        if self.opcodes.is_empty() {
-            return write!(f, ", opcodes=[]");
-        }
-        write!(f, ", opcodes=[")?;
-        for (index, (opcode, count)) in self.opcodes.iter().enumerate() {
-            if index > 0 {
-                write!(f, " ")?;
-            }
-            write!(f, "{opcode}:{count}")?;
-        }
-        write!(f, "]")
+        write!(
+            f,
+            ", submits={}/{} ok/refused, presents={}/{} ok/refused",
+            self.submits_ok, self.submits_refused, self.presents_ok, self.presents_refused
+        )?;
+        write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
+        write!(f, "{}", opcode_list(&self.refusals, "refusals"))
     }
+}
+
+/// One `, name=[opcode:count ...]` field for the frame line.
+fn opcode_list(opcodes: &BTreeMap<u16, u64>, name: &str) -> String {
+    if opcodes.is_empty() {
+        return format!(", {name}=[]");
+    }
+    let mut text = format!(", {name}=[");
+    for (index, (opcode, count)) in opcodes.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        if *opcode == NO_OPCODE {
+            text.push_str("none");
+        } else {
+            text.push_str(&opcode.to_string());
+        }
+        text.push(':');
+        text.push_str(&count.to_string());
+    }
+    text.push(']');
+    text
 }
 
 /// The process-wide telemetry the entry points record into.
@@ -424,6 +541,36 @@ pub fn d3dmetal_fallback_count() -> u64 {
 /// Declares one D3DMetal fallback in the process-wide telemetry.
 pub fn note_d3dmetal_fallback() {
     global().note_d3dmetal_fallback();
+}
+
+/// Records one refused producer call by the wire opcode it needed.
+pub fn note_unsupported_opcode(opcode: Option<u16>) {
+    global().note_unsupported_opcode(opcode);
+}
+
+/// The process-wide refusal histogram.
+pub fn refusal_histogram() -> BTreeMap<u16, u64> {
+    global().refusal_histogram()
+}
+
+/// Records one successful native submission batch.
+pub fn note_submit_ok() {
+    global().note_submit_ok();
+}
+
+/// Records one refused native submission batch.
+pub fn note_submit_refused() {
+    global().note_submit_refused();
+}
+
+/// Records one accepted native present.
+pub fn note_present_ok() {
+    global().note_present_ok();
+}
+
+/// Records one refused native present.
+pub fn note_present_refused() {
+    global().note_present_refused();
 }
 
 /// The process-wide strict zero-D3DMetal guard.
@@ -644,6 +791,38 @@ mod tests {
         assert_eq!(telemetry.window_len(), WINDOW_FRAMES);
         assert_eq!(telemetry.recorded_frames() as usize, WINDOW_FRAMES + 10);
         assert_eq!(telemetry.frame_times()[0], 10, "the oldest samples dropped");
+    }
+
+    /// The snapshot names the unsupported opcodes and the submit/present
+    /// statuses the native path observed, with the hard fallback count.
+    #[test]
+    fn the_snapshot_carries_refusals_and_submit_present_statuses() {
+        let telemetry = telemetry();
+        telemetry.note_unsupported_opcode(Some(44));
+        telemetry.note_unsupported_opcode(Some(44));
+        telemetry.note_unsupported_opcode(None);
+        telemetry.note_submit_ok();
+        telemetry.note_submit_refused();
+        telemetry.note_present_ok();
+        telemetry.note_present_refused();
+        telemetry.note_present_refused();
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.refusals, BTreeMap::from([(44, 2), (NO_OPCODE, 1)]));
+        assert_eq!((snapshot.submits_ok, snapshot.submits_refused), (1, 1));
+        assert_eq!((snapshot.presents_ok, snapshot.presents_refused), (1, 2));
+        assert_eq!(snapshot.d3dmetal_fallback_count, 0);
+        let line = snapshot.to_string();
+        assert!(line.contains("refusals=[44:2 none:1]"), "{line}");
+        assert!(line.contains("submits=1/1"), "{line}");
+        assert!(line.contains("presents=1/2"), "{line}");
+        assert!(line.contains("fallback=0"), "{line}");
+        // The session totals survive a window reset.
+        telemetry.reset();
+        let after = telemetry.snapshot();
+        assert_eq!(after.refusals, BTreeMap::new());
+        assert_eq!((after.submits_ok, after.submits_refused), (1, 1));
+        assert_eq!((after.presents_ok, after.presents_refused), (1, 2));
     }
 
     #[test]

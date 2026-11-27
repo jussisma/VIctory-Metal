@@ -153,6 +153,42 @@ pub extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // The native path connects its one host session here, before any queue,
+    // list or resource can be made. A configured endpoint that refuses the
+    // session fails device creation explicitly; with no endpoint the first
+    // submission reports the transport failure. There is no silent fallback
+    // (ADR-019).
+    #[cfg(windows)]
+    if crate::backend::metal_selected() {
+        match crate::native_metal::queue::connect_once_from_env() {
+            Ok(live) => {
+                if !live {
+                    tracing::warn!(
+                        "VICTORY_BACKEND=metal: no Wire v3 endpoint is configured; every native \
+                         submission will fail explicitly"
+                    );
+                }
+                match crate::native_metal::queue::install_present_from_env() {
+                    Ok(true) => tracing::info!("native present surface installed from the environment"),
+                    Ok(false) => tracing::debug!(
+                        "VICTORY_BACKEND=metal: no VICTORY_METAL_SURFACE; Present will fail \
+                         explicitly until a native surface is installed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "VICTORY_BACKEND=metal: the native present surface was not installed"
+                    ),
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "VICTORY_BACKEND=metal: device creation could not open the native host session"
+                );
+                return error.hresult();
+            }
+        }
+    }
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 
