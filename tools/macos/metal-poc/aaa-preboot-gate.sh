@@ -2,8 +2,9 @@
 # C6 / Wave 6B: unified AAA pre-boot gate.
 #
 # One command boots the ARM64 `victory_metal_host` through the Wave 6A
-# `run-title-metal.sh`, runs the Win64 `aaa_preboot_gate` guest twice under
-# Wine, and reports both runs plus a per-feature verdict.
+# `run-title-metal.sh`, runs the Win64 `aaa_preboot_gate` guest once per
+# `--runs` (default 2) under Wine, and reports every run plus a per-feature
+# verdict.
 #
 # The guest needs six prebuilt metallibs and their converter reflection JSONs
 # (vertex, pixel, compute, object/amplification, mesh, mesh pixel). The launcher
@@ -25,10 +26,15 @@
 # VICTORY_FRAME_WARMUP (20), VICTORY_FRAME_MEASURED (120).
 #
 # Exit codes:
-#   0   both runs observed every feature
-#   12  the gate report exists but a Cycle 06 feature is not observed
-#   3   setup failure; 10 a guest failed; 11 a D3DMetal fallback; 4 a leak
+#   0   every run observed every feature
+#   12  the gate report exists but a Cycle 06 feature is not observed (PARTIAL)
+#   3   setup failure; 10 a guest failed; 11 a D3DMetal fallback
+#   13  a child started by this run survived cleanup (orphan); see the
+#       `PROCESS_ORPHAN_SURVIVED` line and `process-hygiene.sh`
 set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 START_DIR="$(pwd)"
@@ -82,25 +88,39 @@ DXIL_DIR="$WORK/dxil"
 METALLIB_DIR="$WORK/metallib"
 WINEPREFIX_DIR="$WORK/wineprefix"
 mkdir -p "$HLSL_DIR" "$DXIL_DIR" "$METALLIB_DIR"
+victory_hygiene_work "$WORK"
 
 LOCK="/tmp/victory-gpu.lock"
 CALLER_LOCK=0
+LOCK_RESTORED=0
 
 cleanup() {
     status=$?
+    trap - EXIT INT TERM HUP
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    rm -rf "$WORK"
+    # Reap every child this run started: TERM, bounded wait, KILL survivors,
+    # bounded wait. Then use the unique temp dir as an ownership proof for any
+    # process the tracked-PID pass could not reach (e.g. a helper's grandchild).
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
     # The validation command holds the lock across this script; restore it so
     # its EXIT trap can remove an owned directory. Never touch a lock another
-    # task acquired in the meantime.
-    if [ "$CALLER_LOCK" = 1 ] && [ ! -d "$LOCK" ]; then
-        mkdir "$LOCK" 2>/dev/null || true
+    # task acquired in the meantime, and restore it exactly once.
+    if [ "$CALLER_LOCK" = 1 ] && [ "$LOCK_RESTORED" = 0 ]; then
+        if [ ! -d "$LOCK" ]; then
+            mkdir "$LOCK" 2>/dev/null || true
+        fi
+        LOCK_RESTORED=1
     fi
-    exit "$status"
+    victory_hygiene_remove_work
+    victory_hygiene_finalize "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 fail_setup() {
     echo "aaa-preboot-gate.sh: FAIL: $1" >&2
@@ -336,9 +356,11 @@ compile_dxil psm ps_6_0
 
 # --- Translate through the real --stdio reflection worker -------------------
 echo "aaa-preboot-gate.sh: translating the stages with victory-irconverter..."
-if ! python3 - "$IRCONV" "$CONV" "$DXIL_DIR" "$METALLIB_DIR" <<'PY'
+cat >"$WORK/translate_pool.py" <<'PY'
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 
@@ -353,6 +375,44 @@ proc = subprocess.Popen(
     stderr=subprocess.PIPE,
     env=env,
 )
+
+
+def _reap_worker():
+    # The stdio worker is this helper's child. Reap it on normal exit, on a
+    # protocol error and on SIGTERM/SIGHUP so it can never outlive the run.
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+
+atexit.register(_reap_worker)
+
+
+def _on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGHUP, _on_signal)
+
 for index, (name, stage) in enumerate(jobs):
     dxil = open(os.path.join(dxil_dir, name + ".dxil"), "rb").read()
     entry = b"main"
@@ -389,8 +449,13 @@ proc.stdin.close()
 proc.wait()
 sys.exit(0 if proc.returncode == 0 else 3)
 PY
-then
-    fail_setup "the reflection worker refused a gate stage"
+translate_rc=0
+victory_hygiene_run python3 "$WORK/translate_pool.py" \
+    "$IRCONV" "$CONV" "$DXIL_DIR" "$METALLIB_DIR" \
+    >"$WORK/translate.log" 2>&1 || translate_rc=$?
+cat "$WORK/translate.log"
+if [ "$translate_rc" -ne 0 ]; then
+    fail_setup "the reflection worker refused a gate stage (exit $translate_rc)"
 fi
 
 for stem in vs ps cs as ms psm; do
@@ -415,7 +480,7 @@ export VICTORY_AAA_GATE_REFLECTION_PSM="$(winpath "$METALLIB_DIR/psm.reflection.
 XMEM_STATUS="unavailable"
 XMEM_LINE=""
 echo "aaa-preboot-gate.sh: running the real victory-hle xmem registry stress under Wine..."
-if tools/macos/test-wine.sh -p victory-hle --lib \
+if victory_hygiene_run tools/macos/test-wine.sh -p victory-hle --lib \
     sustained_streaming_bounds_the_retired_submission_map \
     -- --nocapture >"$OUT/xmem-registry.log" 2>&1; then
     XMEM_LINE="$(grep -E 'bounded share registry:' "$OUT/xmem-registry.log" | tail -1)"
@@ -464,13 +529,14 @@ run_once() {
     run_out="$OUT/run$n"
     mkdir -p "$run_out"
     log="$run_out/launcher.log"
-    echo "aaa-preboot-gate.sh: run $n/2 through run-title-metal.sh..."
+    echo "aaa-preboot-gate.sh: run $n/$RUNS through run-title-metal.sh..."
     rc=0
-    VICTORY_LIVE_GATE=1 \
-    VICTORY_AAA_PREBOOT_GATE=1 \
-    VICTORY_FRAME_WARMUP="${VICTORY_FRAME_WARMUP:-20}" \
-    VICTORY_FRAME_MEASURED="${VICTORY_FRAME_MEASURED:-120}" \
-    "$ROOT/tools/macos/metal-poc/run-title-metal.sh" --headless --keep --out "$run_out" -- \
+    export VICTORY_LIVE_GATE=1
+    export VICTORY_AAA_PREBOOT_GATE=1
+    export VICTORY_FRAME_WARMUP="${VICTORY_FRAME_WARMUP:-20}"
+    export VICTORY_FRAME_MEASURED="${VICTORY_FRAME_MEASURED:-120}"
+    victory_hygiene_run "$ROOT/tools/macos/metal-poc/run-title-metal.sh" \
+        --headless --keep --out "$run_out" -- \
         "$GUEST_EXE" --ignored --exact aaa_preboot_guest_gate --test-threads=1 --nocapture \
         >"$log" 2>&1 || rc=$?
     echo "RUN_STATUS run=$n launcher_exit=$rc"
@@ -492,7 +558,11 @@ run_once() {
 }
 
 run_once 1
-run_once 2
+n=2
+while [ "$n" -le "$RUNS" ]; do
+    run_once "$n"
+    n=$((n + 1))
+done
 
 # --- Evaluate both runs -----------------------------------------------------
 set +e

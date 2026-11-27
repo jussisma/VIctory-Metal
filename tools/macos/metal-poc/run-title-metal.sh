@@ -32,16 +32,23 @@
 #      guest report
 #   2  usage error
 #   3  setup failure (missing Wine, host build, daemon not ready, ...)
-#   4  a process from this session leaked after teardown
 #  10  the guest exited non-zero
 #  11  a D3DMetal fallback / module / image was observed
-#  12  the gate guest report is incomplete or reports a failing stage
-#  13  the diagnostic summary could not be produced (e.g. host telemetry lost)
+#  12  the gate guest report is incomplete or reports a failing stage (PARTIAL)
+#  13  a child started by this run survived cleanup (orphan); the
+#      `PROCESS_ORPHAN_SURVIVED` line names it. See `process-hygiene.sh`.
 #  14  the host daemon exited non-zero on its own
-# 130  interrupted by SIGINT; 143 by SIGTERM
+#  15  the diagnostic summary could not be produced (e.g. host telemetry lost)
+# 130  interrupted by SIGINT; 143 by SIGTERM; 129 by SIGHUP
+#
+# Logs may be kept with `--keep` or `VICTORY_KEEP_LOGS=1`; children are still
+# reaped and the orphan assertion still runs.
 #
 # One GPU task at a time: the script takes /tmp/victory-gpu.lock.
 set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 START_DIR="$(pwd)"
@@ -194,7 +201,7 @@ ABI_STATUS="skipped"
 ABI_SUMMARY=""
 HOST_STARTED=0
 LOCK="/tmp/victory-gpu.lock"
-LOCK_HELD=0
+victory_hygiene_work "$WORK"
 
 fail_setup() {
     echo "run-title-metal.sh: FAIL: $1" >&2
@@ -203,58 +210,31 @@ fail_setup() {
 
 cleanup() {
     status=$?
-    trap - EXIT INT TERM
-    if [ -n "$GUEST_PID" ] && kill -0 "$GUEST_PID" 2>/dev/null; then
-        kill "$GUEST_PID" 2>/dev/null || true
-        wait "$GUEST_PID" 2>/dev/null || true
-    fi
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
+    trap - EXIT INT TERM HUP
+    # Stop the private prefix's wineserver first so its guests do not linger.
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    sleep 0.3
-    leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    if [ -n "$leaked" ]; then
-        echo "run-title-metal.sh: PROCESS_LEAK remaining=\"$leaked\"" >&2
-        for pid in $leaked; do kill -9 "$pid" 2>/dev/null || true; done
-        sleep 0.2
-        leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    fi
-    echo "PROCESS_CHECK host=0 guest=0 leaks=${leaked:-0}"
-    if [ "$KEEP" = 1 ]; then
-        echo "run-title-metal.sh: kept session files in $WORK"
+    # Reap every PID this launcher started (host daemon, Wine guest, helper
+    # children): TERM, bounded wait, KILL survivors, bounded wait. The unique
+    # temp dir is then the ownership proof for any leftover grandchild.
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_lock_release
+    victory_hygiene_remove_work
+    if victory_hygiene_keep_logs; then
         echo "run-title-metal.sh: diagnostics in $OUT"
-    else
-        rm -rf "$WORK"
     fi
-    if [ "$LOCK_HELD" = 1 ]; then
-        rmdir "$LOCK" 2>/dev/null || true
-        LOCK_HELD=0
-    fi
-    if [ "$status" -eq 0 ] && [ -n "$leaked" ]; then
-        exit 4
-    fi
+    victory_hygiene_finalize "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # --- Serialise exclusive GPU work ------------------------------------------
-acquired=0
-while [ "$acquired" -eq 0 ]; do
-    if mkdir "$LOCK" 2>/dev/null; then
-        acquired=1
-        LOCK_HELD=1
-    else
-        if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-            rmdir "$LOCK" 2>/dev/null || true
-        fi
-        sleep 0.5
-    fi
-done
+victory_hygiene_lock_acquire "$LOCK"
 
 mkdir -m 700 "$SHARE"
 if ! command -v openssl >/dev/null 2>&1; then
@@ -281,7 +261,7 @@ HOST_BIN="$TARGET_DIR/aarch64-apple-darwin/debug/victory_metal_host"
 
 if [ ! -x "$HOST_BIN" ]; then
     echo "run-title-metal.sh: building the ARM64 victory_metal_host (missing $HOST_BIN)..."
-    if ! cargo build --locked -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host; then
+    if ! victory_hygiene_run cargo build --locked -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host; then
         fail_setup "the ARM64 host daemon did not build"
     fi
 fi
@@ -419,7 +399,7 @@ pool_stage() {
     [ -f "$CONV" ] || { echo "POOL_UNAVAILABLE libmetalirconverter.dylib missing"; return 0; }
     if [ ! -x "$IRCONV" ]; then
         echo "run-title-metal.sh: building the x86_64 victory-irconverter worker..."
-        if ! cargo build --locked -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter; then
+        if ! victory_hygiene_run cargo build --locked -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter; then
             echo "POOL_UNAVAILABLE victory-irconverter did not build"
             return 0
         fi
@@ -432,9 +412,11 @@ pool_stage() {
     compile_dxil psm.hlsl ps_6_0 main psm || return 0
     compile_dxil cs.hlsl cs_6_6 main cs || return 0
 
-    if ! python3 - "$DXIL_DIR" "$IRCONV" "$CONV" "$METALLIB_DIR" <<'PY'
+    cat >"$WORK/pool_worker.py" <<'PY'
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -448,6 +430,43 @@ env["VICTORY_IRCONVERTER_STDIO_REFLECTION"] = "1"
 proc = subprocess.Popen([worker, "--stdio", "--converter", converter],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, env=env)
+
+
+def _reap_worker():
+    # Reap the stdio worker on normal exit, protocol error, SIGTERM or SIGHUP.
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+
+atexit.register(_reap_worker)
+
+
+def _on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGHUP, _on_signal)
+
 timings = []
 written = {}
 reflections = {}
@@ -520,7 +539,12 @@ summary = {
 }
 print("POOL_SUMMARY " + json.dumps(summary))
 PY
-    then
+    pool_worker_rc=0
+    victory_hygiene_run python3 "$WORK/pool_worker.py" \
+        "$DXIL_DIR" "$IRCONV" "$CONV" "$METALLIB_DIR" \
+        >"$WORK/pool-worker.log" 2>&1 || pool_worker_rc=$?
+    cat "$WORK/pool-worker.log" || true
+    if [ "$pool_worker_rc" -ne 0 ]; then
         echo "POOL_UNAVAILABLE the --stdio worker refused a job (see above)"
         POOL_STATUS="failed"
         return 0
@@ -593,7 +617,7 @@ fn main() {
 EOS
     if [ "$POOL_STATUS" = "translated" ]; then
         echo "run-title-metal.sh: encoding reflection-derived pipeline ABIs..."
-        if CARGO_TARGET_DIR="$TARGET_DIR" cargo run --offline --quiet \
+        if CARGO_TARGET_DIR="$TARGET_DIR" victory_hygiene_run cargo run --offline --quiet \
             --manifest-path "$WORK/abi-helper/Cargo.toml" --target aarch64-apple-darwin -- \
             "$ABI_DIR/graphics.vab1" 0 "$METALLIB_DIR/vs.reflection.json" \
                 1 "$METALLIB_DIR/ps.reflection.json" -- \
@@ -636,6 +660,7 @@ start_host() {
     : >"$HOST_LOG"
     "$HOST_BIN" "$@" >"$HOST_LOG" 2>&1 &
     HOST_PID=$!
+    victory_hygiene_track "$HOST_PID"
     HOST_STARTED=1
 }
 
@@ -715,6 +740,7 @@ GUEST_TIMEOUT="${GUEST_TIMEOUT:-900}"
 # pipefail, so a `| tee` pipeline would hide the guest exit status.
 "$WINE" "$GUEST_EXE" "$@" >"$GUEST_LOG" 2>&1 &
 GUEST_PID=$!
+victory_hygiene_track "$GUEST_PID"
 guest_deadline=$(( $(date +%s) + GUEST_TIMEOUT ))
 while kill -0 "$GUEST_PID" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$guest_deadline" ]; then
@@ -725,11 +751,14 @@ while kill -0 "$GUEST_PID" 2>/dev/null; do
     fi
     sleep 0.2
 done
-if wait "$GUEST_PID"; then
-    GUEST_RC=0
-else
-    GUEST_RC=$?
+GUEST_RC=0
+victory_hygiene_wait_pid "$GUEST_PID" 10 || GUEST_RC=$?
+if [ "$GUEST_RC" -eq 124 ]; then
+    # TERM was ignored; wait_pid escalated to KILL and reaped it.
+    GUEST_RC=143
+    GUEST_TIMED_OUT=1
 fi
+victory_hygiene_untrack "$GUEST_PID"
 GUEST_PID=""
 cat "$GUEST_LOG" 2>/dev/null || true
 
@@ -744,11 +773,13 @@ while kill -0 "$HOST_PID" 2>/dev/null; do
     fi
     sleep 0.1
 done
-if wait "$HOST_PID"; then
-    HOST_RC=0
-else
-    HOST_RC=$?
+HOST_RC=0
+victory_hygiene_wait_pid "$HOST_PID" 10 || HOST_RC=$?
+if [ "$HOST_RC" -eq 124 ]; then
+    HOST_RC=143
+    HOST_TERMINATED=1
 fi
+victory_hygiene_untrack "$HOST_PID"
 HOST_PID=""
 
 # --- Structured summary ----------------------------------------------------
@@ -841,7 +872,7 @@ if guest_timed_out:
 elif guest_rc != 0:
     problem = (10, f"guest exited {guest_rc}")
 elif not telemetry_ok:
-    problem = (13, "host telemetry missing; cannot prove d3dmetal_fallback_count=0")
+    problem = (15, "host telemetry missing; cannot prove d3dmetal_fallback_count=0")
 elif host_fallback not in (0, "0"):
     problem = (11, f"host d3dmetal_fallback_count={host_fallback}")
 elif guest_fallback is not None and guest_fallback not in (0, "0"):
@@ -929,7 +960,7 @@ try:
         handle.write(text)
 except OSError as error:
     print(f"run-title-metal.sh: FAIL: cannot write summary: {error}", file=sys.stderr)
-    sys.exit(13)
+    sys.exit(15)
 sys.stdout.write(text)
 sys.exit(exit_code)
 PY

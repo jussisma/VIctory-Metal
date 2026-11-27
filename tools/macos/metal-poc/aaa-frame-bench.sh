@@ -38,26 +38,25 @@
 #   VICTORY_FRAME_WARMUP=20     excluded warmup frames (default 20)
 #
 # One GPU task at a time: the script takes /tmp/victory-gpu.lock.
+#
+# Process hygiene (C7 / Wave 7A): the host daemon and the Wine guest are started
+# in the background and registered with `process-hygiene.sh`. The EXIT trap
+# reaps them with TERM, a bounded wait and KILL for survivors, removes only the
+# lock this run created, and exits 13 if any started PID is still alive after
+# cleanup. `VICTORY_KEEP_LOGS=1` (or `KEEP=1`) keeps the session files but still
+# reaps every child.
+#
+# Exit codes: 0 PASS, 1/2/3 named failures, 13 orphan survivor after cleanup.
 set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Homebrew's rustup is keg-only; put it first like the other macOS harnesses.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
-# --- Serialise exclusive GPU work ------------------------------------------
 LOCK="/tmp/victory-gpu.lock"
-acquired=0
-while [ "$acquired" -eq 0 ]; do
-    if mkdir "$LOCK" 2>/dev/null; then
-        acquired=1
-    else
-        # Reclaim a lock older than an hour (a crashed earlier run).
-        if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-            rmdir "$LOCK" 2>/dev/null || true
-        fi
-        sleep 0.5
-    fi
-done
 
 if [ -z "${WINE:-}" ]; then
     for wine in "$ROOT/target/wine-cx/bin/wine" \
@@ -86,44 +85,30 @@ GUEST_PID=""
 PORT=""
 GUEST_RC=0
 HOST_RC=0
+victory_hygiene_work "$WORK"
 
 cleanup() {
     status=$?
-    if [ -n "$GUEST_PID" ] && kill -0 "$GUEST_PID" 2>/dev/null; then
-        kill "$GUEST_PID" 2>/dev/null || true
-        wait "$GUEST_PID" 2>/dev/null || true
-    fi
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
+    trap - EXIT INT TERM HUP
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    # Verify no process from this session survives (pgrep is the acceptance
-    # check, not a guess).
-    sleep 0.3
-    leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    if [ -n "$leaked" ]; then
-        echo "PROCESS_LEAK remaining=\"$leaked\"" >&2
-        for pid in $leaked; do kill -9 "$pid" 2>/dev/null || true; done
-        sleep 0.2
-        leaked="$(pgrep -f "$WORK" 2>/dev/null | tr '\n' ' ' || true)"
-    fi
-    echo "PROCESS_CHECK host=0 guest=0 leaks=${leaked:-0}"
-    rmdir "$LOCK" 2>/dev/null || true
-    if [ "${KEEP:-0}" = "1" ]; then
-        echo "kept harness files in $WORK"
-    else
-        rm -rf "$WORK"
-    fi
-    # A successful run is only a pass when nothing from this session leaked.
-    if [ "$status" -eq 0 ] && [ -n "$leaked" ]; then
-        trap - EXIT INT TERM
-        exit 4
-    fi
+    # Reap tracked PIDs, then use the unique temp dir as an ownership proof for
+    # any grandchild the tracked-PID pass could not reach.
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_lock_release
+    victory_hygiene_remove_work
+    victory_hygiene_finalize "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# --- Serialise exclusive GPU work ------------------------------------------
+victory_hygiene_lock_acquire "$LOCK"
 
 mkdir -m 700 "$SHARE"
 python3 -c 'import secrets; print(secrets.token_hex(32))' >"$SECRET"
@@ -146,7 +131,7 @@ command -v "$MINGW_CC" >/dev/null 2>&1 || fail_setup "missing $MINGW_CC"
 
 # --- Build the ARM64 daemon and the Win64 guest ----------------------------
 echo "Building the ARM64 victory-metal-host daemon..."
-cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host \
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin victory_metal_host \
     || fail_setup "the ARM64 host daemon did not build"
 [ -x "$HOST_BIN" ] || fail_setup "missing $HOST_BIN"
 
@@ -1192,7 +1177,7 @@ int main(void) {
 CEOF
 
 echo "Compiling the Win64 guest harness..."
-"$MINGW_CC" -x c -O2 -Wall -Wextra -Werror -o "$GUEST_EXE" "$WORK/aaa_guest.c" -lws2_32 -lpsapi \
+victory_hygiene_run "$MINGW_CC" -x c -O2 -Wall -Wextra -Werror -o "$GUEST_EXE" "$WORK/aaa_guest.c" -lws2_32 -lpsapi \
     || fail_setup "the Win64 guest harness did not compile"
 
 # --- Start the ARM64 daemon ------------------------------------------------
@@ -1208,6 +1193,7 @@ echo "Starting the ARM64 victory-metal-host daemon..."
     --telemetry-json "$TELEMETRY" \
     >"$HOST_OUT" 2>"$HOST_ERR" &
 HOST_PID=$!
+victory_hygiene_track "$HOST_PID"
 
 ready=0
 for _ in $(seq 1 600); do
@@ -1256,6 +1242,7 @@ echo "Host ready: port=$PORT compute_pipeline=$compute_id graphics_pipeline=${gr
 echo "Running the Win64 AAA guest under Wine (warmup=$VICTORY_FRAME_WARMUP measured=$VICTORY_FRAME_MEASURED)..."
 "$WINE" "$GUEST_EXE" >"$GUEST_LOG" 2>&1 &
 GUEST_PID=$!
+victory_hygiene_track "$GUEST_PID"
 guest_deadline=$(( $(date +%s) + 300 ))
 while kill -0 "$GUEST_PID" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$guest_deadline" ]; then
@@ -1265,7 +1252,9 @@ while kill -0 "$GUEST_PID" 2>/dev/null; do
     fi
     sleep 0.2
 done
-wait "$GUEST_PID" || GUEST_RC=$?
+GUEST_RC=0
+victory_hygiene_wait_pid "$GUEST_PID" 10 || GUEST_RC=$?
+victory_hygiene_untrack "$GUEST_PID"
 GUEST_PID=""
 
 host_deadline=$(( $(date +%s) + 60 ))
@@ -1277,7 +1266,9 @@ while kill -0 "$HOST_PID" 2>/dev/null; do
     fi
     sleep 0.1
 done
-wait "$HOST_PID" || HOST_RC=$?
+HOST_RC=0
+victory_hygiene_wait_pid "$HOST_PID" 10 || HOST_RC=$?
+victory_hygiene_untrack "$HOST_PID"
 HOST_PID=""
 
 cat "$GUEST_LOG" 2>/dev/null || true

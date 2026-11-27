@@ -36,9 +36,18 @@
 # Usage: tools/macos/metal-poc/synthetic-frame.sh
 #
 # The launcher creates a private temporary share directory, 32-byte secret,
-# Wine prefix and native host, and removes them on exit (KEEP=1 keeps them).
+# Wine prefix and native host, and removes them on exit (KEEP=1 or
+# VICTORY_KEEP_LOGS=1 keeps them but still reaps every child).
 # Nothing here launches the title. This is one frame, not a benchmark.
+#
+# Process hygiene (C7 / Wave 7A): the native host and the Wine guest are started
+# in the background and registered with `process-hygiene.sh`; the EXIT trap
+# reaps them with TERM, a bounded wait and KILL, then exits 13 if a started PID
+# survived cleanup (0 = PASS, 1/2 = named failure, 13 = orphan survivor).
 set -eu
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/process-hygiene.sh"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Homebrew's rustup is keg-only; put it first like the other macOS harnesses.
@@ -63,24 +72,27 @@ HOST_LOG="$WORK/host.stdout"
 HOST_ERR="$WORK/host.stderr"
 GUEST_LOG="$WORK/guest.log"
 HOST_PID=""
+GUEST_PID=""
 PORT=""
 COMPUTE_PIPELINE=""
+victory_hygiene_work "$WORK"
 
 cleanup() {
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
+    status=$?
+    trap - EXIT INT TERM HUP
     if [ -d "$WORK/wineprefix" ] && [ -n "${WINE:-}" ] && [ -x "${WINE%/*}/wineserver" ]; then
         WINEPREFIX="$WORK/wineprefix" "${WINE%/*}/wineserver" -k -w >/dev/null 2>&1 || true
     fi
-    if [ "${KEEP:-0}" = "1" ]; then
-        echo "kept harness files in $WORK"
-    else
-        rm -rf "$WORK"
-    fi
+    victory_hygiene_reap
+    victory_hygiene_reap_marker "$WORK"
+    echo "PROCESS_CHECK host=0 guest=0 survivors=${VICTORY_HYGIENE_SURVIVORS:-0}"
+    victory_hygiene_remove_work
+    victory_hygiene_finalize "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 mkdir -m 700 "$SHARE"
 python3 -c 'import secrets; print(secrets.token_hex(32))' >"$SECRET"
@@ -100,9 +112,9 @@ fi
 }
 
 echo "Building the native ARM64 host worker, the x86_64 IRConverter worker and the Win64 guest probe..."
-cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
-cargo build --locked --quiet -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter
-cargo build --locked --quiet -p victory-metal --target x86_64-pc-windows-gnullvm --bin metal-worker
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target aarch64-apple-darwin --bin metal-worker
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target x86_64-apple-darwin --bin victory-irconverter
+victory_hygiene_run cargo build --locked --quiet -p victory-metal --target x86_64-pc-windows-gnullvm --bin metal-worker
 WORKER="$ROOT/target/aarch64-apple-darwin/debug/metal-worker"
 IRCONVERTER="$ROOT/target/x86_64-apple-darwin/debug/victory-irconverter"
 GUEST="$ROOT/target/x86_64-pc-windows-gnullvm/debug/metal-worker.exe"
@@ -123,6 +135,7 @@ export VICTORY_IRCONVERTER_WORKER="$IRCONVERTER"
     --accept-timeout-secs 180 \
     >"$HOST_LOG" 2>"$HOST_ERR" &
 HOST_PID=$!
+victory_hygiene_track "$HOST_PID"
 
 ready=0
 for _ in $(seq 1 600); do
@@ -158,7 +171,13 @@ export VICTORY_IPC_SECRET_FILE="$(winpath "$SECRET")"
 echo "Host ready: port=$PORT compute=$COMPUTE_PIPELINE"
 echo "Running the Wine Win64 guest v3 probe..."
 guest_rc=0
-"$WINE" "$GUEST" --guest-v3 2>&1 | tee "$GUEST_LOG" || guest_rc=$?
+"$WINE" "$GUEST" --guest-v3 >"$GUEST_LOG" 2>&1 &
+GUEST_PID=$!
+victory_hygiene_track "$GUEST_PID"
+victory_hygiene_wait_pid "$GUEST_PID" 600 || guest_rc=$?
+victory_hygiene_untrack "$GUEST_PID"
+GUEST_PID=""
+cat "$GUEST_LOG" 2>/dev/null || true
 if [ "$guest_rc" -ne 0 ]; then
     echo "FAIL: the Wine guest probe exited with $guest_rc" >&2
     cat "$HOST_LOG" "$HOST_ERR" >&2 || true
@@ -166,7 +185,8 @@ if [ "$guest_rc" -ne 0 ]; then
 fi
 
 host_rc=0
-wait "$HOST_PID" || host_rc=$?
+victory_hygiene_wait_pid "$HOST_PID" 180 || host_rc=$?
+victory_hygiene_untrack "$HOST_PID"
 HOST_PID=""
 if [ "$host_rc" -ne 0 ]; then
     echo "FAIL: the native host exited with $host_rc" >&2
@@ -205,8 +225,9 @@ echo "PASS synthetic-frame host=\"$compute_line\" host=\"$summary_line\""
 # --- Part 2: host mixed encoder, MRT/depth graphics and converted DXIL ------
 echo "Running the host producer gate (MRT/depth graphics, converted DXIL compute)..."
 gate_rc=0
-cargo test --locked -p victory-metal --target aarch64-apple-darwin --test producer_e2e \
-    -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$WORK/producer_e2e.log" || gate_rc=$?
+victory_hygiene_run cargo test --locked -p victory-metal --target aarch64-apple-darwin --test producer_e2e \
+    -- --ignored --test-threads=1 --nocapture >"$WORK/producer_e2e.log" 2>&1 || gate_rc=$?
+cat "$WORK/producer_e2e.log" 2>/dev/null || true
 if [ "$gate_rc" -ne 0 ]; then
     echo "FAIL: the host producer gate exited with $gate_rc" >&2
     exit 1
