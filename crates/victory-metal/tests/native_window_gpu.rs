@@ -40,8 +40,9 @@ use victory_metal::ipc_host::{
 };
 use victory_metal::wire::{Reply, ReplyStatus};
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, LoadOp, PROTOCOL_VERSION_V3, Present, StoreOp,
-    SubmissionV3, encode_submission_v3,
+    BeginRenderPass, ColorAttachment, CommandV3, DepthStencilAttachment, DrawState, LoadOp,
+    PROTOCOL_VERSION_V3, PipelineRef, Present, PrimitiveTopology, RootConstantsV3, ScissorRect,
+    StoreOp, SubmissionV3, Viewport, encode_submission_v3,
 };
 
 const SECRET: [u8; 32] = [0x5a; 32];
@@ -50,6 +51,17 @@ const TEXTURE_ID: u64 = 7;
 const SURFACE_ID: u64 = 11;
 const GENERATION: u32 = 1;
 const EDGE: u32 = 64;
+
+/// The AAA frame-gate pipeline ids are published here by the host.
+const GRAPHICS_PIPELINE_FILE: &str = "victory-metal-host.graphics.id";
+/// A back-buffer deliberately larger than the window: the title draws
+/// 3840x2160 into a 1280x720 window, so the drawer must size the drawable to
+/// the source rather than clear it.
+const DRAWN_WIDTH: u32 = 128;
+const DRAWN_HEIGHT: u32 = 96;
+/// Second MRT colour and the depth target the built-in pipeline expects.
+const COLOR1_ID: u64 = 8;
+const DEPTH_ID: u64 = 9;
 
 unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *const c_void;
@@ -106,6 +118,14 @@ struct Host {
 
 impl Host {
     fn spawn(share: &TempDir, extra: &[&str], window_env: Option<&str>) -> Self {
+        let mut envs = Vec::new();
+        if let Some(value) = window_env {
+            envs.push(("VICTORY_METAL_WINDOW", value));
+        }
+        Self::spawn_with_env(share, extra, &envs)
+    }
+
+    fn spawn_with_env(share: &TempDir, extra: &[&str], envs: &[(&str, &str)]) -> Self {
         let stderr_path = share.path().join("host.stderr");
         let stderr = std::fs::File::create(&stderr_path).expect("create stderr log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_victory_metal_host"));
@@ -120,8 +140,8 @@ impl Host {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr));
-        if let Some(value) = window_env {
-            command.env("VICTORY_METAL_WINDOW", value);
+        for (name, value) in envs {
+            command.env(name, value);
         }
         command.args(extra);
         let mut child = command.spawn().expect("spawn victory-metal-host");
@@ -238,15 +258,20 @@ impl Client {
     }
 
     fn register_texture(&mut self) {
+        self.register_texture_as(TEXTURE_ID, 1, 1, EDGE, EDGE);
+    }
+
+    /// Registers one kind 8 texture with an explicit wire format/usage code.
+    fn register_texture_as(&mut self, id: u64, format: u8, usage: u8, width: u32, height: u32) {
         let mut payload = [0u8; TEXTURE_REG_PAYLOAD_LEN];
-        payload[..8].copy_from_slice(&TEXTURE_ID.to_le_bytes());
+        payload[..8].copy_from_slice(&id.to_le_bytes());
         payload[8..12].copy_from_slice(&GENERATION.to_le_bytes());
         payload[12] = 1; // TextureDimension::D2
-        payload[13] = 1; // TextureFormat::Bgra8Unorm
-        payload[14] = 1; // TextureUsage::color_attachment
+        payload[13] = format;
+        payload[14] = usage;
         payload[15] = 1; // sample count
-        payload[16..20].copy_from_slice(&EDGE.to_le_bytes());
-        payload[20..24].copy_from_slice(&EDGE.to_le_bytes());
+        payload[16..20].copy_from_slice(&width.to_le_bytes());
+        payload[20..24].copy_from_slice(&height.to_le_bytes());
         payload[24..28].copy_from_slice(&1u32.to_le_bytes());
         payload[28..30].copy_from_slice(&1u16.to_le_bytes());
         payload[30..32].copy_from_slice(&1u16.to_le_bytes());
@@ -255,28 +280,31 @@ impl Client {
         assert_eq!(
             self.read_frame().expect("read texture ack"),
             Some((KIND_ACK, vec![0])),
-            "host rejected the texture registration"
+            "host rejected texture {id} registration"
         );
     }
 
     fn register_surface(&mut self) {
+        self.register_surface_as(SURFACE_ID, TEXTURE_ID);
+    }
+
+    fn register_surface_as(&mut self, surface_id: u64, texture_id: u64) {
         let mut payload = [0u8; SURFACE_REG_PAYLOAD_LEN];
-        payload[..8].copy_from_slice(&SURFACE_ID.to_le_bytes());
-        payload[8..].copy_from_slice(&TEXTURE_ID.to_le_bytes());
+        payload[..8].copy_from_slice(&surface_id.to_le_bytes());
+        payload[8..].copy_from_slice(&texture_id.to_le_bytes());
         self.write_frame(KIND_SURFACE_REG, &payload)
             .expect("send surface registration");
         assert_eq!(
             self.read_frame().expect("read surface ack"),
             Some((KIND_ACK, vec![0])),
-            "host rejected the surface registration"
+            "host rejected surface registration"
         );
     }
 
     fn submit(&mut self, sequence: u32, clear: [f64; 4]) -> Reply {
-        let submission = SubmissionV3 {
+        self.submit_commands(
             sequence,
-            list: None,
-            commands: vec![
+            vec![
                 CommandV3::BeginRenderPass(BeginRenderPass {
                     colors: vec![ColorAttachment {
                         allocation_id: TEXTURE_ID,
@@ -295,6 +323,14 @@ impl Client {
                     sync_interval: 1,
                 }),
             ],
+        )
+    }
+
+    fn submit_commands(&mut self, sequence: u32, commands: Vec<CommandV3>) -> Reply {
+        let submission = SubmissionV3 {
+            sequence,
+            list: None,
+            commands,
         };
         let frame = encode_submission_v3(&submission).expect("encode v3 submission");
         let mut payload = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len());
@@ -378,6 +414,195 @@ fn number_field(json: &str, key: &str) -> Option<i64> {
         .find(|character: char| !(character.is_ascii_digit() || character == '-'))
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// Reads the numeric pipeline id the host published under `name`.
+fn read_pipeline_id(path: &Path) -> u64 {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    text.trim()
+        .strip_prefix("id=")
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{} does not hold an id: {text:?}", path.display()))
+}
+
+/// Builds the AAA frame-gate draw: two RGBA8 targets plus D32F, a full-target
+/// triangle from the host's built-in pipeline, and a `Present` of colour 0.
+fn drawn_frame(pipeline: u64, width: u32, height: u32) -> Vec<CommandV3> {
+    // The built-in `vm_frame_vertex` reads two RGBA tints from root constants.
+    let tints: [f32; 8] = [1.0, 128.0 / 255.0, 0.0, 1.0, 0.0, 128.0 / 255.0, 1.0, 1.0];
+    let mut constants = Vec::with_capacity(32);
+    for tint in tints {
+        constants.extend_from_slice(&tint.to_le_bytes());
+    }
+    vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![
+                ColorAttachment {
+                    allocation_id: TEXTURE_ID,
+                    generation: GENERATION,
+                    mip_level: 0,
+                    slice: 0,
+                    load: LoadOp::Clear,
+                    store: StoreOp::Store,
+                    clear_color: [0.0, 0.0, 0.0, 1.0],
+                },
+                ColorAttachment {
+                    allocation_id: COLOR1_ID,
+                    generation: GENERATION,
+                    mip_level: 0,
+                    slice: 0,
+                    load: LoadOp::Clear,
+                    store: StoreOp::Store,
+                    clear_color: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            depth_stencil: Some(DepthStencilAttachment {
+                allocation_id: DEPTH_ID,
+                generation: GENERATION,
+                mip_level: 0,
+                slice: 0,
+                depth_load: LoadOp::Clear,
+                depth_store: StoreOp::Store,
+                clear_depth: 1.0,
+                stencil_load: LoadOp::DontCare,
+                stencil_store: StoreOp::DontCare,
+                clear_stencil: 0,
+            }),
+        }),
+        CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: pipeline,
+        }),
+        CommandV3::SetViewport(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(width),
+            height: f64::from(height),
+            near: 0.0,
+            far: 1.0,
+        }),
+        CommandV3::SetScissor(ScissorRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::SetRootConstants(RootConstantsV3 {
+            slot: 0,
+            bytes: constants,
+        }),
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+        CommandV3::Present(Present {
+            surface_id: SURFACE_ID,
+            sync_interval: 1,
+        }),
+    ]
+}
+
+#[test]
+fn native_window_presents_a_drawn_backbuffer_larger_than_the_window() {
+    if !window_server_available() {
+        eprintln!(
+            "SKIP: no window server session (CGSessionCopyCurrentDictionary is null); \
+             drawn native window frame not exercised"
+        );
+        return;
+    }
+
+    let share = TempDir::new("drawn");
+    let telemetry = share.path().join("telemetry.json");
+    let telemetry_text = telemetry.to_string_lossy().into_owned();
+    let args = vec!["--aaa-frame", "--telemetry-json", telemetry_text.as_str()];
+    // The window is smaller than the back-buffer, exactly the real boot shape
+    // (3840x2160 title surface in a 1280x720 window). The probe samples the
+    // presented drawable after the blit.
+    let host = Host::spawn_with_env(
+        &share,
+        &args,
+        &[
+            ("VICTORY_METAL_WINDOW", "64x64"),
+            ("VICTORY_METAL_FRAME_PROBE", "1"),
+        ],
+    );
+    let pipeline = read_pipeline_id(&share.path().join(GRAPHICS_PIPELINE_FILE));
+
+    let mut client = Client::connect(host.port);
+    // Wire format 0 is RGBA8Unorm, the built-in frame-gate colour format;
+    // wire format 7 is D32Float and usage 2 is a depth attachment.
+    client.register_texture_as(TEXTURE_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+    client.register_texture_as(COLOR1_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+    client.register_texture_as(DEPTH_ID, 7, 2, DRAWN_WIDTH, DRAWN_HEIGHT);
+    client.register_surface_as(SURFACE_ID, TEXTURE_ID);
+
+    let reply = client.submit_commands(1, drawn_frame(pipeline, DRAWN_WIDTH, DRAWN_HEIGHT));
+    assert_eq!(
+        reply.status,
+        ReplyStatus::Ok,
+        "the drawn frame was refused: {reply:?}"
+    );
+    drop(client);
+
+    let output = host.wait();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no window server session") {
+            eprintln!("SKIP: the host reported no window server session:\n{stderr}");
+            return;
+        }
+        panic!(
+            "host failed: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
+    let json = std::fs::read_to_string(&telemetry).expect("telemetry JSON was written");
+
+    assert_eq!(
+        number_field(&json, "window_drawables"),
+        Some(1),
+        "the window must acquire one drawable: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "window_presented"),
+        Some(1),
+        "the window must present one drawable: {json}"
+    );
+    assert!(
+        json.contains("\"window_error\": null"),
+        "the window path reported an error: {json}"
+    );
+    assert!(
+        json.contains("\"fallback_clear\": false"),
+        "the presented frame is still the diagnostic clear: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "sampled_frames"),
+        Some(1),
+        "the frame probe must sample the presented frame: {json}"
+    );
+    let non_black = number_field(&json, "non_black_pixels").expect("probe non_black_pixels");
+    assert!(
+        non_black > 0,
+        "the drawn back-buffer did not reach the presented surface: {json}"
+    );
+    assert_ne!(
+        number_field(&json, "present_checksum"),
+        Some(-1),
+        "the present texture readback failed: {json}"
+    );
+
+    eprintln!(
+        "native window drawn gate: surface={DRAWN_WIDTH}x{DRAWN_HEIGHT} window=64x64 \
+         fallback_clear=false non_black_pixels={non_black} pipeline={pipeline}"
+    );
 }
 
 #[test]

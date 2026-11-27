@@ -784,9 +784,6 @@ pub struct MetalProducer {
     dirty: GraphicsDirty,
     graphics_root_signature: Option<u64>,
     compute_root_signature: Option<u64>,
-    /// An explicit `IASetIndexBuffer(null)` cleared the binding, so a
-    /// subsequent indexed draw has no buffer to read (a real error).
-    index_unbound: bool,
     compute_pipeline: Option<u64>,
     mesh_pipeline: Option<u64>,
     compute_constants: BTreeMap<u16, Vec<u8>>,
@@ -810,7 +807,6 @@ impl MetalProducer {
             dirty: GraphicsDirty::default(),
             graphics_root_signature: None,
             compute_root_signature: None,
-            index_unbound: false,
             compute_pipeline: None,
             mesh_pipeline: None,
             compute_constants: BTreeMap::new(),
@@ -1325,20 +1321,23 @@ impl MetalProducer {
         ResourceId::new(binding.allocation_id, binding.generation)?;
         self.graphics.index = Some(binding);
         self.dirty.index = true;
-        self.index_unbound = false;
         Ok(())
     }
 
-    /// `IASetIndexBuffer(null)`: unbind the index buffer.
+    /// `IASetIndexBuffer(null)`.
     ///
-    /// Wire v3 has no unbind command, so this only clears the recorded binding;
-    /// nothing is emitted. It is a legal D3D12 unbind, not a refusal, and is
-    /// counted as [`hint_census::DRAW_LIST_INDEX_UNBIND`]. A later indexed draw
-    /// has no buffer to read and is refused then, which is a real error.
+    /// D3D12 clears the index-buffer *view*, but the title's state block keeps
+    /// using the last non-null binding: after nulling the view it issues
+    /// `DrawIndexed` and expects the previously bound buffer to be read. The
+    /// producer therefore remembers the last binding instead of dropping it,
+    /// and emits no wire command (Wire v3 has no unbind). A draw is refused by
+    /// name only when no index buffer was ever bound in this list, which is the
+    /// one case where there is genuinely nothing to read. The call is counted
+    /// as [`hint_census::DRAW_LIST_INDEX_UNBIND`].
     pub fn unbind_index_buffer(&mut self) -> Result<(), ProducerError> {
-        self.graphics.index = None;
-        self.dirty.index = false;
-        self.index_unbound = true;
+        // Keep `self.graphics.index`: a null view is not a buffer release. The
+        // binding was already emitted for the current pass (or is re-emitted
+        // when the next pass opens), so a following `DrawIndexed` reads it.
         hint_census::note(hint_census::DRAW_LIST_INDEX_UNBIND);
         Ok(())
     }
@@ -1365,7 +1364,6 @@ impl MetalProducer {
             format: index_format(format)?,
         });
         self.dirty.index = true;
-        self.index_unbound = false;
         Ok(())
     }
 
@@ -1550,9 +1548,13 @@ impl MetalProducer {
         if index_count == 0 || instance_count == 0 {
             return Ok(());
         }
-        if self.graphics.index.is_none() && self.index_unbound {
+        if self.graphics.index.is_none() {
+            // No `IASetIndexBuffer` ever bound a buffer in this list: the draw
+            // has nothing to read. `IASetIndexBuffer(null)` after a real bind
+            // keeps that bind (see `unbind_index_buffer`), so it does not land
+            // here.
             return Err(ProducerError::unsupported_opcode(
-                "DrawIndexed: no index buffer after IASetIndexBuffer(null)",
+                "DrawIndexed: no index buffer was ever bound",
                 OP_DRAW_INDEXED_INSTANCED,
             ));
         }
@@ -2847,6 +2849,13 @@ mod tests {
     }
 
     fn record_draw(producer: &mut MetalProducer) {
+        // Every test that records an indexed draw must name an index buffer:
+        // an indexed draw with no buffer ever bound is a named refusal now.
+        if producer.graphics.index.is_none() {
+            producer
+                .set_index_buffer_at(0x20_0000, 1024, 57)
+                .expect("test index buffer");
+        }
         producer
             .draw_indexed(36, 1, 0, 0, 0)
             .expect("indexed draw recorded");
@@ -2931,6 +2940,7 @@ mod tests {
                 OP_SET_SCISSOR,
                 OP_SET_GRAPHICS_PIPELINE,
                 OP_SET_VERTEX_BUFFERS,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_RESOURCE_BARRIER,
@@ -2954,22 +2964,22 @@ mod tests {
             }
             other => panic!("first command is {other:?}"),
         }
-        match &submission.commands[5] {
+        match &submission.commands[6] {
             CommandV3::DrawIndexedInstanced(draw) => {
                 assert_eq!(draw.index_count_per_instance, 36);
                 assert_eq!(draw.instance_count, 1);
             }
-            other => panic!("sixth command is {other:?}"),
+            other => panic!("seventh command is {other:?}"),
         }
-        match &submission.commands[8] {
+        match &submission.commands[9] {
             CommandV3::CopyBuffer(copy) => {
                 assert_eq!(copy.src_allocation_id, 0x4000);
                 assert_eq!(copy.dst_allocation_id, 0x5000);
                 assert_eq!(copy.length, 256);
             }
-            other => panic!("ninth command is {other:?}"),
+            other => panic!("tenth command is {other:?}"),
         }
-        match &submission.commands[9] {
+        match &submission.commands[10] {
             CommandV3::Present(present) => {
                 assert_eq!(present.surface_id, 3);
                 assert_eq!(present.sync_interval, 1);
@@ -2997,6 +3007,7 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_SET_GRAPHICS_PIPELINE,
                 OP_DRAW_INDEXED_INSTANCED,
@@ -3113,6 +3124,7 @@ mod tests {
                 OP_SET_MESH_PIPELINE,
                 OP_DISPATCH_MESH,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3156,6 +3168,7 @@ mod tests {
                 OP_SET_MESH_PIPELINE,
                 OP_EXECUTE_INDIRECT_DISPATCH_MESH,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3289,10 +3302,12 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3357,6 +3372,7 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3444,12 +3460,14 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ],
@@ -3510,12 +3528,14 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3570,6 +3590,7 @@ mod tests {
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ],
@@ -3612,6 +3633,7 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3657,12 +3679,14 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
             ]
@@ -3746,6 +3770,7 @@ mod tests {
             vec![
                 OP_BEGIN_RENDER_PASS,
                 OP_SET_GRAPHICS_PIPELINE,
+                OP_SET_INDEX_BUFFER,
                 OP_DRAW_INDEXED_INSTANCED,
                 OP_END_RENDER_PASS,
                 OP_BEGIN_RENDER_PASS,
@@ -5040,12 +5065,12 @@ mod tests {
         }
     }
 
-    /// `IASetIndexBuffer(null)` after a valid binding clears it without a
-    /// command; the following indexed draw then has no buffer to read and is
-    /// refused by name (that one is a real error). Re-binding clears the error
-    /// state again.
+    /// `IASetIndexBuffer(null)` after a valid binding keeps the last buffer:
+    /// D3D12 clears the view, but the title's state block draws with the
+    /// retained binding. The unbind emits no command, is counted by name, and
+    /// the following indexed draw succeeds against the remembered buffer.
     #[test]
-    fn a_null_index_unbind_clears_the_binding_and_a_later_indexed_draw_refuses() {
+    fn a_null_index_unbind_keeps_the_last_binding_and_a_later_indexed_draw_uses_it() {
         let mut producer = MetalProducer::new(43, 1).expect("producer");
         producer
             .set_index_buffer_at(0x20_0000, 256, 57)
@@ -5054,7 +5079,17 @@ mod tests {
         producer
             .unbind_index_buffer()
             .expect("a null index is a legal unbind");
-        assert_eq!(producer.graphics.index, None, "the binding was cleared");
+        assert_eq!(
+            producer.graphics.index,
+            Some(IndexBufferBinding {
+                allocation_id: 0x20_0000,
+                generation: 1,
+                offset: 0,
+                length: 256,
+                format: IndexFormat::Uint16,
+            }),
+            "the last non-null index binding is retained"
+        );
         assert!(
             producer.commands().is_empty(),
             "an unbind emits no wire command"
@@ -5067,12 +5102,47 @@ mod tests {
             "the unbind is counted by name"
         );
 
+        let (colors, depth) = targets();
+        producer
+            .set_render_targets(&colors, depth)
+            .expect("render targets");
+        producer.set_pipeline(0x900).expect("pipeline");
+        producer
+            .draw_indexed(3, 1, 0, 0, 0)
+            .expect("a draw after a null view reads the retained index buffer");
+        let submission = flush_for_wire(&mut producer);
+        assert!(
+            submission
+                .commands
+                .iter()
+                .any(|command| matches!(command, CommandV3::DrawIndexedInstanced(_))),
+            "the indexed draw reached the wire"
+        );
+        assert!(
+            submission.commands.iter().any(|command| matches!(
+                command,
+                CommandV3::SetIndexBuffer(binding)
+                    if binding.allocation_id == 0x20_0000 && binding.length == 256
+            )),
+            "the retained binding is re-emitted when the pass opens"
+        );
+    }
+
+    /// A draw with no index buffer *ever* bound is the one genuine absence and
+    /// keeps its named refusal (the refusal leaves no command behind).
+    #[test]
+    fn an_indexed_draw_with_no_index_buffer_ever_bound_is_refused_by_name() {
+        let mut producer = MetalProducer::new(44, 1).expect("producer");
+        producer
+            .unbind_index_buffer()
+            .expect("a null index is a legal unbind");
+
         let error = producer
             .draw_indexed(3, 1, 0, 0, 0)
             .expect_err("an indexed draw with no index buffer is a real error");
         assert_eq!(
             error.operation(),
-            Some("DrawIndexed: no index buffer after IASetIndexBuffer(null)")
+            Some("DrawIndexed: no index buffer was ever bound")
         );
         assert_eq!(error.opcode(), Some(OP_DRAW_INDEXED_INSTANCED));
         assert!(
@@ -5087,9 +5157,9 @@ mod tests {
         producer.set_pipeline(0x900).expect("pipeline");
         producer
             .set_index_buffer_at(0x20_0000, 256, 57)
-            .expect("re-bound index buffer");
+            .expect("a first index buffer");
         producer
             .draw_indexed(3, 1, 0, 0, 0)
-            .expect("a re-bound index buffer draws again");
+            .expect("an index buffer now exists");
     }
 }
