@@ -437,6 +437,12 @@ pub struct PipelineCensusSnapshot {
     pub translator_unavailable: u64,
     /// Attempts the host translated with its own converter pool.
     pub host_translated: u64,
+    /// Stages whose complete DXIL container was taken from the raw console
+    /// bytes because it already carried a real module (pass-through).
+    pub stages_passed_through: u64,
+    /// Stages whose DXIL container was emitted locally by `victory_shader`
+    /// before upload because the console container carried only a stub.
+    pub stages_translated_locally: u64,
     /// The per-kind counts, in `AttemptKind` order.
     pub by_kind: BTreeMap<AttemptKind, KindCounts>,
     /// Refusals by `(kind name, class name)`, in name order.
@@ -457,13 +463,16 @@ impl PipelineCensusSnapshot {
         let mut text = format!(
             "pipeline_attempts={} pipeline_created={} pipeline_refused={} \
              pipeline_reused={} pipeline_translator_unavailable={} \
-             pipeline_host_translated={}",
+             pipeline_host_translated={} pipeline_stages_translated_locally={} \
+             pipeline_stages_passed_through={}",
             self.attempts,
             self.created,
             self.refused,
             self.reused,
             self.translator_unavailable,
-            self.host_translated
+            self.host_translated,
+            self.stages_translated_locally,
+            self.stages_passed_through
         );
         text.push_str(" pipeline_by_kind=[");
         for (index, (kind, counts)) in self.by_kind.iter().enumerate() {
@@ -553,12 +562,16 @@ struct Census {
     kinds: BTreeMap<AttemptKind, KindCounts>,
     refusals: BTreeMap<(&'static str, &'static str), u64>,
     first: Option<FirstRefusal>,
+    stages_passed_through: u64,
+    stages_translated_locally: u64,
 }
 
 static CENSUS: Mutex<Census> = Mutex::new(Census {
     kinds: BTreeMap::new(),
     refusals: BTreeMap::new(),
     first: None,
+    stages_passed_through: 0,
+    stages_translated_locally: 0,
 });
 
 impl Census {
@@ -604,6 +617,8 @@ impl Census {
             by_kind: self.kinds.clone(),
             refusals: self.refusals.clone(),
             first_refusal: self.first.clone(),
+            stages_passed_through: self.stages_passed_through,
+            stages_translated_locally: self.stages_translated_locally,
             ..PipelineCensusSnapshot::default()
         };
         for counts in snapshot.by_kind.values() {
@@ -657,6 +672,20 @@ pub fn note_translator_unavailable(kind: AttemptKind, class: RefusalClass, reaso
             Some(class),
             Some(reason),
         );
+}
+
+/// Counts one stage whose DXIL container was taken from the raw console bytes
+/// unchanged (it already carried a real module).
+pub fn note_stage_passed_through() {
+    let mut census = CENSUS.lock().unwrap_or_else(|error| error.into_inner());
+    census.stages_passed_through = census.stages_passed_through.saturating_add(1);
+}
+
+/// Counts one stage whose DXIL container was emitted locally by
+/// `victory_shader` before it was uploaded for translation.
+pub fn note_stage_translated_locally() {
+    let mut census = CENSUS.lock().unwrap_or_else(|error| error.into_inner());
+    census.stages_translated_locally = census.stages_translated_locally.saturating_add(1);
 }
 
 /// The process-wide pipeline-attempt census (session totals; never reset by a
@@ -1602,6 +1631,79 @@ fn dxil_header(container: &[u8]) -> Option<DxilHeader> {
     DxilHeader::checked(parsed.part(victory_shader::FourCC::DXIL)?.data)
 }
 
+/// The fewest bitcode bytes a container must declare to count as carrying a
+/// real DXIL module.
+///
+/// An Xbox `DXIL` part may be a 4-byte placeholder beside the console ISA
+/// chunk, and older synthetic/malformed parts declare at most a handful of
+/// bytes. A module this repository's own emitter writes is at least several
+/// hundred bytes even for a trivial stage (the fixtures are 1,116-1,292
+/// bytes), so 512 bytes cleanly separates a stub from a module without
+/// rejecting a small real one.
+pub const REAL_DXIL_BITCODE_FLOOR: u32 = 512;
+
+/// The bitcode size a container's `DXIL` program header declares, when the
+/// header is structurally sound and the bitcode lies inside the part.
+fn declared_bitcode_size(container: &[u8]) -> Option<u32> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let part = parsed.part(victory_shader::FourCC::DXIL)?.data;
+    let header = DxilHeader::checked(part)?;
+    let end = 8usize
+        .checked_add(header.bitcode_offset as usize)?
+        .checked_add(header.bitcode_size as usize)?;
+    (header.bitcode_size > 0 && end <= part.len()).then_some(header.bitcode_size)
+}
+
+/// Whether `container` carries a real DXIL module rather than only a stub.
+///
+/// This is the pass-through test: the raw console container's `DXIL` part must
+/// parse as a program header, declare a real bitcode size (at least
+/// [`REAL_DXIL_BITCODE_FLOOR`] bytes) and keep that bitcode inside the part.
+/// A 4-byte placeholder, a headerless part or a truncated one is not a module
+/// and must never be handed to the converter as if it were.
+pub fn carries_real_dxil(container: &[u8]) -> bool {
+    declared_bitcode_size(container).is_some_and(|bytes| bytes >= REAL_DXIL_BITCODE_FLOOR)
+}
+
+/// Whether a locally translated container carries a usable (non-stub) DXIL
+/// module: the same structural test without the pass-through size floor.
+///
+/// The emitter's output is trusted to be a module, but a container whose
+/// `DXIL` part is empty or truncated is still refused instead of uploaded.
+pub fn carries_usable_dxil(container: &[u8]) -> bool {
+    declared_bitcode_size(container).is_some()
+}
+
+/// Whether a translated mesh container's declared outputs exceed Metal's
+/// budget ([`victory_shader::emit::METAL_MESH_OUTPUT_BYTES`]).
+///
+/// Counted as the runtime counts them: the larger of the packed component
+/// footprint (`MeshOutputs::bytes`: 4 bytes per declared component of a vertex
+/// and of a primitive) and Metal's aligned layout, which pads a row to 16
+/// bytes and can overrun the limit while the packed count fits (#172). This is
+/// the threshold `victory_shader`'s linker itself uses. A mesh stage over the
+/// limit is re-translated together with its pixel shader so the outputs the
+/// pixel shader never reads are pruned.
+pub fn mesh_outputs_over_budget(mesh: &[u8]) -> bool {
+    let packed = victory_shader::emit::mesh_outputs(mesh).map(|outputs| outputs.bytes());
+    let aligned = victory_shader::emit::mesh_output_layout(mesh)
+        .ok()
+        .flatten()
+        .map(|layout| layout.aligned_before);
+    packed
+        .max(aligned)
+        .is_some_and(|bytes| bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES)
+}
+
+/// Whether a `[mesh, pixel]` pair must use the linked mesh/pixel translation
+/// instead of the standalone mesh translation.
+///
+/// Linking needs the pixel shader to know which outputs are read, and is only
+/// worth doing when the standalone mesh outputs are over Metal's budget.
+pub fn linked_mesh_pair_needed(has_pixel: bool, mesh: &[u8]) -> bool {
+    has_pixel && mesh_outputs_over_budget(mesh)
+}
+
 /// The `Program` kind name of a raw kind code, for refusal reasons.
 fn shader_kind_name(raw: u16) -> String {
     use victory_shader::ShaderKind;
@@ -1919,6 +2021,52 @@ pub fn stage_program(
         entry,
     };
     checked_entry(&program)?;
+    Ok(program)
+}
+
+/// The program one stage must register, choosing between the raw console
+/// container and the container translated locally.
+///
+/// The rule (Cycle 14): a raw container that already carries a real DXIL
+/// module ([`carries_real_dxil`]) is passed through unchanged, so the Win64
+/// D3D12 reference path and the synthetic converter tests keep byte parity.
+/// Otherwise `translated` (the complete `DXBC` container
+/// `victory_shader::emit::translate` produced, normally
+/// [`crate::pipeline::Shader::translated`]'s `host.dxil`) is validated and
+/// used, and the stage is counted as translated locally. A stage with neither
+/// a real raw module nor a translation is a named
+/// [`PipelineError::Translation`] refusal: a 4-byte placeholder is never
+/// uploaded to the converter under any circumstances.
+///
+/// The chosen container is validated by [`stage_program`], so the converted
+/// entry point is read from the container that is actually sent (the
+/// emitter's modules export `main` and carry no `PSV0` entry table), never
+/// from the raw console container's `PSV0`.
+pub fn select_stage_program(
+    stage: PipelineStage,
+    raw: &[u8],
+    translated: Option<&[u8]>,
+) -> Result<StageProgram, PipelineError> {
+    if carries_real_dxil(raw) {
+        let program = stage_program(stage, raw)?;
+        note_stage_passed_through();
+        return Ok(program);
+    }
+    let Some(translated) = translated else {
+        return Err(PipelineError::Translation(format!(
+            "the {} stage's console container carries no real DXIL module (a bitcode size below \
+             {REAL_DXIL_BITCODE_FLOOR} bytes is a stub) and it did not translate",
+            stage.label()
+        )));
+    };
+    if !carries_usable_dxil(translated) {
+        return Err(PipelineError::Translation(format!(
+            "the {} stage's locally translated container carries no usable DXIL module",
+            stage.label()
+        )));
+    }
+    let program = stage_program(stage, translated)?;
+    note_stage_translated_locally();
     Ok(program)
 }
 
@@ -4081,6 +4229,206 @@ mod tests {
         }
     }
 
+    /// The pass-through test: a 4-byte placeholder and a header-only part are
+    /// stubs, while a module at or over the documented floor is real. The
+    /// shipped DXC fixtures are real modules.
+    #[test]
+    fn only_a_real_dxil_module_is_passed_through() {
+        use victory_shader::FourCC;
+
+        let stub = dxbc_container(&[(FourCC::DXIL, &[0x42, 0x43, 0xC0, 0xDE])]);
+        assert_eq!(declared_bitcode_size(&stub), None, "4 bytes is no program header");
+        assert!(!carries_real_dxil(&stub));
+
+        let tiny = dxbc_container(&[(FourCC::DXIL, &dxil_part_sm(1, 6, 0))]);
+        assert_eq!(declared_bitcode_size(&tiny), Some(8));
+        assert!(!carries_real_dxil(&tiny), "8 bytes is below the floor");
+        assert!(carries_usable_dxil(&tiny), "but it is a readable module");
+
+        let floor = vec![0x42; REAL_DXIL_BITCODE_FLOOR as usize];
+        let at_floor = dxbc_container(&[(FourCC::DXIL, &dxil_part_with_bitcode(1, 6, 0, &floor))]);
+        assert!(carries_real_dxil(&at_floor), "the floor is inclusive");
+
+        for stage in [
+            PipelineStage::Vertex,
+            PipelineStage::Pixel,
+            PipelineStage::Compute,
+        ] {
+            assert!(
+                carries_real_dxil(&fixture(stage)),
+                "{stage:?}: the checked-in DXC fixture is a real module"
+            );
+        }
+
+        // A header that promises more bitcode than the part holds is not one.
+        let mut short = dxil_part_with_bitcode(1, 6, 0, &vec![0x42; 600]);
+        short.truncate(100);
+        let short = dxbc_container(&[(FourCC::DXIL, &short)]);
+        assert!(!carries_real_dxil(&short));
+        assert!(!carries_usable_dxil(&short));
+    }
+
+    /// A console container whose `DXIL` part is a stub selects the locally
+    /// translated container, never the stub. The converted entry point is the
+    /// translated module's own (`main`, the name `victory_shader`'s emitter
+    /// gives its DXIL function), not the raw container's `PSV0` name.
+    #[test]
+    fn a_stub_console_container_selects_the_translated_module() {
+        use victory_shader::FourCC;
+
+        reset_census();
+        let stub = dxbc_container(&[
+            (FourCC::DXIL, &[0u8; 4]),
+            (FourCC::PSV0, &psv0_part(1, 1, b"\0vs_console\0")),
+        ]);
+        assert_eq!(
+            container_entry_point(&stub).as_deref(),
+            Some("vs_console"),
+            "the raw console container names its own entry"
+        );
+        let translated = dxbc_container(&[(
+            FourCC::DXIL,
+            &dxil_part_with_bitcode(1, 6, 6, &vec![0x42; 600]),
+        )]);
+        // The emitter writes a 48-byte runtime info with no entry table.
+        assert_eq!(container_entry_point(&translated), None);
+
+        let program = select_stage_program(PipelineStage::Vertex, &stub, Some(&translated))
+            .expect("the translated container is selected");
+        assert_eq!(program.dxil, translated, "the 4-byte stub is never uploaded");
+        assert_eq!(program.entry, "main", "the translated module's entry, not PSV0's");
+        let census = census();
+        assert_eq!(census.stages_translated_locally, 1);
+        assert_eq!(census.stages_passed_through, 0);
+    }
+
+    /// A raw container that already carries a real DXIL module is passed
+    /// through byte for byte, even when a translation is available: the Win64
+    /// reference path keeps parity.
+    #[test]
+    fn a_raw_container_with_real_dxil_is_passed_through_unchanged() {
+        use victory_shader::FourCC;
+
+        reset_census();
+        let raw = fixture(PipelineStage::Vertex);
+        let translated = dxbc_container(&[(
+            FourCC::DXIL,
+            &dxil_part_with_bitcode(1, 6, 6, &vec![0x7e; 600]),
+        )]);
+        let program = select_stage_program(PipelineStage::Vertex, &raw, Some(&translated))
+            .expect("the raw module is selected");
+        assert_eq!(program.dxil, raw, "byte parity for the reference path");
+        assert_eq!(program.entry, "main", "the fixture's PSV0 entry");
+        let census = census();
+        assert_eq!(census.stages_passed_through, 1);
+        assert_eq!(census.stages_translated_locally, 0);
+    }
+
+    /// A stub with no translation is a named `Translation` refusal: no bytes
+    /// are invented and the stub never reaches a converter.
+    #[test]
+    fn a_stub_without_a_translation_is_a_named_refusal() {
+        use victory_shader::FourCC;
+
+        reset_census();
+        let stub = dxbc_container(&[(FourCC::DXIL, &[0u8; 4])]);
+        let error = select_stage_program(PipelineStage::Vertex, &stub, None)
+            .expect_err("a stub with no translation must be refused");
+        match &error {
+            PipelineError::Translation(reason) => {
+                assert!(reason.contains("vertex"), "{reason}");
+                assert!(reason.contains("did not translate"), "{reason}");
+                assert!(reason.contains(&REAL_DXIL_BITCODE_FLOOR.to_string()), "{reason}");
+            }
+            other => panic!("expected a named translation refusal, saw {other:?}"),
+        }
+        assert_eq!(RefusalClass::of(&error), RefusalClass::Translation);
+        let census = census();
+        assert_eq!(
+            (census.stages_translated_locally, census.stages_passed_through),
+            (0, 0),
+            "a refused stage is not counted as selected"
+        );
+    }
+
+    /// A mesh `OSG1` part with `rows` register-bearing 4-component rows.
+    fn mesh_signature(rows: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(rows as u32).to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        for index in 0..rows {
+            let mut row = [0u8; 32];
+            row[20..24].copy_from_slice(&(index as u32).to_le_bytes());
+            row[24] = 0xF;
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    /// A mesh `PSV0` part: stage 13, declared vertices and primitives.
+    fn mesh_psv0(vertices: u16, primitives: u16) -> Vec<u8> {
+        let mut psv = Vec::new();
+        psv.extend_from_slice(&48u32.to_le_bytes());
+        psv.resize(4 + 48, 0);
+        psv[4 + 12..4 + 14].copy_from_slice(&vertices.to_le_bytes());
+        psv[4 + 14..4 + 16].copy_from_slice(&primitives.to_le_bytes());
+        psv[4 + 24] = 13;
+        psv
+    }
+
+    /// A synthetic mesh container with `rows` vertex outputs.
+    fn mesh_outputs_container(vertices: u16, rows: usize) -> Vec<u8> {
+        use victory_shader::FourCC;
+        dxbc_container(&[
+            (FourCC::OSG1, &mesh_signature(rows)),
+            (FourCC::PSG1, &mesh_signature(0)),
+            (FourCC::PSV0, &mesh_psv0(vertices, 0)),
+        ])
+    }
+
+    /// A `[mesh, pixel]` pair whose mesh outputs exceed Metal's 32 KiB budget
+    /// selects the linked translation for both stages; an under-budget pair and
+    /// a mesh with no pixel stage do not.
+    #[test]
+    fn an_over_budget_mesh_pair_selects_the_linked_translation() {
+        use victory_shader::FourCC;
+
+        // 17 rows × 4 components × 128 vertices × 4 bytes = 34,816 > 32,768.
+        let over = mesh_outputs_container(128, 17);
+        let under = mesh_outputs_container(8, 1);
+        assert!(mesh_outputs_over_budget(&over));
+        assert!(!mesh_outputs_over_budget(&under));
+        assert!(linked_mesh_pair_needed(true, &over));
+        assert!(
+            !linked_mesh_pair_needed(false, &over),
+            "there is no pixel shader to link with"
+        );
+        assert!(!linked_mesh_pair_needed(true, &under));
+
+        // Both linked containers become the stage programs.
+        let stub = |kind: u8| {
+            dxbc_container(&[
+                (FourCC::DXIL, &[0u8; 4]),
+                (FourCC::PSV0, &psv0_part(kind, 0, b"\0")),
+            ])
+        };
+        let linked_mesh = dxbc_container(&[(
+            FourCC::DXIL,
+            &dxil_part_with_bitcode(13, 6, 6, &vec![0x42; 600]),
+        )]);
+        let linked_pixel = dxbc_container(&[(
+            FourCC::DXIL,
+            &dxil_part_with_bitcode(0, 6, 6, &vec![0x7e; 600]),
+        )]);
+        let mesh = select_stage_program(PipelineStage::Mesh, &stub(13), Some(&linked_mesh))
+            .expect("the linked mesh translation is selected");
+        let pixel = select_stage_program(PipelineStage::Pixel, &stub(0), Some(&linked_pixel))
+            .expect("the linked pixel translation is selected");
+        assert_eq!(mesh.dxil, linked_mesh);
+        assert_eq!(pixel.dxil, linked_pixel);
+        assert_eq!((mesh.entry.as_str(), pixel.entry.as_str()), ("main", "main"));
+    }
+
     /// A minimal standard-layout `DXIL` part for one container `Program` kind.
     fn dxil_part(kind: u16) -> Vec<u8> {
         dxil_part_sm(kind, 6, 0)
@@ -4089,8 +4437,12 @@ mod tests {
     /// A minimal standard-layout `DXIL` part for one `Program` kind and shader
     /// model.
     fn dxil_part_sm(kind: u16, major: u8, minor: u8) -> Vec<u8> {
-        let bitcode = [0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0];
-        let size_dwords = (24 + bitcode.len()) / 4;
+        dxil_part_with_bitcode(kind, major, minor, &[0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0])
+    }
+
+    /// A standard-layout `DXIL` part carrying `bitcode` bytes.
+    fn dxil_part_with_bitcode(kind: u16, major: u8, minor: u8, bitcode: &[u8]) -> Vec<u8> {
+        let size_dwords = (24 + bitcode.len()).div_ceil(4);
         let mut part = Vec::with_capacity(24 + bitcode.len());
         let version = (u32::from(kind) << 16) | (u32::from(major) << 4) | u32::from(minor);
         part.extend_from_slice(&version.to_le_bytes());
@@ -4099,7 +4451,7 @@ mod tests {
         part.extend_from_slice(&0x100u32.to_le_bytes());
         part.extend_from_slice(&16u32.to_le_bytes());
         part.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
-        part.extend_from_slice(&bitcode);
+        part.extend_from_slice(bitcode);
         part
     }
 
