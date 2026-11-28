@@ -3105,6 +3105,46 @@ impl PipelineAbi {
         found
     }
 
+    /// The declaration of wire descriptor-table set `set`.
+    ///
+    /// A wire `DescriptorTableV3.set` is the table's *ordinal* among the
+    /// pipeline's descriptor tables, not a flattened root-parameter index
+    /// (a signature may declare root constants or root views before it). The
+    /// authoritative map is enumerated in slot order; without one, the stage
+    /// layouts are walked in registration order and a table declared by two
+    /// stages counts once.
+    pub fn root_parameter_for_table(&self, set: usize) -> Option<RootParameterSlot> {
+        if let Some(map) = self.root_parameters.as_ref() {
+            let mut ordinal = 0usize;
+            for slot in map.slots() {
+                if matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
+                    if ordinal == set {
+                        return Some(*slot);
+                    }
+                    ordinal += 1;
+                }
+            }
+            return None;
+        }
+        let mut tables: Vec<RootParameterSlot> = Vec::new();
+        for layout in self.layouts() {
+            for parameter in layout.parameters() {
+                if matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
+                    let candidate = RootParameterSlot::new(
+                        parameter.space(),
+                        parameter.register(),
+                        parameter.kind(),
+                        parameter.size(),
+                    );
+                    if !tables.contains(&candidate) {
+                        tables.push(candidate);
+                    }
+                }
+            }
+        }
+        tables.get(set).copied()
+    }
+
     /// Every stage layout this ABI carries, in registration order.
     fn layouts(&self) -> impl Iterator<Item = &RootSignatureLayout> {
         self.vertex
@@ -4778,7 +4818,7 @@ fn prepare_compute_segment(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter(usize::from(table.set)) else {
+                    let Some(slot) = active.root_parameter_for_table(usize::from(table.set)) else {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
                             "descriptor table names no declared root parameter",
@@ -5668,7 +5708,7 @@ fn build_render_ops(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter(usize::from(table.set)) else {
+                    let Some(slot) = active.root_parameter_for_table(usize::from(table.set)) else {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
                             "descriptor table names no declared root parameter",
@@ -8813,6 +8853,56 @@ mod tests {
         self, BufferBinding, Command, Dispatch1d, DrawIndexed, Reply, ReplyStatus, RootConstants,
         SetPipeline, Submission,
     };
+
+    /// A wire descriptor-table `set` is an ordinal among the pipeline's
+    /// tables, not a flattened root-parameter index: a signature with root
+    /// constants first must still resolve table 0 to the table parameter.
+    #[test]
+    fn a_descriptor_table_set_resolves_by_ordinal() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Compute,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::UnorderedAccessView),
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+            ],
+        )
+        .expect("three root parameters");
+        let abi = super::PipelineAbi::compute(layout);
+        let uav = abi.root_parameter_for_table(0).expect("first table");
+        assert_eq!(uav.space(), 1);
+        assert_eq!(uav.register(), 0);
+        assert!(matches!(
+            uav.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::UnorderedAccessView)
+        ));
+        // A flattened-index lookup would have named the constants block; the
+        // ordinal lookup must not.
+        assert!(matches!(
+            abi.root_parameter(0).map(|slot| slot.kind()),
+            Some(RootParameterKind::Constants)
+        ));
+        assert!(abi.root_parameter_for_table(2).is_none());
+    }
 
     /// Encoder state is applied once per change: repeating the same wire state
     /// must not emit a second op, and a later change must be emitted again.
