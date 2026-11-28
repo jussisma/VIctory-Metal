@@ -4464,6 +4464,19 @@ struct AbiPending {
     /// persists until overwritten, so an inert set stays visible on every
     /// following draw of the same pipeline.
     inert: Vec<InertTableRecord>,
+    /// Declared fragment texture/sampler sources dropped by a partially bound
+    /// table (`DROP_FRAGMENT_SOURCE_RESIDUE`), keyed by the wire set that
+    /// dropped them. A later resolution of the same set clears the record.
+    source_drops: Vec<SourceDropRecord>,
+}
+
+/// One declared fragment source dropped by a partially bound wire table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceDropRecord {
+    /// Wire `DescriptorTableV3.set` the command named.
+    wire_set: u16,
+    /// Fixed reason word of the drop.
+    reason: &'static str,
 }
 
 /// One wire table the bound pipeline cannot address at any root parameter.
@@ -4471,28 +4484,52 @@ struct AbiPending {
 struct InertTableRecord {
     /// Wire `DescriptorTableV3.set` the command named.
     wire_set: u16,
+    /// Fixed reason word of the early return that dropped it.
+    reason: &'static str,
 }
 
 impl AbiPending {
     fn is_empty(&self) -> bool {
-        self.bindings.is_empty() && self.inert.is_empty()
+        self.bindings.is_empty() && self.inert.is_empty() && self.source_drops.is_empty()
     }
 
     fn clear(&mut self) {
         self.bindings.clear();
         self.inert.clear();
+        self.source_drops.clear();
     }
 
     /// Records one inert wire table set, replacing a previous one.
-    fn note_inert(&mut self, wire_set: u16) {
-        if !self.inert.iter().any(|record| record.wire_set == wire_set) {
-            self.inert.push(InertTableRecord { wire_set });
+    fn note_inert(&mut self, wire_set: u16, reason: &'static str) {
+        if let Some(record) = self
+            .inert
+            .iter_mut()
+            .find(|record| record.wire_set == wire_set)
+        {
+            record.reason = reason;
+            return;
         }
+        self.inert.push(InertTableRecord { wire_set, reason });
     }
 
     /// A table set that now resolves is no longer inert.
     fn clear_inert(&mut self, wire_set: u16) {
         self.inert.retain(|record| record.wire_set != wire_set);
+        self.source_drops
+            .retain(|record| record.wire_set != wire_set);
+    }
+
+    /// Records one declared fragment source dropped by a partially bound table.
+    fn note_source_drop(&mut self, wire_set: u16, reason: &'static str) {
+        if let Some(record) = self
+            .source_drops
+            .iter_mut()
+            .find(|record| record.wire_set == wire_set)
+        {
+            record.reason = reason;
+            return;
+        }
+        self.source_drops.push(SourceDropRecord { wire_set, reason });
     }
 
     /// Wire tables the current draw leaves unaddressed.
@@ -4500,18 +4537,47 @@ impl AbiPending {
         u32::try_from(self.inert.len()).unwrap_or(u32::MAX)
     }
 
-    /// Inert wire tables the fragment stage would have had to consume while
-    /// the layout declares no table parameter the wire could fill.
+    /// What a declared fragment texture/sampler source lost on this draw:
+    /// `(unreachable, dropped, reason)`.
     ///
-    /// Every inert table counts, not only one whose entries are textures: the
-    /// fragment stage has no root-parameter path for **any** descriptor table
-    /// in that shape, and the wire has no descriptor-heap command that could
-    /// carry it instead.
-    fn unreachable_fragment_sources(&self, fragment_sources_declared: u32) -> u32 {
-        if fragment_sources_declared > 0 {
-            return 0;
+    /// Every path is counted. A layout with no texture-source parameter at all
+    /// reports its inert wire tables as unreachable (the missing wire concept is
+    /// named by [`crate::macos::trace::FRAGMENT_SOURCE_UNREACHABLE_REASON`]). A
+    /// layout that declares one but bound none reports the inert or residue
+    /// record's own reason word, or the named
+    /// [`crate::macos::trace::DROP_DECLARED_SOURCE_UNFILLED`] state when no
+    /// texture/sampler entry reached it. `declared > 0 && bound == 0` can
+    /// therefore never be silent.
+    fn fragment_source_drops(&self, declared: u32, bound: u32) -> (u32, u32, &'static str) {
+        use crate::macos::trace::DROP_DECLARED_SOURCE_UNFILLED;
+
+        if declared == 0 {
+            let unreachable = self.inert_count();
+            let reason = if unreachable == 0 {
+                "none"
+            } else {
+                crate::macos::trace::FRAGMENT_SOURCE_UNREACHABLE_REASON
+            };
+            return (unreachable, 0, reason);
         }
-        self.inert_count()
+        if bound >= declared {
+            return (0, 0, "none");
+        }
+        // Every declared source that is not bound has a reason: a partition
+        // dropped as residue, an inert wire table's own early return, or the
+        // named "no texture/sampler entry reached it" state.
+        let reason = self
+            .source_drops
+            .first()
+            .map(|record| record.reason)
+            .or_else(|| self.inert.first().map(|record| record.reason))
+            .unwrap_or(DROP_DECLARED_SOURCE_UNFILLED);
+        let unreachable = if self.inert.is_empty() {
+            0
+        } else {
+            self.inert_count()
+        };
+        (unreachable, declared - bound, reason)
     }
 
     /// Records one title write, replacing the previous value of its slot.
@@ -4537,6 +4603,7 @@ impl AbiPending {
         // not retained. Drop the record so a stale miss cannot be reported as
         // this pipeline's inert table.
         self.inert.clear();
+        self.source_drops.clear();
         let before = self.bindings.len();
         self.bindings.retain(|binding| {
             stages
@@ -4647,6 +4714,34 @@ fn descriptor_table_mix_class(table: &crate::wire_v3::DescriptorTableV3) -> &'st
         (false, true, true) => "texture+sampler",
         _ => "single",
     }
+}
+
+/// Records one dropped declared table under the bounded `binding_drops` key.
+///
+/// The key names the pipeline, the wire set, the declared range kind, how many
+/// table slots the pipeline declares, the entry combination class and the fixed
+/// early-return reason. It is what makes a boot say *why* the table was inert
+/// instead of only that it was.
+fn note_descriptor_table_binding_drop(
+    abi: &PipelineAbi,
+    pipeline_id: u64,
+    table: &crate::wire_v3::DescriptorTableV3,
+    declared_kind: DescriptorTableKind,
+    reason: &'static str,
+) {
+    crate::macos::trace::note_descriptor_table_binding_drop(
+        crate::macos::trace::DescriptorTableBindingDropKey {
+            pipeline_id,
+            wire_set: table.set,
+            declared_kind: declared_kind.name(),
+            declared_tables: u16::try_from(abi.declared_descriptor_table_count())
+                .unwrap_or(u16::MAX),
+            declared_slots: u16::try_from(abi.widest_stage_descriptor_table_count())
+                .unwrap_or(u16::MAX),
+            mix_class: descriptor_table_mix_class(table),
+            reason,
+        },
+    );
 }
 
 /// Records one kind-mismatch in the bounded descriptor-table census.
@@ -4906,8 +5001,6 @@ fn build_descriptor_table_entries(
     partition: u8,
     parameter_index: Option<usize>,
 ) -> Result<PendingAbiBinding, PrepareAbort> {
-    use crate::wire_v3::DescriptorTableEntryV3;
-
     let usage = match table.kind {
         DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
         _ => MTL_RESOURCE_USAGE_READ,
@@ -4915,60 +5008,7 @@ fn build_descriptor_table_entries(
     let mut builder = DescriptorTableBuilder::new(shape);
     let mut resources = Vec::with_capacity(entries.len());
     for entry in entries {
-        match entry {
-            DescriptorTableEntryV3::Texture(handle)
-                if shape == DescriptorTableKind::Texture =>
-            {
-                let texture =
-                    resolve_registered_texture(state, *handle).ok_or(PrepareAbort::UnknownHandle)?;
-                builder.push_texture(resource_gpu_id(texture))?;
-                resources.push((texture, usage));
-            }
-            DescriptorTableEntryV3::Sampler(handle) if shape == DescriptorTableKind::Sampler => {
-                note_unknown_site("sampler");
-                let sampler = state
-                    .samplers
-                    .get(handle)
-                    .map(ObjcObject::as_raw)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
-                builder.push_sampler(resource_gpu_id(sampler))?;
-                // `MTLSamplerState` is not an `MTLResource`: it is referenced
-                // through the descriptor and kept alive by `state.samplers`,
-                // so it is never passed to `useResource:` (which would fault).
-            }
-            DescriptorTableEntryV3::Buffer(binding)
-                if matches!(
-                    shape,
-                    DescriptorTableKind::ConstantBufferView
-                        | DescriptorTableKind::ShaderResourceView
-                        | DescriptorTableKind::UnorderedAccessView
-                        | DescriptorTableKind::Unspecified
-                ) =>
-            {
-                let (buffer, offset, _length) = resolve_buffer_range(
-                    state,
-                    allocations,
-                    binding.allocation_id,
-                    binding.generation,
-                    binding.offset,
-                    binding.length,
-                )
-                .ok_or(PrepareAbort::UnknownHandle)?;
-                let address = buffer_gpu_address(buffer)
-                    .checked_add(offset as u64)
-                    .ok_or(MetalError::InvalidArg(
-                        "descriptor table address overflows u64",
-                    ))?;
-                builder.push_address(address)?;
-                resources.push((buffer, usage));
-            }
-            _ => {
-                return Err(MetalError::InvalidArg(
-                    "descriptor table entry does not match its encoding shape",
-                )
-                .into());
-            }
-        }
+        encode_table_entry(state, allocations, entry, shape, usage, &mut builder, &mut resources)?;
     }
     let buffer = new_argument_buffer(device, builder.bytes())?;
     let address = buffer_gpu_address(buffer.as_raw());
@@ -4988,6 +5028,154 @@ fn build_descriptor_table_entries(
             shape,
             DescriptorTableKind::Texture | DescriptorTableKind::Sampler
         ),
+    })
+}
+
+/// Resolves and CPU-encodes one wire table entry into `builder`.
+///
+/// One entry encodes exactly one 24-byte converter descriptor; `shape` is the
+/// descriptor shape that entry actually uses. Resolution happens here, so an
+/// unregistered handle is [`PrepareAbort::UnknownHandle`] before any encoder
+/// exists, and every resource the entry references is collected for
+/// `useResource:`.
+fn encode_table_entry(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    entry: &crate::wire_v3::DescriptorTableEntryV3,
+    shape: DescriptorTableKind,
+    usage: usize,
+    builder: &mut DescriptorTableBuilder,
+    resources: &mut Vec<(objc::Id, usize)>,
+) -> Result<(), PrepareAbort> {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    match entry {
+        DescriptorTableEntryV3::Texture(handle) if shape == DescriptorTableKind::Texture => {
+            let texture =
+                resolve_registered_texture(state, *handle).ok_or(PrepareAbort::UnknownHandle)?;
+            builder.push_texture(resource_gpu_id(texture))?;
+            resources.push((texture, usage));
+        }
+        DescriptorTableEntryV3::Sampler(handle) if shape == DescriptorTableKind::Sampler => {
+            note_unknown_site("sampler");
+            let sampler = state
+                .samplers
+                .get(handle)
+                .map(ObjcObject::as_raw)
+                .ok_or(PrepareAbort::UnknownHandle)?;
+            builder.push_sampler(resource_gpu_id(sampler))?;
+            // `MTLSamplerState` is not an `MTLResource`: it is referenced
+            // through the descriptor and kept alive by `state.samplers`,
+            // so it is never passed to `useResource:` (which would fault).
+        }
+        DescriptorTableEntryV3::Buffer(binding)
+            if matches!(
+                shape,
+                DescriptorTableKind::ConstantBufferView
+                    | DescriptorTableKind::ShaderResourceView
+                    | DescriptorTableKind::UnorderedAccessView
+                    | DescriptorTableKind::Unspecified
+            ) =>
+        {
+            let (buffer, offset, _length) = resolve_buffer_range(
+                state,
+                allocations,
+                binding.allocation_id,
+                binding.generation,
+                binding.offset,
+                binding.length,
+            )
+            .ok_or(PrepareAbort::UnknownHandle)?;
+            let address = buffer_gpu_address(buffer)
+                .checked_add(offset as u64)
+                .ok_or(MetalError::InvalidArg(
+                    "descriptor table address overflows u64",
+                ))?;
+            builder.push_address(address)?;
+            resources.push((buffer, usage));
+        }
+        _ => {
+            return Err(MetalError::InvalidArg(
+                "descriptor table entry does not match its encoding shape",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Builds one converted descriptor array from a whole wire table, in wire
+/// order, for a declared `Unspecified` table slot.
+///
+/// The converter's argument-buffer element is the same 24-byte
+/// `{pointer, pointer, i64}` for every kind; only the two handle fields differ
+/// (an address descriptor zeroes them, a texture descriptor repeats its
+/// `gpuResourceID`). A kind-less declared slot is exactly that array, so each
+/// wire entry keeps its index: entry `i` is descriptor `i`, which is the heap
+/// slice order D3D12 gave the table. Entries are encoded run by run with the
+/// same per-shape encoder a homogeneous table uses, so the 24-byte contract and
+/// its validation are unchanged.
+fn build_merged_descriptor_table(
+    device: objc::Id,
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    table: &crate::wire_v3::DescriptorTableV3,
+    slot: RootParameterSlot,
+    parameter_index: Option<usize>,
+) -> Result<PendingAbiBinding, PrepareAbort> {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    let usage = match table.kind {
+        DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
+        _ => MTL_RESOURCE_USAGE_READ,
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut resources = Vec::new();
+    let mut run_shape: Option<WireEntryShape> = None;
+    let mut run = DescriptorTableBuilder::new(DescriptorTableKind::Unspecified);
+    for entry in &table.bindings {
+        let shape = wire_entry_shape(entry);
+        if run_shape != Some(shape) {
+            bytes.extend_from_slice(run.bytes());
+            run = DescriptorTableBuilder::new(mixed_partition_encoding_shape(
+                shape,
+                DescriptorTableKind::Unspecified,
+            ));
+            run_shape = Some(shape);
+        }
+        let encoding = mixed_partition_encoding_shape(shape, DescriptorTableKind::Unspecified);
+        encode_table_entry(state, allocations, entry, encoding, usage, &mut run, &mut resources)?;
+    }
+    bytes.extend_from_slice(run.bytes());
+    if bytes.is_empty() {
+        return Err(MetalError::InvalidArg("descriptor table is empty").into());
+    }
+    let count = u32::try_from(table.bindings.len()).map_err(|_| {
+        MetalError::InvalidArg("descriptor table entry count is outside 1..=65536")
+    })?;
+    let buffer = new_argument_buffer(device, &bytes)?;
+    let address = buffer_gpu_address(buffer.as_raw());
+    let length = bytes.len() as u64;
+    // Every converted element is one 24-byte descriptor; the extent check in
+    // `flush_abi` uses this stride against `length`.
+    let stride = DescriptorTableKind::Unspecified.descriptor_bytes();
+    Ok(PendingAbiBinding::Table {
+        slot,
+        wire_slot: usize::from(table.set),
+        partition: 0,
+        parameter_index,
+        buffer,
+        address,
+        length,
+        count,
+        stride,
+        resources,
+        texture_source: table.bindings.iter().any(|entry| {
+            matches!(
+                entry,
+                DescriptorTableEntryV3::Texture(_) | DescriptorTableEntryV3::Sampler(_)
+            )
+        }),
     })
 }
 
@@ -5061,10 +5249,10 @@ fn descriptor_table_partitions(
 ///
 /// The address families are shape-identical (one 24-byte address descriptor),
 /// a texture partition needs a declared `Texture` range, and a sampler
-/// partition a declared `Sampler` range. `Unspecified` is deliberately not
-/// accepted for a mix: the converter reports no range kind there, so the
-/// partition order cannot be proven and the table is treated as
-/// unrepresentable rather than guessed.
+/// partition a declared `Sampler` range. A declared `Unspecified` range is the
+/// converter's own 24-byte descriptor array: it carries any single-shape
+/// partition, and the entry variant decides the encoding (exactly as
+/// [`descriptor_table_shape`] does for a homogeneous table).
 fn mixed_partition_fits(
     shape: WireEntryShape,
     declared: DescriptorTableKind,
@@ -5077,16 +5265,40 @@ fn mixed_partition_fits(
                 DescriptorTableKind::ConstantBufferView
                     | DescriptorTableKind::ShaderResourceView
                     | DescriptorTableKind::UnorderedAccessView
+                    | DescriptorTableKind::Unspecified
             ) && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
         }
         WireEntryShape::Texture => {
-            declared == DescriptorTableKind::Texture
-                && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
+            matches!(
+                declared,
+                DescriptorTableKind::Texture | DescriptorTableKind::Unspecified
+            ) && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
         }
         WireEntryShape::Sampler => {
-            declared == DescriptorTableKind::Sampler
-                && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
+            matches!(
+                declared,
+                DescriptorTableKind::Sampler | DescriptorTableKind::Unspecified
+            ) && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
         }
+    }
+}
+
+/// The converter descriptor shape one partition encodes, given the declared
+/// range kind of the slot it binds.
+///
+/// A declared `Unspecified` slot has no range kind of its own, so the entry
+/// variant is authoritative per partition, mirroring [`descriptor_table_shape`].
+fn mixed_partition_encoding_shape(
+    shape: WireEntryShape,
+    declared: DescriptorTableKind,
+) -> DescriptorTableKind {
+    match declared {
+        DescriptorTableKind::Unspecified => match shape {
+            WireEntryShape::Buffer => DescriptorTableKind::Unspecified,
+            WireEntryShape::Texture => DescriptorTableKind::Texture,
+            WireEntryShape::Sampler => DescriptorTableKind::Sampler,
+        },
+        declared => declared,
     }
 }
 
@@ -5131,6 +5343,39 @@ struct MixedTableSlotPlan {
     residue: Vec<MixedTableResidue>,
 }
 
+/// Why no partition of a mixed resource table could be bound.
+///
+/// `slot_index == None` means no layout declares a table parameter naming the
+/// resolved slot at all; `Some` means one was found but could not carry any
+/// partition (its range kind rejects every entry shape). The census key records
+/// that, so a boot states the exact early return instead of a coarse `inert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixedTablePlanMiss {
+    /// Flattened parameter index of the declared slot the wire set resolved to.
+    slot_index: Option<usize>,
+    /// Declared range kind of that slot (`Unspecified` when none matched).
+    declared_kind: DescriptorTableKind,
+    /// Descriptor-table parameters the widest stage layout declares.
+    declared_slots: usize,
+}
+
+/// The planner's decision for one mixed resource table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MixedTablePlan {
+    /// Every shape partition binds at its own declared consecutive slot.
+    Partitioned(MixedTableSlotPlan),
+    /// The resolved declared slot is the converter's `Unspecified` descriptor
+    /// array, so the whole wire table binds there as one array in wire order.
+    Merged {
+        /// The declared slot the array binds.
+        slot: RootParameterSlot,
+        /// Flattened parameter index of that slot.
+        parameter_index: usize,
+    },
+    /// No declared slot can carry any partition.
+    Unbound(MixedTablePlanMiss),
+}
+
 /// Maps the shape partitions of a mixed resource table onto the declared table
 /// parameters at the resolved ordinal and its consecutive successors.
 ///
@@ -5142,15 +5387,30 @@ struct MixedTableSlotPlan {
 /// address: for each declared slot in register order it takes the longest
 /// remaining partition whose shape fits, then continues with the next slot.
 /// Partitions left over are returned as residue so the caller counts them by
-/// name instead of accepting the whole table inertly. `None` means no
-/// partition fits any declared slot, so the table really is unaddressable.
+/// name instead of accepting the whole table inertly.
+///
+/// A resolved slot of kind `Unspecified` is the converter reporting a table
+/// with no range kind (`Type=Table`). There is no range order to place
+/// partitions in, and the entries are the authoritative shape, so such a table
+/// binds whole at that slot ([`MixedTablePlan::Merged`]) with every entry at the
+/// index the title gave it. Nothing is dropped and no index is renumbered.
 fn plan_mixed_table_partition_slots(
     abi: &PipelineAbi,
     wire_set: usize,
     resolved: RootParameterSlot,
     partitions: &[(WireEntryShape, usize)],
     wire_kind: DescriptorKind,
-) -> Option<MixedTableSlotPlan> {
+) -> MixedTablePlan {
+    let declared_slots = abi.widest_stage_descriptor_table_count();
+    let resolved_kind = match resolved.kind() {
+        RootParameterKind::DescriptorTable(kind) => kind,
+        _ => DescriptorTableKind::Unspecified,
+    };
+    let mut miss = MixedTablePlanMiss {
+        slot_index: None,
+        declared_kind: resolved_kind,
+        declared_slots,
+    };
     for layout in abi.layouts() {
         let parameters = layout.parameters();
         // Prefer the parameter whose table ordinal is the wire set; a reflected
@@ -5176,6 +5436,13 @@ fn plan_mixed_table_partition_slots(
         let Some(start) = start else {
             continue;
         };
+        if miss.slot_index.is_none() {
+            miss.slot_index = Some(start);
+            miss.declared_kind = match parameters[start].kind() {
+                RootParameterKind::DescriptorTable(kind) => kind,
+                _ => resolved_kind,
+            };
+        }
 
         // Positional mapping first: it is the exact converter flattening order.
         let mut positional = Vec::with_capacity(partitions.len());
@@ -5199,10 +5466,26 @@ fn plan_mixed_table_partition_slots(
             });
         }
         if !positional.is_empty() && positional.len() == partitions.len() {
-            return Some(MixedTableSlotPlan {
+            return MixedTablePlan::Partitioned(MixedTableSlotPlan {
                 bound: positional,
                 residue: Vec::new(),
             });
+        }
+
+        // The resolved slot is the converter's kind-less descriptor array: the
+        // wire entries are the only shape information, so bind the table whole
+        // at that slot instead of renumbering its entries across guessed
+        // partitions. Every entry keeps its wire index.
+        if resolved_kind == DescriptorTableKind::Unspecified
+            && matches!(
+                parameters[start].kind(),
+                RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
+            )
+        {
+            return MixedTablePlan::Merged {
+                slot: parameter_slot(&parameters[start]),
+                parameter_index: start,
+            };
         }
 
         // Fallback: bind the longest remaining partition each declared slot can
@@ -5257,29 +5540,35 @@ fn plan_mixed_table_partition_slots(
                 declared_kind: residue_kind,
             })
             .collect();
-        return Some(MixedTableSlotPlan { bound, residue });
+        return MixedTablePlan::Partitioned(MixedTableSlotPlan { bound, residue });
     }
-    None
+    MixedTablePlan::Unbound(miss)
 }
 
 /// Prepares the converted bindings for one wire `SetDescriptorTable`.
 ///
 /// A single-shape table keeps the ADR-062 path unchanged. A mixed *resource*
-/// table (buffer and texture entries, no sampler) is split by entry shape and
-/// bound to the resolved declared table parameter and its consecutive
-/// successors in converter flattening order, each partition with its own
-/// argument buffer and slot. When the layout has fewer matching slots than
-/// entry shapes, the partitions the declared slots *can* address are still
-/// bound (longest fitting partition per slot, in register order) and the rest
-/// are counted as named residue
-/// ([`DirectMetalTransport::descriptor_table_partition_residue_entry_count`]
-/// and the census `partition_residues`), so the composition table's texture
-/// source becomes reachable instead of the whole table going inert.
+/// table (buffer and texture entries, no sampler) is bound by one of three
+/// rules, in order:
+///
+/// 1. **Merged.** The resolved declared slot is the converter's `Unspecified`
+///    descriptor array (reflection reports every range as `Type=Table`): the
+///    whole wire table is one converted array at that slot, each entry at the
+///    index the title gave it. Nothing is renumbered and nothing is dropped.
+/// 2. **Partitioned.** The layout declares consecutive table slots whose range
+///    kinds can carry each shape partition, in converter flattening order; each
+///    partition becomes its own argument buffer at its own slot.
+/// 3. **Partial.** Fewer matching slots than entry shapes: the partitions the
+///    declared slots *can* address are still bound (longest fitting partition
+///    per slot, in register order) and the rest are counted as named residue
+///    ([`DirectMetalTransport::descriptor_table_partition_residue_entry_count`]
+///    and the census `partition_residues`).
 ///
 /// A layout where no partition fits any declared slot is accepted inertly: the
-/// submission still encodes, the `mixed_table_unrepresentable` counter and the
-/// mix census (`outcome: "inert"`) keep the class visible, and `abi_refusals`
-/// does not move.
+/// submission still encodes, `abi_refusals` does not move, and the exact early
+/// return is named by the bounded `binding_drops` census key
+/// ([`crate::macos::trace::DescriptorTableBindingDropKey`]) instead of only the
+/// coarse mix `outcome: "inert"`.
 ///
 /// A sampler entry inside a resource table (or a buffer/texture entry inside a
 /// sampler table) is illegal in D3D12: that case alone keeps the named,
@@ -5294,6 +5583,7 @@ fn prepare_descriptor_table_bindings(
     table: &crate::wire_v3::DescriptorTableV3,
     slot: RootParameterSlot,
     pipeline_id: u64,
+    pending: &mut AbiPending,
 ) -> Result<Vec<PendingAbiBinding>, PrepareAbort> {
     let mix_class = descriptor_table_mix_class(table);
     if mix_class == "single" || mix_class == "empty" {
@@ -5331,25 +5621,58 @@ fn prepare_descriptor_table_bindings(
         .iter()
         .map(|(shape, entries)| (*shape, entries.len()))
         .collect();
-    let Some(plan) = plan_mixed_table_partition_slots(
+    let plan = plan_mixed_table_partition_slots(
         abi,
         usize::from(table.set),
         slot,
         &partition_sizes,
         table.kind,
-    ) else {
-        // No declared slot can carry any partition. Accept inertly so the
-        // submission encodes; count both the class and the inert acceptance
-        // (the mix key says which).
-        note_descriptor_table_mix(
-            pipeline_id,
-            table.set,
-            mix_class,
-            crate::macos::trace::OUTCOME_INERT,
-        );
-        transport.count_descriptor_table_mixed_unrepresentable();
-        transport.count_descriptor_table_inert_acceptance();
-        return Ok(Vec::new());
+    );
+    let plan = match plan {
+        MixedTablePlan::Unbound(miss) => {
+            // No declared slot can carry any partition. Accept inertly so the
+            // submission encodes, but name the exact early return and the
+            // declared shape instead of hiding it behind a coarse `inert`.
+            let reason = if miss.slot_index.is_some() {
+                crate::macos::trace::DROP_DECLARED_KIND_REJECTS_PARTITIONS
+            } else {
+                crate::macos::trace::DROP_NO_DECLARED_SLOT
+            };
+            note_descriptor_table_mix(
+                pipeline_id,
+                table.set,
+                mix_class,
+                crate::macos::trace::OUTCOME_INERT,
+            );
+            note_descriptor_table_binding_drop(abi, pipeline_id, table, miss.declared_kind, reason);
+            transport.count_descriptor_table_mixed_unrepresentable();
+            transport.count_descriptor_table_inert_acceptance();
+            pending.note_inert(table.set, reason);
+            return Ok(Vec::new());
+        }
+        MixedTablePlan::Merged {
+            slot: merged_slot,
+            parameter_index,
+        } => {
+            // The declared slot is the converter's kind-less descriptor array:
+            // every wire entry keeps its index. Nothing is partitioned and no
+            // entry is dropped, so the fragment's texture source is bound.
+            note_descriptor_table_mix(
+                pipeline_id,
+                table.set,
+                mix_class,
+                crate::macos::trace::OUTCOME_MERGED,
+            );
+            return Ok(vec![build_merged_descriptor_table(
+                device,
+                state,
+                allocations,
+                table,
+                merged_slot,
+                Some(parameter_index),
+            )?]);
+        }
+        MixedTablePlan::Partitioned(plan) => plan,
     };
 
     if plan.residue.is_empty() {
@@ -5375,8 +5698,10 @@ fn prepare_descriptor_table_bindings(
             .map(|residue| partition_sizes[residue.partition].1)
             .sum::<usize>();
         transport.count_descriptor_table_partial_binding(dropped);
+        let mut dropped_source = false;
         for residue in &plan.residue {
             let (shape, entries) = &partitions[residue.partition];
+            dropped_source |= matches!(shape, WireEntryShape::Texture | WireEntryShape::Sampler);
             crate::macos::trace::note_descriptor_table_partition_residue(
                 crate::macos::trace::DescriptorTablePartitionResidueKey {
                     pipeline_id,
@@ -5387,6 +5712,14 @@ fn prepare_descriptor_table_bindings(
                     dropped_entries: u16::try_from(entries.len()).unwrap_or(u16::MAX),
                 },
             );
+        }
+        if dropped_source {
+            // A texture/sampler partition did not fit: the table is bound but
+            // the declared fragment source is not. Record the reason so
+            // declared-but-unbound can never be silent.
+            let reason = crate::macos::trace::DROP_FRAGMENT_SOURCE_RESIDUE;
+            note_descriptor_table_binding_drop(abi, pipeline_id, table, declared, reason);
+            pending.note_source_drop(table.set, reason);
         }
     }
 
@@ -5406,7 +5739,7 @@ fn prepare_descriptor_table_bindings(
             allocations,
             table,
             entries,
-            declared_kind,
+            mixed_partition_encoding_shape(*shape, declared_kind),
             bound.slot,
             table.set,
             u8::try_from(bound.partition).unwrap_or(u8::MAX),
@@ -6037,6 +6370,24 @@ fn fill_stage_declarations(
     }
 }
 
+/// Settles the declared-fragment-source accounting for one draw.
+///
+/// Every declared source is either bound or belongs to a named drop, so
+/// `fragment_texture_sources_declared > 0 && fragment_texture_sources_bound == 0`
+/// always carries a non-zero [`AbiBindingSummary::fragment_texture_sources_dropped`]
+/// and a fixed reason word.
+fn settle_fragment_source_drops(
+    summary: &mut crate::macos::trace::AbiBindingSummary,
+    pending: &AbiPending,
+    bound: u32,
+) {
+    let (unreachable, dropped, reason) =
+        pending.fragment_source_drops(summary.fragment_texture_sources_declared, bound);
+    summary.fragment_source_unreachable = unreachable;
+    summary.fragment_texture_sources_dropped = dropped;
+    summary.fragment_source_drop_reason = reason;
+}
+
 fn flush_abi(
     transport: &DirectMetalTransport,
     state: &mut DeviceState,
@@ -6063,13 +6414,14 @@ fn flush_abi(
     } else {
         0
     };
-    summary.fragment_source_unreachable =
-        pending.unreachable_fragment_sources(summary.fragment_texture_sources_declared);
+    // `fragment_texture_sources_bound` is only known after the per-stage loop,
+    // so the drop accounting is settled at both exit points below.
     // ADR-060: an empty pending set may skip the whole flush only when no
     // active stage declares a root parameter. A stage that declares one must
     // still receive a zero-filled argument buffer at `buffer(2)`, otherwise a
     // shader reading its reflected parameters sees a stale (or no) binding.
     if pending.is_empty() && !stages.iter().any(|(_, layout)| !layout.parameters().is_empty()) {
+        settle_fragment_source_drops(&mut summary, pending, 0);
         return Ok((buffers, bytes_ops, summary));
     }
 
@@ -6451,6 +6803,8 @@ fn flush_abi(
             resources: resources.into_iter().map(|(resource, _)| resource).collect(),
         });
     }
+    let bound = summary.fragment_texture_sources_bound;
+    settle_fragment_source_drops(&mut summary, pending, bound);
     Ok((buffers, bytes_ops, summary))
 }
 
@@ -6508,6 +6862,8 @@ fn trace_encoded_work(
         ps_bound_tables: bindings.fragment_bound_tables,
         fragment_texture_sources_declared: bindings.fragment_texture_sources_declared,
         fragment_texture_sources_bound: bindings.fragment_texture_sources_bound,
+        fragment_texture_sources_dropped: bindings.fragment_texture_sources_dropped,
+        fragment_source_drop_reason: bindings.fragment_source_drop_reason,
         tables_dropped_inert: bindings.tables_dropped_inert,
         ps_tables_dropped_inert: bindings.ps_tables_dropped_inert,
         fragment_source_unreachable: bindings.fragment_source_unreachable,
@@ -7057,7 +7413,10 @@ fn prepare_compute_segment(
                         // Named, counted inert acceptance: the bound pipeline
                         // declares no table, so this set addresses no root
                         // parameter. The batch still encodes.
-                        pending.note_inert(table.set);
+                        pending.note_inert(
+                            table.set,
+                            crate::macos::trace::DROP_NO_DECLARED_TABLE,
+                        );
                         continue;
                     };
                     pending.clear_inert(table.set);
@@ -7077,6 +7436,7 @@ fn prepare_compute_segment(
                         table,
                         slot,
                         current_pipeline_id,
+                        &mut pending,
                     )? {
                         pending.set(binding);
                     }
@@ -8033,7 +8393,10 @@ fn build_render_ops(
                         // Named, counted inert acceptance: the bound pipeline
                         // declares no table, so this set addresses no root
                         // parameter. The batch still encodes.
-                        pending.note_inert(table.set);
+                        pending.note_inert(
+                            table.set,
+                            crate::macos::trace::DROP_NO_DECLARED_TABLE,
+                        );
                         // Gate G5/G11: if the fragment stage declares no table
                         // parameter at all, this wire table has no
                         // root-parameter path. Name the missing wire concept (a
@@ -8061,6 +8424,7 @@ fn build_render_ops(
                         table,
                         slot,
                         current_pipeline_id,
+                        &mut pending,
                     )? {
                         pending.set(binding);
                     }
@@ -13601,9 +13965,10 @@ mod async_pipeline_tests {
 #[cfg(test)]
 mod descriptor_table_kind_tests {
     use super::{
-        DescriptorTableKind, DescriptorTableSet, PipelineAbi, WireEntryShape, check_table_kind,
-        descriptor_table_entry_shape, descriptor_table_mix_class, descriptor_table_partitions,
-        descriptor_table_shape, plan_mixed_table_partition_slots,
+        DescriptorTableKind, DescriptorTableSet, MixedTablePlan, MixedTableSlotPlan, PipelineAbi,
+        WireEntryShape, check_table_kind, descriptor_table_entry_shape,
+        descriptor_table_mix_class, descriptor_table_partitions, descriptor_table_shape,
+        plan_mixed_table_partition_slots,
     };
     use crate::macos::bindings::{
         ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
@@ -13850,6 +14215,13 @@ mod descriptor_table_kind_tests {
             .collect()
     }
 
+    fn partitioned(plan: MixedTablePlan) -> MixedTableSlotPlan {
+        match plan {
+            MixedTablePlan::Partitioned(plan) => plan,
+            other => panic!("expected a partitioned plan, got {other:?}"),
+        }
+    }
+
     fn partition_sizes(table: &DescriptorTableV3) -> Vec<(WireEntryShape, usize)> {
         descriptor_table_partitions(table)
             .expect("a resource mix partitions")
@@ -13909,14 +14281,13 @@ mod descriptor_table_kind_tests {
             WireEntryShape::Texture,
             WireEntryShape::Buffer,
         ]);
-        let plan = plan_mixed_table_partition_slots(
+        let plan = partitioned(plan_mixed_table_partition_slots(
             &abi,
             0,
             resolved,
             &partition_sizes(&wire),
             wire.kind,
-        )
-        .expect("two consecutive declared slots represent the mix");
+        ));
         assert_eq!(plan.bound.len(), 2);
         assert!(plan.residue.is_empty(), "both partitions have a slot");
         assert_eq!(plan.bound[0].parameter_index, 0);
@@ -13932,14 +14303,13 @@ mod descriptor_table_kind_tests {
         // The reverse mix (buffer entries first) still binds by kind: the
         // fallback binds the longest partition each declared slot can carry.
         let reversed = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
-        let plan = plan_mixed_table_partition_slots(
+        let plan = partitioned(plan_mixed_table_partition_slots(
             &abi,
             0,
             resolved,
             &partition_sizes(&reversed),
             reversed.kind,
-        )
-        .expect("the by-kind fallback binds both partitions");
+        ));
         assert_eq!(plan.bound.len(), 2);
         assert!(plan.residue.is_empty());
         let mut by_slot = plan
@@ -13975,14 +14345,13 @@ mod descriptor_table_kind_tests {
         // The composition shape: buffer entries first, then the texture the
         // fragment actually samples.
         let wire = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
-        let plan = plan_mixed_table_partition_slots(
+        let plan = partitioned(plan_mixed_table_partition_slots(
             &abi,
             0,
             resolved,
             &partition_sizes(&wire),
             wire.kind,
-        )
-        .expect("the texture partition fits the one declared slot");
+        ));
         assert_eq!(plan.bound.len(), 1);
         assert_eq!(plan.bound[0].partition, 1, "the texture partition binds");
         assert_eq!(
@@ -14007,14 +14376,13 @@ mod descriptor_table_kind_tests {
             DescriptorTableKind::Texture,
         ]);
         let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
-        let plan = plan_mixed_table_partition_slots(
+        let plan = partitioned(plan_mixed_table_partition_slots(
             &abi,
             0,
             resolved,
             &partition_sizes(&wire),
             wire.kind,
-        )
-        .expect("each partition fits one declared kind");
+        ));
         assert_eq!(plan.bound.len(), 2);
         assert!(plan.residue.is_empty());
         let texture = plan
@@ -14037,6 +14405,76 @@ mod descriptor_table_kind_tests {
             buffer.slot.kind(),
             RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView)
         );
+    }
+
+    /// A `Unspecified` declared slot is the converter's kind-less 24-byte
+    /// descriptor array. The one declared slot cannot take a partition per
+    /// shape, but the whole wire table binds there in wire order: the texture
+    /// entry stays at index 1 and the buffer entry at index 0, so nothing is
+    /// renumbered and no fragment source is dropped.
+    #[test]
+    fn a_mixed_table_under_one_unspecified_slot_binds_whole_in_wire_order() {
+        let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Unspecified]);
+        let wire = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
+        match plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        ) {
+            MixedTablePlan::Merged {
+                parameter_index,
+                slot,
+            } => {
+                assert_eq!(parameter_index, 0);
+                assert_eq!(
+                    slot.kind(),
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
+                );
+            }
+            other => panic!("one kind-less slot binds the table whole, got {other:?}"),
+        }
+
+        // Two kind-less slots still use the converter's flattening order: each
+        // range partition lands on its own consecutive parameter.
+        let (abi, resolved) = table_layout_abi(&[
+            DescriptorTableKind::Unspecified,
+            DescriptorTableKind::Unspecified,
+        ]);
+        let plan = partitioned(plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        ));
+        assert_eq!(plan.bound.len(), 2);
+        assert!(plan.residue.is_empty());
+        assert_eq!(plan.bound[0].partition, 0);
+        assert_eq!(plan.bound[1].partition, 1);
+    }
+
+    /// When no declared slot can carry a partition, the planner names which
+    /// early return dropped it: the declared kind and the slot it resolved to.
+    #[test]
+    fn a_table_no_declared_slot_can_carry_names_its_drop_reason() {
+        let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Sampler]);
+        let wire = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
+        match plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        ) {
+            MixedTablePlan::Unbound(miss) => {
+                assert_eq!(miss.slot_index, Some(0), "one declared slot resolved");
+                assert_eq!(miss.declared_kind, DescriptorTableKind::Sampler);
+                assert_eq!(miss.declared_slots, 1);
+            }
+            other => panic!("a sampler slot cannot carry resource views, got {other:?}"),
+        }
     }
 
     /// Sampler entries mixed with resource entries are illegal in D3D12 and
