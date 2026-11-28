@@ -190,6 +190,10 @@ impl TitleMemory {
         device: Id,
         buffers: &HashMap<u64, RegisteredBuffer>,
     ) -> Result<Option<Binding>, MetalError> {
+        // Every call is one flush that wanted the page table; a request with no
+        // installed map is counted apart from one that had a map and could not
+        // build from it (ADR-058).
+        crate::macos::memory_space_bind::note_table_request(!self.ranges.is_empty());
         if self.ranges.is_empty() {
             return Ok(None);
         }
@@ -506,6 +510,29 @@ mod tests {
         memory.set_map(1, Vec::new());
         assert_eq!(memory.stats().updates, 2, "an older generation is ignored");
         assert_eq!(memory.stats().ranges, 1);
+    }
+
+    /// ADR-058: a flush that declares `MEMORY_SPACE` before the map arrives asks
+    /// for a table; that request is counted apart from a refused build, so a
+    /// boot can name the map path rather than the emit decision. An empty map
+    /// returns before the device is touched, so this needs no GPU.
+    #[test]
+    fn a_binding_request_with_no_installed_map_is_counted_not_bound() {
+        let before = crate::macos::memory_space_bind::telemetry();
+        let mut memory = TitleMemory::new();
+        let buffers = HashMap::new();
+        assert!(
+            memory
+                .binding(std::ptr::null_mut(), &buffers)
+                .expect("no map is not an error")
+                .is_none(),
+            "no map leaves the zero fallback"
+        );
+        let after = crate::macos::memory_space_bind::telemetry();
+        assert_eq!(after.requests, before.requests + 1, "the flush asked for a table");
+        assert_eq!(after.no_map, before.no_map + 1, "and there was no map");
+        assert_eq!(after.misses, before.misses, "no map is not a refused build");
+        assert_eq!(after.bindings, before.bindings, "nothing was bound");
     }
 }
 

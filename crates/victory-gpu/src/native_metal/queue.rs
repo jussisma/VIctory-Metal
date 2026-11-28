@@ -1502,6 +1502,61 @@ pub fn register_resolved_range(range: &GuestRange) -> Result<(), BufferRegistrat
 /// Generation of the last title-memory map the guest sent (ADR-055).
 static TITLE_MAP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Guest-side title-map send counters (ADR-058).
+///
+/// Host counters say whether a map *arrived*; these say why the guest sent
+/// nothing: no resolver, no host-visible mapping, no live session, an unchanged
+/// content digest, or a refusal the submission path swallowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TitleMapSendStats {
+    /// Calls to [`sync_title_memory_map`].
+    pub syncs: u64,
+    /// Calls disabled by `VICTORY_METAL_TITLE_MEMORY_MAP=0`.
+    pub disabled: u64,
+    /// Calls with no installed [`GuestRangeResolver`].
+    pub no_resolver: u64,
+    /// Calls whose resolver enumerated no host-visible mapping.
+    pub no_mappings: u64,
+    /// Calls with no live native session.
+    pub no_session: u64,
+    /// Calls whose map was byte-identical to the last sent one.
+    pub unchanged: u64,
+    /// Calls that sent at least one chunk.
+    pub sent: u64,
+    /// Calls the transport refused or failed (the submission still proceeds).
+    pub failed: u64,
+    /// Ranges the resolver enumerated on the most recent call.
+    pub ranges: u64,
+}
+
+static TITLE_MAP_SYNCS: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_DISABLED: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_NO_RESOLVER: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_NO_MAPPINGS: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_NO_SESSION: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_UNCHANGED: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_SENT: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_FAILED: AtomicU64 = AtomicU64::new(0);
+static TITLE_MAP_RANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the guest-side title-map send counters (ADR-058).
+///
+/// Process-wide, like the host counters: one guest process serves one session.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn title_map_send_stats() -> TitleMapSendStats {
+    TitleMapSendStats {
+        syncs: TITLE_MAP_SYNCS.load(Ordering::Relaxed),
+        disabled: TITLE_MAP_DISABLED.load(Ordering::Relaxed),
+        no_resolver: TITLE_MAP_NO_RESOLVER.load(Ordering::Relaxed),
+        no_mappings: TITLE_MAP_NO_MAPPINGS.load(Ordering::Relaxed),
+        no_session: TITLE_MAP_NO_SESSION.load(Ordering::Relaxed),
+        unchanged: TITLE_MAP_UNCHANGED.load(Ordering::Relaxed),
+        sent: TITLE_MAP_SENT.load(Ordering::Relaxed),
+        failed: TITLE_MAP_FAILED.load(Ordering::Relaxed),
+        ranges: TITLE_MAP_RANGES.load(Ordering::Relaxed),
+    }
+}
+
 /// Sends the guest's VA → share-allocation map when it changed (ADR-055).
 ///
 /// The ranges come from the installed [`GuestRangeResolver::mappings`]: the
@@ -1514,17 +1569,25 @@ static TITLE_MAP_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Returns whether a frame was sent. A transport problem is returned, but
 /// callers on the submission path may treat it as non-fatal: the page table is
 /// an optimization for shaders that use title memory, and dropping the frame
-/// never changes an existing submission's bytes.
+/// never changes an existing submission's bytes. Every outcome is counted
+/// ([`title_map_send_stats`]) and a refusal is logged, so a boot that reads no
+/// live table can say whether the guest had nothing to send or the host said
+/// no.
 #[cfg(any(windows, test, target_os = "macos"))]
 pub fn sync_title_memory_map() -> Result<bool, NativeQueueError> {
+    TITLE_MAP_SYNCS.fetch_add(1, Ordering::Relaxed);
     if std::env::var_os("VICTORY_METAL_TITLE_MEMORY_MAP").is_some_and(|value| value == "0") {
+        TITLE_MAP_DISABLED.fetch_add(1, Ordering::Relaxed);
         return Ok(false);
     }
     let Some(resolver) = bindings::resolver() else {
+        TITLE_MAP_NO_RESOLVER.fetch_add(1, Ordering::Relaxed);
         return Ok(false);
     };
     let mappings = resolver.mappings();
+    TITLE_MAP_RANGES.store(mappings.len() as u64, Ordering::Relaxed);
     if mappings.is_empty() {
+        TITLE_MAP_NO_MAPPINGS.fetch_add(1, Ordering::Relaxed);
         return Ok(false);
     }
     let ranges: Vec<victory_metal::title_map::Range> = mappings
@@ -1538,11 +1601,31 @@ pub fn sync_title_memory_map() -> Result<bool, NativeQueueError> {
         .collect();
     let mut queue = native_queue();
     let Some(client) = queue.sink_mut().client_mut() else {
+        TITLE_MAP_NO_SESSION.fetch_add(1, Ordering::Relaxed);
         return Ok(false);
     };
     let generation = u32::try_from(TITLE_MAP_GENERATION.fetch_add(1, Ordering::Relaxed) % u64::from(u32::MAX - 1) + 1)
         .unwrap_or(1);
-    client.send_title_memory_map(generation, &ranges)
+    match client.send_title_memory_map(generation, &ranges) {
+        Ok(sent) => {
+            if sent {
+                TITLE_MAP_SENT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                TITLE_MAP_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(sent)
+        }
+        Err(error) => {
+            TITLE_MAP_FAILED.fetch_add(1, Ordering::Relaxed);
+            // The submission path calls this with `let _ =`; a refused map is
+            // metadata, never a changed submission, but it must not vanish.
+            tracing::warn!(
+                reason = %error,
+                "VICTORY_BACKEND=metal: the host did not take the title-memory map"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Resolves one guest buffer range through `resolver` without pinning it.
