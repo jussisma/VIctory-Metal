@@ -1345,7 +1345,8 @@ fn draw_trace_json_for(report: &victory_metal::macos::trace::TraceReport) -> Str
             "\"last_offscreen_nonzero_bytes\": {}, ",
             "\"last_offscreen_distinct_values\": {}, ",
             "\"failure\": {}, ",
-            "\"rt_evidence\": {}",
+            "\"rt_evidence\": {}, ",
+            "\"sampled_textures\": {}",
             "}}"
         ),
         report.enabled,
@@ -1354,7 +1355,8 @@ fn draw_trace_json_for(report: &victory_metal::macos::trace::TraceReport) -> Str
         report.last_offscreen_nonzero_bytes,
         report.last_offscreen_distinct_values,
         failure,
-        report.rt_evidence().json_value()
+        report.rt_evidence().json_value(),
+        report.sampled_textures().json_value()
     )
 }
 
@@ -2071,7 +2073,7 @@ mod draw_trace_json_tests {
     use victory_metal::macos::trace::TraceReport;
 
     /// Every key `draw_trace` must carry, in the emitted order.
-    const DRAW_TRACE_KEYS: [&str; 7] = [
+    const DRAW_TRACE_KEYS: [&str; 8] = [
         "enabled",
         "traced_work",
         "traced_passes",
@@ -2079,6 +2081,7 @@ mod draw_trace_json_tests {
         "last_offscreen_distinct_values",
         "failure",
         "rt_evidence",
+        "sampled_textures",
     ];
 
     fn object_keys(json: &str) -> Vec<String> {

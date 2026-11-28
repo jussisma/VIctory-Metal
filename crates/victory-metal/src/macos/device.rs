@@ -53,6 +53,8 @@ const V3_EXECUTED_LIST_CAPACITY: usize = 256;
 const APPLE_SILICON_NOCOPY_PAGE_SIZE: usize = 16 * 1024;
 /// `MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared | MTLResourceHazardTrackingModeDefault`.
 const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
+/// `MTLStorageModePrivate`, read by the ADR-069 texture-sample diagnostic.
+const MTL_TEXTURE_STORAGE_MODE_PRIVATE: usize = 2;
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// `MTLResourceUsageRead`.
 const MTL_RESOURCE_USAGE_READ: usize = 1;
@@ -1958,6 +1960,89 @@ impl DirectMetalTransport {
             Err(error) => {
                 eprintln!("draw_trace_rt failure=readback {error}");
                 crate::macos::trace::note_failure("target readback failed");
+            }
+        }
+    }
+
+    /// ADR-069: reads back the bounded fragment-texture samples of one
+    /// submission.
+    ///
+    /// Called only after the command buffer completed (the same
+    /// `waitUntilCompleted` the render-target sample pays for). At most two
+    /// textures per submission reach this path and at most four submissions per
+    /// process are queued, so the cost is bounded. Only format, size, class and
+    /// counts are published; no texel payload or handle is logged.
+    fn trace_sample_textures(&self, samples: &[crate::macos::trace::PendingTextureSample]) {
+        for sample in samples {
+            let Some(texture) = retain_object(sample.texture as objc::Id) else {
+                crate::macos::trace::note_texture_sample(
+                    sample.ordinal,
+                    crate::macos::trace::TextureSampleOutcome::Unreadable(
+                        crate::macos::trace::TEXTURE_UNREADABLE_GONE,
+                    ),
+                );
+                continue;
+            };
+            let raw = texture.as_raw();
+            // SAFETY: `raw` is a live `MTLTexture` retained above; both accessors
+            // only read immutable properties.
+            let (pixel_format, storage_mode) = unsafe {
+                (
+                    objc::msg_send_usize_0(raw, objc::sel(c"pixelFormat")),
+                    objc::msg_send_usize_0(raw, objc::sel(c"storageMode")),
+                )
+            };
+            let color = PixelFormat::from_mtl_pixel_format(pixel_format)
+                .is_some_and(PixelFormat::is_color);
+            if !color {
+                crate::macos::trace::note_texture_sample(
+                    sample.ordinal,
+                    crate::macos::trace::TextureSampleOutcome::NotColor,
+                );
+                continue;
+            }
+            let texels = u64::from(sample.width).saturating_mul(u64::from(sample.height));
+            if sample.width == 0
+                || sample.height == 0
+                || texels.saturating_mul(4) > crate::macos::trace::MAX_SAMPLED_TEXTURE_BYTES
+            {
+                crate::macos::trace::note_texture_sample(
+                    sample.ordinal,
+                    crate::macos::trace::TextureSampleOutcome::Unreadable(
+                        crate::macos::trace::TEXTURE_UNREADABLE_TOO_LARGE,
+                    ),
+                );
+                continue;
+            }
+            let readback = RenderTarget::from_objc(texture)
+                .map_err(|_| ())
+                .and_then(|target| read_back_render_target(self, &target).map_err(|_| ()));
+            match readback {
+                Ok(bytes) => {
+                    let stats = crate::macos::trace::sample_texture_grid(
+                        &bytes,
+                        sample.width,
+                        sample.height,
+                    );
+                    crate::macos::trace::note_texture_sample(
+                        sample.ordinal,
+                        crate::macos::trace::TextureSampleOutcome::Sampled(stats),
+                    );
+                }
+                Err(_) => {
+                    // A private-storage texture whose blit failed is named as
+                    // such; any other failure is the texture being gone by the
+                    // time the readback ran.
+                    let reason = if storage_mode == MTL_TEXTURE_STORAGE_MODE_PRIVATE {
+                        crate::macos::trace::TEXTURE_UNREADABLE_PRIVATE_STORAGE
+                    } else {
+                        crate::macos::trace::TEXTURE_UNREADABLE_GONE
+                    };
+                    crate::macos::trace::note_texture_sample(
+                        sample.ordinal,
+                        crate::macos::trace::TextureSampleOutcome::Unreadable(reason),
+                    );
+                }
             }
         }
     }
@@ -4356,6 +4441,64 @@ fn resolve_texture(
     }
 }
 
+/// ADR-069: resolves a texture handle without emitting an attachment diagnostic.
+///
+/// The draw tracer calls this for every pass attachment of a submission to build
+/// the `sampled-is-pass-target` set. A miss is not an error here: the real
+/// prepare path names it, and a tracer must never change a submission's outcome.
+fn quiet_texture(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    allocation_id: u64,
+    generation: u32,
+) -> Option<objc::Id> {
+    if allocation_id == 0 || generation == 0 {
+        return None;
+    }
+    let registered = allocations.get(&(allocation_id, generation))?;
+    if let Some(texture) = state.textures.get(&registered.0) {
+        return Some(texture.as_raw());
+    }
+    resolve_registered_texture(state, registered.0)
+}
+
+/// ADR-069: the texture handles any pass of this submission renders into.
+///
+/// The set is bounded to one entry per distinct attachment and never grows with
+/// the pass count.
+fn submission_render_targets(
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    passes: &[&BeginRenderPass],
+) -> Vec<usize> {
+    let mut targets: Vec<usize> = Vec::new();
+    for pass in passes {
+        for color in &pass.colors {
+            if let Some(texture) =
+                quiet_texture(state, allocations, color.allocation_id, color.generation)
+            {
+                push_unique_target(&mut targets, texture as usize);
+            }
+        }
+        if let Some(depth) = &pass.depth_stencil
+            && let Some(texture) =
+                quiet_texture(state, allocations, depth.allocation_id, depth.generation)
+        {
+            push_unique_target(&mut targets, texture as usize);
+        }
+    }
+    targets
+}
+
+/// Bounded attachment-set insert: at most
+/// [`crate::macos::trace::MAX_RT_HISTORY`] distinct texture handles.
+fn push_unique_target(targets: &mut Vec<usize>, texture: usize) {
+    if targets.len() >= crate::macos::trace::MAX_RT_HISTORY || targets.contains(&texture) {
+        return;
+    }
+    targets.push(texture);
+}
+
 /// Bounded host-stderr diagnostic for an attachment resolution failure.
 ///
 /// The host binary does not install a tracing subscriber, so a `tracing` event
@@ -4502,6 +4645,10 @@ enum PendingAbiBinding {
         count: u32,
         stride: usize,
         resources: Vec<(objc::Id, usize)>,
+        /// ADR-069: raw `MTLTexture` handles this table bound as texture
+        /// descriptors, in entry order. Used only for the opt-in binding
+        /// evidence; never published.
+        textures: Vec<usize>,
         /// The table carries at least one texture or sampler entry, so a bound
         /// slot at a fragment table parameter is a real fragment texture
         /// source.
@@ -5066,8 +5213,18 @@ fn build_descriptor_table_entries(
     };
     let mut builder = DescriptorTableBuilder::new(shape);
     let mut resources = Vec::with_capacity(entries.len());
+    let mut textures = Vec::new();
     for entry in entries {
-        encode_table_entry(state, allocations, entry, shape, usage, &mut builder, &mut resources)?;
+        encode_table_entry(
+            state,
+            allocations,
+            entry,
+            shape,
+            usage,
+            &mut builder,
+            &mut resources,
+            &mut textures,
+        )?;
     }
     let buffer = new_argument_buffer(device, builder.bytes())?;
     let address = buffer_gpu_address(buffer.as_raw());
@@ -5083,6 +5240,7 @@ fn build_descriptor_table_entries(
         count: table_binding.count,
         stride: table_binding.stride,
         resources,
+        textures,
         texture_source: matches!(
             shape,
             DescriptorTableKind::Texture | DescriptorTableKind::Sampler
@@ -5097,6 +5255,9 @@ fn build_descriptor_table_entries(
 /// unregistered handle is [`PrepareAbort::UnknownHandle`] before any encoder
 /// exists, and every resource the entry references is collected for
 /// `useResource:`.
+/// `resources` is the `useResource:` list; `textures` collects the raw texture
+/// handles the table bound for the ADR-069 evidence (never published).
+#[allow(clippy::too_many_arguments)]
 fn encode_table_entry(
     state: &DeviceState,
     allocations: &HashMap<(u64, u32), VmBufferId>,
@@ -5105,6 +5266,7 @@ fn encode_table_entry(
     usage: usize,
     builder: &mut DescriptorTableBuilder,
     resources: &mut Vec<(objc::Id, usize)>,
+    textures: &mut Vec<usize>,
 ) -> Result<(), PrepareAbort> {
     use crate::wire_v3::DescriptorTableEntryV3;
 
@@ -5113,6 +5275,7 @@ fn encode_table_entry(
             let texture =
                 resolve_registered_texture(state, *handle).ok_or(PrepareAbort::UnknownHandle)?;
             builder.push_texture(resource_gpu_id(texture))?;
+            textures.push(texture as usize);
             resources.push((texture, usage));
         }
         DescriptorTableEntryV3::Sampler(handle) if shape == DescriptorTableKind::Sampler => {
@@ -5190,6 +5353,7 @@ fn build_merged_descriptor_table(
     };
     let mut bytes: Vec<u8> = Vec::new();
     let mut resources = Vec::new();
+    let mut textures = Vec::new();
     let mut run_shape: Option<WireEntryShape> = None;
     let mut run = DescriptorTableBuilder::new(DescriptorTableKind::Unspecified);
     for entry in &table.bindings {
@@ -5203,7 +5367,16 @@ fn build_merged_descriptor_table(
             run_shape = Some(shape);
         }
         let encoding = mixed_partition_encoding_shape(shape, DescriptorTableKind::Unspecified);
-        encode_table_entry(state, allocations, entry, encoding, usage, &mut run, &mut resources)?;
+        encode_table_entry(
+            state,
+            allocations,
+            entry,
+            encoding,
+            usage,
+            &mut run,
+            &mut resources,
+            &mut textures,
+        )?;
     }
     bytes.extend_from_slice(run.bytes());
     if bytes.is_empty() {
@@ -5229,6 +5402,7 @@ fn build_merged_descriptor_table(
         count,
         stride,
         resources,
+        textures,
         texture_source: table.bindings.iter().any(|entry| {
             matches!(
                 entry,
@@ -6891,7 +7065,11 @@ fn flush_abi(
                                     u32::try_from(parameter.size()).unwrap_or(u32::MAX);
                             }
                         }
-                        PendingAbiBinding::Table { texture_source, .. } => {
+                        PendingAbiBinding::Table {
+                            texture_source,
+                            textures,
+                            ..
+                        } => {
                             summary.bound_bytes = summary
                                 .bound_bytes
                                 .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
@@ -6911,6 +7089,14 @@ fn flush_abi(
                                     summary.fragment_texture_sources_bound = summary
                                         .fragment_texture_sources_bound
                                         .saturating_add(1);
+                                    // ADR-069: describe each bound texture (format
+                                    // and geometry only; the handle stays
+                                    // internal and is never serialized).
+                                    for texture in textures {
+                                        summary
+                                            .fragment_textures
+                                            .push(fragment_texture_info(*texture));
+                                    }
                                 }
                             }
                         }
@@ -6973,11 +7159,41 @@ fn flush_abi(
     Ok((buffers, bytes_ops, summary))
 }
 
-/// Stage layouts a render-family pipeline binds converter argument buffers for.
+/// ADR-069: describes one bound fragment texture for the draw trace.
 ///
-/// A mesh-family pipeline (mesh/object/fragment) binds its mesh stages; the
-/// converter never emits a vertex stage for a mesh PSO, so looking only at
-/// vertex/fragment would miss every mesh-stage root parameter.
+/// Returns the Metal pixel-format name and level-0 geometry only. The opaque
+/// handle stays in [`crate::macos::trace::TextureBindingInfo::texture`] and is
+/// never serialized.
+fn fragment_texture_info(texture: usize) -> crate::macos::trace::TextureBindingInfo {
+    let raw = texture as objc::Id;
+    // SAFETY: `raw` is a live `MTLTexture` resolved by the descriptor-table
+    // encoder for this submission; the accessors only read immutable properties.
+    let (width, height, pixel_format) = unsafe {
+        (
+            objc::msg_send_usize_0(raw, objc::sel(c"width")),
+            objc::msg_send_usize_0(raw, objc::sel(c"height")),
+            objc::msg_send_usize_0(raw, objc::sel(c"pixelFormat")),
+        )
+    };
+    let format = PixelFormat::from_mtl_pixel_format(pixel_format).map_or("unknown", |format| {
+        match format {
+            PixelFormat::Bgra8Unorm => "bgra8unorm",
+            PixelFormat::Rgba8Unorm => "rgba8unorm",
+            PixelFormat::Depth32Float => "depth32float",
+            PixelFormat::Depth32FloatStencil8 => "depth32float-stencil8",
+            PixelFormat::Depth16Unorm => "depth16unorm",
+        }
+    });
+    crate::macos::trace::TextureBindingInfo {
+        texture,
+        format,
+        width: u32::try_from(width).unwrap_or(u32::MAX),
+        height: u32::try_from(height).unwrap_or(u32::MAX),
+        stage: "fragment",
+        sampled_is_pass_target: false,
+    }
+}
+
 /// ADR-053: records one encoded draw/dispatch in the opt-in tracer.
 ///
 /// A no-op unless `VICTORY_METAL_DRAW_TRACE` armed the trace and fewer than
@@ -7005,6 +7221,13 @@ fn trace_encoded_work(
         return;
     }
     let (parameters, bytes) = abi_argument_summary(abi, mesh_family);
+    // ADR-069: flag each bound fragment texture that is also a render target of
+    // any pass in this submission. The handle list is submission-scoped and
+    // never published.
+    let mut texture_bindings = bindings.fragment_textures;
+    for binding in texture_bindings.bindings[..texture_bindings.len as usize].iter_mut() {
+        binding.sampled_is_pass_target = trace.is_pass_target(binding.texture);
+    }
     let record = crate::macos::trace::DrawRecord {
         ordinal: trace.records.len() + 1,
         kind,
@@ -7033,6 +7256,7 @@ fn trace_encoded_work(
         ps_tables_dropped_inert: bindings.ps_tables_dropped_inert,
         fragment_source_unreachable: bindings.fragment_source_unreachable,
         stages: bindings.stages,
+        texture_bindings,
         target,
     };
     if let Some(line) = trace.record(record) {
@@ -7059,6 +7283,11 @@ fn abi_argument_summary(abi: Option<&PipelineAbi>, mesh_family: bool) -> (u32, u
     (parameters, bytes)
 }
 
+/// Stage layouts a render-family pipeline binds converter argument buffers for.
+///
+/// A mesh-family pipeline (mesh/object/fragment) binds its mesh stages; the
+/// converter never emits a vertex stage for a mesh PSO, so looking only at
+/// vertex/fragment would miss every mesh-stage root parameter.
 fn abi_render_stages(
     abi: &PipelineAbi,
     mesh_family: bool,
@@ -9620,6 +9849,17 @@ fn prepare_v3(
             _ => None,
         })
         .collect();
+    // ADR-069: publish this submission's pass attachments before any draw is
+    // described, so a bound texture can report `sampled-is-pass-target`.
+    if state.trace.is_none() && crate::macos::trace::enabled() {
+        state.trace = Some(crate::macos::trace::TraceState::default());
+    }
+    if state.trace.is_some() {
+        let targets = submission_render_targets(state, allocations, &passes);
+        if let Some(trace) = state.trace.as_mut() {
+            trace.begin_submission(targets);
+        }
+    }
     let mut prepared = Vec::with_capacity(plan.len());
     for segment in plan {
         match &segment.kind {
@@ -10429,6 +10669,14 @@ impl DirectMetalTransport {
                 return Err(error);
             }
         };
+        // ADR-069: take this submission's queued fragment textures only once the
+        // command buffer encoded cleanly, so a failed submission never consumes
+        // a readback slot.
+        let texture_samples = state
+            .trace
+            .as_mut()
+            .map(crate::macos::trace::TraceState::take_texture_samples_for_readback)
+            .unwrap_or_default();
         let has_present = submission
             .commands
             .iter()
@@ -10439,9 +10687,14 @@ impl DirectMetalTransport {
             .first()
             .map(segment_failure_site)
             .unwrap_or(("command buffer", 0));
-        self.commit_async(encoded, submission.sequence, site, trace_sample.is_some())?;
+        let trace_wait = trace_sample.is_some() || !texture_samples.is_empty();
+        self.commit_async(encoded, submission.sequence, site, trace_wait)?;
         if let Some(target) = trace_sample {
             self.trace_sample_target(&target);
+        }
+        if !texture_samples.is_empty() {
+            crate::macos::trace::note_texture_submission();
+            self.trace_sample_textures(&texture_samples);
         }
         if let Some((list_id, generation)) = list_key {
             state.mark_list_executed(list_id, generation);
