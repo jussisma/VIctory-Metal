@@ -164,6 +164,166 @@ impl CounterSnapshot {
     }
 }
 
+/// Maximum distinct keys the descriptor-table refusal census retains.
+///
+/// A boot refuses one class at a time; sixteen distinct `(pipeline, set,
+/// declared tables, plan)` shapes are enough to attribute every real class
+/// without letting a hostile or pathological title grow host memory. Keys past
+/// the cap are counted in [`DescriptorTableRefusalCensus::omitted`].
+pub const MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS: usize = 16;
+
+/// One bounded key of the descriptor-table refusal census.
+///
+/// It names only counts and fixed plan-kind words: no shader bytes, resource
+/// contents, register values or title identifiers appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorTableRefusalKey {
+    /// Host pipeline id the refused table was selected with.
+    pub pipeline_id: u64,
+    /// Wire `DescriptorTableV3.set` the submission carried.
+    pub wire_set: u16,
+    /// Descriptor-table parameters the selected pipeline declares.
+    pub declared_tables: u16,
+    /// Whether the submission carried a root-argument plan at all.
+    pub had_plan: bool,
+    /// The plan's kind for this set (`none` without an entry).
+    pub plan_kind: &'static str,
+}
+
+/// One counted key of the descriptor-table refusal census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTableRefusalCount {
+    /// The bounded key.
+    pub key: DescriptorTableRefusalKey,
+    /// How many refusals the key describes in this process.
+    pub count: u64,
+}
+
+/// Bounded per-process descriptor-table refusal census.
+///
+/// It is the one host-side answer to "which descriptor-table set did not
+/// resolve, and did the guest send a plan for it?". Reading it never arms the
+/// draw tracer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DescriptorTableRefusalCensus {
+    /// Distinct keys retained (`<= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`).
+    pub distinct_keys: u64,
+    /// Refusals whose key did not fit the cap.
+    pub omitted: u64,
+    /// Retained keys in first-observed order.
+    pub entries: Vec<DescriptorTableRefusalCount>,
+}
+
+impl DescriptorTableRefusalCensus {
+    /// Whether no descriptor table was refused.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The census as the `descriptor_table_refusal_census` telemetry member.
+    ///
+    /// The caller appends this after a comma; it is exactly
+    /// `"descriptor_table_refusal_census": <json_value>`.
+    pub fn json_fields(&self) -> String {
+        format!(
+            "\"descriptor_table_refusal_census\": {}",
+            self.json_value()
+        )
+    }
+
+    /// The census as the `descriptor_table_refusal_census` telemetry object.
+    ///
+    /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`;
+    /// each key carries `pipeline_id`, `wire_set`, `declared_tables`,
+    /// `had_plan`, `plan_kind` and `count`.
+    pub fn json_value(&self) -> String {
+        let keys = self
+            .entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"pipeline_id\": {}, \"wire_set\": {}, \"declared_tables\": {}, \
+                     \"had_plan\": {}, \"plan_kind\": \"{}\", \"count\": {}}}",
+                    entry.key.pipeline_id,
+                    entry.key.wire_set,
+                    entry.key.declared_tables,
+                    entry.key.had_plan,
+                    entry.key.plan_kind,
+                    entry.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}]}}",
+            self.distinct_keys, self.omitted, keys
+        )
+    }
+}
+
+#[derive(Default)]
+struct DescriptorTableRefusalLog {
+    entries: Vec<(DescriptorTableRefusalKey, u64)>,
+    omitted: u64,
+}
+
+static DESCRIPTOR_TABLE_REFUSALS: OnceLock<Mutex<DescriptorTableRefusalLog>> = OnceLock::new();
+
+fn descriptor_table_refusals() -> &'static Mutex<DescriptorTableRefusalLog> {
+    DESCRIPTOR_TABLE_REFUSALS.get_or_init(|| Mutex::new(DescriptorTableRefusalLog::default()))
+}
+
+/// Counts one descriptor-table refusal under its bounded key.
+///
+/// Only a refusal calls this, so the hot encode path allocates nothing. The
+/// map is capped at [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`]; keys past the cap
+/// only bump `omitted`.
+pub fn note_descriptor_table_refusal(key: DescriptorTableRefusalKey) {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, count)) = log.entries.iter_mut().find(|(known, _)| *known == key) {
+        *count = count.saturating_add(1);
+        return;
+    }
+    if log.entries.len() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+        log.omitted = log.omitted.saturating_add(1);
+        return;
+    }
+    log.entries.push((key, 1));
+}
+
+/// A copy of the process-wide descriptor-table refusal census.
+pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
+    let log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    DescriptorTableRefusalCensus {
+        distinct_keys: log.entries.len() as u64,
+        omitted: log.omitted,
+        entries: log
+            .entries
+            .iter()
+            .map(|(key, count)| DescriptorTableRefusalCount {
+                key: *key,
+                count: *count,
+            })
+            .collect(),
+    }
+}
+
+/// Clears the process-wide descriptor-table refusal census.
+///
+/// Test-only: a proof that runs several refusal shapes in one process starts
+/// each case from a clean census. Never called by the host.
+#[doc(hidden)]
+pub fn reset_descriptor_table_refusal_census() {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *log = DescriptorTableRefusalLog::default();
+}
+
 /// Maximum bytes kept in the bounded [`TraceReport::failure`] string.
 pub const MAX_FAILURE_BYTES: usize = 96;
 
@@ -742,6 +902,50 @@ mod tests {
         assert!(line.contains("count=36"));
         assert!(line.contains("viewport=0,0,1280,720"));
         assert!(line.contains("rt=offscreen 1920x1080 rgba8unorm"));
+    }
+
+    fn key(set: u16) -> DescriptorTableRefusalKey {
+        DescriptorTableRefusalKey {
+            pipeline_id: 7,
+            wire_set: set,
+            declared_tables: 2,
+            had_plan: false,
+            plan_kind: "none",
+        }
+    }
+
+    #[test]
+    fn the_descriptor_table_census_counts_repeated_keys_once() {
+        reset_descriptor_table_refusal_census();
+        note_descriptor_table_refusal(key(1));
+        note_descriptor_table_refusal(key(1));
+        note_descriptor_table_refusal(key(0));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, 2);
+        assert_eq!(census.omitted, 0);
+        assert_eq!(census.entries[0].key.wire_set, 1);
+        assert_eq!(census.entries[0].count, 2);
+        assert_eq!(census.entries[1].key.wire_set, 0);
+        assert_eq!(census.entries[1].count, 1);
+        let json = census.json_value();
+        assert!(json.contains("\"distinct_keys\": 2"));
+        assert!(json.contains("\"plan_kind\": \"none\""));
+        reset_descriptor_table_refusal_census();
+    }
+
+    #[test]
+    fn the_descriptor_table_census_is_capped() {
+        reset_descriptor_table_refusal_census();
+        for set in 0..MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u16 {
+            note_descriptor_table_refusal(key(set));
+        }
+        note_descriptor_table_refusal(key(99));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u64);
+        assert_eq!(census.entries.len(), MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS);
+        assert_eq!(census.omitted, 1);
+        reset_descriptor_table_refusal_census();
+        assert!(descriptor_table_refusal_census().is_empty());
     }
 
     #[test]
