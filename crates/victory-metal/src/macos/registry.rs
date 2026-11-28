@@ -1643,6 +1643,13 @@ struct TextureObjectRecord {
 #[derive(Debug, Default)]
 struct TextureObjectCensus {
     per_handle: HashMap<u64, Vec<TextureObjectRecord>>,
+    /// Registration ordinal of every object the registry created, so two
+    /// objects that share a descriptor can be ordered by when the host made
+    /// them. It is evidence for a tie-break only: the present path never
+    /// decides an alias from registration order alone.
+    registration_order: HashMap<usize, u64>,
+    dropped_orders: u64,
+    next_order: u64,
     dropped_handles: u64,
     dropped_objects: u64,
     views_aliased: u64,
@@ -1656,6 +1663,10 @@ static TEXTURE_OBJECT_CENSUS: std::sync::Mutex<Option<TextureObjectCensus>> =
 const TEXTURE_OBJECT_HANDLE_MAX: usize = 4096;
 /// Distinct objects remembered per handle.
 const TEXTURE_OBJECTS_PER_HANDLE_MAX: usize = 8;
+/// Objects whose registration ordinal is remembered. Eight objects for each of
+/// [`TEXTURE_OBJECT_HANDLE_MAX`] handles is the bound the per-handle records
+/// already imply, so this cannot drop an object the census kept.
+const TEXTURE_OBJECT_ORDER_MAX: usize = TEXTURE_OBJECT_HANDLE_MAX * TEXTURE_OBJECTS_PER_HANDLE_MAX;
 
 fn with_texture_object_census<R>(f: impl FnOnce(&mut TextureObjectCensus) -> R) -> R {
     let mut guard = TEXTURE_OBJECT_CENSUS
@@ -1670,7 +1681,8 @@ fn with_texture_object_census<R>(f: impl FnOnce(&mut TextureObjectCensus) -> R) 
 /// Recording the same pointer twice is idempotent: a retain is the same object.
 /// A second pointer for one handle is a conflict, and a `View` is named as such
 /// so the histogram reason can distinguish an RTV wrapper from a re-created
-/// allocation.
+/// allocation. Every newly observed object also receives a monotonically
+/// increasing registration ordinal.
 fn note_texture_object_for(id: u64, texture: usize, origin: TextureObjectOrigin) {
     with_texture_object_census(|census| {
         if !census.per_handle.contains_key(&id) {
@@ -1681,6 +1693,7 @@ fn note_texture_object_for(id: u64, texture: usize, origin: TextureObjectOrigin)
             census
                 .per_handle
                 .insert(id, vec![TextureObjectRecord { texture }]);
+            note_registration_order(census, texture);
             return;
         }
         let records = census
@@ -1695,10 +1708,24 @@ fn note_texture_object_for(id: u64, texture: usize, origin: TextureObjectOrigin)
             return;
         }
         records.push(TextureObjectRecord { texture });
+        note_registration_order(census, texture);
         if origin == TextureObjectOrigin::View {
             census.conflicts = census.conflicts.saturating_add(1);
         }
     });
+}
+
+/// Assigns the next registration ordinal to `texture` when it is new.
+fn note_registration_order(census: &mut TextureObjectCensus, texture: usize) {
+    if census.registration_order.contains_key(&texture) {
+        return;
+    }
+    if census.registration_order.len() >= TEXTURE_OBJECT_ORDER_MAX {
+        census.dropped_orders = census.dropped_orders.saturating_add(1);
+        return;
+    }
+    census.registration_order.insert(texture, census.next_order);
+    census.next_order = census.next_order.saturating_add(1);
 }
 
 /// Notes that a full-resource RTV resolved to the base object instead of a new
@@ -1747,6 +1774,21 @@ pub fn texture_objects_share_handle(left: usize, right: usize) -> bool {
         records.iter().any(|record| record.texture == left)
             && records.iter().any(|record| record.texture == right)
     })
+}
+
+/// Registration ordinal of one `MTLTexture` object the registry created.
+///
+/// Higher means the host created the object later. It orders two objects that
+/// share a descriptor; it is never the only reason to prefer one of them. An
+/// object the registry never created has no ordinal, so it cannot be ordered —
+/// the present path falls back to the other evidence rather than inventing one.
+pub(crate) fn texture_object_registration_order(object: usize) -> Option<u64> {
+    let guard = TEXTURE_OBJECT_CENSUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    guard
+        .as_ref()
+        .and_then(|census| census.registration_order.get(&object).copied())
 }
 
 /// Views that were resolved to the base object (one object per allocation).
