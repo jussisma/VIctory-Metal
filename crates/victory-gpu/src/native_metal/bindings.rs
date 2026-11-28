@@ -834,15 +834,27 @@ where
         });
     }
     let remaining = (u64::from(heap.count) - first) as usize;
-    let count = table_size.unwrap_or(remaining);
-    if count == 0 || count > remaining {
-        return Err(TableRunError::OutsideHeap {
-            handle: base_handle,
-        });
-    }
-    if count > MAX_DESCRIPTOR_BINDINGS_V3 {
-        return Err(TableRunError::OverCap { count });
-    }
+    // ADR-064 correction: the root signature's table size is authoritative. A
+    // v3 table carries at most `MAX_DESCRIPTOR_BINDINGS_V3` entries, so when the
+    // guest does not know the size (the table handle alone carries none), the
+    // run is bounded by that cap and ends at the first slot the heap does not
+    // fill, exactly as a heap-allocated table ends. A *known* size that exceeds
+    // the cap is still a named refusal: binding a prefix of it would be a
+    // silent truncation.
+    let known_size = table_size.is_some();
+    let count = match table_size {
+        Some(size) if size == 0 || size > remaining => {
+            return Err(TableRunError::OutsideHeap {
+                handle: base_handle,
+            });
+        }
+        Some(size) if size > MAX_DESCRIPTOR_BINDINGS_V3 => {
+            return Err(TableRunError::OverCap { count: size });
+        }
+        Some(size) => size,
+        None => remaining.min(MAX_DESCRIPTOR_BINDINGS_V3),
+    };
+    let mut boundary = TableRunBoundary::HeapEnd;
     let mut entries = Vec::with_capacity(count);
     let mut run_kind: Option<DescriptorKind> = None;
     for index in 0..count {
@@ -854,13 +866,25 @@ where
                 (DescriptorKind::Sampler, DescriptorEntry::Sampler(handle))
             }
             DescriptorSlot::Empty => {
-                return Err(TableRunError::EmptyInHeap { index, count });
+                if known_size {
+                    return Err(TableRunError::EmptyInHeap { index, count });
+                }
+                boundary = TableRunBoundary::Empty;
+                break;
             }
             DescriptorSlot::Unresolvable(why) => {
+                if !known_size {
+                    boundary = TableRunBoundary::Empty;
+                    break;
+                }
                 return Err(TableRunError::UnsupportedAt { index, why });
             }
         };
         if samplers != (kind == DescriptorKind::Sampler) {
+            if !known_size {
+                boundary = TableRunBoundary::KindChange { kind };
+                break;
+            }
             return Err(TableRunError::UnsupportedAt {
                 index,
                 why: if samplers {
@@ -872,6 +896,10 @@ where
         }
         if let Some(run_kind) = run_kind {
             if run_kind != kind {
+                if !known_size {
+                    boundary = TableRunBoundary::KindChange { kind };
+                    break;
+                }
                 return Err(TableRunError::UnsupportedAt {
                     index,
                     why: "the active-heap run changes descriptor kind",
@@ -882,10 +910,13 @@ where
         }
         entries.push(entry);
     }
+    let Some(kind) = run_kind else {
+        return Err(TableRunError::Empty);
+    };
     Ok(TypedDescriptorTableRun {
-        kind: run_kind.expect("a non-empty run names its kind"),
+        kind,
         entries,
-        boundary: TableRunBoundary::HeapEnd,
+        boundary,
     })
 }
 
@@ -3091,6 +3122,64 @@ mod tests {
                 index: 1,
                 count: 2
             }
+        );
+    }
+
+    /// ADR-064: when the guest does not name the table size, the run is bounded
+    /// by the wire cap and ends at the first slot the heap does not fill, so a
+    /// large active heap is an enumerated table, not a refusal.
+    #[test]
+    fn unknown_table_size_is_capped_and_ends_at_the_first_empty_slot() {
+        let heap = DescriptorHeapRefV3 {
+            allocation_id: 4,
+            generation: 1,
+            offset: 0,
+            gpu_base: 0x4000,
+            stride: 32,
+            count: 1_000,
+            active: true,
+        };
+        let live = |handle: u64| {
+            if handle < 0x4000 + 3 * 32 {
+                DescriptorSlot::Live(
+                    DescriptorKind::Cbv,
+                    GuestBinding {
+                        address: 0x80_0000,
+                        len: 16,
+                    },
+                )
+            } else {
+                DescriptorSlot::Empty
+            }
+        };
+        let run = enumerate_descriptor_table_in_heap(0x4000, &heap, false, None, live)
+            .expect("an unknown-size run over a large heap enumerates");
+        assert_eq!(run.entries.len(), 3);
+        assert_eq!(run.boundary, TableRunBoundary::Empty);
+        // A heap that never ends is still bounded by the wire cap.
+        let run = enumerate_descriptor_table_in_heap(0x4000, &heap, false, None, |_| {
+            DescriptorSlot::Live(
+                DescriptorKind::Cbv,
+                GuestBinding {
+                    address: 0x80_0000,
+                    len: 16,
+                },
+            )
+        })
+        .expect("a full heap binds up to the cap");
+        assert_eq!(run.entries.len(), MAX_DESCRIPTOR_BINDINGS_V3);
+        // A known size above the cap stays a named refusal.
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x4000, &heap, false, Some(33), |_| {
+                DescriptorSlot::Live(
+                    DescriptorKind::Cbv,
+                    GuestBinding {
+                        address: 0x80_0000,
+                        len: 16,
+                    },
+                )
+            }),
+            Err(TableRunError::OverCap { count: 33 })
         );
     }
 
