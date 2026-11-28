@@ -561,6 +561,14 @@ struct Stats {
     descriptor_table_inert: u64,
     /// ADR-057: descriptor-table sets naming a table the bound pipeline lacks.
     descriptor_table_stale: u64,
+    /// ADR-060: parameters title root writes bound (vs. zero defaults).
+    abi_bound_parameters: u64,
+    /// ADR-060: declared parameters filled with the zero default.
+    abi_unbound_parameters: u64,
+    /// ADR-060: bytes the title-written root arguments occupy.
+    abi_bound_bytes: u64,
+    /// ADR-060: persisted root arguments dropped on a pipeline change.
+    abi_stale_parameters_dropped: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -607,6 +615,10 @@ impl Default for Stats {
             abi_refusals: 0,
             descriptor_table_inert: 0,
             descriptor_table_stale: 0,
+            abi_bound_parameters: 0,
+            abi_unbound_parameters: 0,
+            abi_bound_bytes: 0,
+            abi_stale_parameters_dropped: 0,
         }
     }
 }
@@ -888,6 +900,12 @@ impl BatchExecutor for DaemonExecutor {
                 self.transport.descriptor_table_inert_acceptance_count();
             stats.descriptor_table_stale =
                 self.transport.descriptor_table_stale_refusal_count();
+            // ADR-060: title-written vs zero-default root-argument accounting.
+            let abi_bindings = victory_metal::macos::trace::abi_binding_telemetry();
+            stats.abi_bound_parameters = abi_bindings.bound_parameters;
+            stats.abi_unbound_parameters = abi_bindings.unbound_parameters;
+            stats.abi_bound_bytes = abi_bindings.bound_bytes;
+            stats.abi_stale_parameters_dropped = self.transport.abi_stale_parameter_count();
             if matches!(&result, Ok(reply) if reply.status == ReplyStatus::UnknownHandle) {
                 let site = victory_metal::macos::device::last_unknown_site().to_string();
                 stats.unknown_handle_id = victory_metal::macos::device::last_unknown_id();
@@ -1446,6 +1464,10 @@ fn write_telemetry(
             "  \"memory_space_no_map\": {memory_space_no_map},\n",
             "  \"descriptor_table_inert_acceptances\": {descriptor_table_inert},\n",
             "  \"descriptor_table_stale_refusals\": {descriptor_table_stale},\n",
+            "  \"abi_bound_parameters\": {abi_bound_parameters},\n",
+            "  \"abi_unbound_parameters\": {abi_unbound_parameters},\n",
+            "  \"abi_bound_bytes\": {abi_bound_bytes},\n",
+            "  \"abi_stale_parameters_dropped\": {abi_stale_parameters_dropped},\n",
             "  \"abi_refusals\": {abi_refusals},\n",
             "  \"descriptor_table_refusal_census\": {descriptor_table_census},\n",
             "  \"present_trace\": {present_trace},\n",
@@ -1525,6 +1547,10 @@ fn write_telemetry(
         memory_space_no_map = memory_space.no_map,
         descriptor_table_inert = stats.descriptor_table_inert,
         descriptor_table_stale = stats.descriptor_table_stale,
+        abi_bound_parameters = stats.abi_bound_parameters,
+        abi_unbound_parameters = stats.abi_unbound_parameters,
+        abi_bound_bytes = stats.abi_bound_bytes,
+        abi_stale_parameters_dropped = stats.abi_stale_parameters_dropped,
         abi_refusals = stats.abi_refusals,
         descriptor_table_census = descriptor_table_census,
         present_trace = present_trace,
@@ -1831,6 +1857,10 @@ impl Clone for Stats {
             memory_space_bytes: self.memory_space_bytes,
             descriptor_table_inert: self.descriptor_table_inert,
             descriptor_table_stale: self.descriptor_table_stale,
+            abi_bound_parameters: self.abi_bound_parameters,
+            abi_unbound_parameters: self.abi_unbound_parameters,
+            abi_bound_bytes: self.abi_bound_bytes,
+            abi_stale_parameters_dropped: self.abi_stale_parameters_dropped,
             abi_refusals: self.abi_refusals,
         }
     }
@@ -2098,7 +2128,7 @@ mod draw_trace_json_tests {
         let json = std::fs::read_to_string(&path).expect("telemetry reads");
         let _ = std::fs::remove_file(&path);
 
-        const KEYS: [&str; 58] = [
+        const KEYS: &[&str] = &[
             "host",
             "pid",
             "port",
@@ -2151,7 +2181,26 @@ mod draw_trace_json_tests {
             "unknown_handle_id",
             "memory_space_bound",
             "memory_space_bytes",
+            "memory_space_updates",
+            "memory_space_pages",
+            "memory_space_invalidations",
+            "memory_space_bindings",
+            "memory_space_misses",
+            "memory_space_declared_stages",
+            "memory_space_ranges",
+            "memory_space_heap_pairs",
+            "memory_space_gate_checks",
+            "memory_space_requests",
+            "memory_space_no_map",
+            "descriptor_table_inert_acceptances",
+            "descriptor_table_stale_refusals",
+            "abi_bound_parameters",
+            "abi_unbound_parameters",
+            "abi_bound_bytes",
+            "abi_stale_parameters_dropped",
             "abi_refusals",
+            "descriptor_table_refusal_census",
+            "present_trace",
             "draw_trace",
             "d3dmetal_loaded",
             "d3dmetal_images",

@@ -133,3 +133,76 @@ fn every_frame_carries_a_plan_section() {
         assert_eq!(decoded.commands.len(), submission.commands.len());
     }
 }
+
+/// ADR-060: a graphics `SetGraphicsRoot32BitConstants` recorded before a draw
+/// is forwarded as a `SetRootConstants` command at that draw instead of being
+/// dropped, and the emitted bytes are exactly the title's.
+///
+/// This is the producer half of the guest audit. The D3D12 vtable
+/// (`list::graphics_constant(s)`) calls this method directly and the native
+/// telemetry counter next to it; a draw that encodes with no such command means
+/// the title never made the call, not that the producer discarded it.
+#[test]
+fn a_graphics_root_constant_reaches_the_encoded_draw() {
+    use victory_gpu::native_metal::producer::{RenderTarget, ResourceId};
+    use victory_metal::wire_v3::{
+        CommandV3, LoadOp, PrimitiveTopology, StoreOp,
+    };
+
+    let mut producer = MetalProducer::new(21, 1).expect("a list generation");
+    let target = RenderTarget {
+        resource: ResourceId::new(0x1000, 1).expect("target identity"),
+        mip_level: 0,
+        slice: 0,
+        load: LoadOp::Clear,
+        store: StoreOp::Store,
+        clear_color: [0.0; 4],
+    };
+    producer
+        .set_render_targets(&[target], None)
+        .expect("render target");
+    producer
+        .set_viewport(0.0, 0.0, 64.0, 64.0, 0.0, 1.0)
+        .expect("viewport");
+    producer.set_scissor_edges(0, 0, 64, 64).expect("scissor");
+    producer
+        .set_topology(PrimitiveTopology::TriangleList)
+        .expect("topology");
+    producer
+        .declare_root_constant_block(
+            RootSignatureStage::Graphics,
+            0,
+            USER_DATA_SPACE as u16,
+            4,
+        );
+    producer.set_pipeline(0x800).expect("graphics pipeline");
+    producer
+        .set_graphics_root_constants(0, &[9, 8, 7, 6], 0)
+        .expect("root constants recorded");
+    producer.draw(3, 1, 0, 0).expect("draw records");
+
+    let emitted = producer
+        .commands()
+        .iter()
+        .find_map(|command| match command {
+            CommandV3::SetRootConstants(constants) => Some(constants.clone()),
+            _ => None,
+        })
+        .expect("the title's constants reach the wire at the draw");
+    assert_eq!(emitted.slot, 0);
+    let expected: Vec<u8> = [9u32, 8, 7, 6]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    assert_eq!(emitted.bytes, expected);
+
+    // The plan names the same translated identity, so the host can resolve the
+    // wire slot through the title's root-argument plan as well.
+    let plan = producer.plan_for_submission();
+    assert!(
+        plan.iter().any(|argument| argument.kind
+            == bindings::RootArgumentKind::Constants
+            && argument.root_parameter == 0),
+        "the recorded constants are in the plan"
+    );
+}

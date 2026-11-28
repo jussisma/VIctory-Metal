@@ -527,6 +527,108 @@ fn with_log<R>(f: impl FnOnce(&mut TraceLog) -> R) -> R {
     f(&mut guard)
 }
 
+/// Process-wide ABI binding totals: parameters a title wrote vs. the zero
+/// default, summed over every recorded flush. Always on (cheap relaxed
+/// atomics), independent of the opt-in draw tracer, so `telemetry.json` can
+/// answer G6 on a boot that did not arm the trace.
+static ABI_BOUND_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static ABI_UNBOUND_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static ABI_BOUND_BYTES: AtomicU64 = AtomicU64::new(0);
+static ABI_UNBOUND_BYTES: AtomicU64 = AtomicU64::new(0);
+static ABI_LAST_BOUND_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static ABI_LAST_UNBOUND_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static ABI_LAST_BOUND_BYTES: AtomicU64 = AtomicU64::new(0);
+static ABI_LAST_KIND_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Exact process-wide ABI binding totals and the last draw's shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AbiBindingTelemetry {
+    /// Title-written parameters across every recorded flush.
+    pub bound_parameters: u64,
+    /// Parameters filled with the zero default across every recorded flush.
+    pub unbound_parameters: u64,
+    /// Bytes the title-written arguments occupy.
+    pub bound_bytes: u64,
+    /// Bytes the zero default covers.
+    pub unbound_bytes: u64,
+    /// Last recorded flush's title-written parameter count.
+    pub last_bound_parameters: u64,
+    /// Last recorded flush's zero-default parameter count.
+    pub last_unbound_parameters: u64,
+    /// Last recorded flush's title-written bytes.
+    pub last_bound_bytes: u64,
+    /// Last recorded flush's `none|constants|view|table` shape.
+    pub last_bound_kind: &'static str,
+}
+
+/// Records one ABI flush's binding summary.
+pub fn note_abi_binding(summary: AbiBindingSummary) {
+    ABI_BOUND_PARAMETERS.fetch_add(u64::from(summary.bound_parameters), Ordering::Relaxed);
+    ABI_UNBOUND_PARAMETERS.fetch_add(u64::from(summary.unbound_parameters), Ordering::Relaxed);
+    ABI_BOUND_BYTES.fetch_add(u64::from(summary.bound_bytes), Ordering::Relaxed);
+    ABI_UNBOUND_BYTES.fetch_add(u64::from(summary.unbound_bytes), Ordering::Relaxed);
+    ABI_LAST_BOUND_PARAMETERS.store(u64::from(summary.bound_parameters), Ordering::Relaxed);
+    ABI_LAST_UNBOUND_PARAMETERS.store(u64::from(summary.unbound_parameters), Ordering::Relaxed);
+    ABI_LAST_BOUND_BYTES.store(u64::from(summary.bound_bytes), Ordering::Relaxed);
+    ABI_LAST_KIND_BITS.store(u64::from(summary.kind_bits()), Ordering::Relaxed);
+}
+
+/// The last recorded ABI binding summary.
+///
+/// Unlike [`last_record`] this is available without arming the draw tracer, so
+/// the GPU proof can assert the per-draw counts directly.
+pub fn last_abi_binding() -> AbiBindingSummary {
+    let bits = ABI_LAST_KIND_BITS.load(Ordering::Relaxed) as u8;
+    AbiBindingSummary {
+        bound_parameters: ABI_LAST_BOUND_PARAMETERS.load(Ordering::Relaxed) as u32,
+        unbound_parameters: ABI_LAST_UNBOUND_PARAMETERS.load(Ordering::Relaxed) as u32,
+        bound_bytes: ABI_LAST_BOUND_BYTES.load(Ordering::Relaxed) as u32,
+        unbound_bytes: 0,
+        constants: bits & 0b001 != 0,
+        view: bits & 0b010 != 0,
+        table: bits & 0b100 != 0,
+    }
+}
+
+/// A snapshot of the process-wide ABI binding totals.
+pub fn abi_binding_telemetry() -> AbiBindingTelemetry {
+    AbiBindingTelemetry {
+        bound_parameters: ABI_BOUND_PARAMETERS.load(Ordering::Relaxed),
+        unbound_parameters: ABI_UNBOUND_PARAMETERS.load(Ordering::Relaxed),
+        bound_bytes: ABI_BOUND_BYTES.load(Ordering::Relaxed),
+        unbound_bytes: ABI_UNBOUND_BYTES.load(Ordering::Relaxed),
+        last_bound_parameters: ABI_LAST_BOUND_PARAMETERS.load(Ordering::Relaxed),
+        last_unbound_parameters: ABI_LAST_UNBOUND_PARAMETERS.load(Ordering::Relaxed),
+        last_bound_bytes: ABI_LAST_BOUND_BYTES.load(Ordering::Relaxed),
+        last_bound_kind: AbiBindingSummary {
+            bound_parameters: ABI_LAST_BOUND_PARAMETERS.load(Ordering::Relaxed) as u32,
+            unbound_parameters: ABI_LAST_UNBOUND_PARAMETERS.load(Ordering::Relaxed) as u32,
+            bound_bytes: ABI_LAST_BOUND_BYTES.load(Ordering::Relaxed) as u32,
+            unbound_bytes: 0,
+            constants: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b001 != 0,
+            view: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b010 != 0,
+            table: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b100 != 0,
+        }
+        .bound_kind(),
+    }
+}
+
+/// Clears the process-wide ABI binding totals and last-draw summary.
+///
+/// Test-only: a proof that runs several ABI shapes in one process starts each
+/// case from a clean count. Never called by the host.
+#[doc(hidden)]
+pub fn reset_abi_binding_telemetry() {
+    ABI_BOUND_PARAMETERS.store(0, Ordering::Relaxed);
+    ABI_UNBOUND_PARAMETERS.store(0, Ordering::Relaxed);
+    ABI_BOUND_BYTES.store(0, Ordering::Relaxed);
+    ABI_UNBOUND_BYTES.store(0, Ordering::Relaxed);
+    ABI_LAST_BOUND_PARAMETERS.store(0, Ordering::Relaxed);
+    ABI_LAST_UNBOUND_PARAMETERS.store(0, Ordering::Relaxed);
+    ABI_LAST_BOUND_BYTES.store(0, Ordering::Relaxed);
+    ABI_LAST_KIND_BITS.store(0, Ordering::Relaxed);
+}
+
 /// Bounded picture of what the tracer saw, for `telemetry.json`.
 ///
 /// When the trace is off this returns an all-zero report with
@@ -619,6 +721,54 @@ pub struct TraceTarget {
     pub swapchain: bool,
 }
 
+/// What one ABI flush wrote into the top-level argument buffer(s).
+///
+/// A parameter is **bound** only when a title `SetRootConstants`,
+/// `SetRootBufferView` or `SetDescriptorTable` wrote it. Every declared
+/// parameter without such a write is **unbound** and is filled with the zero
+/// default the builder starts from (`MEMORY_SPACE` host-owned parameters are
+/// also counted here: they are not title writes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AbiBindingSummary {
+    /// Declared parameters that received a title-written argument.
+    pub bound_parameters: u32,
+    /// Declared parameters with no title write (zero default).
+    pub unbound_parameters: u32,
+    /// Bytes a title-written argument occupies (constants bytes, 8-byte
+    /// device addresses / table pointers).
+    pub bound_bytes: u32,
+    /// Bytes the zero default covers for the unbound parameters.
+    pub unbound_bytes: u32,
+    /// At least one bound parameter is a root-constants block.
+    pub constants: bool,
+    /// At least one bound parameter is a root CBV/SRV/UAV.
+    pub view: bool,
+    /// At least one bound parameter is a descriptor table.
+    pub table: bool,
+}
+
+impl AbiBindingSummary {
+    /// `none`, `constants`, `view`, `table`, or the `+`-joined combination.
+    pub fn bound_kind(&self) -> &'static str {
+        let bits = self.kind_bits();
+        match bits {
+            0 => "none",
+            0b001 => "constants",
+            0b010 => "view",
+            0b100 => "table",
+            0b011 => "constants+view",
+            0b101 => "constants+table",
+            0b110 => "view+table",
+            _ => "constants+view+table",
+        }
+    }
+
+    /// Bit mask: bit 0 constants, bit 1 view, bit 2 table.
+    pub fn kind_bits(&self) -> u8 {
+        u8::from(self.constants) | (u8::from(self.view) << 1) | (u8::from(self.table) << 2)
+    }
+}
+
 /// One traced draw or dispatch.
 #[derive(Debug, Clone, Copy)]
 pub struct DrawRecord {
@@ -639,8 +789,17 @@ pub struct DrawRecord {
     pub scissor: Option<[u32; 4]>,
     /// Reflected argument-buffer parameters of the active pipeline.
     pub abi_parameters: u32,
-    /// Bytes of the stage argument buffers the call binds.
+    /// Bytes of the stage argument buffers the call binds (the declared layout
+    /// size; see [`AbiBindingSummary`] for what was title-written).
     pub abi_bytes: u32,
+    /// Parameters the title wrote for this draw.
+    pub abi_bound_parameters: u32,
+    /// Declared parameters this draw left at the zero default.
+    pub abi_unbound_parameters: u32,
+    /// Bytes the title-written arguments occupy.
+    pub abi_bound_bytes: u32,
+    /// `none|constants|view|table` (or a `+`-joined combination).
+    pub abi_bound: &'static str,
     /// Attachment the pass renders into, when known.
     pub target: Option<TraceTarget>,
 }
@@ -665,6 +824,11 @@ impl DrawRecord {
         out.push_str(&format!(
             " abi_parameters={} abi_bytes={}",
             self.abi_parameters, self.abi_bytes
+        ));
+        out.push_str(&format!(
+            " abi_bound_parameters={} abi_unbound_parameters={} abi_bound_bytes={} bound={}",
+            self.abi_bound_parameters, self.abi_unbound_parameters, self.abi_bound_bytes,
+            self.abi_bound
         ));
         match self.target {
             Some(target) => out.push_str(&format!(" rt={}", target_name(&target))),
@@ -935,6 +1099,10 @@ mod tests {
                 scissor: None,
                 abi_parameters: 0,
                 abi_bytes: 0,
+                abi_bound_parameters: 0,
+                abi_unbound_parameters: 0,
+                abi_bound_bytes: 0,
+                abi_bound: "none",
                 target: None,
             };
             assert!(state.record(record).is_some());
@@ -952,6 +1120,10 @@ mod tests {
                     scissor: None,
                     abi_parameters: 0,
                     abi_bytes: 0,
+                    abi_bound_parameters: 0,
+                    abi_unbound_parameters: 0,
+                    abi_bound_bytes: 0,
+                    abi_bound: "none",
                     target: None,
                 })
                 .is_none()
@@ -1029,6 +1201,10 @@ mod tests {
             scissor: Some([0, 0, 640, 360]),
             abi_parameters: 3,
             abi_bytes: 40,
+            abi_bound_parameters: 2,
+            abi_unbound_parameters: 1,
+            abi_bound_bytes: 24,
+            abi_bound: "constants+view",
             target: Some(TraceTarget {
                 texture: 0,
                 width: 1920,
@@ -1041,6 +1217,10 @@ mod tests {
         assert!(line.contains("kind=draw_indexed"));
         assert!(line.contains("count=36"));
         assert!(line.contains("viewport=0,0,1280,720"));
+        assert!(line.contains("abi_bound_parameters=2"));
+        assert!(line.contains("abi_unbound_parameters=1"));
+        assert!(line.contains("abi_bound_bytes=24"));
+        assert!(line.contains("bound=constants+view"));
         assert!(line.contains("rt=offscreen 1920x1080 rgba8unorm"));
     }
 

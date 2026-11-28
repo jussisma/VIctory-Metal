@@ -73,6 +73,33 @@ pub const WINDOW_FRAMES: usize = 4096;
 /// Histogram key for a refused call that has no wire opcode.
 pub const NO_OPCODE: u16 = u16::MAX;
 
+/// Graphics `SetGraphicsRoot*` calls the native producer accepted for this
+/// session. Boot #32 reads this to prove the guest actually forwarded the
+/// title's root arguments for the draws that encode (rather than the trace's
+/// declared `abi_bytes` being only the reflected layout size).
+static GRAPHICS_ROOT_RECORDED: AtomicU64 = AtomicU64::new(0);
+/// Graphics `SetGraphicsRoot*` calls the native producer refused or could not
+/// resolve, so a title write never became a wire root argument.
+static GRAPHICS_ROOT_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Records one accepted graphics root argument.
+pub fn note_graphics_root_argument_recorded() {
+    GRAPHICS_ROOT_RECORDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one graphics root argument the native producer did not accept.
+pub fn note_graphics_root_argument_dropped() {
+    GRAPHICS_ROOT_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(recorded, dropped)` graphics root-argument counts for this session.
+pub fn graphics_root_argument_counts() -> (u64, u64) {
+    (
+        GRAPHICS_ROOT_RECORDED.load(Ordering::Relaxed),
+        GRAPHICS_ROOT_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
 /// Maximum bytes of a host error reason kept in telemetry and logged.
 ///
 /// Matches [`victory_metal::wire::MAX_REPLY_REASON_BYTES`] so the guest never
@@ -1469,6 +1496,8 @@ impl FrameTelemetry {
             pool_warm: self.pool_warm.load(Ordering::Relaxed),
             registration_failures: self.registration_failures.load(Ordering::Relaxed),
             compute_dispatches_without_bindings: self.compute_dispatches_without_bindings(),
+            graphics_root_arguments_recorded: GRAPHICS_ROOT_RECORDED.load(Ordering::Relaxed),
+            graphics_root_arguments_dropped: GRAPHICS_ROOT_DROPPED.load(Ordering::Relaxed),
             pipeline_census: crate::native_metal::pso::census(),
             host_errors: self.host_error_count(),
             last_host_error: self.last_host_error(),
@@ -1580,6 +1609,10 @@ pub struct TelemetrySnapshot {
     pub registration_failures: u64,
     /// Compute dispatches recorded with no root view or descriptor table.
     pub compute_dispatches_without_bindings: u64,
+    /// Accepted graphics `SetGraphicsRoot*` calls (native path).
+    pub graphics_root_arguments_recorded: u64,
+    /// Graphics `SetGraphicsRoot*` calls the native producer did not accept.
+    pub graphics_root_arguments_dropped: u64,
     /// Native pipeline attempts, creations, reuses and refusals by kind
     /// (session totals: a pipeline made in an early frame stays counted).
     pub pipeline_census: crate::native_metal::pso::PipelineCensusSnapshot,
@@ -1636,13 +1669,15 @@ impl std::fmt::Display for TelemetrySnapshot {
         write!(
             f,
             ", registered={} buffers/{} psos, pool={} cold/{} warm, registration_failures={}, \
-             compute_unbound={}",
+             compute_unbound={}, graphics_root_arguments={}/{} recorded/dropped",
             self.buffers_registered,
             self.psos_registered,
             self.pool_cold,
             self.pool_warm,
             self.registration_failures,
-            self.compute_dispatches_without_bindings
+            self.compute_dispatches_without_bindings,
+            self.graphics_root_arguments_recorded,
+            self.graphics_root_arguments_dropped
         )?;
         write!(f, ", {}", self.pipeline_census.fields())?;
         write!(f, ", {}", self.heaps.fields())?;

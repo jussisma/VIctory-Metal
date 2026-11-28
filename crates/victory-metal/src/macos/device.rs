@@ -1199,6 +1199,9 @@ pub struct DirectMetalTransport {
     /// Descriptor-table sets a plan named as tables that the bound pipeline
     /// declares none of (a genuinely stale/correlated set).
     descriptor_table_stale_refusals: std::sync::atomic::AtomicU64,
+    /// Persisted root arguments dropped when a pipeline change produced a
+    /// layout that does not declare their `(space, register, kind)`.
+    abi_stale_parameters_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl DirectMetalTransport {
@@ -1269,6 +1272,7 @@ impl DirectMetalTransport {
             memory_space_bytes: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_inert_acceptances: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_stale_refusals: std::sync::atomic::AtomicU64::new(0),
+            abi_stale_parameters_dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1324,6 +1328,23 @@ impl DirectMetalTransport {
     fn count_descriptor_table_stale_refusal(&self) {
         self.descriptor_table_stale_refusals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Persisted root arguments dropped on a pipeline change.
+    ///
+    /// D3D12 root arguments persist until overwritten, so a binding is kept
+    /// across `SetPipeline`; one the new layout cannot express has no parameter
+    /// to map to, so it is dropped and counted here rather than refused.
+    pub fn abi_stale_parameter_count(&self) -> u64 {
+        self.abi_stale_parameters_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_abi_stale_parameters(&self, dropped: usize) {
+        if dropped > 0 {
+            self.abi_stale_parameters_dropped
+                .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Root arguments bound through the legacy wire-slot lookup, i.e. without a
@@ -4129,6 +4150,12 @@ enum PendingAbiBinding {
 }
 
 /// Root-signature bindings collected for the active pipeline, in wire order.
+///
+/// The state is D3D12 root state: a write replaces the binding for its slot and
+/// survives pipeline selection, `SetDescriptorHeaps` and a draw flush. A
+/// pipeline that does not declare the slot cannot express it, so
+/// [`Self::retain_declared`] drops exactly those stale entries when the layout
+/// changes; every entry that survives is re-emitted at the next draw.
 #[derive(Default)]
 struct AbiPending {
     bindings: Vec<PendingAbiBinding>,
@@ -4141,6 +4168,33 @@ impl AbiPending {
 
     fn clear(&mut self) {
         self.bindings.clear();
+    }
+
+    /// Records one title write, replacing the previous value of its slot.
+    fn set(&mut self, binding: PendingAbiBinding) {
+        let key = binding.key();
+        if let Some(existing) = self.bindings.iter_mut().find(|known| known.key() == key) {
+            *existing = binding;
+        } else {
+            self.bindings.push(binding);
+        }
+    }
+
+    /// Drops bindings the new stage layouts cannot express.
+    ///
+    /// A root argument written before a pipeline change still applies when the
+    /// new layout declares its `(space, register, kind)`; when it does not, the
+    /// layout has no parameter for it. Dropping that stale state keeps the
+    /// D3D12 persist-until-overwritten rule without refusing a pipeline that
+    /// legitimately dropped a parameter. Returns how many entries were dropped.
+    fn retain_declared(&mut self, stages: &[(ShaderStage, RootSignatureLayout)]) -> usize {
+        let before = self.bindings.len();
+        self.bindings.retain(|binding| {
+            stages
+                .iter()
+                .any(|(_, layout)| abi_parameter_index(layout, binding).is_some())
+        });
+        before - self.bindings.len()
     }
 }
 
@@ -4551,6 +4605,32 @@ impl PendingAbiBinding {
             | Self::Table { wire_slot, .. } => *wire_slot,
         }
     }
+
+    /// The kind discriminant the persistent root state is keyed by.
+    fn kind(&self) -> PendingAbiKind {
+        match self {
+            Self::Constants { .. } => PendingAbiKind::Constants,
+            Self::RootView { .. } => PendingAbiKind::RootView,
+            Self::Table { .. } => PendingAbiKind::Table,
+        }
+    }
+
+    /// `(kind, wire_slot)`: one title root-argument slot.
+    fn key(&self) -> (PendingAbiKind, usize) {
+        (self.kind(), self.wire_slot())
+    }
+}
+
+/// Which D3D12 root-argument kind one pending binding names.
+///
+/// The wire addresses root constants and root views by root-parameter slot and
+/// descriptor tables by their set ordinal; the two namespaces can overlap, so
+/// the persistent root state is keyed by both the kind and the wire index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PendingAbiKind {
+    Constants,
+    RootView,
+    Table,
 }
 
 /// Upper bound on bytes the default MEMORY_SPACE fallback may allocate for one
@@ -4976,21 +5056,20 @@ fn flush_abi(
     (
         Vec<PreparedArgumentBuffer>,
         Vec<(ShaderStage, usize, Vec<u8>)>,
+        crate::macos::trace::AbiBindingSummary,
     ),
     PrepareAbort,
 > {
     let device = transport.device_raw();
     let mut buffers = Vec::new();
     let mut bytes_ops = Vec::new();
-    if pending.is_empty()
-        && !stages.iter().any(|(_, layout)| {
-            layout
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.space() == victory_shader::emit::MEMORY_SPACE)
-        })
-    {
-        return Ok((buffers, bytes_ops));
+    let mut summary = crate::macos::trace::AbiBindingSummary::default();
+    // ADR-060: an empty pending set may skip the whole flush only when no
+    // active stage declares a root parameter. A stage that declares one must
+    // still receive a zero-filled argument buffer at `buffer(2)`, otherwise a
+    // shader reading its reflected parameters sees a stale (or no) binding.
+    if pending.is_empty() && !stages.iter().any(|(_, layout)| !layout.parameters().is_empty()) {
+        return Ok((buffers, bytes_ops, summary));
     }
 
     // ADR-055: build the live page table once for this flush. A stage that
@@ -5238,8 +5317,65 @@ fn flush_abi(
             transport.count_memory_space(unbound.len() as u64, zero.len() as u64);
         }
 
+        // A stage that binds root constants through a dedicated `setBytes`
+        // index (rather than inline in buffer 2) must also receive the zero
+        // default when the title never wrote it, so the shader never reads a
+        // stale value at that index.
+        if stage_bytes.is_none()
+            && let Some(metal_index) = layout.root_constants_metal_index()
+            && let Some((index, parameter)) = layout
+                .parameters()
+                .iter()
+                .enumerate()
+                .find(|(_, parameter)| parameter.kind() == RootParameterKind::Constants)
+            && !bound_per_stage[stage_index][index]
+        {
+            bytes_ops.push((*stage, metal_index, vec![0u8; parameter.size()]));
+        }
         if let Some((index, bytes)) = stage_bytes {
             bytes_ops.push((*stage, index, bytes));
+        }
+        // ADR-060: count what this stage's argument buffer actually carries.
+        // A parameter is bound only when a title write resolved to it; every
+        // other declared parameter keeps the builder's zero default (a
+        // MEMORY_SPACE page-table binding is host-owned, so it also counts as
+        // unbound here and is reported separately by `memory_space_counters`).
+        let bound_flags = &bound_per_stage[stage_index];
+        for (index, parameter) in layout.parameters().iter().enumerate() {
+            if bound_flags[index] {
+                summary.bound_parameters = summary.bound_parameters.saturating_add(1);
+                if let Some(binding) = pending
+                    .bindings
+                    .iter()
+                    .find(|binding| abi_parameter_index(layout, binding) == Some(index))
+                {
+                    match binding {
+                        PendingAbiBinding::Constants { bytes, .. } => {
+                            summary.bound_bytes = summary
+                                .bound_bytes
+                                .saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+                            summary.constants = true;
+                        }
+                        PendingAbiBinding::RootView { .. } => {
+                            summary.bound_bytes = summary
+                                .bound_bytes
+                                .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
+                            summary.view = true;
+                        }
+                        PendingAbiBinding::Table { .. } => {
+                            summary.bound_bytes = summary
+                                .bound_bytes
+                                .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
+                            summary.table = true;
+                        }
+                    }
+                }
+            } else {
+                summary.unbound_parameters = summary.unbound_parameters.saturating_add(1);
+                summary.unbound_bytes = summary
+                    .unbound_bytes
+                    .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
+            }
         }
         let mut heap = None;
         let mut title_owned = Vec::new();
@@ -5253,7 +5389,12 @@ fn flush_abi(
             }
             heap = retain_object(binding.heap);
         }
-        if builder.encoded_parameters() == 0 {
+        // A stage with a declared parameter always receives its argument
+        // buffer, even when nothing was title-written: the builder is
+        // zero-filled, so the zero default is bound and counted as unbound. A
+        // layout with no parameter at all is skipped (its shader cannot read
+        // buffer 2, and binding it would risk overwriting a real vertex stream).
+        if builder.encoded_parameters() == 0 && layout.parameters().is_empty() {
             continue;
         }
         let buffer = new_argument_buffer(device, builder.bytes())?;
@@ -5267,7 +5408,7 @@ fn flush_abi(
             resources: resources.into_iter().map(|(resource, _)| resource).collect(),
         });
     }
-    Ok((buffers, bytes_ops))
+    Ok((buffers, bytes_ops, summary))
 }
 
 /// Stage layouts a render-family pipeline binds converter argument buffers for.
@@ -5292,6 +5433,7 @@ fn trace_encoded_work(
     scissor: Option<[u32; 4]>,
     abi: Option<&PipelineAbi>,
     mesh_family: bool,
+    bindings: crate::macos::trace::AbiBindingSummary,
     target: Option<crate::macos::trace::TraceTarget>,
 ) {
     let Some(trace) = state.trace.as_mut() else {
@@ -5311,6 +5453,10 @@ fn trace_encoded_work(
         scissor,
         abi_parameters: parameters,
         abi_bytes: bytes,
+        abi_bound_parameters: bindings.bound_parameters,
+        abi_unbound_parameters: bindings.unbound_parameters,
+        abi_bound_bytes: bindings.bound_bytes,
+        abi_bound: bindings.bound_kind(),
         target,
     };
     if let Some(line) = trace.record(record) {
@@ -5319,6 +5465,11 @@ fn trace_encoded_work(
 }
 
 /// Counts a pipeline's reflected parameters and argument-buffer bytes.
+///
+/// This is the *declared* layout size (the trace's `abi_parameters`/
+/// `abi_bytes`), not a measure of what is uploaded: an empty-pending draw still
+/// reports it. `AbiBindingSummary` reports the parameters actually written into
+/// `buffer(2)` and which of them came from a title write.
 fn abi_argument_summary(abi: Option<&PipelineAbi>, mesh_family: bool) -> (u32, u32) {
     let Some(abi) = abi else {
         return (0, 0);
@@ -5350,7 +5501,43 @@ fn abi_render_stages(
         .collect()
 }
 
+/// Keeps the title's persisted root arguments that a render layout can express.
+fn retain_pending_for_layout(
+    transport: &DirectMetalTransport,
+    pending: &mut AbiPending,
+    abi: Option<&PipelineAbi>,
+    mesh_family: bool,
+) {
+    let stages = abi
+        .map(|abi| abi_render_stages(abi, mesh_family))
+        .unwrap_or_default();
+    let dropped = pending.retain_declared(&stages);
+    transport.count_abi_stale_parameters(dropped);
+}
+
+/// Keeps the title's persisted root arguments that a compute layout can express.
+fn retain_pending_for_compute_layout(
+    transport: &DirectMetalTransport,
+    pending: &mut AbiPending,
+    abi: Option<&PipelineAbi>,
+) {
+    let stages: Vec<(ShaderStage, RootSignatureLayout)> = abi
+        .map(|abi| {
+            abi.stages_for(ReflectedStage::Compute)
+                .into_iter()
+                .map(|(stage, layout)| (stage, layout.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let dropped = pending.retain_declared(&stages);
+    transport.count_abi_stale_parameters(dropped);
+}
+
 /// Flushes collected root-signature bindings for a render-family pipeline.
+///
+/// `record` is false for the end-of-sub-pass flush that only re-establishes the
+/// encoder state after the last draw; it never corresponds to encoded work, so
+/// it does not move the process-wide ABI counters.
 fn flush_render_abi(
     transport: &DirectMetalTransport,
     state: &mut DeviceState,
@@ -5358,27 +5545,44 @@ fn flush_render_abi(
     mesh_family: bool,
     pending: &mut AbiPending,
     ops: &mut Vec<PreparedRenderOp>,
-) -> Result<(), PrepareAbort> {
+    record: bool,
+) -> Result<crate::macos::trace::AbiBindingSummary, PrepareAbort> {
     let Some(abi) = abi else {
         pending.clear();
-        return Ok(());
+        let summary = crate::macos::trace::AbiBindingSummary::default();
+        if record {
+            crate::macos::trace::note_abi_binding(summary);
+        }
+        return Ok(summary);
     };
     let stages = abi_render_stages(abi, mesh_family);
-    // ADR-058: a translated stage whose MEMORY_SPACE t0/u0 is host-owned has
-    // no pending wire binding, so the empty-pending shortcut must not skip the
-    // live page-table bind.
-    if pending.is_empty() && !crate::macos::memory_space_bind::declares_memory_space(&stages) {
-        return Ok(());
+    // ADR-058/ADR-060: the empty-pending shortcut may skip only when no stage
+    // declares a parameter at all. `declares_memory_space` keeps the ADR-058
+    // gate telemetry; the broader `any parameter` test is the G6 condition: a
+    // declared non-MEMORY_SPACE parameter still needs its zero-filled buffer.
+    if pending.is_empty()
+        && !crate::macos::memory_space_bind::declares_memory_space(&stages)
+        && !stages
+            .iter()
+            .any(|(_, layout)| !layout.parameters().is_empty())
+    {
+        let summary = crate::macos::trace::AbiBindingSummary::default();
+        if record {
+            crate::macos::trace::note_abi_binding(summary);
+        }
+        return Ok(summary);
     }
-    let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
+    let (buffers, bytes_ops, summary) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
     }
     for (stage, slot, bytes) in bytes_ops {
         ops.push(PreparedRenderOp::StageBytes { stage, slot, bytes });
     }
-    pending.clear();
-    Ok(())
+    if record {
+        crate::macos::trace::note_abi_binding(summary);
+    }
+    Ok(summary)
 }
 
 /// Flushes collected root-signature bindings for a compute pipeline.
@@ -5388,28 +5592,37 @@ fn flush_compute_abi(
     abi: Option<&PipelineAbi>,
     pending: &mut AbiPending,
     ops: &mut Vec<PreparedComputeOp>,
-) -> Result<(), PrepareAbort> {
+) -> Result<crate::macos::trace::AbiBindingSummary, PrepareAbort> {
     let Some(abi) = abi else {
         pending.clear();
-        return Ok(());
+        let summary = crate::macos::trace::AbiBindingSummary::default();
+        crate::macos::trace::note_abi_binding(summary);
+        return Ok(summary);
     };
     let stages: Vec<(ShaderStage, RootSignatureLayout)> = abi
         .stages_for(ReflectedStage::Compute)
         .into_iter()
         .map(|(stage, layout)| (stage, layout.clone()))
         .collect();
-    if pending.is_empty() && !crate::macos::memory_space_bind::declares_memory_space(&stages) {
-        return Ok(());
+    if pending.is_empty()
+        && !crate::macos::memory_space_bind::declares_memory_space(&stages)
+        && !stages
+            .iter()
+            .any(|(_, layout)| !layout.parameters().is_empty())
+    {
+        let summary = crate::macos::trace::AbiBindingSummary::default();
+        crate::macos::trace::note_abi_binding(summary);
+        return Ok(summary);
     }
-    let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
+    let (buffers, bytes_ops, summary) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedComputeOp::ArgumentBuffer(buffer));
     }
     for (_stage, slot, bytes) in bytes_ops {
         ops.push(PreparedComputeOp::Bytes { slot, bytes });
     }
-    pending.clear();
-    Ok(())
+    crate::macos::trace::note_abi_binding(summary);
+    Ok(summary)
 }
 
 fn validate_viewport(
@@ -5584,15 +5797,15 @@ fn prepare_compute_segment(
         match &commands[index] {
             CommandV3::SetComputePipeline(pipeline) => {
                 let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
-                pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                retain_pending_for_compute_layout(transport, &mut pending, abi.as_ref());
                 current_pipeline_id = pipeline.pipeline_id;
                 ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
             CommandV3::SetPipeline(pipeline) => {
                 let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
-                pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                retain_pending_for_compute_layout(transport, &mut pending, abi.as_ref());
                 current_pipeline_id = pipeline.pipeline_id;
                 ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
@@ -5610,7 +5823,8 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
+                let abi_bindings =
+                    flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 trace_encoded_work(
                     state,
@@ -5622,6 +5836,7 @@ fn prepare_compute_segment(
                     None,
                     abi.as_ref(),
                     false,
+                    abi_bindings,
                     None,
                 );
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
@@ -5652,7 +5867,8 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
+                let abi_bindings =
+                    flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 trace_encoded_work(
                     state,
@@ -5664,6 +5880,7 @@ fn prepare_compute_segment(
                     None,
                     abi.as_ref(),
                     false,
+                    abi_bindings,
                     None,
                 );
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
@@ -5723,7 +5940,8 @@ fn prepare_compute_segment(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
+                let abi_bindings =
+                    flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_indirect();
                 trace_encoded_work(
                     state,
@@ -5735,6 +5953,7 @@ fn prepare_compute_segment(
                     None,
                     abi.as_ref(),
                     false,
+                    abi_bindings,
                     None,
                 );
                 ops.push(PreparedComputeOp::DispatchIndirect {
@@ -5770,7 +5989,7 @@ fn prepare_compute_segment(
                         )
                         .into());
                     }
-                    pending.bindings.push(PendingAbiBinding::Constants {
+                    pending.set(PendingAbiBinding::Constants {
                         slot,
                         wire_slot: usize::from(constants.slot),
                         bytes: constants.bytes.clone(),
@@ -5816,7 +6035,7 @@ fn prepare_compute_segment(
                         )
                         .into());
                     }
-                    pending.bindings.push(build_descriptor_table(
+                    pending.set(build_descriptor_table(
                         device,
                         state,
                         allocations,
@@ -5887,7 +6106,7 @@ fn prepare_compute_segment(
                         .ok_or(MetalError::InvalidArg(
                             "root buffer view address overflows u64",
                         ))?;
-                    pending.bindings.push(PendingAbiBinding::RootView {
+                    pending.set(PendingAbiBinding::RootView {
                         slot,
                         wire_slot: usize::from(view.slot),
                         address,
@@ -6447,8 +6666,8 @@ fn build_render_ops(
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
-                pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                retain_pending_for_layout(transport, &mut pending, abi.as_ref(), false);
                 ops.push(PreparedRenderOp::Pipeline {
                     state: state_raw,
                     depth_state,
@@ -6495,8 +6714,8 @@ fn build_render_ops(
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
-                pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                retain_pending_for_layout(transport, &mut pending, abi.as_ref(), false);
                 ops.push(PreparedRenderOp::Pipeline {
                     state: state_raw,
                     depth_state,
@@ -6538,8 +6757,8 @@ fn build_render_ops(
                         depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
                     }
                 }
-                pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                retain_pending_for_layout(transport, &mut pending, abi.as_ref(), true);
                 ops.push(PreparedRenderOp::Pipeline {
                     state: state_raw,
                     depth_state,
@@ -6691,7 +6910,7 @@ fn build_render_ops(
                         )
                         .into());
                     }
-                    pending.bindings.push(PendingAbiBinding::Constants {
+                    pending.set(PendingAbiBinding::Constants {
                         slot,
                         wire_slot: usize::from(constants.slot),
                         bytes: constants.bytes.clone(),
@@ -6737,7 +6956,7 @@ fn build_render_ops(
                         )
                         .into());
                     }
-                    pending.bindings.push(build_descriptor_table(
+                    pending.set(build_descriptor_table(
                         device,
                         state,
                         allocations,
@@ -6808,7 +7027,7 @@ fn build_render_ops(
                         .ok_or(MetalError::InvalidArg(
                             "root buffer view address overflows u64",
                         ))?;
-                    pending.bindings.push(PendingAbiBinding::RootView {
+                    pending.set(PendingAbiBinding::RootView {
                         slot,
                         wire_slot: usize::from(view.slot),
                         address,
@@ -6853,13 +7072,14 @@ fn build_render_ops(
                     )
                     .into());
                 }
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_mesh_dispatch();
                 trace_encoded_work(
@@ -6872,6 +7092,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DispatchMesh {
@@ -6898,13 +7119,14 @@ fn build_render_ops(
                     )
                     .into());
                 }
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_draw();
                 trace_encoded_work(
@@ -6917,6 +7139,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::Draw {
@@ -6940,13 +7163,14 @@ fn build_render_ops(
                     )
                     .into());
                 }
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_draw();
                 trace_encoded_work(
@@ -6959,6 +7183,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::Draw {
@@ -6983,13 +7208,14 @@ fn build_render_ops(
                         MetalError::InvalidArg("draw instance count must be nonzero").into(),
                     );
                 }
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_draw_indexed();
                 trace_encoded_work(
@@ -7002,6 +7228,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DrawIndexed {
@@ -7032,13 +7259,14 @@ fn build_render_ops(
                         MetalError::InvalidArg("draw instance count must be nonzero").into(),
                     );
                 }
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_draw_indexed();
                 trace_encoded_work(
@@ -7051,6 +7279,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DrawIndexed {
@@ -7078,13 +7307,14 @@ fn build_render_ops(
                     indirect::DRAW_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_indirect();
                 trace_encoded_work(
@@ -7097,6 +7327,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DrawIndirect {
@@ -7120,13 +7351,14 @@ fn build_render_ops(
                     indirect::DRAW_INDEXED_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_indirect();
                 trace_encoded_work(
@@ -7139,6 +7371,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DrawIndexedIndirect {
@@ -7164,13 +7397,14 @@ fn build_render_ops(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_render_abi(
+                let abi_bindings = flush_render_abi(
                     transport,
                     state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
                     &mut ops,
+                    true,
                 )?;
                 transport.encode_counters.bump_indirect();
                 trace_encoded_work(
@@ -7183,6 +7417,7 @@ fn build_render_ops(
                     scissor_rect,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
+                    abi_bindings,
                     trace_target,
                 );
                 ops.push(PreparedRenderOp::DispatchMeshIndirect {
@@ -7200,7 +7435,8 @@ fn build_render_ops(
     }
     // A sub-pass can end on state that no draw consumed (for example right
     // before an explicit clear). Emit those bindings so the encoder is in the
-    // same state the pass had reached.
+    // same state the pass had reached. This flush encodes no work, so it does
+    // not move the process-wide ABI counters.
     flush_render_abi(
         transport,
         state,
@@ -7208,6 +7444,7 @@ fn build_render_ops(
         mesh_pipeline.is_some(),
         &mut pending,
         &mut ops,
+        false,
     )?;
     Ok(ops)
 }

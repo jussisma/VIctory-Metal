@@ -102,9 +102,39 @@ fragment MrtOut bind_fragment(constant BindAbi &abi [[buffer(2)]]) {
 }
 "#;
 
-/// Content-hashed compute shader used by the optional compute proof.
-const COMPUTE_MSL: &str = r#"
+/// Content-hashed graphics shader whose vertex stage reads *both* a vertex
+/// stream at `buffer(0)` and a root-constants block in the top-level argument
+/// buffer at `buffer(2)`.
+///
+/// The flat varying takes the provoking (first) vertex, so the exact pixel is
+/// `verts[0] + tint`: `[1,1,0,1]` (yellow) when the title wrote the constant,
+/// `[1,0,0,1]` (red) when the zero-filled default is bound instead.
+const ROOT_ARG_MIX_MSL: &str = r#"
 #include <metal_stdlib>
+using namespace metal;
+
+struct RootArgOut {
+    float4 position [[position]];
+    float4 colour [[flat]];
+};
+
+vertex RootArgOut ra_vertex(uint vid [[vertex_id]],
+                            const device float4 *verts [[buffer(0)]],
+                            constant float4 &tint [[buffer(2)]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    RootArgOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    out.colour = verts[vid] + tint;
+    return out;
+}
+
+fragment float4 ra_fragment(RootArgOut in [[stage_in]]) {
+    return in.colour;
+}
+"#;
+
+/// Content-hashed compute shader used by the optional compute proof.
+const COMPUTE_MSL: &str = r#"#include <metal_stdlib>
 using namespace metal;
 
 struct BindAbi {
@@ -1498,5 +1528,196 @@ fn a_planned_root_view_binds_the_translated_parameter_and_draws() {
         info.name_str(),
         target0[0],
         target1[0]
+    );
+}
+
+/// ADR-060 / G6: a translated vertex stage that reads a vertex buffer and a
+/// root constant draws exact yellow only when the title's constant was uploaded
+/// into `buffer(2)`. The same draw without the title write still encodes, binds
+/// a zero-filled argument buffer, draws exact red (the unmodified vertex
+/// colour) and reports `abi_bound_parameters == 0` with
+/// `abi_unbound_parameters > 0`.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn root_constant_and_vertex_buffer_bind_together_and_zero_fills_when_unwritten() {
+    let dir = TempDir::new("submit-v3-root-arg-mix");
+    let Some(metallib) = compile_metallib(dir.path(), "root-arg-mix", ROOT_ARG_MIX_MSL) else {
+        eprintln!(
+            "PARTIAL: Apple Metal toolchain (metal/metallib) not found; root-argument mix proof skipped"
+        );
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    const TARGET: u64 = 0x2200;
+    transport
+        .register_registry_texture(TARGET, rgba8_desc(EDGE, EDGE))
+        .expect("registry colour target must create");
+
+    // The translated vertex signature's root constants: a 16-byte block at
+    // USER_DATA space, register 0, flattened parameter 0.
+    let vertex_layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Vertex,
+        &[RootParameterSpec {
+            kind: RootParameterKind::Constants,
+            size: 16,
+            register: 0,
+            space: 0,
+        }],
+    )
+    .expect("vertex root signature must build");
+
+    let pipeline_state = victory_metal::macos::registry::PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("ra_fragment".to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+    const HANDLE: u64 = 0x6200;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "ra_vertex",
+            &pipeline_state,
+            PipelineAbi::graphics(Some(vertex_layout), None),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    // Vertex stream at buffer(0): the provoking vertex is [1, 0, 0, 1].
+    let mut vertices = Vec::with_capacity(3 * 16);
+    for colour in [
+        [1.0f32, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ] {
+        for value in colour {
+            vertices.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let mut vertex_page = HostPage::new(16 * 1024);
+    vertex_page.write(0, &vertices);
+    // SAFETY: the page is live for the whole test.
+    let vertex_id = unsafe { transport.register_zerocopy(vertex_page.raw(), 16 * 1024) }
+        .expect("vertex page must register");
+
+    let mut snapshot = HashMap::new();
+    snapshot.insert((1u64, 1u32), VmBufferId(TARGET));
+    snapshot.insert((2u64, 1u32), vertex_id);
+
+    let commands = |with_constant: bool| {
+        let mut commands = vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(1, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetVertexBuffers(VertexBufferSet {
+                start_slot: 0,
+                buffers: vec![VertexBuffer {
+                    allocation_id: 2,
+                    generation: 1,
+                    offset: 0,
+                    stride: 16,
+                    length: vertices.len() as u64,
+                }],
+            }),
+        ];
+        if with_constant {
+            // Title root parameter 0 is the constants block; the vertex tint
+            // adds green to the provoking vertex's red.
+            commands.push(CommandV3::SetRootConstants(RootConstantsV3 {
+                slot: 0,
+                bytes: float4_bytes([0.0, 1.0, 0.0, 0.0]),
+            }));
+        }
+        commands.push(CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }));
+        commands.push(CommandV3::EndRenderPass);
+        commands
+    };
+
+    // (a) The title writes the constant: it must be uploaded and bound with
+    // the vertex stream, producing exact yellow.
+    let plan = victory_metal::root_arguments::decode_root_plan(&encoded_root_plan(&[
+        root_plan_record(0, 0, 0, 0),
+    ]))
+    .expect("the root-argument plan decodes");
+    let written = SubmissionV3 {
+        sequence: 121,
+        list: Some(ListIdentity {
+            list_id: 31,
+            list_generation: 1,
+        }),
+        commands: commands(true),
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats_and_plan(&written, &snapshot, Some(&plan))
+        .expect("the written-constant pass must execute");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    assert_eq!(stats.render_encoders, 1);
+    let bindings = victory_metal::macos::trace::last_abi_binding();
+    assert_eq!(bindings.bound_parameters, 1, "one title-written parameter");
+    assert_eq!(bindings.unbound_parameters, 0, "nothing defaulted");
+    assert_eq!(bindings.bound_bytes, 16, "16 constant bytes uploaded");
+    assert_eq!(bindings.bound_kind(), "constants");
+    transport.wait_for_gpu().expect("the written pass completes");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("written-constant target readback");
+    assert_uniform(&pixels, [255, 255, 0, 255], "written-constant target");
+
+    // (b) No title write: the draw still encodes, a zero-filled argument
+    // buffer is bound, and the pixel is the vertex colour with a zero tint.
+    let unwritten = SubmissionV3 {
+        sequence: 122,
+        list: Some(ListIdentity {
+            list_id: 32,
+            list_generation: 1,
+        }),
+        commands: commands(false),
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats_and_plan(&unwritten, &snapshot, Some(&plan))
+        .expect("the unwritten-constant pass must execute");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    assert_eq!(stats.render_encoders, 1, "the draw still encodes");
+    let bindings = victory_metal::macos::trace::last_abi_binding();
+    assert_eq!(
+        bindings.bound_parameters, 0,
+        "a zero default is not a title binding"
+    );
+    assert!(
+        bindings.unbound_parameters > 0,
+        "the declared block is counted as unbound"
+    );
+    assert_eq!(bindings.bound_bytes, 0);
+    assert_eq!(bindings.bound_kind(), "none");
+    transport.wait_for_gpu().expect("the unwritten pass completes");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("unwritten-constant target readback");
+    assert_uniform(&pixels, [255, 0, 0, 255], "unwritten-constant target");
+
+    transport
+        .unregister_buffer(vertex_id)
+        .expect("unregister the vertex page");
+    eprintln!(
+        "root-argument mix proof on {}: written={:?} (bound=1), unwritten={:?} (bound=0, unbound={})",
+        info.name_str(),
+        [255u8, 255, 0, 255],
+        [255u8, 0, 0, 255],
+        bindings.unbound_parameters
     );
 }

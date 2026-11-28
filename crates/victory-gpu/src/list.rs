@@ -520,6 +520,7 @@ fn bind_compute_root_view(this: This, slot: u32, address: u64) {
 fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
     use crate::native_metal::bindings;
     let Ok(slot) = u16::try_from(slot) else {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         refuse_binding(
             this,
             "a root view slot does not fit the wire",
@@ -528,6 +529,7 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
         return;
     };
     let Some(resolver) = bindings::resolver() else {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         refuse_binding(
             this,
             "a root view needs the guest range resolver",
@@ -538,12 +540,14 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
     let resolved = match bindings::root_buffer_view_page(&*resolver, slot, address) {
         Ok(resolved) => resolved,
         Err(error) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
             refuse_binding(this, "a root view could not be resolved", error);
             return;
         }
     };
     let (view, tokens) = resolved.into_parts();
     if let Err(error) = crate::native_metal::queue::register_allocation_entry(view.allocation_id) {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         bindings::retire_all(&*resolver, &tokens);
         refuse_unregistered(
             this,
@@ -562,8 +566,15 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
         result
     });
     match recorded {
-        Some(true) => retain_on_list(this, &tokens),
-        _ => bindings::retire_all(&*resolver, &tokens),
+        Some(true) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_recorded();
+            retain_on_list(this, &tokens);
+        }
+        Some(false) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
+            bindings::retire_all(&*resolver, &tokens);
+        }
+        None => bindings::retire_all(&*resolver, &tokens),
     }
 }
 
@@ -1109,6 +1120,7 @@ fn buffer_entry(
 fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     use crate::native_metal::bindings;
     let Ok(slot) = u16::try_from(slot) else {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         refuse_binding(
             this,
             "a descriptor table slot does not fit the wire",
@@ -1117,6 +1129,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         return;
     };
     if handle == 0 {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         refuse_binding(
             this,
             "a descriptor table handle is zero",
@@ -1125,6 +1138,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         return;
     }
     let Some(resolver) = bindings::resolver() else {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         refuse_binding(
             this,
             "a descriptor table needs the guest range resolver",
@@ -1138,6 +1152,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     ) {
         Ok(run) => run,
         Err(error) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
             refuse_binding(this, "a descriptor table could not be enumerated", error);
             return;
         }
@@ -1147,6 +1162,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
             refuse_binding(this, "a descriptor table could not be resolved", error);
             return;
         }
@@ -1157,6 +1173,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         crate::native_metal::queue::texture_registered,
         crate::native_metal::queue::sampler_registered,
     ) {
+        crate::native_metal::telemetry::note_graphics_root_argument_dropped();
         bindings::retire_all(&*resolver, &tokens);
         refuse_binding(
             this,
@@ -1172,6 +1189,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         if let Err(error) =
             crate::native_metal::queue::register_allocation_entry(binding.allocation_id)
         {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
             bindings::retire_all(&*resolver, &tokens);
             refuse_unregistered(
                 this,
@@ -1193,8 +1211,15 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         result
     });
     match recorded {
-        Some(true) => retain_on_list(this, &tokens),
-        _ => bindings::retire_all(&*resolver, &tokens),
+        Some(true) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_recorded();
+            retain_on_list(this, &tokens);
+        }
+        Some(false) => {
+            crate::native_metal::telemetry::note_graphics_root_argument_dropped();
+            bindings::retire_all(&*resolver, &tokens);
+        }
+        None => bindings::retire_all(&*resolver, &tokens),
     }
 }
 
@@ -3753,14 +3778,22 @@ mod state {
         offset: u32,
     ) {
         if metal() {
+            let mut recorded = None;
             with_metal(this, |p| {
-                p.set_graphics_root_constants_at(
+                let result = p.set_graphics_root_constants_at(
                     slot,
                     victory_shader::emit::USER_DATA_SPACE as u16,
                     &[value],
                     offset,
-                )
+                );
+                recorded = Some(result.is_ok());
+                result
             });
+            match recorded {
+                Some(true) => crate::native_metal::telemetry::note_graphics_root_argument_recorded(),
+                Some(false) => crate::native_metal::telemetry::note_graphics_root_argument_dropped(),
+                None => {}
+            }
             return;
         }
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
@@ -3797,14 +3830,22 @@ mod state {
     ) {
         if metal() {
             let values = items(values, count);
+            let mut recorded = None;
             with_metal(this, |p| {
-                p.set_graphics_root_constants_at(
+                let result = p.set_graphics_root_constants_at(
                     slot,
                     victory_shader::emit::USER_DATA_SPACE as u16,
                     values,
                     offset,
-                )
+                );
+                recorded = Some(result.is_ok());
+                result
             });
+            match recorded {
+                Some(true) => crate::native_metal::telemetry::note_graphics_root_argument_recorded(),
+                Some(false) => crate::native_metal::telemetry::note_graphics_root_argument_dropped(),
+                None => {}
+            }
             return;
         }
         with_state(this, |_, s| {
