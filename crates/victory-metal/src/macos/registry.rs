@@ -316,7 +316,12 @@ impl UnsupportedDxgiFormat {
 
 impl std::fmt::Display for UnsupportedDxgiFormat {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "{} ({}) has no Metal pixel format", self.name(), self.0)
+        write!(
+            out,
+            "{} ({}) has no Metal pixel format",
+            self.name(),
+            self.0
+        )
     }
 }
 
@@ -1566,6 +1571,9 @@ pub struct TextureView {
     kind: TextureViewKind,
     format: TextureFormat,
     subresource: TextureSubresource,
+    /// The view is the full resource in the source format, so it resolved to
+    /// the source `MTLTexture` object itself (one object per allocation).
+    aliases_source: bool,
 }
 
 impl TextureView {
@@ -1589,9 +1597,173 @@ impl TextureView {
         self.subresource
     }
 
+    /// Whether this view is the source `MTLTexture` object itself.
+    pub fn aliases_source(&self) -> bool {
+        self.aliases_source
+    }
+
+    /// Process-local object identity of the view's `MTLTexture`.
+    ///
+    /// Exposed so the hardware identity gate can prove two handles resolve to
+    /// one object; never used on the frame path.
+    #[doc(hidden)]
+    pub fn object_identity(&self) -> usize {
+        self.texture.as_raw() as usize
+    }
+
     pub(crate) fn raw(&self) -> objc::Id {
         self.texture.as_raw()
     }
+}
+
+/// Why a second `MTLTexture` object exists for one registered handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureObjectOrigin {
+    /// `newTextureWithDescriptor` for the handle itself.
+    Creation,
+    /// `newTextureViewWithPixelFormat` over a sub-range or another format.
+    View,
+}
+
+/// One distinct host `MTLTexture` object created for a registered handle.
+#[derive(Debug, Clone, Copy)]
+struct TextureObjectRecord {
+    texture: usize,
+}
+
+/// Bounded host object identity census.
+///
+/// The contract is one `MTLTexture` object per guest allocation (the kind-8
+/// handle): a duplicate registration widens the stored usage and a full-resource
+/// same-format RTV is aliased to the base object. A real sub-range or
+/// different-format view is a second object and is counted as a conflict, never
+/// silently aliased. Bounded so a long boot cannot grow it without limit.
+#[derive(Debug, Default)]
+struct TextureObjectCensus {
+    per_handle: HashMap<u64, Vec<TextureObjectRecord>>,
+    dropped_handles: u64,
+    dropped_objects: u64,
+    views_aliased: u64,
+    conflicts: u64,
+}
+
+static TEXTURE_OBJECT_CENSUS: std::sync::Mutex<Option<TextureObjectCensus>> =
+    std::sync::Mutex::new(None);
+
+/// Handles the objects-per-allocation census remembers.
+const TEXTURE_OBJECT_HANDLE_MAX: usize = 4096;
+/// Distinct objects remembered per handle.
+const TEXTURE_OBJECTS_PER_HANDLE_MAX: usize = 8;
+
+fn with_texture_object_census<R>(f: impl FnOnce(&mut TextureObjectCensus) -> R) -> R {
+    let mut guard = TEXTURE_OBJECT_CENSUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let census = guard.get_or_insert_with(TextureObjectCensus::default);
+    f(census)
+}
+
+/// Records one live `MTLTexture` object for `id`.
+///
+/// Recording the same pointer twice is idempotent: a retain is the same object.
+/// A second pointer for one handle is a conflict, and a `View` is named as such
+/// so the histogram reason can distinguish an RTV wrapper from a re-created
+/// allocation.
+fn note_texture_object_for(id: u64, texture: usize, origin: TextureObjectOrigin) {
+    with_texture_object_census(|census| {
+        if !census.per_handle.contains_key(&id) {
+            if census.per_handle.len() >= TEXTURE_OBJECT_HANDLE_MAX {
+                census.dropped_handles = census.dropped_handles.saturating_add(1);
+                return;
+            }
+            census
+                .per_handle
+                .insert(id, vec![TextureObjectRecord { texture }]);
+            return;
+        }
+        let records = census
+            .per_handle
+            .get_mut(&id)
+            .expect("handle was just checked");
+        if records.iter().any(|record| record.texture == texture) {
+            return;
+        }
+        if records.len() >= TEXTURE_OBJECTS_PER_HANDLE_MAX {
+            census.dropped_objects = census.dropped_objects.saturating_add(1);
+            return;
+        }
+        records.push(TextureObjectRecord { texture });
+        if origin == TextureObjectOrigin::View {
+            census.conflicts = census.conflicts.saturating_add(1);
+        }
+    });
+}
+
+/// Notes that a full-resource RTV resolved to the base object instead of a new
+/// `MTLTexture` view (one object per allocation).
+fn note_texture_view_aliased() {
+    with_texture_object_census(|census| {
+        census.views_aliased = census.views_aliased.saturating_add(1);
+    });
+}
+
+/// Histogram of distinct `MTLTexture` objects per registered handle:
+/// `(objects, handles)` rows sorted by object count.
+///
+/// A healthy process reports `(1, n)` only. A row with `objects >= 2` names an
+/// identity split (a view wrapper or a handle re-created while a surface or
+/// pass still used the old object).
+pub fn texture_objects_per_allocation() -> Vec<(u64, u64)> {
+    let guard = TEXTURE_OBJECT_CENSUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(census) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut histogram: HashMap<u64, u64> = HashMap::new();
+    for records in census.per_handle.values() {
+        let count = u64::try_from(records.len().max(1)).unwrap_or(u64::MAX);
+        *histogram.entry(count).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(u64, u64)> = histogram.into_iter().collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Whether both texture pointers were observed for the same registered handle.
+///
+/// True means one is a view (or an alias) of the other's allocation; false
+/// means they are two different allocations that merely share a descriptor.
+pub fn texture_objects_share_handle(left: usize, right: usize) -> bool {
+    let guard = TEXTURE_OBJECT_CENSUS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(census) = guard.as_ref() else {
+        return false;
+    };
+    census.per_handle.values().any(|records| {
+        records.iter().any(|record| record.texture == left)
+            && records.iter().any(|record| record.texture == right)
+    })
+}
+
+/// Views that were resolved to the base object (one object per allocation).
+pub fn texture_views_aliased() -> u64 {
+    with_texture_object_census(|census| census.views_aliased)
+}
+
+/// Second objects created for one handle (view wrappers or re-creations).
+pub fn texture_view_conflicts() -> u64 {
+    with_texture_object_census(|census| census.conflicts)
+}
+
+/// Clears the object identity census (tests and the hardware identity gate).
+///
+/// Public and hidden so an integration test can start each case from a clean
+/// census; the host never calls it.
+#[doc(hidden)]
+pub fn reset_texture_object_census() {
+    with_texture_object_census(|census| *census = TextureObjectCensus::default());
 }
 
 /// Host texture registry: one `MTLTexture` per caller-supplied id.
@@ -1653,6 +1825,7 @@ impl TextureRegistry {
         })?;
 
         verify_texture_attributes(&texture, &desc, self.support)?;
+        note_texture_object_for(id, texture.as_raw() as usize, TextureObjectOrigin::Creation);
         self.textures.insert(id, TextureEntry { texture, desc });
         Ok(())
     }
@@ -1720,6 +1893,28 @@ impl TextureRegistry {
     ) -> Result<TextureView, RegistryError> {
         let entry = self.get(id).ok_or(RegistryError::UnknownTexture(id))?;
         let plan = ViewPlan::resolve_as(&entry.desc, kind, subresource, format, self.support)?;
+        // A full-resource, same-format RTV is not a distinct texture: it names
+        // exactly the registered object. Returning the base `MTLTexture` keeps
+        // the present surface, the pass target and the copy destination one
+        // object per guest allocation, so a draw into the RTV lands directly on
+        // the texture the present path samples. A sub-range or different-format
+        // view is a genuine second object and stays one (counted as a conflict).
+        let full_resource = subresource.base_mip_level == 0
+            && subresource.mip_level_count == entry.desc.mip_levels
+            && subresource.base_array_layer == 0
+            && subresource.array_layer_count == entry.desc.array_layers;
+        if kind == TextureViewKind::Rtv && full_resource && format == entry.desc.format {
+            let texture = retain(entry.raw())?;
+            note_texture_view_aliased();
+            return Ok(TextureView {
+                texture,
+                source_id: id,
+                kind,
+                format,
+                subresource,
+                aliases_source: true,
+            });
+        }
         let _pool = AutoreleasePool::new();
         let raw = unsafe { new_texture_view(entry.raw(), plan) };
         let texture = ObjcObject::from_retained(raw).ok_or_else(|| {
@@ -1727,12 +1922,14 @@ impl TextureRegistry {
                 "newTextureViewWithPixelFormat returned null for texture {id}"
             )))
         })?;
+        note_texture_object_for(id, texture.as_raw() as usize, TextureObjectOrigin::View);
         Ok(TextureView {
             texture,
             source_id: id,
             kind,
             format,
             subresource,
+            aliases_source: false,
         })
     }
 
@@ -1764,9 +1961,8 @@ impl TextureRegistry {
         unsafe {
             objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
             objc::msg_send_void_0(cb, objc::sel(c"commit"));
-            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
         }
-        check_completion(cb, "texture clear")
+        wait_for_completion(cb, "texture clear")
     }
 
     /// Reads a level-0, slice-0 RGBA8/BGRA8 view back through a blit.
@@ -1831,9 +2027,8 @@ impl TextureRegistry {
             );
             objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
             objc::msg_send_void_0(cb, objc::sel(c"commit"));
-            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
         }
-        check_completion(cb, "texture readback")?;
+        wait_for_completion(cb, "texture readback")?;
 
         let contents = unsafe { objc::msg_send_ptr_0(buffer.as_raw(), objc::sel(c"contents")) };
         if contents.is_null() {
@@ -2111,9 +2306,8 @@ const RENDER_SECTION_DEPTH_STENCIL: u8 = 2;
 /// Render-state section flag: a [`RasterizerState`] follows.
 const RENDER_SECTION_RASTERIZER: u8 = 4;
 /// Every bit the render-state section defines.
-const RENDER_SECTION_KNOWN: u8 = RENDER_SECTION_BLEND
-    | RENDER_SECTION_DEPTH_STENCIL
-    | RENDER_SECTION_RASTERIZER;
+const RENDER_SECTION_KNOWN: u8 =
+    RENDER_SECTION_BLEND | RENDER_SECTION_DEPTH_STENCIL | RENDER_SECTION_RASTERIZER;
 
 impl PipelineState {
     /// Serialises this state into the versioned `state` blob.
@@ -2123,9 +2317,8 @@ impl PipelineState {
     /// section in one fixed order, so the bytes (and therefore the BLAKE3 key)
     /// change whenever any encoded state changes.
     pub fn encode(&self, stage: PipelineStage) -> Vec<u8> {
-        let has_render_state = self.blend.is_some()
-            || self.depth_stencil.is_some()
-            || self.rasterizer.is_some();
+        let has_render_state =
+            self.blend.is_some() || self.depth_stencil.is_some() || self.rasterizer.is_some();
         let mut out = Vec::with_capacity(if has_render_state { 192 } else { 64 });
         out.extend_from_slice(if has_render_state { b"VPS2" } else { b"VPS1" });
         out.push(stage.code());
@@ -2190,8 +2383,7 @@ impl PipelineState {
             out.push(u8::from(blend.independent_blend));
             out.push(u8::from(blend.alpha_to_coverage));
             out.push(
-                u8::try_from(blend.attachments.len())
-                    .expect("blend attachment count exceeds u8"),
+                u8::try_from(blend.attachments.len()).expect("blend attachment count exceeds u8"),
             );
             for attachment in &blend.attachments {
                 push_blend_attachment(out, attachment);
@@ -2443,9 +2635,7 @@ fn decode_stencil_face(reader: &mut BlobReader<'_>) -> Result<StencilFaceState, 
     })
 }
 
-fn decode_rasterizer_state(
-    reader: &mut BlobReader<'_>,
-) -> Result<RasterizerState, RegistryError> {
+fn decode_rasterizer_state(reader: &mut BlobReader<'_>) -> Result<RasterizerState, RegistryError> {
     Ok(RasterizerState {
         fill: decode_fill_mode(reader)?,
         cull: decode_cull_mode(reader)?,
@@ -2991,9 +3181,8 @@ impl PipelineRegistry {
             );
             objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
             objc::msg_send_void_0(cb, objc::sel(c"commit"));
-            objc::msg_send_void_0(cb, objc::sel(c"waitUntilCompleted"));
         }
-        check_completion(cb, "registry compute dispatch")
+        wait_for_completion(cb, "registry compute dispatch")
     }
 }
 
@@ -3160,7 +3349,11 @@ fn build_graphics_pso(
         ))
     })?;
     unsafe {
-        objc::msg_send_void_1(descriptor.as_raw(), objc::sel(c"setVertexFunction:"), vertex);
+        objc::msg_send_void_1(
+            descriptor.as_raw(),
+            objc::sel(c"setVertexFunction:"),
+            vertex,
+        );
         objc::msg_send_void_1(
             descriptor.as_raw(),
             objc::sel(c"setFragmentFunction:"),
@@ -3214,9 +3407,8 @@ fn apply_vertex_descriptor(
             "MTLVertexDescriptor creation returned null".to_string(),
         ))
     })?;
-    let attributes = unsafe {
-        objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"attributes"))
-    };
+    let attributes =
+        unsafe { objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"attributes")) };
     if attributes.is_null() {
         return Err(RegistryError::Metal(MetalError::InternalError(
             "MTLVertexDescriptor attributes is nil".to_string(),
@@ -3258,9 +3450,8 @@ fn apply_vertex_descriptor(
             .or_insert(attribute.stride);
     }
 
-    let layout_array = unsafe {
-        objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"layouts"))
-    };
+    let layout_array =
+        unsafe { objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"layouts")) };
     if layout_array.is_null() {
         return Err(RegistryError::Metal(MetalError::InternalError(
             "MTLVertexDescriptor layouts is nil".to_string(),
@@ -3437,7 +3628,11 @@ fn build_mesh_pso(
             fragment,
         );
         if let Some(object) = object {
-            objc::msg_send_void_1(descriptor.as_raw(), objc::sel(c"setObjectFunction:"), object);
+            objc::msg_send_void_1(
+                descriptor.as_raw(),
+                objc::sel(c"setObjectFunction:"),
+                object,
+            );
             objc::msg_send_void_usize(
                 descriptor.as_raw(),
                 objc::sel(c"setMaxTotalThreadsPerObjectThreadgroup:"),
@@ -3510,10 +3705,7 @@ fn validate_stage_set(
             ));
         }
     }
-    if stages
-        .iter()
-        .any(|entry| !expected.contains(&entry.role))
-    {
+    if stages.iter().any(|entry| !expected.contains(&entry.role)) {
         return Err(RegistryError::InvalidState(
             "a stage does not belong to this pipeline family",
         ));
@@ -3558,15 +3750,16 @@ fn stage_function(
     stage: &StageLibrary<'_>,
 ) -> Result<(ObjcObject, ObjcObject), RegistryError> {
     let library = load_library(device, stage.metallib, stage.role.label())?;
-    let function = new_function(&library, stage.entry, stage.role.mtl_function_type()).map_err(
-        |error| match error {
-            RegistryError::EntryPointNotFound(_) => RegistryError::MissingStageFunction {
-                stage: stage.role.label(),
-                entry: stage.entry.to_string(),
-            },
-            other => other,
-        },
-    )?;
+    let function =
+        new_function(&library, stage.entry, stage.role.mtl_function_type()).map_err(|error| {
+            match error {
+                RegistryError::EntryPointNotFound(_) => RegistryError::MissingStageFunction {
+                    stage: stage.role.label(),
+                    entry: stage.entry.to_string(),
+                },
+                other => other,
+            }
+        })?;
     Ok((library, function))
 }
 
@@ -3591,11 +3784,7 @@ fn set_attachment_formats(
             )));
         }
         unsafe {
-            objc::msg_send_void_usize(
-                attachment,
-                objc::sel(c"setPixelFormat:"),
-                pixel_format,
-            );
+            objc::msg_send_void_usize(attachment, objc::sel(c"setPixelFormat:"), pixel_format);
             // Blending is pipeline state in Metal. The shared
             // (`IndependentBlendEnable = FALSE`) form applies entry 0 to every
             // target, exactly like D3D12. `apply_blend_attachment` is the one
@@ -3618,11 +3807,7 @@ fn set_attachment_formats(
         .is_some_and(|blend| blend.alpha_to_coverage)
     {
         unsafe {
-            objc::msg_send_void_u8(
-                descriptor,
-                objc::sel(c"setAlphaToCoverageEnabled:"),
-                1,
-            );
+            objc::msg_send_void_u8(descriptor, objc::sel(c"setAlphaToCoverageEnabled:"), 1);
         }
     }
     if let Some(format) = state.depth_format {
@@ -3965,16 +4150,41 @@ unsafe fn copy_texture_to_buffer(
     }
 }
 
-fn check_completion(cb: objc::Id, what: &'static str) -> Result<(), RegistryError> {
-    let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
-    if status == MTL_COMMAND_BUFFER_STATUS_COMPLETED {
-        return Ok(());
+/// How long a registry diagnostic/dispatch wait may block before it is named.
+const REGISTRY_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Poll interval of a bounded registry completion wait.
+const REGISTRY_COMPLETION_POLL: std::time::Duration = std::time::Duration::from_micros(250);
+/// `MTLCommandBufferStatusError`.
+const MTL_COMMAND_BUFFER_STATUS_ERROR: usize = 5;
+
+/// Waits for a command buffer without an unbounded `waitUntilCompleted`.
+///
+/// Polls the status with a sleep (never a busy spin) and returns a named
+/// timeout after [`REGISTRY_COMPLETION_TIMEOUT`], so a wedged queue fails the
+/// caller instead of hanging the process. Registry work is host-side
+/// diagnostics and registry compute; the frame path never waits here.
+fn wait_for_completion(cb: objc::Id, what: &'static str) -> Result<(), RegistryError> {
+    let started = std::time::Instant::now();
+    loop {
+        let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        if status == MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            return Ok(());
+        }
+        if status == MTL_COMMAND_BUFFER_STATUS_ERROR {
+            let err = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
+            let message = unsafe { objc::nserror_message(err) };
+            return Err(RegistryError::Metal(MetalError::InternalError(format!(
+                "{what} failed (status={status}): {message}"
+            ))));
+        }
+        if started.elapsed() >= REGISTRY_COMPLETION_TIMEOUT {
+            return Err(RegistryError::Metal(MetalError::InternalError(format!(
+                "{what} timed out after {} ms waiting for the GPU (status={status})",
+                REGISTRY_COMPLETION_TIMEOUT.as_millis()
+            ))));
+        }
+        std::thread::sleep(REGISTRY_COMPLETION_POLL);
     }
-    let err = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
-    let message = unsafe { objc::nserror_message(err) };
-    Err(RegistryError::Metal(MetalError::InternalError(format!(
-        "{what} failed (status={status}): {message}"
-    ))))
 }
 
 #[cfg(test)]
@@ -4525,7 +4735,11 @@ mod tests {
             object_threadgroup: [8, 1, 1],
             payload_memory_length: 128,
             max_total_threadgroups_per_mesh_grid: 4,
-            blend: Some(test_blend(true, BlendFactor::SrcAlpha, BlendFactor::InvSrcAlpha)),
+            blend: Some(test_blend(
+                true,
+                BlendFactor::SrcAlpha,
+                BlendFactor::InvSrcAlpha,
+            )),
             depth_stencil: Some(test_depth_stencil()),
             rasterizer: Some(test_rasterizer()),
             ..PipelineState::default()
@@ -4674,22 +4888,25 @@ mod tests {
             entry: "ps_main",
         };
         let state = b"graphics state";
-        let with_a =
-            PipelineKey::from_stages(&[vertex, pixel_a], PipelineStage::Graphics, state);
+        let with_a = PipelineKey::from_stages(&[vertex, pixel_a], PipelineStage::Graphics, state);
         assert_eq!(
             with_a,
             PipelineKey::from_stages(&[pixel_a, vertex], PipelineStage::Graphics, state),
             "stage order does not change the key"
         );
-        let with_b =
-            PipelineKey::from_stages(&[vertex, pixel_b], PipelineStage::Graphics, state);
+        let with_b = PipelineKey::from_stages(&[vertex, pixel_b], PipelineStage::Graphics, state);
         assert_ne!(
             with_a, with_b,
             "a changed pixel library is a different pipeline"
         );
         assert_ne!(
             with_a,
-            PipelineKey::from_parts(b"vertex metallib", "vs_main", PipelineStage::Graphics, state),
+            PipelineKey::from_parts(
+                b"vertex metallib",
+                "vs_main",
+                PipelineStage::Graphics,
+                state
+            ),
             "the single-library key covers neither stage's separate library"
         );
         let single = StageLibrary {
@@ -4724,7 +4941,15 @@ mod tests {
             entry: "ps_main",
         };
         let expected = [FunctionRole::Vertex, FunctionRole::Fragment];
-        assert!(validate_stage_set(&[vertex, pixel], &expected, PipelineStage::Graphics, &parsed).is_ok());
+        assert!(
+            validate_stage_set(
+                &[vertex, pixel],
+                &expected,
+                PipelineStage::Graphics,
+                &parsed
+            )
+            .is_ok()
+        );
 
         let wrong_role = StageLibrary {
             role: FunctionRole::Mesh,
@@ -4732,7 +4957,12 @@ mod tests {
             entry: "ms_main",
         };
         assert!(matches!(
-            validate_stage_set(&[vertex, wrong_role], &expected, PipelineStage::Graphics, &parsed),
+            validate_stage_set(
+                &[vertex, wrong_role],
+                &expected,
+                PipelineStage::Graphics,
+                &parsed
+            ),
             Err(RegistryError::InvalidState(_))
         ));
         let missing = StageLibrary {
@@ -4741,7 +4971,12 @@ mod tests {
             entry: "ps_other",
         };
         assert!(matches!(
-            validate_stage_set(&[vertex, missing], &expected, PipelineStage::Graphics, &parsed),
+            validate_stage_set(
+                &[vertex, missing],
+                &expected,
+                PipelineStage::Graphics,
+                &parsed
+            ),
             Err(RegistryError::InvalidState(_))
         ));
         assert!(matches!(
@@ -4817,10 +5052,7 @@ mod tests {
         msaa.sample_count = 4;
         msaa.usage = TextureUsage::color_attachment();
         assert!(msaa.validate().is_ok());
-        assert_eq!(
-            msaa.mtl_texture_type(),
-            MTL_TEXTURE_TYPE_2D_MULTISAMPLE
-        );
+        assert_eq!(msaa.mtl_texture_type(), MTL_TEXTURE_TYPE_2D_MULTISAMPLE);
         let view = ViewPlan::resolve(
             &msaa,
             TextureViewKind::Rtv,
@@ -4847,7 +5079,9 @@ mod tests {
 
         let mut rgba8 = target.clone();
         rgba8.mip_levels = 5;
-        registry.register(1, rgba8.clone()).expect("RGBA8 mipmapped target");
+        registry
+            .register(1, rgba8.clone())
+            .expect("RGBA8 mipmapped target");
         assert_eq!(registry.get(1).expect("registered").desc(), &rgba8);
         let view = registry
             .create_view(1, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
@@ -4862,7 +5096,9 @@ mod tests {
         let mut fp16 = target.clone();
         fp16.format = TextureFormat::Rgba16Float;
         fp16.mip_levels = 5;
-        registry.register(2, fp16.clone()).expect("RGBA16F mipmapped target");
+        registry
+            .register(2, fp16.clone())
+            .expect("RGBA16F mipmapped target");
         assert_eq!(registry.get(2).expect("registered").desc(), &fp16);
         registry
             .create_view(2, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
@@ -4944,7 +5180,9 @@ mod tests {
             .register_registry_texture(41, different)
             .expect_err("a different descriptor is a conflict");
         assert!(
-            error.to_string().contains("already registered with a different descriptor"),
+            error
+                .to_string()
+                .contains("already registered with a different descriptor"),
             "the conflict is named: {error}"
         );
     }
@@ -4978,7 +5216,10 @@ mod tests {
             "the MTLTexture is not recreated"
         );
         let entry = registry.get(21).expect("still registered");
-        assert!(entry.desc().usage.render_target, "the colour use is recorded");
+        assert!(
+            entry.desc().usage.render_target,
+            "the colour use is recorded"
+        );
         assert!(
             entry.desc().usage.shader_read,
             "the earlier sampled use stays"
@@ -5085,10 +5326,8 @@ mod tests {
         };
         let metal = tool("metal")?;
         let metallib = tool("metallib")?;
-        let dir = std::env::temp_dir().join(format!(
-            "victory-registry-state-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("victory-registry-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let source = dir.join("state.metal");
@@ -5204,7 +5443,10 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
         let second = registry
             .register_graphics(key_b, &library, "vs_main", &state_b)
             .expect("the disabled pipeline registers");
-        assert_ne!(first, second, "a different blend state is a different PSO id");
+        assert_ne!(
+            first, second,
+            "a different blend state is a different PSO id"
+        );
         assert_eq!(registry.created_count(), 2);
         assert_eq!(registry.reuse_count(), 1);
     }
@@ -5292,7 +5534,9 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
         }
 
         // Every typeless family resolves and names its concrete base.
-        for dxgi in [1u32, 9, 15, 19, 23, 27, 33, 39, 44, 48, 53, 60, 70, 73, 76, 79, 82, 90, 92, 94, 97] {
+        for dxgi in [
+            1u32, 9, 15, 19, 23, 27, 33, 39, 44, 48, 53, 60, 70, 73, 76, 79, 82, 90, 92, 94, 97,
+        ] {
             let format = TextureFormat::from_dxgi(dxgi)
                 .unwrap_or_else(|error| panic!("typeless DXGI {dxgi}: {error}"));
             assert!(format.is_typeless(), "DXGI {dxgi} must be typeless");
@@ -5325,7 +5569,11 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
             (18, TextureFormat::R32Uint),
             (19, TextureFormat::R32Sint),
         ] {
-            assert_eq!(TextureFormat::from_code(code), Some(expected), "code {code}");
+            assert_eq!(
+                TextureFormat::from_code(code),
+                Some(expected),
+                "code {code}"
+            );
             assert_eq!(expected.code(), code, "{} code", expected.name());
         }
         let mut codes = std::collections::HashSet::new();
@@ -5391,54 +5639,53 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
     /// format.
     #[test]
     fn typeless_view_reinterpretation_is_family_limited() {
-        let typeless = |format| {
-            TextureDesc {
-                width: 64,
-                height: 64,
-                depth: 1,
-                mip_levels: 1,
-                sample_count: 1,
-                array_layers: 1,
-                dimension: TextureDimension::D2,
-                format,
-                usage: TextureUsage {
-                    shader_read: true,
-                    shader_write: true,
-                    render_target: true,
-                    depth_stencil: false,
-                },
-                label: None,
-            }
+        let typeless = |format| TextureDesc {
+            width: 64,
+            height: 64,
+            depth: 1,
+            mip_levels: 1,
+            sample_count: 1,
+            array_layers: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsage {
+                shader_read: true,
+                shader_write: true,
+                render_target: true,
+                depth_stencil: false,
+            },
+            label: None,
         };
         let rgba8 = typeless(TextureFormat::Rgba8Typeless);
         // Inside the 32-bit family: R32_UINT and RGBA8 both resolve.
-        assert!(ViewPlan::resolve_as(
-            &rgba8,
-            TextureViewKind::Uav,
-            TextureSubresource::single(0, 0),
-            TextureFormat::R32Uint,
-            FormatSupport {
-                bc_texture_compression: true,
-                depth24_stencil8: false,
-            },
-        )
-        .is_ok());
-        assert!(ViewPlan::resolve_as(
-            &rgba8,
-            TextureViewKind::Srv,
-            TextureSubresource::single(0, 0),
-            TextureFormat::Rgba8Unorm,
-            FormatSupport {
-                bc_texture_compression: true,
-                depth24_stencil8: false,
-            },
-        )
-        .is_ok());
+        assert!(
+            ViewPlan::resolve_as(
+                &rgba8,
+                TextureViewKind::Uav,
+                TextureSubresource::single(0, 0),
+                TextureFormat::R32Uint,
+                FormatSupport {
+                    bc_texture_compression: true,
+                    depth24_stencil8: false,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            ViewPlan::resolve_as(
+                &rgba8,
+                TextureViewKind::Srv,
+                TextureSubresource::single(0, 0),
+                TextureFormat::Rgba8Unorm,
+                FormatSupport {
+                    bc_texture_compression: true,
+                    depth24_stencil8: false,
+                },
+            )
+            .is_ok()
+        );
         // Across the 64-bit family and to depth: refused.
-        for refused in [
-            TextureFormat::Rgba16Float,
-            TextureFormat::Depth32Float,
-        ] {
+        for refused in [TextureFormat::Rgba16Float, TextureFormat::Depth32Float] {
             assert!(
                 ViewPlan::resolve_as(
                     &rgba8,
@@ -5468,8 +5715,7 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
         let support = transport.format_support();
         println!(
             "gpu proof: BC {}, 24-bit depth {}",
-            support.bc_texture_compression,
-            support.depth24_stencil8
+            support.bc_texture_compression, support.depth24_stencil8
         );
         let mut registry = TextureRegistry::new(&transport).expect("texture registry");
 
@@ -5545,9 +5791,9 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
                 let mut desc = colour(format, false, false);
                 desc.width = 64;
                 desc.height = 64;
-                registry.register(id, desc).unwrap_or_else(|error| {
-                    panic!("{} creation: {error}", format.name())
-                });
+                registry
+                    .register(id, desc)
+                    .unwrap_or_else(|error| panic!("{} creation: {error}", format.name()));
                 registry
                     .create_view(id, TextureViewKind::Srv, TextureSubresource::single(0, 0))
                     .unwrap_or_else(|error| panic!("{} SRV: {error}", format.name()));
@@ -5588,7 +5834,12 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
             .create_view(8, TextureViewKind::Dsv, TextureSubresource::single(0, 0))
             .expect("D24S8 DSV view");
         assert_eq!(
-            registry.get(8).unwrap().desc().format.mtl_pixel_format_on(support),
+            registry
+                .get(8)
+                .unwrap()
+                .desc()
+                .format
+                .mtl_pixel_format_on(support),
             if support.depth24_stencil8 { 255 } else { 260 },
             "D24S8 effective Metal format"
         );
@@ -5615,7 +5866,9 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
             .create_view(9, TextureViewKind::Uav, TextureSubresource::single(0, 0))
             .expect("33x33x33 FP16 UAV 3D view");
         println!("gpu proof: 33x33x33 FP16 UAV volume created as MTLTextureType3D and viewed");
-        println!("gpu proof: every creation and view succeeded ({} textures)", registry.len());
+        println!(
+            "gpu proof: every creation and view succeeded ({} textures)",
+            registry.len()
+        );
     }
-
 }

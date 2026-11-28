@@ -340,6 +340,35 @@ struct PassTargetFacts {
     is_presented_surface: bool,
 }
 
+/// One distinct `MTLTexture` object the present path observed with its
+/// immutable descriptor.
+///
+/// Objects are recorded from three places that can reach the same guest
+/// texture: the registered present surface, a traced render-pass attachment and
+/// a blit copy destination (`blit::note_copy_destination`). Counting distinct
+/// process-local addresses per descriptor is how the host proves "one object
+/// per allocation"; no address reaches telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextureObjectEntry {
+    descriptor: SurfaceDescriptor,
+    texture: usize,
+    origin: TextureObjectOrigin,
+}
+
+/// Where the present path observed one `MTLTexture` object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextureObjectOrigin {
+    /// The registered present surface / presented source.
+    Surface,
+    /// A traced render-pass colour attachment.
+    PassTarget,
+    /// A blit copy or resolve destination.
+    CopyDestination,
+}
+
+/// Distinct `MTLTexture` objects the host remembers for the identity census.
+const TEXTURE_OBJECTS_MAX: usize = 32;
+
 #[derive(Debug, Default)]
 struct PresentTrace {
     frames: u64,
@@ -368,12 +397,78 @@ struct PresentTrace {
     surface_pass_target_offscreen: u64,
     /// Presented textures whose census entry did not fit the bound.
     dropped_surfaces: u64,
+    /// Distinct `MTLTexture` objects seen as a surface, pass target or copy
+    /// destination, with their descriptor and provenance.
+    texture_objects: Vec<TextureObjectEntry>,
+    /// Texture objects dropped after the bound was reached.
+    dropped_texture_objects: u64,
+    /// Presents whose traced pass target had the surface's descriptor but was a
+    /// different object (a different allocation, or a stale sampled pass).
+    surface_pass_target_same_descriptor_other_object: u64,
 }
 
 static PRESENT_TRACE: OnceLock<Mutex<PresentTrace>> = OnceLock::new();
 
 fn present_trace() -> &'static Mutex<PresentTrace> {
     PRESENT_TRACE.get_or_init(|| Mutex::new(PresentTrace::default()))
+}
+
+/// One-shot pass-target identity a caller declares for the next present.
+///
+/// The bounded sampling tracer is opt-in and process-wide; a hardware identity
+/// case knows the exact texture it just encoded as the render-pass target and
+/// declares it here instead of depending on which pass the sampler happened to
+/// pick. The census then compares that object with the presented source and the
+/// copy destination without arming the tracer's synchronous readback. Taken
+/// (cleared) by the next present so it cannot leak across frames.
+static IDENTITY_PASS_TARGET: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Declares the object a hardware identity case just used as the pass target.
+///
+/// Public and hidden; the host never calls it. It is an identity token only
+/// (no descriptor is read from it), so a stale value can never be dereferenced.
+#[doc(hidden)]
+pub fn note_identity_pass_target(texture: usize) {
+    if texture == 0 {
+        return;
+    }
+    if let Ok(mut slot) = IDENTITY_PASS_TARGET.lock() {
+        *slot = Some(texture);
+    }
+}
+
+/// Takes and clears the declared pass target.
+fn take_identity_pass_target() -> Option<usize> {
+    IDENTITY_PASS_TARGET
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
+impl DirectMetalTransport {
+    /// Object identity of a texture the transport registered for a pass target.
+    ///
+    /// Public and hidden for the hardware identity gate; the frame path uses
+    /// [`resolve_texture`](crate::macos::device) directly. Two handles that name
+    /// one guest allocation must return the same address.
+    #[doc(hidden)]
+    pub fn registered_texture_object(&self, id: u64) -> Option<usize> {
+        let state = self.lock_state().ok()?;
+        state
+            .textures
+            .get(&id)
+            .map(|texture| texture.as_raw() as usize)
+    }
+
+    /// Object identity of the texture registered as present surface `surface_id`.
+    #[doc(hidden)]
+    pub fn registered_surface_object(&self, surface_id: u64) -> Option<usize> {
+        let state = self.lock_state().ok()?;
+        state
+            .surfaces
+            .get(&surface_id)
+            .map(|texture| texture.as_raw() as usize)
+    }
 }
 
 /// Reads the immutable descriptor of a live `MTLTexture`.
@@ -396,15 +491,54 @@ fn surface_descriptor_of(texture: objc::Id) -> Option<SurfaceDescriptor> {
     })
 }
 
-/// The pass target the draw tracer observed, when it is armed.
+/// The pass targets the draw tracer observed, when it is armed.
 ///
-/// The sampled pass is preferred (its pixels were summarized), then the most
-/// recent described draw. Both are `None` with the tracer off, which the
-/// present trace records as "unarmed" rather than as "no pass".
-fn observed_pass_target() -> Option<trace::TraceTarget> {
-    trace::last_sample()
-        .and_then(|sample| sample.target)
-        .or_else(|| trace::last_record().and_then(|record| record.target))
+/// The sampled pass and the most recent described draw are both real traced
+/// pass targets, and the surface may be either one depending on which pass the
+/// bounded tracer happened to sample. Both are `None` with the tracer off, which
+/// the present trace records as "unarmed" rather than as "no pass".
+fn observed_pass_targets() -> [Option<trace::TraceTarget>; 2] {
+    [
+        trace::last_sample().and_then(|sample| sample.target),
+        trace::last_record().and_then(|record| record.target),
+    ]
+}
+
+/// Records one live `MTLTexture` in the bounded object identity census.
+///
+/// Called with real textures only: the registered present surface, a traced
+/// pass attachment and a blit/copy destination. Tests that pass synthetic
+/// tokens use [`record_present_trace`] with no descriptor, which skips this.
+/// Recording the same pointer twice is idempotent; the first provenance wins.
+pub(crate) fn note_texture_object(texture: objc::Id, origin: TextureObjectOrigin) {
+    let Some(descriptor) = surface_descriptor_of(texture) else {
+        return;
+    };
+    let key = texture as usize;
+    let Ok(mut trace) = present_trace().lock() else {
+        return;
+    };
+    if trace
+        .texture_objects
+        .iter()
+        .any(|entry| entry.texture == key)
+    {
+        return;
+    }
+    if trace.texture_objects.len() >= TEXTURE_OBJECTS_MAX {
+        trace.dropped_texture_objects = trace.dropped_texture_objects.saturating_add(1);
+        return;
+    }
+    trace.texture_objects.push(TextureObjectEntry {
+        descriptor,
+        texture: key,
+        origin,
+    });
+}
+
+/// Records a blit/copy destination object for the identity census.
+pub(crate) fn note_copy_destination_object(texture: objc::Id) {
+    note_texture_object(texture, TextureObjectOrigin::CopyDestination);
 }
 
 /// Updates the bounded surface census for one presented source texture.
@@ -422,7 +556,10 @@ fn note_surface_census(
         return;
     }
     let texture = source as usize;
-    let index = trace.surfaces.iter().position(|entry| entry.texture == texture);
+    let index = trace
+        .surfaces
+        .iter()
+        .position(|entry| entry.texture == texture);
     let index = match index {
         Some(index) => {
             let entry = &mut trace.surfaces[index];
@@ -467,29 +604,46 @@ fn note_surface_census(
         swapchain: target.swapchain,
         is_presented_surface: target.texture == texture,
     };
+    let descriptor = trace.surfaces[index].descriptor;
+    let descriptor_matches = facts.format == pixel_format_name(descriptor.format)
+        && usize::try_from(facts.width).ok() == Some(descriptor.width)
+        && usize::try_from(facts.height).ok() == Some(descriptor.height);
     if facts.is_presented_surface {
         trace.surfaces[index].seen_as_pass = true;
-        let descriptor_matches = facts.format == pixel_format_name(trace.surfaces[index].descriptor.format)
-            && usize::try_from(facts.width).ok() == Some(trace.surfaces[index].descriptor.width)
-            && usize::try_from(facts.height).ok() == Some(trace.surfaces[index].descriptor.height);
         if !descriptor_matches && !trace.surfaces[index].descriptor_mismatch {
             trace.surfaces[index].descriptor_mismatch = true;
             trace.surface_descriptor_mismatch = trace.surface_descriptor_mismatch.saturating_add(1);
         }
-    } else if facts.swapchain {
-        if !trace
-            .pass_targets
-            .iter()
-            .any(|(seen, _)| seen.swapchain && !seen.is_presented_surface)
-        {
-            trace.surface_pass_target_other_surface =
-                trace.surface_pass_target_other_surface.saturating_add(1);
-        }
-    } else if !trace.pass_targets.iter().any(|(seen, _)| !seen.swapchain) {
-        trace.surface_pass_target_offscreen =
-            trace.surface_pass_target_offscreen.saturating_add(1);
+    } else if descriptor_matches {
+        // The tracer named a different object with the surface's shape. It can
+        // be the pass that intentionally targets another allocation of that
+        // shape, or the bounded tracer's stale sample; either way the surface
+        // object is not this target, so the verdict stays false and the reason
+        // is named instead of being folded into "no pass".
+        trace.surface_pass_target_same_descriptor_other_object = trace
+            .surface_pass_target_same_descriptor_other_object
+            .saturating_add(1);
     }
-    match trace.pass_targets.iter_mut().find(|(seen, _)| *seen == facts) {
+    if !facts.is_presented_surface {
+        if facts.swapchain {
+            if !trace
+                .pass_targets
+                .iter()
+                .any(|(seen, _)| seen.swapchain && !seen.is_presented_surface)
+            {
+                trace.surface_pass_target_other_surface =
+                    trace.surface_pass_target_other_surface.saturating_add(1);
+            }
+        } else if !trace.pass_targets.iter().any(|(seen, _)| !seen.swapchain) {
+            trace.surface_pass_target_offscreen =
+                trace.surface_pass_target_offscreen.saturating_add(1);
+        }
+    }
+    match trace
+        .pass_targets
+        .iter_mut()
+        .find(|(seen, _)| *seen == facts)
+    {
         Some((_, count)) => *count = count.saturating_add(1),
         None => {
             if trace.pass_targets.len() < PRESENT_TRACE_MAX_KEYS {
@@ -508,6 +662,7 @@ fn note_surface_census(
 /// `descriptor` is the source's immutable shape (read from the live texture,
 /// `None` for a synthetic test token) and `pass_target` is the render-pass
 /// attachment the draw tracer last observed.
+#[cfg(test)]
 fn record_present_trace(
     source: objc::Id,
     presented: objc::Id,
@@ -516,6 +671,48 @@ fn record_present_trace(
     descriptor: Option<SurfaceDescriptor>,
     pass_target: Option<trace::TraceTarget>,
 ) {
+    record_present_trace_targets(
+        source,
+        presented,
+        probe_sampled,
+        fallback_clear,
+        source == presented,
+        descriptor,
+        &[pass_target],
+    );
+}
+
+/// [`record_present_trace`] over every pass target the tracer observed.
+///
+/// `registered_source` is true when `source` is the texture the host registered
+/// as this present's surface (the headless image itself, or the window's
+/// registered present texture). Together with `source == presented` it is the
+/// identity verdict: the texture being shown is the surface host work targeted.
+fn record_present_trace_targets(
+    source: objc::Id,
+    presented: objc::Id,
+    probe_sampled: Option<objc::Id>,
+    fallback_clear: bool,
+    registered_source: bool,
+    descriptor: Option<SurfaceDescriptor>,
+    pass_targets: &[Option<trace::TraceTarget>],
+) {
+    // Object identity is recorded before the trace lock is taken: the census
+    // reads immutable texture properties and takes the same lock. `descriptor`
+    // is `Some` only for a live texture (a synthetic test token passes `None`),
+    // so no selector is ever sent to a fake address.
+    let explicit_pass_target = take_identity_pass_target();
+    if descriptor.is_some() && !source.is_null() {
+        note_texture_object(source, TextureObjectOrigin::Surface);
+    }
+    for target in pass_targets.iter().flatten() {
+        if target.texture != 0 {
+            note_texture_object(target.texture as objc::Id, TextureObjectOrigin::PassTarget);
+        }
+    }
+    if let Some(object) = explicit_pass_target {
+        note_texture_object(object as objc::Id, TextureObjectOrigin::PassTarget);
+    }
     let copy_total = if source.is_null() {
         0
     } else {
@@ -528,7 +725,11 @@ fn record_present_trace(
         0
     } else {
         let key = source as usize;
-        match trace.source_copies.iter().position(|(seen, _)| *seen == key) {
+        match trace
+            .source_copies
+            .iter()
+            .position(|(seen, _)| *seen == key)
+        {
             Some(index) => {
                 let previous = trace.source_copies[index].1;
                 trace.source_copies[index].1 = copy_total;
@@ -553,9 +754,7 @@ fn record_present_trace(
         } else {
             match blit::copy_kind_for(source) {
                 Some(blit::BlitCopyKind::CopyTextureRegion) => PresentCopyKind::CopyTextureRegion,
-                Some(blit::BlitCopyKind::ResolveSubresource) => {
-                    PresentCopyKind::ResolveSubresource
-                }
+                Some(blit::BlitCopyKind::ResolveSubresource) => PresentCopyKind::ResolveSubresource,
                 None => PresentCopyKind::None,
             }
         }
@@ -564,7 +763,11 @@ fn record_present_trace(
     };
     let key = PresentTraceKey {
         copy_kind,
-        source_is_presented: !source.is_null() && source == presented,
+        // Identity: the source is the texture the host registered for this
+        // present, or it is literally the drawable (headless). In the windowed
+        // path the source is the registered surface and the drawable is its
+        // display copy, so `source == presented` alone would always read 0.
+        source_is_presented: !source.is_null() && (source == presented || registered_source),
         probe_sampled_presented: probe_sampled.is_some_and(|sampled| sampled == presented),
         fallback_clear,
     };
@@ -578,7 +781,33 @@ fn record_present_trace(
     if fallback_clear {
         trace.fallback_clear = trace.fallback_clear.saturating_add(1);
     }
-    note_surface_census(&mut trace, source, descriptor, pass_target, copy_total);
+    let mut counted_targets: Vec<trace::TraceTarget> = Vec::new();
+    for target in pass_targets.iter().flatten() {
+        if counted_targets.contains(target) {
+            continue;
+        }
+        counted_targets.push(*target);
+        note_surface_census(&mut trace, source, descriptor, Some(*target), copy_total);
+    }
+    // A declared identity target is compared with the source's own descriptor:
+    // same shape and same object is the one-object verdict; a different object
+    // with the same shape is exactly the split the census must name.
+    if let (Some(object), Some(shape)) = (explicit_pass_target, descriptor) {
+        let target = trace::TraceTarget {
+            texture: object,
+            width: u32::try_from(shape.width).unwrap_or(u32::MAX),
+            height: u32::try_from(shape.height).unwrap_or(u32::MAX),
+            format: pixel_format_name(shape.format),
+            swapchain: true,
+        };
+        if !counted_targets.contains(&target) {
+            counted_targets.push(target);
+            note_surface_census(&mut trace, source, descriptor, Some(target), copy_total);
+        }
+    }
+    if counted_targets.is_empty() {
+        note_surface_census(&mut trace, source, descriptor, None, copy_total);
+    }
     match trace.keys.iter_mut().find(|(seen, _)| *seen == key) {
         Some((_, count)) => *count = count.saturating_add(1),
         None => {
@@ -635,6 +864,42 @@ pub struct PresentTraceReport {
     pub surface_pass_targets_not_surface: u64,
     /// Presented surface descriptors dropped after the bound was reached.
     pub dropped_surfaces: u64,
+    /// Distinct `MTLTexture` objects seen per descriptor by the present path
+    /// (surface, traced pass target and blit destination). One object per
+    /// descriptor is the identity contract.
+    pub texture_objects_per_descriptor: Vec<PresentTextureObjectsEntry>,
+    /// The registry's histogram of `MTLTexture` objects per registered handle:
+    /// `objects` is the number of distinct objects ever created for one handle,
+    /// `allocations` how many handles have that count.
+    pub texture_objects_per_allocation: Vec<PresentAllocationObjectsEntry>,
+    /// One-word class of why the presented surface and the traced pass target
+    /// are not the same object: `none`, `sampled-other-object` or `descriptor`.
+    pub surface_object_mismatch_reason: &'static str,
+    /// Presents whose traced pass target had the surface's descriptor but was a
+    /// different object.
+    pub surface_pass_target_same_descriptor_other_object: u64,
+}
+
+/// Distinct `MTLTexture` objects seen for one descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentTextureObjectsEntry {
+    /// Metal pixel-format name.
+    pub format: &'static str,
+    /// Level-0 width in texels.
+    pub width: usize,
+    /// Level-0 height in texels.
+    pub height: usize,
+    /// Distinct process-local texture objects with this descriptor.
+    pub objects: u64,
+}
+
+/// One row of the registry's objects-per-handle histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentAllocationObjectsEntry {
+    /// Distinct objects created for one registered handle.
+    pub objects: u64,
+    /// Handles with this count.
+    pub allocations: u64,
 }
 
 /// One presented source texture as the identity census saw it.
@@ -696,6 +961,68 @@ fn reset_present_trace() {
     }
 }
 
+/// Clears the present trace for an integration test's identity gate.
+///
+/// Public and hidden so each hardware case starts from a clean census; the
+/// host never calls it.
+#[doc(hidden)]
+pub fn reset_present_trace_for_test() {
+    if let Ok(mut trace) = present_trace().lock() {
+        *trace = PresentTrace::default();
+    }
+    if let Ok(mut slot) = IDENTITY_PASS_TARGET.lock() {
+        *slot = None;
+    }
+    blit::reset_copy_trace();
+}
+
+/// One-word class of the surface / pass-target object disagreement.
+///
+/// The reason is derived from observed provenance, never guessed:
+/// - `none` — no distinct object shared the surface's descriptor;
+/// - `descriptor` — the same object disagreed about its shape;
+/// - `rtv-wrapper` — a full or partial view object over one registered handle
+///   was seen as the pass target (the registry records both pointers on one
+///   handle; a full-resource same-format RTV is now aliased, so a remaining
+///   wrapper is a real sub-range/format view);
+/// - `copy-destination` — the other object was a blit/copy destination;
+/// - `creation-path` — two distinct allocations (two handles) share a
+///   descriptor, i.e. the guest registered the same shape under two handles;
+/// - `view` — an object pair with no surface/pass/copy provenance.
+fn surface_object_mismatch_reason(trace: &PresentTrace) -> &'static str {
+    if trace.surface_descriptor_mismatch > 0 {
+        return "descriptor";
+    }
+    let objects = &trace.texture_objects;
+    for (index, left) in objects.iter().enumerate() {
+        for right in &objects[index + 1..] {
+            if left.descriptor != right.descriptor || left.texture == right.texture {
+                continue;
+            }
+            let origins = [left.origin, right.origin];
+            if origins.contains(&TextureObjectOrigin::CopyDestination)
+                && (origins.contains(&TextureObjectOrigin::Surface)
+                    || origins.contains(&TextureObjectOrigin::PassTarget))
+            {
+                return "copy-destination";
+            }
+            if crate::macos::registry::texture_objects_share_handle(left.texture, right.texture) {
+                return "rtv-wrapper";
+            }
+            if origins.contains(&TextureObjectOrigin::Surface)
+                && origins.contains(&TextureObjectOrigin::PassTarget)
+            {
+                return "creation-path";
+            }
+            return "view";
+        }
+    }
+    if trace.surface_pass_target_same_descriptor_other_object > 0 {
+        return "distinct-object";
+    }
+    "none"
+}
+
 /// The present trace accumulated so far.
 pub fn present_trace_report() -> PresentTraceReport {
     let Ok(trace) = present_trace().lock() else {
@@ -714,8 +1041,41 @@ pub fn present_trace_report() -> PresentTraceReport {
             descriptor_mismatch: entry.descriptor_mismatch,
         })
         .collect();
-    let surface_targeted_by_pass = surfaces.iter().filter(|entry| entry.targeted_by_pass).count() as u64;
-    let surface_targeted_by_copy = surfaces.iter().filter(|entry| entry.targeted_by_copy).count() as u64;
+    let surface_targeted_by_pass = surfaces
+        .iter()
+        .filter(|entry| entry.targeted_by_pass)
+        .count() as u64;
+    let surface_targeted_by_copy = surfaces
+        .iter()
+        .filter(|entry| entry.targeted_by_copy)
+        .count() as u64;
+    let mut descriptor_objects: Vec<(SurfaceDescriptor, u64)> = Vec::new();
+    for entry in &trace.texture_objects {
+        match descriptor_objects
+            .iter_mut()
+            .find(|(descriptor, _)| *descriptor == entry.descriptor)
+        {
+            Some((_, count)) => *count = count.saturating_add(1),
+            None => descriptor_objects.push((entry.descriptor, 1)),
+        }
+    }
+    let texture_objects_per_descriptor = descriptor_objects
+        .iter()
+        .map(|(descriptor, objects)| PresentTextureObjectsEntry {
+            format: pixel_format_name(descriptor.format),
+            width: descriptor.width,
+            height: descriptor.height,
+            objects: *objects,
+        })
+        .collect();
+    let texture_objects_per_allocation = crate::macos::registry::texture_objects_per_allocation()
+        .into_iter()
+        .map(|(objects, allocations)| PresentAllocationObjectsEntry {
+            objects,
+            allocations,
+        })
+        .collect();
+    let surface_object_mismatch_reason = surface_object_mismatch_reason(&trace);
     PresentTraceReport {
         frames: trace.frames,
         copied_into_source: trace.copied_into_source,
@@ -754,6 +1114,11 @@ pub fn present_trace_report() -> PresentTraceReport {
         surface_pass_targets_not_surface: trace.surface_pass_target_offscreen,
         dropped_surfaces: trace.dropped_surfaces,
         surfaces,
+        texture_objects_per_descriptor,
+        texture_objects_per_allocation,
+        surface_object_mismatch_reason,
+        surface_pass_target_same_descriptor_other_object: trace
+            .surface_pass_target_same_descriptor_other_object,
     }
 }
 
@@ -788,7 +1153,9 @@ impl PresentTraceReport {
              distinct_keys={} dropped_keys={} dropped_sources={} distinct_surfaces={} \
              surface_targeted_by_pass={} surface_targeted_by_copy={} \
              surface_registered_twice={} surface_descriptor_mismatch={} \
-             surface_pass_targets_not_surface={} surface_pass_targets_other_surface={} {}",
+             surface_pass_targets_not_surface={} surface_pass_targets_other_surface={} \
+             surface_object_mismatch_reason={} \
+             surface_pass_target_same_descriptor_other_object={} {}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -808,6 +1175,8 @@ impl PresentTraceReport {
             self.surface_descriptor_mismatch,
             self.surface_pass_targets_not_surface,
             self.surface_pass_targets_other_surface,
+            self.surface_object_mismatch_reason,
+            self.surface_pass_target_same_descriptor_other_object,
             self.surface_log_fields(),
         )
     }
@@ -835,8 +1204,24 @@ impl PresentTraceReport {
                 target.width,
                 target.height,
                 target.format,
-                if target.swapchain { "surface" } else { "offscreen" },
+                if target.swapchain {
+                    "surface"
+                } else {
+                    "offscreen"
+                },
                 u8::from(target.is_presented_surface),
+            ));
+        }
+        for (index, entry) in self.texture_objects_per_descriptor.iter().enumerate() {
+            out.push_str(&format!(
+                " texture_objects{index}={}x{}:{}:objects{}",
+                entry.width, entry.height, entry.format, entry.objects,
+            ));
+        }
+        for (index, entry) in self.texture_objects_per_allocation.iter().enumerate() {
+            out.push_str(&format!(
+                " allocation_objects{index}=objects{}:allocations{}",
+                entry.objects, entry.allocations,
             ));
         }
         out
@@ -901,6 +1286,28 @@ impl PresentTraceReport {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let texture_objects = self
+            .texture_objects_per_descriptor
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"format\": \"{}\", \"width\": {}, \"height\": {}, \"objects\": {}}}",
+                    entry.format, entry.width, entry.height, entry.objects,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let allocation_objects = self
+            .texture_objects_per_allocation
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"objects\": {}, \"allocations\": {}}}",
+                    entry.objects, entry.allocations,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "{{\"frames\": {}, \"copied_into_source\": {}, \
              \"copy_kind_copy_texture_region\": {}, \
@@ -913,7 +1320,11 @@ impl PresentTraceReport {
              \"surface_descriptor_mismatch\": {}, \
              \"surface_pass_targets_not_surface\": {}, \
              \"surface_pass_targets_other_surface\": {}, \"dropped_surfaces\": {}, \
-             \"surfaces\": [{}], \"pass_targets\": [{}]}}",
+             \"surface_object_mismatch_reason\": \"{}\", \
+             \"surface_pass_target_same_descriptor_other_object\": {}, \
+             \"surfaces\": [{}], \"pass_targets\": [{}], \
+             \"texture_objects_per_descriptor\": [{}], \
+             \"texture_objects_per_allocation\": [{}]}}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -934,8 +1345,12 @@ impl PresentTraceReport {
             self.surface_pass_targets_not_surface,
             self.surface_pass_targets_other_surface,
             self.dropped_surfaces,
+            self.surface_object_mismatch_reason,
+            self.surface_pass_target_same_descriptor_other_object,
             surfaces,
             pass_targets,
+            texture_objects,
+            allocation_objects,
         )
     }
 }
@@ -1186,20 +1601,8 @@ impl NativeSwapchain {
                 drawable.as_raw(),
             );
             objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
-            objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
         }
-
-        // SAFETY: The command buffer completed via `waitUntilCompleted`.
-        let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
-        if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
-            // SAFETY: `[command_buffer error]` is null or an autoreleased `NSError *`.
-            let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
-            // SAFETY: `error` is null or a live `NSError *` inside this pool.
-            let message = unsafe { objc::nserror_message(error) };
-            return Err(PresentError::Metal(format!(
-                "drawable present failed (status={status}): {message}"
-            )));
-        }
+        wait_for_completion_bounded(command_buffer, "drawable present")?;
 
         // The drawable now holds exactly the pixels the window server shows:
         // either the GPU blit of `source` or the diagnostic clear. Sampling it
@@ -1218,13 +1621,16 @@ impl NativeSwapchain {
             }
         }
 
-        record_present_trace(
+        record_present_trace_targets(
             source_info.map_or(std::ptr::null_mut(), |(source, ..)| source),
             target,
             probe_sampled,
             !filled,
+            // `NativeWindow` only ever hands this path the texture it retained
+            // from the transport's registered surface table.
+            source_info.is_some(),
             source.and_then(surface_descriptor_of),
-            observed_pass_target(),
+            &observed_pass_targets(),
         );
 
         self.presented = self.presented.wrapping_add(1);
@@ -1840,12 +2246,7 @@ impl ProbeGeometry {
         let source_row_bytes = u64::from(width).checked_mul(bytes_per_pixel)?;
         let source_bytes = source_row_bytes.checked_mul(u64::from(height))?;
         let first = layout.block_origin(0, 0, width, height);
-        let last = layout.block_origin(
-            FRAME_PROBE_GRID - 1,
-            FRAME_PROBE_GRID - 1,
-            width,
-            height,
-        );
+        let last = layout.block_origin(FRAME_PROBE_GRID - 1, FRAME_PROBE_GRID - 1, width, height);
         let pixel_byte = |origin: MTLOrigin| {
             (origin.y as u64)
                 .checked_mul(u64::from(width))?
@@ -2956,7 +3357,8 @@ impl SurfaceImage {
         unsafe { std::ptr::copy_nonoverlapping(base, pixels.as_mut_ptr(), len) };
         // SAFETY: Unlocks the same live surface locked above; the read-only
         // option must match.
-        let rc = unsafe { IOSurfaceUnlock(surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) };
+        let rc =
+            unsafe { IOSurfaceUnlock(surface, IOSURFACE_LOCK_READ_ONLY, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "IOSurfaceUnlock failed");
         pixels
     }
@@ -3150,13 +3552,14 @@ impl<'a> PresentPath<'a> {
         // copy trace names whatever wrote it last (for the title path this is
         // the offscreen->swapchain copy/resolve).
         let texture = image.texture_raw();
-        record_present_trace(
+        record_present_trace_targets(
             texture,
             texture,
             None,
             false,
+            true,
             surface_descriptor_of(texture),
-            observed_pass_target(),
+            &observed_pass_targets(),
         );
         self.in_flight = Some(frame);
         if let Err(error) = sink.present(frame) {
@@ -3235,10 +3638,7 @@ fn create_iosurface(
             PropertyValue::Int(BYTES_PER_PIXEL as i32),
         ),
         ("IOSurfaceBytesPerRow", PropertyValue::Int(row_prop)),
-        (
-            "IOSurfacePixelFormat",
-            PropertyValue::Int(pixel_format),
-        ),
+        ("IOSurfacePixelFormat", PropertyValue::Int(pixel_format)),
         ("IOSurfaceAllocSize", PropertyValue::Long(alloc_size as i64)),
     ];
     for (key, value) in properties {
@@ -3321,7 +3721,8 @@ fn create_iosurface_texture(
     // IOSurface and `plane` is `0` for the single plane of a BGRA8 surface. The
     // returned texture is retained (+1).
     let raw = unsafe {
-        type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, *mut c_void, usize) -> objc::Id;
+        type Fn =
+            unsafe extern "C" fn(objc::Id, objc::Sel, objc::Id, *mut c_void, usize) -> objc::Id;
         let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
         f(
             device,
@@ -3363,8 +3764,7 @@ fn encode_clear_pass(
     }
     // SAFETY: `class` is the descriptor class and `renderPassDescriptor` is its
     // documented factory, returning an autoreleased descriptor.
-    let descriptor =
-        unsafe { objc::msg_send_id_0(class, objc::sel(c"renderPassDescriptor")) };
+    let descriptor = unsafe { objc::msg_send_id_0(class, objc::sel(c"renderPassDescriptor")) };
     if descriptor.is_null() {
         return Err(PresentError::Metal(
             "MTLRenderPassDescriptor creation returned null".to_string(),
@@ -3381,9 +3781,8 @@ fn encode_clear_pass(
         ));
     }
     // SAFETY: See above; index 0 is inside a colour attachment array.
-    let attachment = unsafe {
-        msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0)
-    };
+    let attachment =
+        unsafe { msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0) };
     if attachment.is_null() {
         return Err(PresentError::Metal(
             "colour attachment 0 is null".to_string(),
@@ -3438,21 +3837,52 @@ fn encode_clear_pass(
     unsafe {
         objc::msg_send_void_0(encoder, objc::sel(c"endEncoding"));
         objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
-        objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
     }
+    wait_for_completion_bounded(command_buffer, "present command buffer")
+}
 
-    // SAFETY: The command buffer completed via `waitUntilCompleted`.
-    let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
-    if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
-        // SAFETY: `[command_buffer error]` is null or an autoreleased `NSError *`.
-        let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
-        // SAFETY: `error` is null or a live `NSError *` inside this pool.
-        let message = unsafe { objc::nserror_message(error) };
-        return Err(PresentError::Metal(format!(
-            "present command buffer failed (status={status}): {message}"
-        )));
+/// How long the present path may wait for one command buffer.
+const PRESENT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval of a bounded present wait: a sleep, never a busy spin.
+const PRESENT_COMPLETION_POLL: Duration = Duration::from_micros(250);
+
+/// Waits for one present command buffer without an unbounded
+/// `waitUntilCompleted`.
+///
+/// Polls the immutable status with a sleep and names a timeout, so a wedged
+/// queue returns [`PresentError::Metal`] with the label and elapsed bound
+/// instead of hanging the caller. Called from the frame path only with a
+/// command buffer that was just committed.
+fn wait_for_completion_bounded(
+    command_buffer: objc::Id,
+    what: &'static str,
+) -> Result<(), PresentError> {
+    let started = Instant::now();
+    loop {
+        // SAFETY: `command_buffer` is a live committed `MTLCommandBuffer`; the
+        // accessors only read its status and error.
+        let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
+        if status == MTL_COMMAND_BUFFER_STATUS_COMPLETED {
+            return Ok(());
+        }
+        if status == 5 {
+            // SAFETY: `[command_buffer error]` is null or an autoreleased
+            // `NSError *` inside the caller's pool.
+            let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
+            // SAFETY: `error` is null or a live `NSError *`.
+            let message = unsafe { objc::nserror_message(error) };
+            return Err(PresentError::Metal(format!(
+                "{what} failed (status={status}): {message}"
+            )));
+        }
+        if started.elapsed() >= PRESENT_COMPLETION_TIMEOUT {
+            return Err(PresentError::Metal(format!(
+                "{what} timed out after {} ms waiting for the GPU (status={status})",
+                PRESENT_COMPLETION_TIMEOUT.as_millis()
+            )));
+        }
+        std::thread::sleep(PRESENT_COMPLETION_POLL);
     }
-    Ok(())
 }
 
 /// Commits an empty command buffer and waits for it, fencing earlier work.
@@ -3477,21 +3907,8 @@ fn wait_for_queue_completion(queue: objc::Id) -> Result<(), PresentError> {
     // committing and waiting on it only orders it after earlier queue work.
     unsafe {
         objc::msg_send_void_0(command_buffer, objc::sel(c"commit"));
-        objc::msg_send_void_0(command_buffer, objc::sel(c"waitUntilCompleted"));
     }
-
-    // SAFETY: The command buffer completed via `waitUntilCompleted`.
-    let status = unsafe { objc::msg_send_usize_0(command_buffer, objc::sel(c"status")) };
-    if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
-        // SAFETY: `[command_buffer error]` is null or an autoreleased `NSError *`.
-        let error = unsafe { objc::msg_send_id_0(command_buffer, objc::sel(c"error")) };
-        // SAFETY: `error` is null or a live `NSError *` inside this pool.
-        let message = unsafe { objc::nserror_message(error) };
-        return Err(PresentError::Metal(format!(
-            "present fence command buffer failed (status={status}): {message}"
-        )));
-    }
-    Ok(())
+    wait_for_completion_bounded(command_buffer, "present fence command buffer")
 }
 
 /// Apple `MTLClearColor` (`double red, green, blue, alpha`).
@@ -3628,11 +4045,7 @@ mod tests {
         ]
     }
 
-    fn assert_solid(
-        image: &SurfaceImage,
-        clear: ClearColor,
-        context: &str,
-    ) -> Vec<u8> {
+    fn assert_solid(image: &SurfaceImage, clear: ClearColor, context: &str) -> Vec<u8> {
         let pixels = image.read_bgra_rows();
         let expected = expected_bgra(clear);
         let width = image.width() as usize;
@@ -3679,9 +4092,8 @@ mod tests {
             ClearColor::OPAQUE_GREEN,
             ClearColor::OPAQUE_BLUE,
         ];
-        let mut images: Vec<SurfaceImage> = (0..3)
-            .map(|_| create_surface(&transport, 64, 64))
-            .collect();
+        let mut images: Vec<SurfaceImage> =
+            (0..3).map(|_| create_surface(&transport, 64, 64)).collect();
         let mut latencies = Vec::with_capacity(3);
 
         for (index, image) in images.iter_mut().enumerate() {
@@ -3702,7 +4114,11 @@ mod tests {
         );
 
         let surface_ids: HashSet<u32> = frames.iter().map(|frame| frame.surface_id).collect();
-        assert_eq!(surface_ids.len(), 3, "each frame must use a distinct surface");
+        assert_eq!(
+            surface_ids.len(),
+            3,
+            "each frame must use a distinct surface"
+        );
         for (index, image) in images.iter().enumerate() {
             assert_eq!(frames[index].surface_id, image.surface_id());
             assert_eq!(image.frame_index(), Some(index as u64));
@@ -3758,10 +4174,16 @@ mod tests {
 
         let after = assert_solid(&image, ClearColor::OPAQUE_RED, "after refused overwrite");
         assert_eq!(before, after, "in-flight surface contents must not change");
-        assert_eq!(sink.frames().len(), 1, "sink must not see the refused frame");
+        assert_eq!(
+            sink.frames().len(),
+            1,
+            "sink must not see the refused frame"
+        );
 
         assert_eq!(
-            path.finish_present().expect("finish in-flight frame").frame_index,
+            path.finish_present()
+                .expect("finish in-flight frame")
+                .frame_index,
             0
         );
         assert_eq!(
@@ -3789,16 +4211,13 @@ mod tests {
             .present(&mut image, ClearColor::OPAQUE_RED, &mut sink)
             .expect_err("refused frame must fail");
         assert!(
-            matches!(
-                error,
-                PresentError::SinkRefused {
-                    frame_index: 0,
-                    ..
-                }
-            ),
+            matches!(error, PresentError::SinkRefused { frame_index: 0, .. }),
             "unexpected refusal error: {error:?}"
         );
-        assert!(sink.frames().is_empty(), "refused frame must not be recorded");
+        assert!(
+            sink.frames().is_empty(),
+            "refused frame must not be recorded"
+        );
         assert_eq!(path.in_flight(), None, "refusal must clear in-flight state");
         assert_eq!(path.finish_present(), Err(PresentError::NoFrameInFlight));
         assert_solid(&image, ClearColor::OPAQUE_RED, "refused frame render");
@@ -3807,7 +4226,8 @@ mod tests {
             .expect("present after refusal should succeed");
         assert_eq!(sink.frames().len(), 1);
         assert_eq!(
-            sink.frames()[0].frame_index, 1,
+            sink.frames()[0].frame_index,
+            1,
             "a refused frame consumes its index, so indexes stay monotonic"
         );
     }
@@ -4095,11 +4515,7 @@ mod tests {
         // A uniform clear of any colour is exactly one class even when its
         // luma sits in the middle of the range (the case where "distinct luma
         // buckets" alone would be meaningless as a content test).
-        for clear in [
-            [0u8, 0, 0, 255],
-            [128, 128, 128, 255],
-            [51, 26, 13, 255],
-        ] {
+        for clear in [[0u8, 0, 0, 255], [128, 128, 128, 255], [51, 26, 13, 255]] {
             let sample = analyze_bgra8(&vec![clear; 64], clear, FRAME_PROBE_CHANNEL_THRESHOLD);
             assert_eq!(sample.non_black_pixels, 0);
             assert_eq!(sample.unique_luma_buckets, 1);
@@ -4301,7 +4717,10 @@ mod tests {
         let sample = analyze_bgra8(&one, [0, 0, 0, 255], FRAME_PROBE_CHANNEL_THRESHOLD);
         assert_eq!(sample.non_black_pixels, 1);
         assert_eq!(sample.nonzero_bytes, 1);
-        assert_ne!(sample.frame_crc, 0, "one non-zero pixel must change the CRC");
+        assert_ne!(
+            sample.frame_crc, 0,
+            "one non-zero pixel must change the CRC"
+        );
         assert_ne!(
             sample.frame_crc, clean.frame_crc,
             "the CRC is sensitive to the one changed pixel"
@@ -4374,7 +4793,10 @@ mod tests {
             grey_sample.nonzero_bytes, black_sample.nonzero_bytes,
             "mid-grey has three non-zero colour bytes per pixel, black one alpha byte"
         );
-        assert_eq!(grey_sample.unique_luma_buckets, black_sample.unique_luma_buckets);
+        assert_eq!(
+            grey_sample.unique_luma_buckets,
+            black_sample.unique_luma_buckets
+        );
         assert_eq!(grey_sample.unique_luma_buckets, 1);
         assert_ne!(
             probe_color_name(&grey_sample),
@@ -4523,8 +4945,8 @@ mod tests {
         let (width, height) = (3840u32, 2160u32);
         let layout = ProbeLayout::new(width, height).expect("4K layout");
 
-        let bgra8 = ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM)
-            .expect("BGRA8 4K geometry");
+        let bgra8 =
+            ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("BGRA8 4K geometry");
         assert_eq!(bgra8.pixel_format, 80);
         assert_eq!((bgra8.width, bgra8.height), (3840, 2160));
         assert_eq!(bgra8.source_row_bytes, 15_360);
@@ -4588,7 +5010,10 @@ mod tests {
         let geometry =
             ProbeGeometry::new(source, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("4K geometry");
         assert_eq!((geometry.width, geometry.height), (3840, 2160));
-        assert_eq!((geometry.last_sample_x, geometry.last_sample_y), (3360, 1890));
+        assert_eq!(
+            (geometry.last_sample_x, geometry.last_sample_y),
+            (3360, 1890)
+        );
 
         // The last sampled pixel's byte offset is far past the entire window
         // buffer (1280 * 720 * 4 = 3_686_400 bytes), which is the proof the
@@ -4607,7 +5032,10 @@ mod tests {
         // source layout's values, not these.
         let window_geometry =
             ProbeGeometry::new(window, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("window geometry");
-        assert_eq!((window_geometry.last_sample_x, window_geometry.last_sample_y), (1120, 630));
+        assert_eq!(
+            (window_geometry.last_sample_x, window_geometry.last_sample_y),
+            (1120, 630)
+        );
         assert_ne!(geometry.last_sample_byte, window_geometry.last_sample_byte);
         assert_eq!(window_geometry.source_row_bytes, 5_120);
     }
@@ -4693,8 +5121,7 @@ mod tests {
             let command_buffer =
                 objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer"));
             assert!(!command_buffer.is_null());
-            let encoder =
-                objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
+            let encoder = objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
             assert!(!encoder.is_null());
             for grid_y in 0..FRAME_PROBE_GRID {
                 for grid_x in 0..FRAME_PROBE_GRID {
@@ -4726,12 +5153,7 @@ mod tests {
         // SAFETY: the command buffer completed above; `pixels` holds the whole
         // 64x64 staging texture at a matching row pitch.
         unsafe {
-            get_texture_bytes(
-                staging.as_raw(),
-                pixels.as_mut_ptr().cast(),
-                64 * 4,
-                region,
-            );
+            get_texture_bytes(staging.as_raw(), pixels.as_mut_ptr().cast(), 64 * 4, region);
         }
         let expected = expected_bgra(ClearColor::OPAQUE_RED);
         let mismatch = pixels.iter().position(|pixel| *pixel != expected);
@@ -4816,11 +5238,14 @@ mod tests {
         assert_eq!(probe_color_name(&sample), "swatch_0d1a33");
         assert_eq!(sample.uniform_rgba, Some([13, 26, 51, 255]));
         assert_eq!(sample.non_black_pixels, 0);
-        assert_ne!(sample.frame_crc, 0, "the diagnostic clear is not all-zero bytes");
+        assert_ne!(
+            sample.frame_crc, 0,
+            "the diagnostic clear is not all-zero bytes"
+        );
 
         // The real blit's geometry is the same one the report names.
-        let geometry = ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM)
-            .expect("4K geometry");
+        let geometry =
+            ProbeGeometry::new(layout, MTL_PIXEL_FORMAT_BGRA8_UNORM).expect("4K geometry");
         assert_eq!((geometry.width, geometry.height), (3840, 2160));
         assert_eq!(geometry.source_row_bytes, 15_360);
         assert_eq!(geometry.first_sample_byte, 0);
@@ -4870,8 +5295,7 @@ mod tests {
             let command_buffer =
                 objc::msg_send_id_0(transport.queue_raw(), objc::sel(c"commandBuffer"));
             assert!(!command_buffer.is_null());
-            let encoder =
-                objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
+            let encoder = objc::msg_send_id_0(command_buffer, objc::sel(c"blitCommandEncoder"));
             assert!(!encoder.is_null());
             for grid_y in 0..FRAME_PROBE_GRID {
                 for grid_x in 0..FRAME_PROBE_GRID {
@@ -4912,11 +5336,9 @@ mod tests {
                 let staging_origin = layout.staging_origin(grid_x, grid_y);
                 for row in 0..8usize {
                     for column in 0..8usize {
-                        let source_offset =
-                            (origin.y + row) * row_bytes + (origin.x + column) * 4;
-                        let staging_index = (staging_origin.y + row) * 64
-                            + staging_origin.x
-                            + column;
+                        let source_offset = (origin.y + row) * row_bytes + (origin.x + column) * 4;
+                        let staging_index =
+                            (staging_origin.y + row) * 64 + staging_origin.x + column;
                         if pixels[staging_index] != source[source_offset..source_offset + 4] {
                             mismatches += 1;
                         }
@@ -4980,7 +5402,10 @@ mod tests {
         assert_eq!(report.frames, 2);
         assert_eq!(report.probe_source_mismatch, 1);
         assert!(
-            report.keys.iter().any(|entry| !entry.probe_sampled_presented),
+            report
+                .keys
+                .iter()
+                .any(|entry| !entry.probe_sampled_presented),
             "a different sampled texture is a distinct key"
         );
     }

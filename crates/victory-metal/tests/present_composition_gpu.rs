@@ -24,14 +24,111 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 
+use victory_metal::ipc_host::BatchExecutor;
 use victory_metal::macos::present::{
     FRAME_PROBE_CHANNEL_THRESHOLD, PixelOrder, PresentCopyKind, PresentPath, RecordingSink,
-    SurfaceImage, analyze_pixels, present_trace_report,
+    SurfaceImage, analyze_pixels, note_identity_pass_target, present_trace_report,
+    reset_present_trace_for_test,
+};
+use victory_metal::macos::registry::{
+    TextureDesc, TextureDimension, TextureFormat, TextureRegistry, TextureSubresource,
+    TextureUsage, TextureViewKind, reset_texture_object_census, texture_objects_per_allocation,
+    texture_view_conflicts, texture_views_aliased,
 };
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat, RenderTarget};
 use victory_metal::wire::ListIdentity;
-use victory_metal::{DirectMetalTransport, wire_v3};
+use victory_metal::{DirectMetalTransport, VmBufferId, wire_v3};
+/// `/tmp/victory-gpu.lock` mutual exclusion, **tried once**.
+///
+/// A GPU case must never block on the lock: the coordinator may already hold it
+/// (`.swarm/bin/gpu-lock`) and a retry loop there is the nested acquisition that
+/// used to look like a hang. One atomic `mkdir` attempt either owns the lock or
+/// the case reports PARTIAL and skips; a directory whose recorded owner PID is
+/// gone is reclaimed once.
+struct GpuLock {
+    path: PathBuf,
+}
+
+impl GpuLock {
+    fn try_acquire() -> Option<Self> {
+        let path = PathBuf::from("/tmp/victory-gpu.lock");
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                let pid = std::process::id();
+                let _ = std::fs::write(path.join("owner"), format!("{pid} 0\n"));
+                Some(Self { path })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !lock_is_stale(&path) {
+                    return None;
+                }
+                // One reclaim attempt only; never loop on a live holder.
+                let _ = std::fs::remove_dir_all(&path);
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        let pid = std::process::id();
+                        let _ = std::fs::write(path.join("owner"), format!("{pid} 0\n"));
+                        Some(Self { path })
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for GpuLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Whether the lock directory's owner is gone (or is unreadable and old).
+fn lock_is_stale(path: &Path) -> bool {
+    let owner = std::fs::read_to_string(path.join("owner")).unwrap_or_default();
+    let pid = owner
+        .split_whitespace()
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok());
+    let Some(pid) = pid else {
+        return std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60));
+    };
+    !std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Acquires the serializing GPU lock or reports the case as PARTIAL.
+macro_rules! gpu_lock_or_skip {
+    ($case:expr) => {
+        match GpuLock::try_acquire() {
+            Some(lock) => lock,
+            None => {
+                eprintln!(
+                    "present_composition_gpu PARTIAL {}: /tmp/victory-gpu.lock is held; \
+                     run cargo test directly, never under .swarm/bin/gpu-lock",
+                    $case
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// Clears every process-wide census so one case cannot see another's objects.
+fn reset_identity_census() {
+    reset_present_trace_for_test();
+    reset_texture_object_census();
+}
 
 /// Destination (presented) extent.
 const EDGE: u32 = 64;
@@ -134,6 +231,8 @@ fn expected_rgba8(rgba: [f32; 4]) -> [u8; 4] {
 
 #[test]
 fn an_offscreen_draw_copied_to_the_present_surface_is_non_black() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
     let transport = match DirectMetalTransport::new() {
         Ok(transport) => transport,
         Err(error) => {
@@ -389,6 +488,8 @@ fn an_offscreen_draw_copied_to_the_present_surface_is_non_black() {
 /// exactly the two drawn colours.
 #[test]
 fn a_surface_that_is_the_pass_target_presents_identity_pixels() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
     let transport = match DirectMetalTransport::new() {
         Ok(transport) => transport,
         Err(error) => {
@@ -577,4 +678,359 @@ fn a_surface_that_is_the_pass_target_presents_identity_pixels() {
         trace.surfaces.len(),
         trace.log_line()
     );
+}
+
+/// How the same IOSurface texture is registered: the realistic kind-9 alias
+/// after the render target exists, or the surface first and the render target
+/// second. Both orders must converge on one `MTLTexture` object.
+#[derive(Clone, Copy, Debug)]
+enum RegistrationOrder {
+    /// `register_render_target` first, then the kind-9 surface alias
+    /// (`BatchExecutor::register_surface`), the order the live title uses.
+    RenderTargetThenSurfaceAlias,
+    /// `register_present_surface` first, then `register_render_target` with the
+    /// same `RenderTarget` object.
+    SurfaceThenRenderTarget,
+}
+
+/// Draws the two-tone frame into the registered target and checks the
+/// presented IOSurface. Each case owns its transport and its one traced pass.
+fn identity_pixels_for_order(order: RegistrationOrder, edge: u32) {
+    let transport = match DirectMetalTransport::new() {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("present_composition_gpu SKIP no Metal device: {error}");
+            return;
+        }
+    };
+    let mut image = SurfaceImage::create_rgba8(&transport, edge, edge).expect("IOSurface surface");
+    let target = wrap_surface_texture(&image);
+    let surface_id = u64::from(image.surface_id());
+    let host_id = match order {
+        RegistrationOrder::RenderTargetThenSurfaceAlias => {
+            let host_id = transport
+                .register_render_target(&target)
+                .expect("register the render target");
+            BatchExecutor::register_surface(&transport, surface_id, host_id.0)
+                .expect("kind-9 surface alias registers");
+            host_id
+        }
+        RegistrationOrder::SurfaceThenRenderTarget => {
+            transport
+                .register_present_surface(surface_id, &target)
+                .expect("register the present surface first");
+            transport
+                .register_render_target(&target)
+                .expect("register the render target second")
+        }
+    };
+
+    // One object: the present surface and the render-pass target name the same
+    // host `MTLTexture`, whichever registration happened first.
+    let surface_object = transport
+        .registered_surface_object(surface_id)
+        .expect("the surface is registered");
+    let pass_object = transport
+        .registered_texture_object(host_id.0)
+        .expect("the pass target texture is registered");
+    assert_eq!(
+        surface_object, pass_object,
+        "{order:?}: the present surface and the pass target must be one MTLTexture object"
+    );
+
+    let pipeline = GraphicsPipeline::compile_mrt(
+        &transport,
+        MSL,
+        "pc_vertex",
+        "pc_fragment",
+        &[PixelFormat::Rgba8Unorm],
+        None,
+    )
+    .expect("identity pipeline should compile");
+    let pipeline_id = transport
+        .register_graphics_pipeline_state(pipeline)
+        .expect("identity pipeline should register");
+
+    let commands = vec![
+        wire_v3::CommandV3::BeginRenderPass(wire_v3::BeginRenderPass {
+            colors: vec![wire_v3::ColorAttachment {
+                allocation_id: host_id.0,
+                generation: GENERATION,
+                mip_level: 0,
+                slice: 0,
+                load: wire_v3::LoadOp::Clear,
+                store: wire_v3::StoreOp::Store,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            }],
+            depth_stencil: None,
+        }),
+        wire_v3::CommandV3::SetGraphicsPipeline(wire_v3::PipelineRef {
+            pipeline_id: pipeline_id.0,
+        }),
+        wire_v3::CommandV3::SetViewport(wire_v3::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(edge),
+            height: f64::from(edge),
+            near: 0.0,
+            far: 1.0,
+        }),
+        wire_v3::CommandV3::SetScissor(wire_v3::ScissorRect {
+            x: 0,
+            y: 0,
+            width: edge,
+            height: edge,
+        }),
+        wire_v3::CommandV3::SetPrimitiveTopology(wire_v3::PrimitiveTopology::TriangleList),
+        wire_v3::CommandV3::SetRootConstants(wire_v3::RootConstantsV3 {
+            slot: 1,
+            bytes: float4_bytes(COLOR),
+        }),
+        wire_v3::CommandV3::Draw(wire_v3::DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        wire_v3::CommandV3::SetScissor(wire_v3::ScissorRect {
+            x: edge / 2,
+            y: 0,
+            width: edge / 2,
+            height: edge,
+        }),
+        wire_v3::CommandV3::SetRootConstants(wire_v3::RootConstantsV3 {
+            slot: 1,
+            bytes: float4_bytes(HIGHLIGHT),
+        }),
+        wire_v3::CommandV3::Draw(wire_v3::DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        wire_v3::CommandV3::EndRenderPass,
+    ];
+    let submission = wire_v3::SubmissionV3 {
+        sequence: 1,
+        list: Some(ListIdentity {
+            list_id: 9,
+            list_generation: 1,
+        }),
+        commands,
+    };
+    let mut allocations = std::collections::HashMap::new();
+    allocations.insert((host_id.0, GENERATION), VmBufferId(host_id.0));
+    let reply = transport
+        .submit_v3(&submission, &allocations)
+        .expect("the identity draw must execute");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    transport
+        .wait_for_gpu()
+        .expect("the identity draw must complete");
+
+    // Declare the exact object the submit just used as the pass target, so the
+    // present census compares it with the source without arming the sampling
+    // tracer (whose synchronous readback is an opt-in diagnostic, not this
+    // gate's dependency).
+    note_identity_pass_target(pass_object);
+
+    let mut path = PresentPath::new(&transport);
+    let mut sink = RecordingSink::new();
+    path.present_drawn(&mut image, &mut sink)
+        .expect("the identity frame must present");
+    assert_eq!(sink.frames().len(), 1);
+    assert_eq!(sink.frames()[0].surface_id, image.surface_id());
+    path.finish_present().expect("the identity frame finishes");
+
+    // The presented IOSurface holds exactly the two drawn colours.
+    let presented = read_surface_rgba(&image);
+    let row_bytes = image.bytes_per_row();
+    let base = expected_rgba8(COLOR);
+    let highlight = expected_rgba8(HIGHLIGHT);
+    let mut nonzero_bytes = 0u64;
+    for y in 0..edge as usize {
+        for x in 0..edge as usize {
+            let at = y * row_bytes + x * 4;
+            let pixel = [
+                presented[at],
+                presented[at + 1],
+                presented[at + 2],
+                presented[at + 3],
+            ];
+            let expected = if x >= (edge / 2) as usize {
+                highlight
+            } else {
+                base
+            };
+            assert_eq!(
+                pixel, expected,
+                "{order:?}: pixel ({x}, {y}) is {pixel:?}, expected {expected:?}"
+            );
+            nonzero_bytes += pixel.iter().filter(|byte| **byte != 0).count() as u64;
+        }
+    }
+    assert_eq!(
+        nonzero_bytes,
+        u64::from(edge) * u64::from(edge) * 4,
+        "{order:?}: every presented byte is drawn content"
+    );
+
+    // Identity: the pass target is the presented surface object, and exactly
+    // one texture object exists for that descriptor across the surface and the
+    // pass target.
+    let trace = present_trace_report();
+    assert!(
+        trace.surfaces.iter().any(|surface| {
+            surface.format == "rgba8unorm"
+                && surface.width == edge as usize
+                && surface.height == edge as usize
+                && surface.targeted_by_pass
+        }),
+        "{order:?}: the census must name this surface as a pass target: {trace:?}"
+    );
+    assert!(
+        trace.pass_targets.iter().any(|target| {
+            target.swapchain
+                && target.is_presented_surface
+                && target.width == edge
+                && target.height == edge
+        }),
+        "{order:?}: the pass target must be the registered surface object: {trace:?}"
+    );
+    assert!(
+        trace.texture_objects_per_descriptor.iter().any(|entry| {
+            entry.format == "rgba8unorm"
+                && entry.width == edge as usize
+                && entry.height == edge as usize
+                && entry.objects == 1
+        }),
+        "{order:?}: one texture object per descriptor: {trace:?}"
+    );
+    assert_eq!(
+        trace.surface_object_mismatch_reason, "none",
+        "{order:?}: the surface and the pass target are one object: {trace:?}"
+    );
+    assert!(
+        trace.keys.iter().any(|entry| entry.source_is_presented),
+        "{order:?}: the presented source is the registered surface: {trace:?}"
+    );
+    assert_eq!(trace.probe_source_mismatch, 0);
+    assert_eq!(trace.fallback_clear, 0);
+    eprintln!(
+        "present_composition_gpu IDENTITY ORDER {order:?} PASS extent={edge}x{edge} \
+         nonzero_bytes={nonzero_bytes} surface_targeted_by_pass={} \
+         source_is_presented=1 reason={} texture_objects={:?}",
+        trace.surface_targeted_by_pass,
+        trace.surface_object_mismatch_reason,
+        trace.texture_objects_per_descriptor,
+    );
+}
+
+/// Negative control: a different-format view over one registered handle stays
+/// a second `MTLTexture` object and is counted as a conflict, while a
+/// full-resource same-format RTV is the base object itself. This is the
+/// "a genuinely different view stays a named conflict" rule.
+#[test]
+fn a_different_format_view_is_a_counted_conflict_not_an_alias() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
+
+    let transport = match DirectMetalTransport::new() {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("present_composition_gpu SKIP no Metal device: {error}");
+            return;
+        }
+    };
+    let mut registry = TextureRegistry::new(&transport).expect("texture registry");
+    let desc = TextureDesc {
+        width: 16,
+        height: 16,
+        depth: 1,
+        mip_levels: 1,
+        sample_count: 1,
+        array_layers: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsage {
+            shader_read: true,
+            shader_write: false,
+            render_target: true,
+            depth_stencil: false,
+        },
+        label: None,
+    };
+    registry
+        .register(0x9001, desc)
+        .expect("register the base texture");
+    let before = texture_view_conflicts();
+    let alias = registry
+        .create_view_as(
+            0x9001,
+            TextureViewKind::Rtv,
+            TextureSubresource::single(0, 0),
+            TextureFormat::Rgba8Unorm,
+        )
+        .expect("full-resource RTV");
+    assert!(
+        alias.aliases_source(),
+        "a full-resource same-format RTV is the base MTLTexture object"
+    );
+    assert_eq!(texture_views_aliased(), 1);
+    assert_eq!(
+        texture_view_conflicts(),
+        before,
+        "an aliased RTV creates no second object"
+    );
+
+    let conflict = registry
+        .create_view_as(
+            0x9001,
+            TextureViewKind::Rtv,
+            TextureSubresource::single(0, 0),
+            TextureFormat::Rgba8Srgb,
+        )
+        .expect("different-format RTV");
+    assert!(
+        !conflict.aliases_source(),
+        "a different-format view must not be silently aliased"
+    );
+    assert_ne!(
+        alias.object_identity(),
+        conflict.object_identity(),
+        "a genuinely different view is a distinct MTLTexture"
+    );
+    assert_eq!(
+        texture_view_conflicts(),
+        before + 1,
+        "the different-format view is a counted conflict"
+    );
+    assert_eq!(
+        texture_objects_per_allocation(),
+        vec![(2, 1)],
+        "one handle must be the only allocation with two objects"
+    );
+    eprintln!(
+        "present_composition_gpu CONFLICT PASS objects_per_allocation={:?} conflicts={}",
+        texture_objects_per_allocation(),
+        texture_view_conflicts(),
+    );
+}
+
+/// The live order: the render target is registered first, then the surface is
+/// aliased to it by handle.
+#[test]
+fn one_texture_object_when_the_render_target_is_registered_first() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
+    identity_pixels_for_order(RegistrationOrder::RenderTargetThenSurfaceAlias, 32);
+}
+
+/// The reverse order: the present surface is registered first, then the render
+/// target wrapping the same texture.
+#[test]
+fn one_texture_object_when_the_surface_is_registered_first() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
+    identity_pixels_for_order(RegistrationOrder::SurfaceThenRenderTarget, 48);
 }

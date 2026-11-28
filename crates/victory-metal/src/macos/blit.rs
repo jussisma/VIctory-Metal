@@ -155,6 +155,15 @@ pub(crate) fn copy_trace_totals() -> (u64, u64, u64) {
 
 /// Clears the bounded copy trace (tests and a fresh session).
 #[cfg(test)]
+/// Clears the copy trace for an integration test's identity gate.
+///
+/// Public and hidden so a hardware case starts with no earlier copy; the host
+/// never calls it.
+#[doc(hidden)]
+pub fn reset_copy_trace_for_test() {
+    reset_copy_trace();
+}
+
 pub(crate) fn reset_copy_trace() {
     if let Ok(mut trace) = copy_trace().lock() {
         *trace = CopyTrace::default();
@@ -214,12 +223,7 @@ pub(crate) struct TextureRegion {
 impl TextureRegion {
     /// Validates the box against both live textures.
     pub(crate) fn validate(&self) -> Result<(), MetalError> {
-        validate_box(
-            "source",
-            self.source,
-            self.source_origin,
-            self.size,
-        )?;
+        validate_box("source", self.source, self.source_origin, self.size)?;
         validate_box(
             "destination",
             self.destination,
@@ -247,15 +251,7 @@ fn texture_geometry(texture: objc::Id) -> Result<TextureGeometry, MetalError> {
     }
     // SAFETY: `texture` is a live `MTLTexture` and these accessors only read
     // immutable texture properties.
-    let (
-        width,
-        height,
-        depth,
-        mip_levels,
-        slices,
-        pixel_format,
-        sample_count,
-    ) = unsafe {
+    let (width, height, depth, mip_levels, slices, pixel_format, sample_count) = unsafe {
         (
             objc::msg_send_usize_0(texture, objc::sel(c"width")),
             objc::msg_send_usize_0(texture, objc::sel(c"height")),
@@ -291,7 +287,11 @@ fn texture_geometry(texture: objc::Id) -> Result<TextureGeometry, MetalError> {
 fn level_extent(geometry: &TextureGeometry, level: usize) -> [usize; 3] {
     let shift = u32::try_from(level).unwrap_or(u32::MAX);
     let half = |value: usize| value.checked_shr(shift).unwrap_or(0).max(1);
-    [half(geometry.width), half(geometry.height), half(geometry.depth)]
+    [
+        half(geometry.width),
+        half(geometry.height),
+        half(geometry.depth),
+    ]
 }
 
 fn validate_subresource(
@@ -346,17 +346,16 @@ fn validate_box(
 }
 
 /// Copies one explicit texel box between two textures on a live blit encoder.
-pub(crate) fn copy_texture_region(
-    enc: objc::Id,
-    region: &TextureRegion,
-) -> Result<(), MetalError> {
+pub(crate) fn copy_texture_region(enc: objc::Id, region: &TextureRegion) -> Result<(), MetalError> {
     if enc.is_null() {
-        return Err(MetalError::InternalError(
-            "blit encoder is nil".to_string(),
-        ));
+        return Err(MetalError::InternalError("blit encoder is nil".to_string()));
     }
     region.validate()?;
     note_copy_destination(BlitCopyKind::CopyTextureRegion, region.destination.texture);
+    // The copy destination joins the present path's object identity census, so
+    // a surface, pass target and copy target of one guest texture are proven to
+    // be the same `MTLTexture`.
+    crate::macos::present::note_copy_destination_object(region.destination.texture);
     let origin = |values: [usize; 3]| MTLOrigin {
         x: values[0],
         y: values[1],
@@ -476,11 +475,10 @@ pub(crate) fn copy_buffer_to_texture(
     copy: &BufferTextureCopy,
 ) -> Result<(), MetalError> {
     if enc.is_null() {
-        return Err(MetalError::InternalError(
-            "blit encoder is nil".to_string(),
-        ));
+        return Err(MetalError::InternalError("blit encoder is nil".to_string()));
     }
     copy.validate()?;
+    crate::macos::present::note_copy_destination_object(copy.destination.texture);
     let origin = MTLOrigin {
         x: copy.destination_origin[0],
         y: copy.destination_origin[1],
@@ -571,6 +569,7 @@ pub(crate) fn encode_resolve(
     }
     validate_resolve(source, destination)?;
     note_copy_destination(BlitCopyKind::ResolveSubresource, destination.texture);
+    crate::macos::present::note_copy_destination_object(destination.texture);
 
     let _pool = AutoreleasePool::new();
     let cls = objc::class(c"MTLRenderPassDescriptor");
@@ -595,9 +594,8 @@ pub(crate) fn encode_resolve(
         ));
     }
     // SAFETY: index 0 is below the declared 1..=8 colour attachment limit.
-    let attachment = unsafe {
-        objc::msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0)
-    };
+    let attachment =
+        unsafe { objc::msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), 0) };
     if attachment.is_null() {
         return Err(MetalError::InternalError(
             "colour attachment descriptor is nil".to_string(),
@@ -607,11 +605,7 @@ pub(crate) fn encode_resolve(
     // documented `MTLLoadAction`/`MTLStoreAction` encodings and subresource
     // indices.
     unsafe {
-        objc::msg_send_void_1(
-            attachment,
-            objc::sel(c"setTexture:"),
-            source.texture,
-        );
+        objc::msg_send_void_1(attachment, objc::sel(c"setTexture:"), source.texture);
         objc::msg_send_void_1(
             attachment,
             objc::sel(c"setResolveTexture:"),
@@ -674,7 +668,8 @@ pub fn create_multisample_render_target(
     format: PixelFormat,
     sample_count: usize,
 ) -> Result<RenderTarget, MetalError> {
-    if width == 0 || height == 0 || width > MAX_TEXTURE_DIMENSION || height > MAX_TEXTURE_DIMENSION {
+    if width == 0 || height == 0 || width > MAX_TEXTURE_DIMENSION || height > MAX_TEXTURE_DIMENSION
+    {
         return Err(MetalError::InvalidArg(
             "multisample target dimensions are zero or oversized",
         ));
@@ -728,11 +723,7 @@ pub fn create_multisample_render_target(
             objc::sel(c"setTextureType:"),
             MTL_TEXTURE_TYPE_2D_MULTISAMPLE,
         );
-        objc::msg_send_void_usize(
-            descriptor,
-            objc::sel(c"setSampleCount:"),
-            sample_count,
-        );
+        objc::msg_send_void_usize(descriptor, objc::sel(c"setSampleCount:"), sample_count);
         objc::msg_send_void_usize(
             descriptor,
             objc::sel(c"setStorageMode:"),
@@ -816,7 +807,10 @@ mod tests {
         note_copy_destination(BlitCopyKind::CopyTextureRegion, first);
         note_copy_destination(BlitCopyKind::ResolveSubresource, second);
         assert_eq!(copy_kind_for(first), Some(BlitCopyKind::CopyTextureRegion));
-        assert_eq!(copy_kind_for(second), Some(BlitCopyKind::ResolveSubresource));
+        assert_eq!(
+            copy_kind_for(second),
+            Some(BlitCopyKind::ResolveSubresource)
+        );
         assert_eq!(
             BlitCopyKind::CopyTextureRegion.as_str(),
             "copy_texture_region"
@@ -825,7 +819,10 @@ mod tests {
 
         reset_copy_trace();
         for index in 0..(COPY_TRACE_MAX_KEYS + 3) {
-            note_copy_destination(BlitCopyKind::CopyTextureRegion, (0x3000 + index) as objc::Id);
+            note_copy_destination(
+                BlitCopyKind::CopyTextureRegion,
+                (0x3000 + index) as objc::Id,
+            );
         }
         let (region, resolve, dropped) = copy_trace_totals();
         assert_eq!(region, COPY_TRACE_MAX_KEYS as u64);
