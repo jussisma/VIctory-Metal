@@ -550,6 +550,8 @@ struct Stats {
     clear_ops_encoded: u64,
     /// ADR-052: handle class of the last `UnknownHandle` refusal.
     unknown_handle_site: Option<String>,
+    /// ADR-052: wire allocation id the last texture refusal named.
+    unknown_handle_id: u64,
     /// ADR-051: MEMORY_SPACE parameters bound and bytes allocated.
     memory_space_bound: u64,
     memory_space_bytes: u64,
@@ -595,6 +597,7 @@ impl Default for Stats {
             render_passes_encoded: 0,
             clear_ops_encoded: 0,
             unknown_handle_site: None,
+            unknown_handle_id: 0,
             memory_space_bound: 0,
             memory_space_bytes: 0,
             abi_refusals: 0,
@@ -877,6 +880,7 @@ impl BatchExecutor for DaemonExecutor {
             stats.abi_refusals = self.transport.abi_refusal_count();
             if matches!(&result, Ok(reply) if reply.status == ReplyStatus::UnknownHandle) {
                 let site = victory_metal::macos::device::last_unknown_site().to_string();
+                stats.unknown_handle_id = victory_metal::macos::device::last_unknown_id();
                 stats.last_error = Some(format!(
                     "the executor answered UnknownHandle at {site}"
                 ));
@@ -1412,6 +1416,7 @@ fn write_telemetry(
             "  \"render_passes_encoded\": {render_passes_encoded},\n",
             "  \"clear_ops_encoded\": {clear_ops_encoded},\n",
             "  \"unknown_handle_site\": {unknown_handle_site},\n",
+            "  \"unknown_handle_id\": {unknown_handle_id},\n",
             "  \"memory_space_bound\": {memory_space_bound},\n",
             "  \"memory_space_bytes\": {memory_space_bytes},\n",
             "  \"abi_refusals\": {abi_refusals},\n",
@@ -1475,6 +1480,7 @@ fn write_telemetry(
             .unknown_handle_site
             .as_deref()
             .map_or_else(|| "null".to_string(), |site| format!("\"{site}\"")),
+        unknown_handle_id = stats.unknown_handle_id,
         memory_space_bound = stats.memory_space_bound,
         memory_space_bytes = stats.memory_space_bytes,
         abi_refusals = stats.abi_refusals,
@@ -1776,6 +1782,7 @@ impl Clone for Stats {
             render_passes_encoded: self.render_passes_encoded,
             clear_ops_encoded: self.clear_ops_encoded,
             unknown_handle_site: self.unknown_handle_site.clone(),
+            unknown_handle_id: self.unknown_handle_id,
             memory_space_bound: self.memory_space_bound,
             memory_space_bytes: self.memory_space_bytes,
             abi_refusals: self.abi_refusals,
@@ -2095,6 +2102,7 @@ mod draw_trace_json_tests {
             "render_passes_encoded",
             "clear_ops_encoded",
             "unknown_handle_site",
+            "unknown_handle_id",
             "memory_space_bound",
             "memory_space_bytes",
             "abi_refusals",

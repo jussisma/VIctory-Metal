@@ -3529,6 +3529,14 @@ pub fn last_unknown_site() -> &'static str {
     UNKNOWN_SITES[index % UNKNOWN_SITES.len()]
 }
 
+/// ADR-052: the wire allocation id the last texture refusal named.
+static UNKNOWN_HANDLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The allocation id the last `UnknownHandle` refusal named, or `0`.
+pub fn last_unknown_id() -> u64 {
+    UNKNOWN_HANDLE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn resolve_buffer_range(
     state: &DeviceState,
     allocations: &HashMap<(u64, u32), VmBufferId>,
@@ -4912,8 +4920,15 @@ fn prepare_render_segment(
     let mut trace_target: Option<crate::macos::trace::TraceTarget> = None;
     for color in &pass.colors {
         let (texture, info) =
-            resolve_texture(state, allocations, color.allocation_id, color.generation)
-                .ok_or(PrepareAbort::UnknownHandle)?;
+            resolve_texture(state, allocations, color.allocation_id, color.generation).ok_or_else(
+                || {
+                    UNKNOWN_HANDLE_ID.store(
+                        color.allocation_id,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    PrepareAbort::UnknownHandle
+                },
+            )?;
         if !info.format.is_color() {
             return Err(MetalError::InvalidArg(
                 "colour attachment must be BGRA8Unorm or RGBA8Unorm",
@@ -4968,10 +4983,16 @@ fn prepare_render_segment(
         Some(depth) => {
             let (texture, info) =
                 resolve_texture(state, allocations, depth.allocation_id, depth.generation)
-                    .ok_or(PrepareAbort::UnknownHandle)?;
+                    .ok_or_else(|| {
+                        UNKNOWN_HANDLE_ID.store(
+                            depth.allocation_id,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        PrepareAbort::UnknownHandle
+                    })?;
             if !info.format.is_depth() {
                 return Err(MetalError::InvalidArg(
-                    "depth attachment must be Depth32Float or Depth32Float_Stencil8",
+                    "depth attachment must be a depth format",
                 )
                 .into());
             }
@@ -7319,6 +7340,7 @@ impl DirectMetalTransport {
             }
         }
 
+        UNKNOWN_HANDLE_ID.store(0, std::sync::atomic::Ordering::Relaxed);
         let prepared = match prepare_v3(&mut state, self, allocations, &submission.commands, &plan) {
             Ok(prepared) => prepared,
             Err(PrepareAbort::UnknownHandle) => {
