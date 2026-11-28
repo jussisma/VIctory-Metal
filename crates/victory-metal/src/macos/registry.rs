@@ -993,6 +993,17 @@ impl TextureUsage {
         !self.shader_read && !self.shader_write && !self.render_target && !self.depth_stencil
     }
 
+    /// The union of two usage sets, for a handle registered again with a wider
+    /// use (ADR-054: an SRV-first texture later bound as an RTV/DSV).
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            shader_read: self.shader_read || other.shader_read,
+            shader_write: self.shader_write || other.shader_write,
+            render_target: self.render_target || other.render_target,
+            depth_stencil: self.depth_stencil || other.depth_stencil,
+        }
+    }
+
     const fn mtl_bits(self) -> usize {
         let mut bits = MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW;
         if self.shader_read {
@@ -1230,6 +1241,23 @@ impl TextureDesc {
     pub fn max_mip_levels(&self) -> u32 {
         let widest = self.width.max(self.height).max(self.depth).max(1);
         32 - widest.leading_zeros()
+    }
+
+    /// Whether `other` names the same host texture: dimension, format, sample
+    /// count, extents, mip chain and array layers.
+    ///
+    /// Usage and label may differ. ADR-054 uses this to tell a wider use of one
+    /// handle (a sampled texture later bound as an RTV/DSV, which keeps the
+    /// live `MTLTexture`) from a real descriptor conflict.
+    pub fn same_geometry(&self, other: &Self) -> bool {
+        self.dimension == other.dimension
+            && self.format == other.format
+            && self.sample_count == other.sample_count
+            && self.width == other.width
+            && self.height == other.height
+            && self.depth == other.depth
+            && self.mip_levels == other.mip_levels
+            && self.array_layers == other.array_layers
     }
 
     const fn mtl_texture_type(&self) -> usize {
@@ -1590,14 +1618,24 @@ impl TextureRegistry {
     /// Duplicate ids are rejected before Metal sees the descriptor. The created
     /// object's type, pixel format, extents, mip count, sample count and array
     /// length are read back and compared with the request.
+    ///
+    /// Re-registering a live handle with the same geometry but a different
+    /// usage widens the stored usage (union) and succeeds without recreating
+    /// the `MTLTexture`: a texture first registered as an SRV can later be
+    /// bound as a render or depth attachment (ADR-054). A different geometry or
+    /// format stays a named [`RegistryError::DuplicateTexture`] conflict.
     pub fn register(&mut self, id: u64, desc: TextureDesc) -> Result<(), RegistryError> {
         if id == 0 {
             return Err(RegistryError::InvalidDesc("texture id 0 is reserved"));
         }
-        if self.textures.contains_key(&id) {
+        desc.validate()?;
+        if let Some(existing) = self.textures.get_mut(&id) {
+            if existing.desc.same_geometry(&desc) {
+                existing.desc.usage = existing.desc.usage.union(desc.usage);
+                return Ok(());
+            }
             return Err(RegistryError::DuplicateTexture(id));
         }
-        desc.validate()?;
 
         let _pool = AutoreleasePool::new();
         let descriptor = new_texture_descriptor(&desc, self.support)?;
@@ -4911,6 +4949,93 @@ mod tests {
         );
     }
 
+    /// ADR-054: a handle first registered as a sampled texture is the same
+    /// Metal object when a later session registers it as a colour or depth
+    /// attachment. The stored usage widens (union) and the live `MTLTexture`
+    /// is never recreated; a different width or format is still a named
+    /// conflict.
+    #[test]
+    fn a_later_attachment_usage_widens_without_recreating_the_texture() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let mut registry = TextureRegistry::new(&transport).expect("registry");
+
+        // An SRV-first texture: registered as sampled, as a table bind does.
+        let sampled = desc();
+        registry
+            .register(21, sampled.clone())
+            .expect("sampled registration");
+        let before = registry.raw(21).expect("a live sampled texture");
+
+        // The same handle, same geometry, now a colour attachment.
+        let mut colour = sampled.clone();
+        colour.usage = TextureUsage::color_attachment();
+        registry
+            .register(21, colour)
+            .expect("a wider usage must reuse the texture, not refuse it");
+        assert_eq!(
+            before,
+            registry.raw(21).expect("still the same live texture"),
+            "the MTLTexture is not recreated"
+        );
+        let entry = registry.get(21).expect("still registered");
+        assert!(entry.desc().usage.render_target, "the colour use is recorded");
+        assert!(
+            entry.desc().usage.shader_read,
+            "the earlier sampled use stays"
+        );
+        registry
+            .create_view(21, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("the widened usage allows an RTV");
+
+        // A different width and a different format remain real conflicts.
+        let mut wider = sampled.clone();
+        wider.width = 128;
+        assert!(
+            matches!(
+                registry.register(21, wider),
+                Err(RegistryError::DuplicateTexture(21))
+            ),
+            "a different width stays a named conflict"
+        );
+        let mut other_format = sampled.clone();
+        other_format.format = TextureFormat::Rgba8Srgb;
+        assert!(
+            matches!(
+                registry.register(21, other_format),
+                Err(RegistryError::DuplicateTexture(21))
+            ),
+            "a different format stays a named conflict"
+        );
+
+        // The depth twin: sampled -> depth attachment, same live texture.
+        let mut depth = desc();
+        depth.format = TextureFormat::Depth32Float;
+        registry
+            .register(22, depth.clone())
+            .expect("sampled depth registration");
+        let depth_before = registry.raw(22).expect("a live depth texture");
+        let mut depth_usage = depth;
+        depth_usage.usage = TextureUsage::depth_attachment();
+        registry
+            .register(22, depth_usage)
+            .expect("the depth usage widens");
+        assert_eq!(
+            depth_before,
+            registry.raw(22).expect("still the same live depth texture")
+        );
+        assert!(
+            registry
+                .get(22)
+                .expect("still registered")
+                .desc()
+                .usage
+                .depth_stencil
+        );
+        registry
+            .create_view(22, TextureViewKind::Dsv, TextureSubresource::single(0, 0))
+            .expect("the widened usage allows a DSV");
+    }
+
     #[test]
     fn texture_registry_rejects_zero_and_duplicate_ids_without_gpu_objects() {
         let transport = DirectMetalTransport::new().expect("Metal device should open");
@@ -4922,8 +5047,16 @@ mod tests {
         registry
             .register(7, desc())
             .expect("a valid descriptor must create a real texture");
+        // ADR-054: the same handle with the same geometry is the same texture,
+        // so the idempotent re-registration succeeds; only a different
+        // geometry is a conflict.
+        registry
+            .register(7, desc())
+            .expect("the same descriptor is idempotent");
+        let mut other = desc();
+        other.width = 32;
         assert!(matches!(
-            registry.register(7, desc()),
+            registry.register(7, other),
             Err(RegistryError::DuplicateTexture(7))
         ));
         assert!(matches!(

@@ -2500,6 +2500,30 @@ fn refuse_target_texture_registration(
     S_OK
 }
 
+/// Records one refused eager attachment registration made while a view was
+/// created (ADR-054), and answers whether it was counted.
+///
+/// View creation has no D3D12 failure contract, so this never fails it: the
+/// refusal is counted in the same [`TEXTURE_REGISTRATION_REFUSALS`] census a
+/// creation-time refusal uses and logged with the handle, usage and exact
+/// reason. The lazy bind path still refuses the pass if the handle stays
+/// unregistered.
+#[cfg(any(windows, test))]
+pub(crate) fn note_view_registration_refusal(handle: u64, usage: u8, reason: &str) -> u64 {
+    let refusals = TEXTURE_REGISTRATION_REFUSALS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    tracing::warn!(
+        handle = format_args!("{handle:#x}"),
+        usage,
+        reason,
+        texture_registration_refusals = refusals,
+        "VICTORY_BACKEND=metal: eager attachment registration refused at view creation; \
+         the view still exists and its first bind will be refused"
+    );
+    refusals
+}
+
 /// Settles a creation-time target texture registration, never failing creation.
 ///
 /// `send` is the transport call (injected in tests): `Ok((true, _))` registered,
@@ -2538,7 +2562,8 @@ fn settle_native_texture_registration(
     }
 }
 
-/// Parameters for registering a texture at its first table bind.
+/// Parameters for registering a texture at its first table bind or attachment
+/// bind.
 #[cfg(any(windows, test))]
 pub(crate) struct TextureTableRegistration {
     /// Guest memory base, the kind 8 handle.
@@ -2547,7 +2572,7 @@ pub(crate) struct TextureTableRegistration {
     pub dimension: u8,
     /// Kind 8 format code.
     pub format: u8,
-    /// Kind 8 usage code (`0` sampled, `3` storage).
+    /// Kind 8 usage code (`0` sampled, `1` colour, `2` depth, `3` storage).
     pub usage: u8,
     /// Sample count.
     pub sample_count: u8,
@@ -2563,6 +2588,38 @@ pub(crate) struct TextureTableRegistration {
     pub array_layers: u16,
 }
 
+/// The kind 8 usage code of a colour render-target attachment.
+pub(crate) const ATTACHMENT_USAGE_COLOR: u8 = 1;
+
+/// The kind 8 usage code of a depth/stencil attachment.
+pub(crate) const ATTACHMENT_USAGE_DEPTH: u8 = 2;
+
+#[cfg(any(windows, test))]
+impl TextureTableRegistration {
+    /// Sends this registration to the live host session (kind 8).
+    ///
+    /// One transport for the table path, the attachment path and the eager
+    /// view-creation path, so the three can never send different requests for
+    /// one texture.
+    pub(crate) fn send(
+        &self,
+    ) -> Result<(bool, Option<String>), crate::native_metal::queue::NativeQueueError> {
+        crate::native_metal::queue::register_texture_with_reason(
+            self.handle,
+            1,
+            self.dimension,
+            self.format,
+            self.usage,
+            self.sample_count,
+            self.width,
+            self.height,
+            self.depth,
+            self.mip_levels,
+            self.array_layers,
+        )
+    }
+}
+
 /// The registration a texture table entry needs, when it is not registered yet.
 ///
 /// A texture that is only sampled has no creation-time registration
@@ -2576,6 +2633,32 @@ pub(crate) fn texture_table_registration(
     this: This,
     usage: u8,
 ) -> Option<Result<TextureTableRegistration, &'static str>> {
+    let (base, desc) = texture_memory(this)?;
+    Some(registration_from_desc(base as u64, &desc, usage))
+}
+
+/// The kind 8 registration a texture needs at its first RTV/DSV bind
+/// (ADR-054).
+///
+/// A texture created with no GPU-write flag (`flags == 0`: an at-address,
+/// placed or otherwise lazily made texture) has no creation-time registration
+/// ([`native_texture_registration`]), yet a title may use it only as a render
+/// or depth attachment (`OMSetRenderTargets`, a clear). This is the same decode
+/// the table bind uses ([`registration_from_desc`]), with `usage` the
+/// attachment code: [`ATTACHMENT_USAGE_COLOR`] for an RTV,
+/// [`ATTACHMENT_USAGE_DEPTH`] for a DSV. `None` means the object is a buffer,
+/// not a texture; an `Err` is the named shape the kind 8 codes cannot express,
+/// never a guessed format.
+#[cfg(any(windows, test))]
+pub(crate) fn texture_attachment_registration(
+    this: This,
+    usage: u8,
+) -> Option<Result<TextureTableRegistration, &'static str>> {
+    if usage != ATTACHMENT_USAGE_COLOR && usage != ATTACHMENT_USAGE_DEPTH {
+        return Some(Err(
+            "texture attachment registration: usage is neither colour nor depth",
+        ));
+    }
     let (base, desc) = texture_memory(this)?;
     Some(registration_from_desc(base as u64, &desc, usage))
 }
@@ -3642,6 +3725,45 @@ pub(crate) fn test_buffer(width: u64) -> This {
         std::ptr::null(),
         &heap,
         0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+/// A plain 2D texture description for tests: `dimension` 3, one mip, one
+/// array layer, `flags` as the title would pass them.
+#[cfg(test)]
+pub(crate) fn test_texture_desc(width: u64, height: u32, format: u32, flags: u32) -> ResourceDesc {
+    ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    }
+}
+
+/// A texture resource the title placed at `address` (the at-address creation).
+///
+/// This is the class of texture that has no creation-time registration when
+/// `desc.flags == 0`; the guest handle is `address` itself (ADR-054).
+#[cfg(test)]
+pub(crate) fn test_texture_at_address(desc: ResourceDesc, address: u64) -> This {
+    let mut out = std::ptr::null();
+    let hr = create_at_address_impl(
+        std::ptr::null(),
+        address,
         &desc,
         0,
         std::ptr::null(),

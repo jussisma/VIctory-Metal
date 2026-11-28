@@ -1385,6 +1385,16 @@ impl<E: BatchExecutor> IpcHost<E> {
         self.last_error.as_deref()
     }
 
+    /// The executor this host serves.
+    ///
+    /// A test reads its own device-side state after the session ends (the
+    /// encode counters an accepted v3 submission bumped, for example), which
+    /// the host otherwise owns. Never used to drive GPU work outside the
+    /// session.
+    pub fn executor(&self) -> &E {
+        &self.executor
+    }
+
     /// Records one answered frame whose status was not `Ok`.
     ///
     /// The wire reason is never raw guest memory: callers pass either Metal's

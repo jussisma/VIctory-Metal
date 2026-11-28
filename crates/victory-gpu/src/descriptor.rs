@@ -567,6 +567,32 @@ fn note_view_failure(name: &'static str, handle: u64, resource: This) {
     let _ = (name, handle, resource);
 }
 
+/// Records a render-target or depth view at `handle`.
+///
+/// `tag` is the view kind's tag and `usage` its kind 8 attachment usage code,
+/// so a depth view is registered as depth on its first (and only) eager
+/// attempt instead of first as a colour view (ADR-054).
+fn record_attachment_view(resource: This, desc: *const [u32; 6], handle: u64, tag: u32, usage: u8) {
+    // SAFETY: the title passes a description or null.
+    let described = unsafe { desc.as_ref() };
+    let record = RtvRecord {
+        tag,
+        described: u32::from(described.is_some()),
+        resource,
+        desc: described.copied().unwrap_or_default(),
+    };
+    // SAFETY: the handle is a descriptor slot, at least 112 bytes.
+    unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
+    // ADR-054: an RTV/DSV is the earliest point a texture is known to be an
+    // attachment, so register it with the host now. Best-effort: view creation
+    // has no D3D12 failure contract, and the bind path still refuses a pass
+    // whose handle stays unregistered.
+    #[cfg(windows)]
+    register_created_view(resource, usage);
+    #[cfg(not(windows))]
+    let _ = (resource, usage);
+}
+
 /// Device method: records the view at `handle` (descriptor memory).
 pub(crate) extern "system" fn create_rtv(
     _: This,
@@ -578,21 +604,18 @@ pub(crate) extern "system" fn create_rtv(
         note_view_failure(call_names::CREATE_RENDER_TARGET_VIEW, handle, resource);
         return;
     }
-    // SAFETY: the title passes a description or null.
-    let described = unsafe { desc.as_ref() };
-    let record = RtvRecord {
-        tag: RTV_TAG,
-        described: u32::from(described.is_some()),
+    record_attachment_view(
         resource,
-        desc: described.copied().unwrap_or_default(),
-    };
-    // SAFETY: the handle is a descriptor slot, at least 112 bytes.
-    unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
+        desc,
+        handle,
+        RTV_TAG,
+        crate::resource::ATTACHMENT_USAGE_COLOR,
+    );
 }
 
 /// Device method: a depth view, recorded as render target views are.
 pub(crate) extern "system" fn create_dsv(
-    this: This,
+    _: This,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
@@ -601,11 +624,88 @@ pub(crate) extern "system" fn create_dsv(
         note_view_failure(call_names::CREATE_DEPTH_STENCIL_VIEW, handle, resource);
         return;
     }
-    create_rtv(this, resource, desc, handle);
-    // SAFETY: just written by `create_rtv`.
-    unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
+    record_attachment_view(
+        resource,
+        desc,
+        handle,
+        DSV_TAG,
+        crate::resource::ATTACHMENT_USAGE_DEPTH,
+    );
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
+
+/// Best-effort eager kind 8 registration of a view's texture (ADR-054).
+///
+/// `usage` is the attachment code the view names (colour for an RTV, depth for
+/// a DSV); `registered` short-circuits a handle this session already holds, so
+/// creating a second view over one texture sends nothing. `register` is the
+/// live wire send in production and is injected by tests.
+///
+/// Never fails view creation: a shape without kind 8 codes, a host refusal and
+/// a transport failure are all counted and named
+/// ([`crate::resource::note_view_registration_refusal`]), and the lazy bind
+/// path refuses the pass if the handle stays unregistered.
+#[cfg(any(windows, test))]
+fn register_view_attachment(
+    resource: This,
+    usage: u8,
+    registered: impl Fn(u64) -> bool,
+    register: impl FnOnce(
+        &crate::resource::TextureTableRegistration,
+    ) -> Result<(bool, Option<String>), String>,
+) -> bool {
+    let Some(registration) = crate::resource::texture_attachment_registration(resource, usage)
+    else {
+        // A buffer (or no texture memory): no kind 8 handle to register.
+        return false;
+    };
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(reason) => {
+            crate::resource::note_view_registration_refusal(0, usage, reason);
+            return false;
+        }
+    };
+    let handle = registration.handle;
+    if registered(handle) {
+        return true;
+    }
+    match register(&registration) {
+        Ok((true, _)) => true,
+        Ok((false, reason)) => {
+            crate::resource::note_view_registration_refusal(
+                handle,
+                usage,
+                reason
+                    .as_deref()
+                    .unwrap_or("the host refused the registration"),
+            );
+            false
+        }
+        Err(error) => {
+            crate::resource::note_view_registration_refusal(handle, usage, &error);
+            false
+        }
+    }
+}
+
+/// Eagerly registers a created view's texture with the live session.
+///
+/// Only the native backend has a host registry to fill: the D3D12 path keeps
+/// its own host resources and must not connect the Wire v3 session from a view
+/// creation.
+#[cfg(windows)]
+fn register_created_view(resource: This, usage: u8) {
+    if !crate::backend::metal_selected() {
+        return;
+    }
+    register_view_attachment(
+        resource,
+        usage,
+        crate::native_metal::queue::texture_registered,
+        |registration| registration.send().map_err(|error| error.to_string()),
+    );
+}
 
 /// A shader view or sampler as the title described it (descriptions in the
 /// host's layout, kept as words), for the host to build its own from.
@@ -2187,5 +2287,92 @@ pub(crate) mod tests {
         let mut allocated_ptrs: Vec<usize> = allocated.iter().map(|a| a.ptr).collect();
         allocated_ptrs.sort_unstable();
         assert_eq!(freed, allocated_ptrs, "every allocation went back");
+    }
+
+    /// ADR-054: creating an RTV/DSV is the earliest point a `flags == 0`
+    /// texture is known to be an attachment. The eager registration uses the
+    /// view's own usage code, and a depth view never registers as colour first.
+    #[test]
+    fn a_created_view_registers_its_texture_with_the_view_usage() {
+        use crate::resource::{
+            ATTACHMENT_USAGE_COLOR, ATTACHMENT_USAGE_DEPTH, test_texture_at_address,
+            test_texture_desc,
+        };
+        use std::cell::RefCell;
+
+        let colour = test_texture_at_address(test_texture_desc(64, 64, 28, 0), 0x2_E2A6_1000);
+        let depth = test_texture_at_address(test_texture_desc(64, 64, 55, 0), 0x2_E2A6_2000);
+        let sent: RefCell<Vec<(u64, u8, u8)>> = RefCell::new(Vec::new());
+
+        assert!(register_view_attachment(
+            colour,
+            ATTACHMENT_USAGE_COLOR,
+            |_| false,
+            |request| {
+                sent.borrow_mut()
+                    .push((request.handle, request.usage, request.format));
+                Ok((true, None))
+            },
+        ));
+        assert!(register_view_attachment(
+            depth,
+            ATTACHMENT_USAGE_DEPTH,
+            |_| false,
+            |request| {
+                sent.borrow_mut()
+                    .push((request.handle, request.usage, request.format));
+                Ok((true, None))
+            },
+        ));
+        assert_eq!(
+            sent.borrow().as_slice(),
+            [
+                (0x2_E2A6_1000, ATTACHMENT_USAGE_COLOR, 0),
+                (0x2_E2A6_2000, ATTACHMENT_USAGE_DEPTH, 54),
+            ],
+            "each view registers exactly its own attachment usage"
+        );
+    }
+
+    /// View creation has no D3D12 failure contract: a host refusal is counted
+    /// and named, and the eager path still answers `false` so the lazy bind
+    /// path refuses the pass.
+    #[test]
+    fn a_refused_eager_registration_does_not_fail_the_view() {
+        use crate::resource::{test_texture_at_address, test_texture_desc};
+
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 28, 0), 0x2_E2A6_3000);
+        let before = crate::resource::texture_registration_refusals();
+        let registered = register_view_attachment(
+            resource,
+            crate::resource::ATTACHMENT_USAGE_COLOR,
+            |_| false,
+            |_| Ok((false, Some("texture was not registered with render_target usage".to_string()))),
+        );
+        assert!(!registered, "the view exists but the texture is unregistered");
+        assert!(
+            crate::resource::texture_registration_refusals() > before,
+            "the refusal is counted"
+        );
+    }
+
+    /// A DSV record is a depth record, never a colour record that is then
+    /// relabelled: `create_dsv` writes one record with the depth tag.
+    #[test]
+    fn a_depth_view_record_is_not_a_colour_view_record() {
+        use crate::resource::{test_texture_at_address, test_texture_desc};
+
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 55, 0), 0x2_E2A6_4000);
+        let mut slot = [0u8; 112];
+        let handle = slot.as_mut_ptr() as u64;
+        create_dsv(std::ptr::null(), resource, std::ptr::null(), handle);
+        assert!(dsv_record(handle).is_some(), "the depth view is recorded");
+        assert!(rtv_record(handle).is_none(), "it is not a colour view");
+
+        let mut rtv_slot = [0u8; 112];
+        let rtv_handle = rtv_slot.as_mut_ptr() as u64;
+        create_rtv(std::ptr::null(), resource, std::ptr::null(), rtv_handle);
+        assert!(rtv_record(rtv_handle).is_some(), "the colour view is recorded");
+        assert!(dsv_record(rtv_handle).is_none());
     }
 }
