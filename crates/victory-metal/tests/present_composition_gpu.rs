@@ -381,3 +381,200 @@ fn an_offscreen_draw_copied_to_the_present_surface_is_non_black() {
         trace.log_line()
     );
 }
+
+/// Cycle 17B identity case: the texture the render pass targets is registered
+/// under the same id as the present surface, and no copy is needed. The present
+/// trace must report `source_is_presented=1` for that surface, its descriptor
+/// must be `rgba8unorm` at the drawn extent, and the presented bytes must be
+/// exactly the two drawn colours.
+#[test]
+fn a_surface_that_is_the_pass_target_presents_identity_pixels() {
+    let transport = match DirectMetalTransport::new() {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("present_composition_gpu SKIP no Metal device: {error}");
+            return;
+        }
+    };
+
+    // One IOSurface-backed rgba8unorm image is both the pass target and the
+    // registered present surface: the alias a title uses when it composes
+    // directly into its back-buffer.
+    let mut image = SurfaceImage::create_rgba8(&transport, EDGE, EDGE)
+        .expect("IOSurface-backed rgba8unorm present surface");
+    let target = wrap_surface_texture(&image);
+    let identity_id = transport
+        .register_render_target(&target)
+        .expect("register the identity target");
+    transport
+        .register_present_surface(identity_id.0, &target)
+        .expect("register the surface under the id the pass targets");
+
+    let pipeline = GraphicsPipeline::compile_mrt(
+        &transport,
+        MSL,
+        "pc_vertex",
+        "pc_fragment",
+        &[PixelFormat::Rgba8Unorm],
+        None,
+    )
+    .expect("identity pipeline should compile");
+    let pipeline_id = transport
+        .register_graphics_pipeline_state(pipeline)
+        .expect("identity pipeline should register");
+
+    let commands = vec![
+        wire_v3::CommandV3::BeginRenderPass(wire_v3::BeginRenderPass {
+            colors: vec![wire_v3::ColorAttachment {
+                allocation_id: identity_id.0,
+                generation: GENERATION,
+                mip_level: 0,
+                slice: 0,
+                load: wire_v3::LoadOp::Clear,
+                store: wire_v3::StoreOp::Store,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            }],
+            depth_stencil: None,
+        }),
+        wire_v3::CommandV3::SetGraphicsPipeline(wire_v3::PipelineRef {
+            pipeline_id: pipeline_id.0,
+        }),
+        wire_v3::CommandV3::SetViewport(wire_v3::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(EDGE),
+            height: f64::from(EDGE),
+            near: 0.0,
+            far: 1.0,
+        }),
+        wire_v3::CommandV3::SetScissor(wire_v3::ScissorRect {
+            x: 0,
+            y: 0,
+            width: EDGE,
+            height: EDGE,
+        }),
+        wire_v3::CommandV3::SetPrimitiveTopology(wire_v3::PrimitiveTopology::TriangleList),
+        wire_v3::CommandV3::SetRootConstants(wire_v3::RootConstantsV3 {
+            slot: 1,
+            bytes: float4_bytes(COLOR),
+        }),
+        wire_v3::CommandV3::Draw(wire_v3::DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        wire_v3::CommandV3::SetScissor(wire_v3::ScissorRect {
+            x: EDGE / 2,
+            y: 0,
+            width: EDGE / 2,
+            height: EDGE,
+        }),
+        wire_v3::CommandV3::SetRootConstants(wire_v3::RootConstantsV3 {
+            slot: 1,
+            bytes: float4_bytes(HIGHLIGHT),
+        }),
+        wire_v3::CommandV3::Draw(wire_v3::DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        wire_v3::CommandV3::EndRenderPass,
+    ];
+    let submission = wire_v3::SubmissionV3 {
+        sequence: 1,
+        list: Some(ListIdentity {
+            list_id: 2,
+            list_generation: 1,
+        }),
+        commands,
+    };
+    let mut allocations = std::collections::HashMap::new();
+    allocations.insert(
+        (identity_id.0, GENERATION),
+        victory_metal::abi::VmBufferId(identity_id.0),
+    );
+    let reply = transport
+        .submit_v3(&submission, &allocations)
+        .expect("the identity draw must execute");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    transport
+        .wait_for_gpu()
+        .expect("the identity draw must complete");
+
+    // Present the drawn image itself: source == presented by construction.
+    let mut path = PresentPath::new(&transport);
+    let mut sink = RecordingSink::new();
+    path.present_drawn(&mut image, &mut sink)
+        .expect("the identity frame must present");
+    assert_eq!(sink.frames().len(), 1);
+    assert_eq!(sink.frames()[0].surface_id, image.surface_id());
+    path.finish_present().expect("the identity frame finishes");
+
+    // Read the presented IOSurface and require the exact two-tone pixels.
+    let presented = read_surface_rgba(&image);
+    let row_bytes = image.bytes_per_row();
+    let base = expected_rgba8(COLOR);
+    let highlight = expected_rgba8(HIGHLIGHT);
+    let mut non_black_pixels = 0u64;
+    let mut nonzero_bytes = 0u64;
+    for y in 0..EDGE as usize {
+        for x in 0..EDGE as usize {
+            let at = y * row_bytes + x * 4;
+            let pixel = [
+                presented[at],
+                presented[at + 1],
+                presented[at + 2],
+                presented[at + 3],
+            ];
+            let expected = if x >= (EDGE / 2) as usize {
+                highlight
+            } else {
+                base
+            };
+            assert_eq!(
+                pixel, expected,
+                "identity pixel ({x}, {y}) is {pixel:?}, expected {expected:?}"
+            );
+            if pixel != [0, 0, 0, 0] {
+                non_black_pixels += 1;
+            }
+            nonzero_bytes += pixel.iter().filter(|byte| **byte != 0).count() as u64;
+        }
+    }
+    assert_eq!(
+        non_black_pixels,
+        u64::from(EDGE) * u64::from(EDGE),
+        "every presented pixel is drawn content"
+    );
+    assert_eq!(
+        nonzero_bytes,
+        u64::from(EDGE) * u64::from(EDGE) * 4,
+        "every presented byte is non-zero"
+    );
+
+    // The bounded trace must name the identity surface and the frame that
+    // presents it without a copy.
+    let trace = present_trace_report();
+    assert!(
+        trace.keys.iter().any(|entry| entry.source_is_presented),
+        "an identity present must report source_is_presented: {trace:?}"
+    );
+    assert!(
+        trace.surfaces.iter().any(|surface| {
+            surface.format == "rgba8unorm"
+                && surface.width == EDGE as usize
+                && surface.height == EDGE as usize
+                && !surface.targeted_by_copy
+        }),
+        "the identity surface is rgba8unorm at the drawn extent and needed no copy: {trace:?}"
+    );
+    assert_eq!(trace.probe_source_mismatch, 0);
+    eprintln!(
+        "present_composition_gpu IDENTITY PASS extent={EDGE}x{EDGE} non_black_pixels={non_black_pixels} \
+         nonzero_bytes={nonzero_bytes} surfaces={} trace={}",
+        trace.surfaces.len(),
+        trace.log_line()
+    );
+}
