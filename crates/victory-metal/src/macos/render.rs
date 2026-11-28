@@ -25,6 +25,7 @@
 use std::ffi::c_void;
 use std::mem;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::VmBufferId;
 use crate::macos::device::{DirectMetalTransport, RegisteredBuffer};
@@ -89,6 +90,18 @@ const MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: usize = 4;
 const MAX_INLINE_BYTES: usize = 4096;
 /// Largest supported level-0 2D render-target edge.
 const MAX_RENDER_TARGET_DIMENSION: u32 = 16_384;
+
+/// Xbox rect lists carry three vertices per rectangle. The fourth corner is
+/// synthesized as `v3 = v0 + v2 - v1`, so a rect list's position is read as two
+/// little-endian `f32` components at this byte offset inside each vertex.
+const RECT_LIST_POSITION_OFFSET: usize = 0;
+/// Bytes of one rect-list position (`float2`), the minimum usable stride.
+const RECT_LIST_POSITION_BYTES: usize = 8;
+/// Bound on one rect-list expansion: 2^14 rects become 2^16 vertices, which
+/// keeps the synthesized index buffer at `u16` width.
+const MAX_RECT_LIST_RECTS: usize = 16_384;
+/// Bound on the synthesized vertex scratch of one rect-list draw (16 MiB).
+const MAX_RECT_LIST_SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Apple `MTLClearColor` (`double red, green, blue, alpha`).
 #[repr(C)]
@@ -265,6 +278,158 @@ impl PrimitiveType {
             Self::TriangleStrip => MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
         }
     }
+}
+
+/// Why a rect-list draw was not expanded into triangles.
+///
+/// A refusal is always counted by [`rect_list_stats`] and never degrades into a
+/// triangle-list draw, so a caller can tell "no rectangle was painted" apart
+/// from "rectangles were forwarded incorrectly".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectListRefusal {
+    /// The vertex count is below one rect or not a multiple of three.
+    VertexCountNotRectMultiple,
+    /// The caller supplied a zero stride.
+    ZeroStride,
+    /// The stride cannot hold a `float2` position at the documented offset.
+    StrideTooSmall,
+    /// The requested vertex range is outside the CPU-readable slice.
+    VertexRangeUnreadable,
+    /// The requested rectangle count exceeds [`MAX_RECT_LIST_RECTS`] or its
+    /// synthesized scratch exceeds [`MAX_RECT_LIST_SCRATCH_BYTES`].
+    ScratchLimit,
+    /// The bound `MTLBuffer` has no CPU-visible contents (private storage).
+    BufferNotCpuReadable,
+}
+
+impl RectListRefusal {
+    /// Stable index used by the bounded refusal histogram.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::VertexCountNotRectMultiple => 0,
+            Self::ZeroStride => 1,
+            Self::StrideTooSmall => 2,
+            Self::VertexRangeUnreadable => 3,
+            Self::ScratchLimit => 4,
+            Self::BufferNotCpuReadable => 5,
+        }
+    }
+
+    /// Stable name reported in diagnostics.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::VertexCountNotRectMultiple => "vertex_count_not_rect_multiple",
+            Self::ZeroStride => "zero_stride",
+            Self::StrideTooSmall => "stride_too_small",
+            Self::VertexRangeUnreadable => "vertex_range_unreadable",
+            Self::ScratchLimit => "scratch_limit",
+            Self::BufferNotCpuReadable => "buffer_not_cpu_readable",
+        }
+    }
+}
+
+/// Result of one [`RenderEncoder::draw_rect_list`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectListOutcome {
+    /// The rect list was expanded and encoded as two triangles per rect.
+    Drawn {
+        /// Rectangles expanded.
+        rects: usize,
+        /// Synthesized vertices (four per rect).
+        vertices: usize,
+        /// Encoded triangle indices (six per rect).
+        indices: usize,
+        /// Bytes of synthesized vertex scratch.
+        vertex_bytes: usize,
+    },
+    /// The draw was refused; nothing was encoded.
+    Refused {
+        /// Named, counted reason.
+        reason: RectListRefusal,
+    },
+}
+
+/// Aggregate rect-list counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RectListStats {
+    /// Calls that expanded at least one rectangle.
+    pub drawn_calls: u64,
+    /// Rectangles expanded into two triangles.
+    pub drawn_rects: u64,
+    /// Synthesized vertices across those calls.
+    pub expanded_vertices: u64,
+    /// Encoded triangle indices across those calls.
+    pub encoded_indices: u64,
+    /// Refusals per [`RectListRefusal`], indexed by
+    /// [`RectListRefusal::index`].
+    pub refusals: [u64; 6],
+}
+
+/// Process-wide rect-list counters, bounded to counters only (no payloads).
+static RECT_LIST_DRAWN_CALLS: AtomicU64 = AtomicU64::new(0);
+static RECT_LIST_DRAWN_RECTS: AtomicU64 = AtomicU64::new(0);
+static RECT_LIST_EXPANDED_VERTICES: AtomicU64 = AtomicU64::new(0);
+static RECT_LIST_ENCODED_INDICES: AtomicU64 = AtomicU64::new(0);
+static RECT_LIST_REFUSALS: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Reads the rect-list counters without clearing them.
+pub fn rect_list_stats() -> RectListStats {
+    let mut refusals = [0u64; 6];
+    for (slot, counter) in refusals.iter_mut().zip(RECT_LIST_REFUSALS.iter()) {
+        *slot = counter.load(Ordering::Relaxed);
+    }
+    RectListStats {
+        drawn_calls: RECT_LIST_DRAWN_CALLS.load(Ordering::Relaxed),
+        drawn_rects: RECT_LIST_DRAWN_RECTS.load(Ordering::Relaxed),
+        expanded_vertices: RECT_LIST_EXPANDED_VERTICES.load(Ordering::Relaxed),
+        encoded_indices: RECT_LIST_ENCODED_INDICES.load(Ordering::Relaxed),
+        refusals,
+    }
+}
+
+/// Clears the rect-list counters (test/diagnostic only).
+pub fn reset_rect_list_stats() {
+    RECT_LIST_DRAWN_CALLS.store(0, Ordering::Relaxed);
+    RECT_LIST_DRAWN_RECTS.store(0, Ordering::Relaxed);
+    RECT_LIST_EXPANDED_VERTICES.store(0, Ordering::Relaxed);
+    RECT_LIST_ENCODED_INDICES.store(0, Ordering::Relaxed);
+    for counter in &RECT_LIST_REFUSALS {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+fn note_rect_list_drawn(rects: usize) {
+    RECT_LIST_DRAWN_CALLS.fetch_add(1, Ordering::Relaxed);
+    RECT_LIST_DRAWN_RECTS.fetch_add(rects as u64, Ordering::Relaxed);
+    RECT_LIST_EXPANDED_VERTICES.fetch_add((rects * 4) as u64, Ordering::Relaxed);
+    RECT_LIST_ENCODED_INDICES.fetch_add((rects * 6) as u64, Ordering::Relaxed);
+}
+
+fn note_rect_list_refusal(reason: RectListRefusal) {
+    RECT_LIST_REFUSALS[reason.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reads the two `f32` position components of one rect-list vertex.
+fn read_rect_list_position(vertex: &[u8]) -> [f32; 2] {
+    let at = RECT_LIST_POSITION_OFFSET;
+    let x = f32::from_le_bytes(
+        vertex[at..at + 4]
+            .try_into()
+            .expect("rect-list vertex holds a float2 position"),
+    );
+    let y = f32::from_le_bytes(
+        vertex[at + 4..at + 8]
+            .try_into()
+            .expect("rect-list vertex holds a float2 position"),
+    );
+    [x, y]
 }
 
 /// Index width for indexed draws.
@@ -1036,6 +1201,10 @@ pub struct RenderEncoder<'a> {
     ended: bool,
     /// Encoder-state trace of this pass, when `VICTORY_METAL_STATE_TRACE` is on.
     state_trace: Option<state_trace::PassState>,
+    /// Synthesized rect-list vertex/index buffers kept alive until the render
+    /// encoder ends. Metal's command buffer retains resources named by encoded
+    /// draws, so they can be released after `endEncoding`.
+    rect_list_scratch: Vec<ObjcObject>,
 }
 
 impl<'a> RenderEncoder<'a> {
@@ -1071,6 +1240,7 @@ impl<'a> RenderEncoder<'a> {
             enc: objc::empty_id(),
             ended: false,
             state_trace: None,
+            rect_list_scratch: Vec::new(),
         })
     }
 
@@ -1101,6 +1271,7 @@ impl<'a> RenderEncoder<'a> {
             enc: objc::empty_id(),
             ended: false,
             state_trace: None,
+            rect_list_scratch: Vec::new(),
         }
     }
 
@@ -1116,6 +1287,9 @@ impl<'a> RenderEncoder<'a> {
             // SAFETY: `self.enc` is a live render encoder not yet ended.
             unsafe { objc::msg_send_void_0(self.enc, objc::sel(c"endEncoding")) };
             self.ended = true;
+            // Every rect-list draw's buffers were named by an encoded draw on
+            // this command buffer, which retains them until completion.
+            self.rect_list_scratch.clear();
             self.finish_state_trace();
         }
     }
@@ -1728,7 +1902,250 @@ impl<'a> RenderEncoder<'a> {
                 base_instance,
             );
         }
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_draw(primitive);
+        }
         Ok(())
+    }
+
+    /// Expands one D3D/Xbox rect list into triangles and encodes it.
+    ///
+    /// A rect list consumes three vertices per rectangle, `v0`, `v1`, `v2`,
+    /// with the fourth corner implicit: `v3 = v0 + v2 - v1`. Each rectangle is
+    /// encoded as the two triangles `[0,1,2, 0,2,3]` with `PrimitiveType::Triangle`
+    /// index draws, so a rect list never degrades into a triangle-list draw
+    /// with the wrong coverage.
+    ///
+    /// Every vertex position is read as two little-endian `f32` components at
+    /// [`RECT_LIST_POSITION_OFFSET`]. All other bytes of each stride are copied
+    /// verbatim; the synthesized fourth vertex copies `v0`'s bytes and only its
+    /// position components are recomputed. `vertices` starts at the first
+    /// vertex the draw reads and `vertex_start` is a further vertex offset.
+    ///
+    /// The expansion uses bounded shared-storage scratch (at most
+    /// [`MAX_RECT_LIST_RECTS`] rectangles and [`MAX_RECT_LIST_SCRATCH_BYTES`]
+    /// vertex bytes) that the command buffer retains and the encoder releases
+    /// when it ends. An unusable stride or range is counted as one named
+    /// [`RectListRefusal`] and encodes nothing.
+    pub fn draw_rect_list(
+        &mut self,
+        vertices: &[u8],
+        stride: usize,
+        vertex_buffer_index: usize,
+        vertex_start: usize,
+        vertex_count: usize,
+    ) -> Result<RectListOutcome, MetalError> {
+        let (Some(source_start), Some(source_len)) = (
+            vertex_start.checked_mul(stride),
+            vertex_count.checked_mul(stride),
+        ) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        let Some(source_end) = source_start.checked_add(source_len) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        let Some(source) = vertices.get(source_start..source_end) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        self.expand_rect_list(source, stride, vertex_buffer_index, vertex_count)
+    }
+
+    /// Expands a rect list straight out of a bound `MTLBuffer`'s CPU-visible
+    /// contents.
+    ///
+    /// This is the shape the v3 executor can call after resolving a guest
+    /// vertex buffer: a private-storage buffer, or a range outside the buffer,
+    /// is a counted [`RectListRefusal`] and draws nothing.
+    ///
+    /// # Safety
+    ///
+    /// `vertex_buffer` must be a live `id<MTLBuffer>` whose backing storage
+    /// stays valid until the pass's command buffer completes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn draw_rect_list_buffer(
+        &mut self,
+        vertex_buffer: *mut c_void,
+        vertex_buffer_offset: usize,
+        stride: usize,
+        vertex_buffer_index: usize,
+        vertex_start: usize,
+        vertex_count: usize,
+    ) -> Result<RectListOutcome, MetalError> {
+        if vertex_buffer.is_null() {
+            return Ok(self.refuse_rect_list(RectListRefusal::BufferNotCpuReadable));
+        }
+        // SAFETY: caller guarantees a live `MTLBuffer`; `contents` is null for
+        // private storage, which is the CPU-readability test this path names.
+        let contents = unsafe { objc::msg_send_ptr_0(vertex_buffer, objc::sel(c"contents")) };
+        if contents.is_null() {
+            return Ok(self.refuse_rect_list(RectListRefusal::BufferNotCpuReadable));
+        }
+        // SAFETY: a live `MTLBuffer`; `length` is immutable and unsigned.
+        let length = unsafe { objc::msg_send_usize_0(vertex_buffer, objc::sel(c"length")) };
+        let (Some(start), Some(len)) = (
+            vertex_start
+                .checked_mul(stride)
+                .and_then(|offset| vertex_buffer_offset.checked_add(offset)),
+            vertex_count.checked_mul(stride),
+        ) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        if end > length {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        }
+        // SAFETY: `contents` spans `length` readable bytes and `start..end` is
+        // inside that span, as checked above.
+        let source = unsafe { std::slice::from_raw_parts(contents.cast::<u8>().add(start), len) };
+        self.expand_rect_list(source, stride, vertex_buffer_index, vertex_count)
+    }
+
+    /// Records one named rect-list refusal without encoding any GPU work.
+    fn refuse_rect_list(&self, reason: RectListRefusal) -> RectListOutcome {
+        note_rect_list_refusal(reason);
+        RectListOutcome::Refused { reason }
+    }
+
+    fn expand_rect_list(
+        &mut self,
+        source: &[u8],
+        stride: usize,
+        vertex_buffer_index: usize,
+        vertex_count: usize,
+    ) -> Result<RectListOutcome, MetalError> {
+        if stride == 0 {
+            return Ok(self.refuse_rect_list(RectListRefusal::ZeroStride));
+        }
+        if stride < RECT_LIST_POSITION_OFFSET + RECT_LIST_POSITION_BYTES {
+            return Ok(self.refuse_rect_list(RectListRefusal::StrideTooSmall));
+        }
+        if vertex_count < 3 || !vertex_count.is_multiple_of(3) {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexCountNotRectMultiple));
+        }
+        let Some(source_len) = vertex_count.checked_mul(stride) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        };
+        if source.len() < source_len {
+            return Ok(self.refuse_rect_list(RectListRefusal::VertexRangeUnreadable));
+        }
+        let rects = vertex_count / 3;
+        if rects > MAX_RECT_LIST_RECTS {
+            return Ok(self.refuse_rect_list(RectListRefusal::ScratchLimit));
+        }
+        let (Some(expanded_len), Some(index_len)) = (
+            rects
+                .checked_mul(4)
+                .and_then(|vertices| vertices.checked_mul(stride)),
+            rects.checked_mul(6).and_then(|indices| indices.checked_mul(2)),
+        ) else {
+            return Ok(self.refuse_rect_list(RectListRefusal::ScratchLimit));
+        };
+        if expanded_len > MAX_RECT_LIST_SCRATCH_BYTES {
+            return Ok(self.refuse_rect_list(RectListRefusal::ScratchLimit));
+        }
+
+        let mut expanded = vec![0u8; expanded_len];
+        for rect in 0..rects {
+            let source_at = rect * 3 * stride;
+            let three = &source[source_at..source_at + 3 * stride];
+            let dest_at = rect * 4 * stride;
+            expanded[dest_at..dest_at + stride].copy_from_slice(&three[..stride]);
+            expanded[dest_at + stride..dest_at + 2 * stride]
+                .copy_from_slice(&three[stride..2 * stride]);
+            expanded[dest_at + 2 * stride..dest_at + 3 * stride]
+                .copy_from_slice(&three[2 * stride..3 * stride]);
+            let p0 = read_rect_list_position(&three[..stride]);
+            let p1 = read_rect_list_position(&three[stride..2 * stride]);
+            let p2 = read_rect_list_position(&three[2 * stride..3 * stride]);
+            let p3 = [
+                p0[0] + p2[0] - p1[0],
+                p0[1] + p2[1] - p1[1],
+            ];
+            let fourth = dest_at + 3 * stride;
+            expanded[fourth..fourth + stride].copy_from_slice(&three[..stride]);
+            let position = fourth + RECT_LIST_POSITION_OFFSET;
+            expanded[position..position + 4].copy_from_slice(&p3[0].to_le_bytes());
+            expanded[position + 4..position + 8].copy_from_slice(&p3[1].to_le_bytes());
+        }
+
+        let mut indices = Vec::with_capacity(index_len);
+        for rect in 0..rects {
+            let base = u16::try_from(rect * 4).expect("rect vertices stay below u16");
+            for offset in [0u16, 1, 2, 0, 2, 3] {
+                indices.extend_from_slice(&(base + offset).to_le_bytes());
+            }
+        }
+
+        let vertex_buffer = self.new_rect_list_scratch(expanded_len)?;
+        let index_buffer = self.new_rect_list_scratch(index_len)?;
+        // SAFETY: both scratch buffers are shared-storage `MTLBuffer`s with at
+        // least the lengths written below; `expanded`/`indices` are exactly
+        // those lengths.
+        unsafe {
+            let vertex_contents =
+                objc::msg_send_ptr_0(vertex_buffer.as_raw(), objc::sel(c"contents"));
+            let index_contents =
+                objc::msg_send_ptr_0(index_buffer.as_raw(), objc::sel(c"contents"));
+            if vertex_contents.is_null() || index_contents.is_null() {
+                return Err(MetalError::InternalError(
+                    "rect-list scratch buffer has no CPU-visible contents".to_string(),
+                ));
+            }
+            std::ptr::copy_nonoverlapping(
+                expanded.as_ptr(),
+                vertex_contents.cast::<u8>(),
+                expanded_len,
+            );
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr(),
+                index_contents.cast::<u8>(),
+                index_len,
+            );
+        }
+
+        let vertex_raw = vertex_buffer.as_raw();
+        let index_raw = index_buffer.as_raw();
+        let index_count = rects * 6;
+        // The encoder owns both buffers until it ends; the command buffer also
+        // retains them once the draw below is encoded.
+        self.rect_list_scratch.push(vertex_buffer);
+        self.rect_list_scratch.push(index_buffer);
+        // SAFETY: both scratch buffers are live and retained above, the index
+        // buffer holds `index_count` aligned `u16` values, and the vertex
+        // buffer holds `rects * 4` stride-sized vertices.
+        unsafe {
+            self.set_vertex_buffer(vertex_raw, 0, vertex_buffer_index)?;
+            self.draw_indexed_primitives_instanced(
+                PrimitiveType::Triangle,
+                index_count,
+                IndexType::Uint16,
+                index_raw,
+                0,
+                1,
+                0,
+                0,
+            )?;
+        }
+        note_rect_list_drawn(rects);
+        Ok(RectListOutcome::Drawn {
+            rects,
+            vertices: rects * 4,
+            indices: index_count,
+            vertex_bytes: expanded_len,
+        })
+    }
+
+    /// Allocates one shared-storage `MTLBuffer` for rect-list scratch.
+    fn new_rect_list_scratch(&self, len: usize) -> Result<ObjcObject, MetalError> {
+        debug_assert!(len > 0);
+        // SAFETY: `device` is a valid `MTLDevice`; storage mode `0` is shared,
+        // `len` is nonzero, and the result is retained (+1).
+        let raw = unsafe { objc::msg_send_new_buffer(self.transport.device_raw(), len, 0) };
+        ObjcObject::from_retained(raw).ok_or_else(|| {
+            MetalError::InternalError("rect-list scratch MTLBuffer allocation returned null".to_string())
+        })
     }
 
     /// Closes the encoder, commits the command buffer and waits for completion.
@@ -1751,6 +2168,9 @@ impl<'a> RenderEncoder<'a> {
         }
         // SAFETY: `cb` completed via `waitUntilCompleted`.
         let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+        // The GPU is done with every encoded draw, so the rect-list scratch
+        // can be released now (the command buffer also retains it).
+        self.rect_list_scratch.clear();
         if status != MTL_COMMAND_BUFFER_STATUS_COMPLETED {
             // SAFETY: `[cb error]` returns null or an autoreleased `NSError *`.
             let error_raw = unsafe { objc::msg_send_id_0(cb, objc::sel(c"error")) };
@@ -4189,6 +4609,26 @@ pub mod state_trace {
 mod tests {
     use super::*;
     use crate::transport::MetalTransport;
+
+    /// Every `PrimitiveType` must keep its own `MTLPrimitiveType` value: a
+    /// collapsed mapping is exactly what made Boot #33 encode strips, lines and
+    /// points as triangles (ADR-065).
+    #[test]
+    fn every_primitive_type_maps_to_its_own_metal_value() {
+        let expected = [
+            (PrimitiveType::Point, MTL_PRIMITIVE_TYPE_POINT),
+            (PrimitiveType::Line, MTL_PRIMITIVE_TYPE_LINE),
+            (PrimitiveType::LineStrip, MTL_PRIMITIVE_TYPE_LINE_STRIP),
+            (PrimitiveType::Triangle, MTL_PRIMITIVE_TYPE_TRIANGLE),
+            (PrimitiveType::TriangleStrip, MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (primitive, mtl) in expected {
+            assert_eq!(primitive.mtl_value(), mtl, "{primitive:?}");
+            assert!(seen.insert(mtl), "{primitive:?} collapsed onto {mtl}");
+        }
+        assert_eq!(seen.len(), 5, "five distinct Metal primitive values");
+    }
 
     /// Apple's `MTLPixelFormatDepth32Float_Stencil8` is 260, not 253
     /// (`Depth24Unorm_Stencil8` is 253). The wrong constant here made every
