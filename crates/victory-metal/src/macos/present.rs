@@ -405,6 +405,26 @@ struct PresentTrace {
     /// Presents whose traced pass target had the surface's descriptor but was a
     /// different object (a different allocation, or a stale sampled pass).
     surface_pass_target_same_descriptor_other_object: u64,
+    /// Copy events observed at the previous present, the composition marker.
+    copy_events_seen: u64,
+    /// Presents whose traced pass target was the presented surface object.
+    surface_path_pass_target: u64,
+    /// Presents whose surface received a copy since the previous present.
+    surface_path_copy_dest: u64,
+    /// Presents where the pass target shared the surface's guest handle but was
+    /// still a distinct `MTLTexture` (the alias was never created).
+    surface_path_alias_missing: u64,
+    /// Presents where a different allocation with the surface's descriptor was
+    /// the pass target and no copy reached the surface.
+    surface_path_unrelated: u64,
+    /// Copies (region copies and resolves) between the last two presents.
+    composition_copies: u64,
+    /// Those copies whose source was one of the traced pass targets.
+    composition_copy_source_is_pass_target: u64,
+    /// Those copies whose destination was the presented surface.
+    composition_copy_dest_is_surface: u64,
+    /// Presents with no copy at all since the previous present.
+    composition_present_without_copy: u64,
 }
 
 static PRESENT_TRACE: OnceLock<Mutex<PresentTrace>> = OnceLock::new();
@@ -421,7 +441,7 @@ fn present_trace() -> &'static Mutex<PresentTrace> {
 /// pick. The census then compares that object with the presented source and the
 /// copy destination without arming the tracer's synchronous readback. Taken
 /// (cleared) by the next present so it cannot leak across frames.
-static IDENTITY_PASS_TARGET: Mutex<Option<usize>> = Mutex::new(None);
+static IDENTITY_PASS_TARGET: Mutex<Option<(usize, bool)>> = Mutex::new(None);
 
 /// Declares the object a hardware identity case just used as the pass target.
 ///
@@ -429,16 +449,30 @@ static IDENTITY_PASS_TARGET: Mutex<Option<usize>> = Mutex::new(None);
 /// (no descriptor is read from it), so a stale value can never be dereferenced.
 #[doc(hidden)]
 pub fn note_identity_pass_target(texture: usize) {
+    note_declared_pass_target(texture, true);
+}
+
+/// Declares a pass target that is *not* one of the host's registered surfaces.
+///
+/// The split a composition conflict names is between the presented surface and
+/// an unregistered (offscreen) allocation; this hook records exactly that, so a
+/// hardware case can prove the conflict without arming the sampling tracer.
+#[doc(hidden)]
+pub fn note_offscreen_pass_target(texture: usize) {
+    note_declared_pass_target(texture, false);
+}
+
+fn note_declared_pass_target(texture: usize, swapchain: bool) {
     if texture == 0 {
         return;
     }
     if let Ok(mut slot) = IDENTITY_PASS_TARGET.lock() {
-        *slot = Some(texture);
+        *slot = Some((texture, swapchain));
     }
 }
 
-/// Takes and clears the declared pass target.
-fn take_identity_pass_target() -> Option<usize> {
+/// Takes and clears the declared pass target and its surface classification.
+fn take_identity_pass_target() -> Option<(usize, bool)> {
     IDENTITY_PASS_TARGET
         .lock()
         .ok()
@@ -710,7 +744,7 @@ fn record_present_trace_targets(
             note_texture_object(target.texture as objc::Id, TextureObjectOrigin::PassTarget);
         }
     }
-    if let Some(object) = explicit_pass_target {
+    if let Some((object, _)) = explicit_pass_target {
         note_texture_object(object as objc::Id, TextureObjectOrigin::PassTarget);
     }
     let copy_total = if source.is_null() {
@@ -771,6 +805,91 @@ fn record_present_trace_targets(
         probe_sampled_presented: probe_sampled.is_some_and(|sampled| sampled == presented),
         fallback_clear,
     };
+    // The composition census: what happened between the previous present and
+    // this one. A copy is named by its source and destination object, so the
+    // three candidate handoffs (pass target, copy into the surface, neither)
+    // are counted rather than inferred.
+    let surface_key = source as usize;
+    let copy_events_total = blit::copy_event_total();
+    let copy_mark = trace.copy_events_seen;
+    trace.copy_events_seen = copy_events_total;
+    let copies_now = copy_events_total.saturating_sub(copy_mark);
+    let copy_events = blit::copy_events_since(copy_mark);
+    let mut target_keys: Vec<usize> = pass_targets
+        .iter()
+        .flatten()
+        .map(|target| target.texture)
+        .filter(|key| *key != 0)
+        .collect();
+    if let Some((object, _)) = explicit_pass_target {
+        target_keys.push(object);
+    }
+    let mut copy_dest_is_surface = 0u64;
+    let mut copy_source_is_target = 0u64;
+    if !source.is_null() {
+        for event in &copy_events {
+            if event.destination == surface_key {
+                copy_dest_is_surface = copy_dest_is_surface.saturating_add(1);
+            }
+            if target_keys.contains(&event.source) {
+                copy_source_is_target = copy_source_is_target.saturating_add(1);
+            }
+        }
+    }
+    trace.composition_copies = trace.composition_copies.saturating_add(copies_now);
+    trace.composition_copy_dest_is_surface = trace
+        .composition_copy_dest_is_surface
+        .saturating_add(copy_dest_is_surface);
+    trace.composition_copy_source_is_pass_target = trace
+        .composition_copy_source_is_pass_target
+        .saturating_add(copy_source_is_target);
+    if copies_now == 0 {
+        trace.composition_present_without_copy =
+            trace.composition_present_without_copy.saturating_add(1);
+    }
+    let target_is_surface = !source.is_null() && target_keys.contains(&surface_key);
+    let copy_into_surface =
+        copy_dest_is_surface > 0 || (copied_since_last_present && !target_is_surface);
+    let mut foreign_same_descriptor = false;
+    let mut foreign_same_handle = false;
+    if let Some(shape) = descriptor
+        && !target_is_surface
+    {
+        for key in &target_keys {
+            if *key == surface_key {
+                continue;
+            }
+            let Some(entry) = trace
+                .texture_objects
+                .iter()
+                .find(|object| object.texture == *key)
+            else {
+                continue;
+            };
+            // Shape, not usage: a texture registered first as storage and
+            // later widened for an RTV keeps the usage it was created with, so
+            // the two objects of one allocation can differ there.
+            if entry.descriptor.format != shape.format
+                || entry.descriptor.width != shape.width
+                || entry.descriptor.height != shape.height
+            {
+                continue;
+            }
+            foreign_same_descriptor = true;
+            if crate::macos::registry::texture_objects_share_handle(surface_key, *key) {
+                foreign_same_handle = true;
+            }
+        }
+    }
+    if target_is_surface {
+        trace.surface_path_pass_target = trace.surface_path_pass_target.saturating_add(1);
+    } else if copy_into_surface {
+        trace.surface_path_copy_dest = trace.surface_path_copy_dest.saturating_add(1);
+    } else if foreign_same_handle {
+        trace.surface_path_alias_missing = trace.surface_path_alias_missing.saturating_add(1);
+    } else if foreign_same_descriptor {
+        trace.surface_path_unrelated = trace.surface_path_unrelated.saturating_add(1);
+    }
     trace.frames = trace.frames.saturating_add(1);
     if copied_since_last_present {
         trace.copied_into_source = trace.copied_into_source.saturating_add(1);
@@ -792,13 +911,13 @@ fn record_present_trace_targets(
     // A declared identity target is compared with the source's own descriptor:
     // same shape and same object is the one-object verdict; a different object
     // with the same shape is exactly the split the census must name.
-    if let (Some(object), Some(shape)) = (explicit_pass_target, descriptor) {
+    if let (Some((object, swapchain)), Some(shape)) = (explicit_pass_target, descriptor) {
         let target = trace::TraceTarget {
             texture: object,
             width: u32::try_from(shape.width).unwrap_or(u32::MAX),
             height: u32::try_from(shape.height).unwrap_or(u32::MAX),
             format: pixel_format_name(shape.format),
-            swapchain: true,
+            swapchain,
         };
         if !counted_targets.contains(&target) {
             counted_targets.push(target);
@@ -872,12 +991,31 @@ pub struct PresentTraceReport {
     /// `objects` is the number of distinct objects ever created for one handle,
     /// `allocations` how many handles have that count.
     pub texture_objects_per_allocation: Vec<PresentAllocationObjectsEntry>,
-    /// One-word class of why the presented surface and the traced pass target
-    /// are not the same object: `none`, `sampled-other-object` or `descriptor`.
+    /// One-word class of the composition path: `none`,
+    /// `surface-is-copy-dest`, `surface-alias-not-created` or
+    /// `surface-is-unrelated-allocation`.
     pub surface_object_mismatch_reason: &'static str,
     /// Presents whose traced pass target had the surface's descriptor but was a
     /// different object.
     pub surface_pass_target_same_descriptor_other_object: u64,
+    /// Presents whose traced pass target was the presented surface object.
+    pub surface_path_pass_target: u64,
+    /// Presents whose surface received a copy since the previous present.
+    pub surface_path_copy_dest: u64,
+    /// Presents whose pass target shared the surface's handle but stayed a
+    /// distinct object (an alias was never created).
+    pub surface_path_alias_missing: u64,
+    /// Presents whose different allocation with the surface's descriptor was the
+    /// pass target and nothing copied into the surface.
+    pub surface_path_unrelated: u64,
+    /// Copies (region copies and resolves) observed between presents.
+    pub composition_copies: u64,
+    /// Those copies whose source was one of the traced pass targets.
+    pub composition_copy_source_is_pass_target: u64,
+    /// Those copies whose destination was the presented surface.
+    pub composition_copy_dest_is_surface: u64,
+    /// Presents with no copy at all since the previous present.
+    pub composition_present_without_copy: u64,
 }
 
 /// Distinct `MTLTexture` objects seen for one descriptor.
@@ -992,6 +1130,17 @@ pub fn reset_present_trace_for_test() {
 fn surface_object_mismatch_reason(trace: &PresentTrace) -> &'static str {
     if trace.surface_descriptor_mismatch > 0 {
         return "descriptor";
+    }
+    // The composition path: a copy into the surface and an unrelated pass
+    // target are different, counted outcomes. Identity stays `none`.
+    if trace.surface_path_copy_dest > 0 {
+        return "surface-is-copy-dest";
+    }
+    if trace.surface_path_alias_missing > 0 {
+        return "surface-alias-not-created";
+    }
+    if trace.surface_path_unrelated > 0 {
+        return "surface-is-unrelated-allocation";
     }
     let objects = &trace.texture_objects;
     for (index, left) in objects.iter().enumerate() {
@@ -1119,6 +1268,14 @@ pub fn present_trace_report() -> PresentTraceReport {
         surface_object_mismatch_reason,
         surface_pass_target_same_descriptor_other_object: trace
             .surface_pass_target_same_descriptor_other_object,
+        surface_path_pass_target: trace.surface_path_pass_target,
+        surface_path_copy_dest: trace.surface_path_copy_dest,
+        surface_path_alias_missing: trace.surface_path_alias_missing,
+        surface_path_unrelated: trace.surface_path_unrelated,
+        composition_copies: trace.composition_copies,
+        composition_copy_source_is_pass_target: trace.composition_copy_source_is_pass_target,
+        composition_copy_dest_is_surface: trace.composition_copy_dest_is_surface,
+        composition_present_without_copy: trace.composition_present_without_copy,
     }
 }
 
@@ -1155,7 +1312,11 @@ impl PresentTraceReport {
              surface_registered_twice={} surface_descriptor_mismatch={} \
              surface_pass_targets_not_surface={} surface_pass_targets_other_surface={} \
              surface_object_mismatch_reason={} \
-             surface_pass_target_same_descriptor_other_object={} {}",
+             surface_pass_target_same_descriptor_other_object={} \
+             surface_path_pass_target={} surface_path_copy_dest={} \
+             surface_path_alias_missing={} surface_path_unrelated={} \
+             composition_copies={} composition_copy_source_is_pass_target={} \
+             composition_copy_dest_is_surface={} composition_present_without_copy={} {}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -1177,6 +1338,14 @@ impl PresentTraceReport {
             self.surface_pass_targets_other_surface,
             self.surface_object_mismatch_reason,
             self.surface_pass_target_same_descriptor_other_object,
+            self.surface_path_pass_target,
+            self.surface_path_copy_dest,
+            self.surface_path_alias_missing,
+            self.surface_path_unrelated,
+            self.composition_copies,
+            self.composition_copy_source_is_pass_target,
+            self.composition_copy_dest_is_surface,
+            self.composition_present_without_copy,
             self.surface_log_fields(),
         )
     }
@@ -1322,6 +1491,12 @@ impl PresentTraceReport {
              \"surface_pass_targets_other_surface\": {}, \"dropped_surfaces\": {}, \
              \"surface_object_mismatch_reason\": \"{}\", \
              \"surface_pass_target_same_descriptor_other_object\": {}, \
+             \"surface_path_pass_target\": {}, \"surface_path_copy_dest\": {}, \
+             \"surface_path_alias_missing\": {}, \"surface_path_unrelated\": {}, \
+             \"composition_copies\": {}, \
+             \"composition_copy_source_is_pass_target\": {}, \
+             \"composition_copy_dest_is_surface\": {}, \
+             \"composition_present_without_copy\": {}, \
              \"surfaces\": [{}], \"pass_targets\": [{}], \
              \"texture_objects_per_descriptor\": [{}], \
              \"texture_objects_per_allocation\": [{}]}}",
@@ -1347,6 +1522,14 @@ impl PresentTraceReport {
             self.dropped_surfaces,
             self.surface_object_mismatch_reason,
             self.surface_pass_target_same_descriptor_other_object,
+            self.surface_path_pass_target,
+            self.surface_path_copy_dest,
+            self.surface_path_alias_missing,
+            self.surface_path_unrelated,
+            self.composition_copies,
+            self.composition_copy_source_is_pass_target,
+            self.composition_copy_dest_is_surface,
+            self.composition_present_without_copy,
             surfaces,
             pass_targets,
             texture_objects,

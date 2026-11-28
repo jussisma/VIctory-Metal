@@ -30,6 +30,27 @@ use crate::transport::MetalError;
 /// first 16 it sees and counts the rest as dropped, so memory is fixed.
 pub(crate) const COPY_TRACE_MAX_KEYS: usize = 16;
 
+/// Largest number of recent copy events (source, destination, kind) kept for
+/// the composition census. Only the copies between two presents are needed, so
+/// a fixed ring is bounded and a long boot cannot grow it.
+pub(crate) const COPY_EVENT_MAX: usize = 256;
+
+/// One host copy between two texture objects, as the composition census sees it.
+///
+/// Counts only: both fields are process-local object addresses and never reach
+/// telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyEvent {
+    /// Copy kind.
+    pub(crate) kind: BlitCopyKind,
+    /// Monotonic event ordinal (1-based); orders events across presents.
+    pub(crate) ordinal: u64,
+    /// Source texture object.
+    pub(crate) source: usize,
+    /// Destination texture object.
+    pub(crate) destination: usize,
+}
+
 /// The copy operation a host blit encoder ran into a texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlitCopyKind {
@@ -61,6 +82,12 @@ struct CopyTraceCount {
 struct CopyTrace {
     keys: Vec<(usize, CopyTraceCount)>,
     dropped_keys: u64,
+    /// The most recent copies, bounded to [`COPY_EVENT_MAX`].
+    events: Vec<CopyEvent>,
+    /// Copies observed since the process started.
+    events_total: u64,
+    /// Copies dropped from the bounded event ring.
+    dropped_events: u64,
 }
 
 static COPY_TRACE: OnceLock<Mutex<CopyTrace>> = OnceLock::new();
@@ -102,6 +129,57 @@ pub(crate) fn note_copy_destination(kind: BlitCopyKind, texture: objc::Id) {
         }
     }
     entry.last = Some(kind);
+}
+
+/// Records one host copy as a `(source, destination)` event for the composition
+/// census, in addition to the destination count.
+///
+/// The events answer "did the title copy the pass target into the presented
+/// surface between two presents?" without a CPU readback. Counts only.
+pub(crate) fn note_copy_event(kind: BlitCopyKind, source: objc::Id, destination: objc::Id) {
+    note_copy_destination(kind, destination);
+    if source.is_null() || destination.is_null() {
+        return;
+    }
+    let Ok(mut trace) = copy_trace().lock() else {
+        return;
+    };
+    trace.events_total = trace.events_total.saturating_add(1);
+    let event = CopyEvent {
+        kind,
+        ordinal: trace.events_total,
+        source: source as usize,
+        destination: destination as usize,
+    };
+    if trace.events.len() >= COPY_EVENT_MAX {
+        trace.events.remove(0);
+        trace.dropped_events = trace.dropped_events.saturating_add(1);
+    }
+    trace.events.push(event);
+}
+
+/// Copies observed since the process started (the composition marker).
+pub(crate) fn copy_event_total() -> u64 {
+    let Ok(trace) = copy_trace().lock() else {
+        return 0;
+    };
+    trace.events_total
+}
+
+/// The copy events after `mark`, oldest first (bounded to [`COPY_EVENT_MAX`]).
+///
+/// A boot that copied more than the ring bound reports the copies it still
+/// holds; `copy_event_total() - mark` is the exact count.
+pub(crate) fn copy_events_since(mark: u64) -> Vec<CopyEvent> {
+    let Ok(trace) = copy_trace().lock() else {
+        return Vec::new();
+    };
+    trace
+        .events
+        .iter()
+        .filter(|event| event.ordinal > mark)
+        .copied()
+        .collect()
 }
 
 /// The most recent host copy kind into `texture`, if any.
@@ -351,7 +429,11 @@ pub(crate) fn copy_texture_region(enc: objc::Id, region: &TextureRegion) -> Resu
         return Err(MetalError::InternalError("blit encoder is nil".to_string()));
     }
     region.validate()?;
-    note_copy_destination(BlitCopyKind::CopyTextureRegion, region.destination.texture);
+    note_copy_event(
+        BlitCopyKind::CopyTextureRegion,
+        region.source.texture,
+        region.destination.texture,
+    );
     // The copy destination joins the present path's object identity census, so
     // a surface, pass target and copy target of one guest texture are proven to
     // be the same `MTLTexture`.
@@ -568,7 +650,11 @@ pub(crate) fn encode_resolve(
         return Err(MetalError::InvalidArg("command buffer is nil"));
     }
     validate_resolve(source, destination)?;
-    note_copy_destination(BlitCopyKind::ResolveSubresource, destination.texture);
+    note_copy_event(
+        BlitCopyKind::ResolveSubresource,
+        source.texture,
+        destination.texture,
+    );
     crate::macos::present::note_copy_destination_object(destination.texture);
 
     let _pool = AutoreleasePool::new();
@@ -828,5 +914,37 @@ mod tests {
         assert_eq!(region, COPY_TRACE_MAX_KEYS as u64);
         assert_eq!(resolve, 0);
         assert_eq!(dropped, 3);
+    }
+
+    #[test]
+    fn copy_events_name_source_and_destination_and_are_bounded() {
+        reset_copy_trace();
+        assert_eq!(copy_event_total(), 0);
+        let source = 0x4000 as objc::Id;
+        let destination = 0x5000 as objc::Id;
+        note_copy_event(BlitCopyKind::CopyTextureRegion, source, destination);
+        note_copy_event(BlitCopyKind::ResolveSubresource, source, destination);
+        assert_eq!(copy_event_total(), 2);
+        let events = copy_events_since(0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source, 0x4000);
+        assert_eq!(events[0].destination, 0x5000);
+        assert_eq!(events[1].kind, BlitCopyKind::ResolveSubresource);
+        // A marker at the second event sees only later copies.
+        assert!(copy_events_since(2).is_empty());
+        // The ring keeps the newest COPY_EVENT_MAX events and counts drops.
+        reset_copy_trace();
+        for index in 0..(COPY_EVENT_MAX + 4) {
+            note_copy_event(
+                BlitCopyKind::CopyTextureRegion,
+                (0x6000 + index) as objc::Id,
+                destination,
+            );
+        }
+        let events = copy_events_since(0);
+        assert_eq!(events.len(), COPY_EVENT_MAX);
+        assert_eq!(events[0].ordinal, 5);
+        assert_eq!(copy_event_total(), (COPY_EVENT_MAX + 4) as u64);
+        reset_copy_trace();
     }
 }

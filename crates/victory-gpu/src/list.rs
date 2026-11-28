@@ -1428,6 +1428,12 @@ fn attachment_resource(
     if let Some((base, desc)) = crate::resource::texture_memory(resource) {
         debug_assert_eq!(base as u64, handle, "attachment handle is the memory base");
         crate::resource::note_pass_attachment(handle, &desc);
+        if usage == crate::resource::ATTACHMENT_USAGE_COLOR {
+            // The last colour pass before a present is the frame the presenter
+            // must show when the title composes by pass-target identity (no
+            // copy). Only colour attachments are candidates.
+            crate::resource::note_colour_target(handle, &desc);
+        }
     }
     if registered(handle) {
         return ResourceId::from_guest_address(handle);

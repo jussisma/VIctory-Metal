@@ -2033,6 +2033,10 @@ pub(crate) fn note_present_surface(handle: u64, desc: &ResourceDesc) {
             });
         }
     }
+    // The composition census needs the surface's shape to recognise the
+    // allocations a pass may legitimately hand off to. It takes its own lock;
+    // nothing takes the composition lock before this one.
+    note_composition_surface(handle, desc);
     // A surface registration always prints its descriptor, even when the
     // foreign-target line budget is already spent.
     tracing::info!("{}", present_surface_census_line_locked(&census));
@@ -2112,6 +2116,201 @@ pub(crate) fn note_copy_destination(handle: u64) {
 pub(crate) fn reset_present_surface_census() {
     if let Ok(mut census) = present_surface_census().lock() {
         *census = PresentSurfaceCensus::default();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composition-target census
+// ---------------------------------------------------------------------------
+//
+// Boot #32 proved the presenter freezes its surface at the first presented
+// plane's allocation while the title keeps drawing into other 4K colour
+// allocations of the same descriptor. The title issues no copy at all
+// (`copy_targets_not_surface=0`), so the handoff can only be pass-target
+// identity: the presenter must present the allocation the last colour pass
+// actually targeted. This census answers that question with counts only.
+
+/// Colour targets the composition census remembers (a rotation set is small).
+pub(crate) const COMPOSITION_TARGET_MAX: usize = 16;
+
+/// Lines the composition census emits at most, so a boot log stays bounded.
+const COMPOSITION_CENSUS_MAX_LINES: u64 = 12;
+
+/// Formats a present target can carry with four 8-bit or 16-bit channels.
+fn composition_format_bytes(format: u32) -> Option<u8> {
+    match format {
+        // DXGI_FORMAT_R8G8B8A8_UNORM / B8G8R8A8_UNORM
+        28 | 87 => Some(4),
+        // DXGI_FORMAT_R16G16B16A16_FLOAT / R16G16B16A16_UNORM
+        10 | 11 => Some(8),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompositionTarget {
+    handle: u64,
+    format: u32,
+    width: u64,
+    height: u32,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct CompositionCensus {
+    /// The descriptor the presenter registered as its surface.
+    surface: Option<(u64, u32, u64, u32)>,
+    targets: Vec<CompositionTarget>,
+    sequence: u64,
+    dropped: u64,
+    emitted: u64,
+}
+
+static COMPOSITION_CENSUS: std::sync::OnceLock<std::sync::Mutex<CompositionCensus>> =
+    std::sync::OnceLock::new();
+
+fn composition_census() -> &'static std::sync::Mutex<CompositionCensus> {
+    COMPOSITION_CENSUS.get_or_init(|| std::sync::Mutex::new(CompositionCensus::default()))
+}
+
+/// The allocation the last colour pass targeted that can be presented.
+///
+/// Only a target whose extent and four-channel format family match the
+/// registered surface is eligible, so a shadow map, a depth target or an
+/// effect buffer of another shape is never chosen.
+fn latest_composition_target_locked(census: &CompositionCensus) -> Option<u64> {
+    let (_, surface_format, width, height) = census.surface?;
+    let bytes = composition_format_bytes(surface_format)?;
+    census
+        .targets
+        .iter()
+        .filter(|target| {
+            target.width == width
+                && target.height == height
+                && composition_format_bytes(target.format) == Some(bytes)
+        })
+        .max_by_key(|target| target.sequence)
+        .map(|target| target.handle)
+}
+
+/// Formats the composition census as one stable `composition_census=...` line.
+///
+/// `selected` is the allocation a pass-target handoff would present. When it is
+/// the surface handle itself the title composes by passing-target identity at
+/// the moment of the bind; when it differs, the draw target is the frame and
+/// the frozen surface is not.
+fn composition_census_line_locked(census: &CompositionCensus) -> String {
+    let surface = census
+        .surface
+        .map(|(handle, format, width, height)| {
+            format!("surface={handle:#x}:{width}x{height}:fmt{format}")
+        })
+        .unwrap_or_else(|| "surface=none".to_string());
+    let selected = latest_composition_target_locked(census)
+        .map(|handle| format!("{handle:#x}"))
+        .unwrap_or_else(|| "none".to_string());
+    let selected_is_surface = census
+        .surface
+        .zip(latest_composition_target_locked(census))
+        .is_some_and(|((handle, ..), target)| handle == target);
+    format!(
+        "composition_census={surface} targets={} dropped={} selected={selected} \
+         selected_is_surface={}",
+        census.targets.len(),
+        census.dropped,
+        u8::from(selected_is_surface),
+    )
+}
+
+/// The census as one stable `composition_census=...` line (counts only).
+#[allow(dead_code)]
+pub(crate) fn composition_census_line() -> String {
+    let census = composition_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    composition_census_line_locked(&census)
+}
+
+fn emit_composition_census(census: &mut CompositionCensus) {
+    if census.emitted >= COMPOSITION_CENSUS_MAX_LINES {
+        return;
+    }
+    census.emitted = census.emitted.saturating_add(1);
+    tracing::info!("{}", composition_census_line_locked(census));
+}
+
+/// Remembers the descriptor of the surface the presenter installed.
+///
+/// Called from [`note_present_surface`]; the presenter's auto-install path
+/// seeds it from the first presented plane.
+fn note_composition_surface(handle: u64, desc: &ResourceDesc) {
+    if handle == 0 {
+        return;
+    }
+    let mut census = composition_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if census.surface.is_none() {
+        census.surface = Some((handle, desc.format, desc.width, desc.height));
+        emit_composition_census(&mut census);
+    }
+}
+
+/// Records one colour render-pass attachment as a candidate composition target.
+///
+/// Only the last bind of each allocation matters, so a handle keeps one row and
+/// its sequence advances. The record is bounded; a title with an unbounded set
+/// of 4K targets keeps the first [`COMPOSITION_TARGET_MAX`] and counts drops.
+pub(crate) fn note_colour_target(handle: u64, desc: &ResourceDesc) {
+    if handle == 0 {
+        return;
+    }
+    let mut census = composition_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    census.sequence = census.sequence.saturating_add(1);
+    let sequence = census.sequence;
+    if let Some(target) = census
+        .targets
+        .iter_mut()
+        .find(|target| target.handle == handle)
+    {
+        target.format = desc.format;
+        target.width = desc.width;
+        target.height = desc.height;
+        target.sequence = sequence;
+    } else if census.targets.len() < COMPOSITION_TARGET_MAX {
+        census.targets.push(CompositionTarget {
+            handle,
+            format: desc.format,
+            width: desc.width,
+            height: desc.height,
+            sequence,
+        });
+    } else {
+        census.dropped = census.dropped.saturating_add(1);
+    }
+    emit_composition_census(&mut census);
+}
+
+/// The allocation the last colour pass targeted that can be presented.
+///
+/// Returns `None` until the presenter has registered a surface and a matching
+/// colour pass has run. The presenter's per-frame rebind needs permission to
+/// change `native_metal::queue`; this accessor is the decision it will use.
+#[allow(dead_code)]
+pub(crate) fn latest_composition_target() -> Option<u64> {
+    let census = composition_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    latest_composition_target_locked(&census)
+}
+
+/// Clears the composition census (tests).
+#[cfg(test)]
+pub(crate) fn reset_composition_census() {
+    if let Ok(mut census) = composition_census().lock() {
+        *census = CompositionCensus::default();
     }
 }
 
@@ -5694,6 +5893,52 @@ mod tests {
         let line = present_surface_census_line();
         assert!(line.contains("registered_twice=1"), "{line}");
         assert!(line.contains("descriptor_mismatch=1"), "{line}");
+        reset_present_surface_census();
+    }
+
+    /// Boot #32's shape: the surface is one 4K allocation while the colour
+    /// passes target other 4K allocations of the same format. The census must
+    /// name the last-drawn matching allocation, and never a different shape.
+    #[test]
+    fn composition_census_names_the_last_drawn_matching_allocation() {
+        reset_composition_census();
+        reset_present_surface_census();
+        let surface = test_texture_desc(3840, 2160, 28, 0x1);
+        note_present_surface(0x1273_3000, &surface);
+        assert_eq!(latest_composition_target(), None);
+
+        // Effect / shadow targets of another shape are never selected.
+        let small = test_texture_desc(1024, 1024, 28, 0x1);
+        note_colour_target(0x1300_0000, &small);
+        let depth = test_texture_desc(3840, 2160, 45, 0x2);
+        note_colour_target(0x1400_0000, &depth);
+        assert_eq!(latest_composition_target(), None);
+
+        // Two frame-sized colour targets: the most recent bind is the frame.
+        note_colour_target(0x1500_0000, &surface);
+        note_colour_target(0x1600_0000, &surface);
+        assert_eq!(latest_composition_target(), Some(0x1600_0000));
+        note_colour_target(0x1500_0000, &surface);
+        assert_eq!(latest_composition_target(), Some(0x1500_0000));
+
+        // A BGRA sibling of the same element size is still a legal target.
+        let bgra = test_texture_desc(3840, 2160, 87, 0x1);
+        note_colour_target(0x1700_0000, &bgra);
+        assert_eq!(latest_composition_target(), Some(0x1700_0000));
+
+        let line = composition_census_line();
+        assert!(line.contains("surface=0x12733000:3840x2160:fmt28"), "{line}");
+        assert!(line.contains("selected=0x17000000"), "{line}");
+        assert!(line.contains("selected_is_surface=0"), "{line}");
+
+        // Binding the surface itself is the identity composition path.
+        note_colour_target(0x1273_3000, &surface);
+        let line = composition_census_line();
+        assert!(line.contains("selected=0x12733000"), "{line}");
+        assert!(line.contains("selected_is_surface=1"), "{line}");
+        assert_eq!(latest_composition_target(), Some(0x1273_3000));
+
+        reset_composition_census();
         reset_present_surface_census();
     }
 

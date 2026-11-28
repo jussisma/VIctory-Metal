@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use victory_metal::ipc_host::BatchExecutor;
 use victory_metal::macos::present::{
     FRAME_PROBE_CHANNEL_THRESHOLD, PixelOrder, PresentCopyKind, PresentPath, RecordingSink,
-    SurfaceImage, analyze_pixels, note_identity_pass_target, present_trace_report,
-    reset_present_trace_for_test,
+    SurfaceImage, analyze_pixels, note_identity_pass_target, note_offscreen_pass_target,
+    present_trace_report, reset_present_trace_for_test,
 };
 use victory_metal::macos::registry::{
     TextureDesc, TextureDimension, TextureFormat, TextureRegistry, TextureSubresource,
@@ -470,6 +470,28 @@ fn an_offscreen_draw_copied_to_the_present_surface_is_non_black() {
             entry.copy_kind == PresentCopyKind::CopyTextureRegion && entry.source_is_presented
         }),
         "trace must name a copy into the presented texture: {trace:?}"
+    );
+    // The copy-to-surface handoff is the named composition path, and the copy
+    // names both ends: source = the pass target, destination = the surface.
+    assert_eq!(
+        trace.surface_targeted_by_copy, 1,
+        "the presented surface is a copy destination: {trace:?}"
+    );
+    assert!(
+        trace.surface_path_copy_dest >= 1,
+        "the copy path is counted: {trace:?}"
+    );
+    assert!(
+        trace.composition_copy_dest_is_surface >= 1,
+        "the copy's destination is the presented surface: {trace:?}"
+    );
+    assert_eq!(
+        trace.composition_present_without_copy, 0,
+        "a copy into the surface is never a no-copy present: {trace:?}"
+    );
+    assert_eq!(
+        trace.surface_object_mismatch_reason, "surface-is-copy-dest",
+        "the composition path is named by the copy: {trace:?}"
     );
     eprintln!(
         "present_composition_gpu PASS extent={EDGE}x{EDGE} offscreen={OFFSCREEN_EDGE}x{OFFSCREEN_EDGE} \
@@ -916,6 +938,16 @@ fn identity_pixels_for_order(order: RegistrationOrder, edge: u32) {
     );
     assert_eq!(trace.probe_source_mismatch, 0);
     assert_eq!(trace.fallback_clear, 0);
+    // Pass-target identity is the other legitimate handoff: the presented
+    // surface is the object the pass targeted, with no copy.
+    assert!(
+        trace.surface_path_pass_target >= 1,
+        "{order:?}: the pass-target identity path is counted: {trace:?}"
+    );
+    assert_eq!(
+        trace.surface_path_copy_dest, 0,
+        "{order:?}: no copy is needed on the identity path: {trace:?}"
+    );
     eprintln!(
         "present_composition_gpu IDENTITY ORDER {order:?} PASS extent={edge}x{edge} \
          nonzero_bytes={nonzero_bytes} surface_targeted_by_pass={} \
@@ -923,6 +955,184 @@ fn identity_pixels_for_order(order: RegistrationOrder, edge: u32) {
         trace.surface_targeted_by_pass,
         trace.surface_object_mismatch_reason,
         trace.texture_objects_per_descriptor,
+    );
+}
+
+/// The composition gap Boot #32 measured: the title draws into a frame-sized
+/// colour allocation and presents a *different* allocation of the same shape,
+/// with no copy in between. The present must stay a counted conflict — the
+/// unrelated draw is never silently presented as success, and the surface's
+/// own (untouched) bytes are what the window would show.
+#[test]
+fn an_unrelated_allocation_is_a_counted_composition_conflict() {
+    let _lock = gpu_lock_or_skip!("present_composition_gpu");
+    reset_identity_census();
+    let transport = match DirectMetalTransport::new() {
+        Ok(transport) => transport,
+        Err(error) => {
+            eprintln!("present_composition_gpu SKIP no Metal device: {error}");
+            return;
+        }
+    };
+
+    // The allocation the pass targets: same descriptor as the surface, a
+    // different allocation.
+    let drawn = transport
+        .create_render_target_2d(EDGE, EDGE, PixelFormat::Rgba8Unorm)
+        .expect("unrelated rgba8unorm render target");
+    let drawn_id = transport
+        .register_render_target(&drawn)
+        .expect("register the unrelated target");
+
+    // The registered surface: never drawn into.
+    let mut image = SurfaceImage::create_rgba8(&transport, EDGE, EDGE)
+        .expect("IOSurface-backed rgba8unorm present surface");
+    let target = wrap_surface_texture(&image);
+    let surface_id = u64::from(image.surface_id());
+    transport
+        .register_present_surface(surface_id, &target)
+        .expect("register the present surface");
+
+    let pipeline = GraphicsPipeline::compile_mrt(
+        &transport,
+        MSL,
+        "pc_vertex",
+        "pc_fragment",
+        &[PixelFormat::Rgba8Unorm],
+        None,
+    )
+    .expect("unrelated pipeline should compile");
+    let pipeline_id = transport
+        .register_graphics_pipeline_state(pipeline)
+        .expect("unrelated pipeline should register");
+
+    let commands = vec![
+        wire_v3::CommandV3::BeginRenderPass(wire_v3::BeginRenderPass {
+            colors: vec![wire_v3::ColorAttachment {
+                allocation_id: drawn_id.0,
+                generation: GENERATION,
+                mip_level: 0,
+                slice: 0,
+                load: wire_v3::LoadOp::Clear,
+                store: wire_v3::StoreOp::Store,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            }],
+            depth_stencil: None,
+        }),
+        wire_v3::CommandV3::SetGraphicsPipeline(wire_v3::PipelineRef {
+            pipeline_id: pipeline_id.0,
+        }),
+        wire_v3::CommandV3::SetViewport(wire_v3::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(EDGE),
+            height: f64::from(EDGE),
+            near: 0.0,
+            far: 1.0,
+        }),
+        wire_v3::CommandV3::SetScissor(wire_v3::ScissorRect {
+            x: 0,
+            y: 0,
+            width: EDGE,
+            height: EDGE,
+        }),
+        wire_v3::CommandV3::SetPrimitiveTopology(wire_v3::PrimitiveTopology::TriangleList),
+        wire_v3::CommandV3::SetRootConstants(wire_v3::RootConstantsV3 {
+            slot: 1,
+            bytes: float4_bytes(COLOR),
+        }),
+        wire_v3::CommandV3::Draw(wire_v3::DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        wire_v3::CommandV3::EndRenderPass,
+    ];
+    let submission = wire_v3::SubmissionV3 {
+        sequence: 1,
+        list: Some(ListIdentity {
+            list_id: 12,
+            list_generation: 1,
+        }),
+        commands,
+    };
+    let mut allocations = std::collections::HashMap::new();
+    allocations.insert((drawn_id.0, GENERATION), VmBufferId(drawn_id.0));
+    let reply = transport
+        .submit_v3(&submission, &allocations)
+        .expect("the unrelated draw must execute");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    transport
+        .wait_for_gpu()
+        .expect("the unrelated draw must complete");
+
+    // Declare the exact object the pass targeted: the surface is a different,
+    // *unregistered* allocation of the same shape.
+    note_offscreen_pass_target(
+        transport
+            .registered_texture_object(drawn_id.0)
+            .expect("the drawn target is registered"),
+    );
+
+    let mut path = PresentPath::new(&transport);
+    let mut sink = RecordingSink::new();
+    path.present_drawn(&mut image, &mut sink)
+        .expect("the unrelated frame must still present the surface");
+    assert_eq!(sink.frames().len(), 1);
+    path.finish_present().expect("the unrelated frame finishes");
+
+    // The presented surface was never the pass target: its bytes are the
+    // untouched clear, not the drawn colour. A black frame is not success.
+    let presented = read_surface_rgba(&image);
+    let row_bytes = image.bytes_per_row();
+    for y in 0..EDGE as usize {
+        for x in 0..EDGE as usize {
+            let at = y * row_bytes + x * 4;
+            assert_eq!(
+                [
+                    presented[at],
+                    presented[at + 1],
+                    presented[at + 2],
+                    presented[at + 3]
+                ],
+                [0, 0, 0, 0],
+                "unrelated pixel ({x}, {y}) must stay the surface's own bytes"
+            );
+        }
+    }
+
+    let trace = present_trace_report();
+    assert_eq!(trace.frames, 1);
+    assert_eq!(
+        trace.surface_targeted_by_pass, 0,
+        "the pass target is not the surface: {trace:?}"
+    );
+    assert_eq!(trace.surface_targeted_by_copy, 0);
+    assert_eq!(
+        trace.surface_pass_targets_not_surface, 1,
+        "the split is counted as a foreign pass target: {trace:?}"
+    );
+    assert_eq!(
+        trace.surface_path_unrelated, 1,
+        "the unrelated-allocation path is counted: {trace:?}"
+    );
+    assert_eq!(
+        trace.surface_object_mismatch_reason, "surface-is-unrelated-allocation",
+        "the split is named, not folded into success: {trace:?}"
+    );
+    assert_eq!(
+        trace.composition_present_without_copy, 1,
+        "no copy reached the surface: {trace:?}"
+    );
+    assert_eq!(trace.composition_copies, 0);
+    assert_eq!(trace.probe_source_mismatch, 0);
+    assert_eq!(trace.fallback_clear, 0);
+    eprintln!(
+        "present_composition_gpu UNRELATED PASS extent={EDGE}x{EDGE} reason={} \
+         targeted_by_pass=0 targeted_by_copy=0 present_without_copy=1 trace={}",
+        trace.surface_object_mismatch_reason,
+        trace.log_line()
     );
 }
 
