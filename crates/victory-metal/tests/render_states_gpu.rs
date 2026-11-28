@@ -1616,8 +1616,8 @@ fn invented_depth_default_never_gates_a_4k_draw() {
     assert_eq!(report.draws, 1, "{report:?}");
     assert_eq!(report.depth_attachment_passes, 1, "{report:?}");
     assert_eq!(
-        report.depth_bind[3], 1,
-        "the pass ran with the invented default suppressed: {report:?}"
+        report.depth_bind[0], 1,
+        "the pass ran with no depth gate (no invented default): {report:?}"
     );
     assert_eq!(
         report.blend_baked_attachments, 0,
@@ -1625,7 +1625,7 @@ fn invented_depth_default_never_gates_a_4k_draw() {
     );
     assert_eq!(report.blend_write_mask_zero, 0, "{report:?}");
     let pass = report.last_pass.expect("the pass summary is published");
-    assert_eq!(pass.depth_bind, "invented_suppressed", "{pass:?}");
+    assert_eq!(pass.depth_bind, "none", "{pass:?}");
     assert_eq!(pass.depth_format, "depth32float", "{pass:?}");
     assert_eq!(pass.depth_load, "clear", "{pass:?}");
     assert_eq!(pass.topology, "triangle", "{pass:?}");
