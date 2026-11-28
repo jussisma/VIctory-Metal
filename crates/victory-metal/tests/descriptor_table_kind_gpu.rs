@@ -33,7 +33,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use victory_metal::MetalTransport;
 use victory_metal::VmBufferId;
 use victory_metal::macos::bindings::{
-    DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
+    DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterMap, RootParameterSlot,
+    RootParameterSpec, RootSignatureLayout,
 };
 use victory_metal::macos::device::{DirectMetalTransport, PipelineAbi};
 use victory_metal::macos::registry::{
@@ -516,5 +517,270 @@ fn a_mixed_kind_buffer_table_encodes_and_an_impossible_pair_is_named() {
         transport.abi_refusal_count(),
         census.json_value()
     );
+    reset_descriptor_table_refusal_census();
+}
+
+// ----- ADR-062a: kind-compatible ordinal resolution -------------------------
+
+/// A fragment that reports *which* flattened argument-buffer slot received the
+/// bound table address. Parameter 0 is a `Sampler` table, parameter 1 the view
+/// table; the converter writes each 8-byte table address at its flattened
+/// offset, so a view binding lights the draw colour and a sampler binding is
+/// red. This makes a silent cross-kind binding visible in the readback.
+const KIND_ORDINAL_MSL: &str = r##"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut kind_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 kind_fragment(constant ulong* arguments [[buffer(2)]]) {
+    ulong sampler_slot = arguments[0];
+    ulong view_slot = arguments[1];
+    if (view_slot != 0ul && sampler_slot == 0ul) {
+        // The table address landed on the view parameter: correct.
+        return float4(7.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0);
+    }
+    if (sampler_slot != 0ul && view_slot == 0ul) {
+        // The table address landed on the sampler parameter: cross-kind.
+        return float4(1.0, 0.0, 0.0, 1.0);
+    }
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+"##;
+
+fn kind_pipeline_state(entry: &str) -> Vec<u8> {
+    PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some(entry.to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics)
+}
+
+fn table_spec(kind: DescriptorTableKind) -> RootParameterSpec {
+    RootParameterSpec {
+        kind: RootParameterKind::DescriptorTable(kind),
+        size: 8,
+        register: 0,
+        space: 0,
+    }
+}
+
+/// Reflection flattens `Sampler` before the SRV view table, but the
+/// authoritative translated map names the view table as wire ordinal 0. The
+/// resolver must skip the sampler at the wire ordinal and bind the view.
+fn sampler_then_view_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            table_spec(DescriptorTableKind::Sampler),
+            table_spec(DescriptorTableKind::ShaderResourceView),
+        ],
+    )
+    .expect("sampler-then-view fragment root signature must build");
+    let map = RootParameterMap::from_slots(vec![
+        RootParameterSlot::new(
+            0,
+            0,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+            8,
+        ),
+        RootParameterSlot::new(
+            0,
+            0,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+            8,
+        ),
+    ]);
+    PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map)
+}
+
+/// Two kind-compatible SRV tables share the declared `(space, register)`; no
+/// deterministic candidate exists.
+fn ambiguous_view_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            table_spec(DescriptorTableKind::Sampler),
+            table_spec(DescriptorTableKind::ShaderResourceView),
+            table_spec(DescriptorTableKind::ShaderResourceView),
+        ],
+    )
+    .expect("ambiguous fragment root signature must build");
+    let map = RootParameterMap::from_slots(vec![RootParameterSlot::new(
+        0,
+        0,
+        RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+        8,
+    )]);
+    PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map)
+}
+
+/// One mixed-entry SRV table with a `kind` wire tag.
+fn sampled_submission(sequence: u32, pipeline: u64) -> SubmissionV3 {
+    submission(sequence, pipeline, DescriptorKind::Srv)
+}
+
+/// An `Srv` wire table at set 0 binds the reflected view parameter even though
+/// the converted layout flattens a sampler table at that ordinal. The draw
+/// encodes, the view slot holds the table address, and the kind-mismatch census
+/// stays empty for the key.
+#[test]
+fn an_srv_table_skips_a_sampler_at_the_wire_ordinal() {
+    let Some(_lock) = GpuLock::acquire() else {
+        eprintln!("PARTIAL: another GPU run holds /tmp/victory-gpu.lock; proof skipped");
+        return;
+    };
+    reset_descriptor_table_refusal_census();
+
+    let dir = TempDir::new("descriptor-table-kind-ordinal");
+    let metallib = compile_metallib(dir.path(), "kindord", KIND_ORDINAL_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), "target"),
+        )
+        .expect("registry texture must create");
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live 16 KiB-aligned allocation that outlives the
+    // synchronous submissions and is unregistered before it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_SIDE, 1), side_id);
+
+    const VIEW_HANDLE: u64 = 0x7001;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            VIEW_HANDLE,
+            &metallib,
+            "kind_vertex",
+            &kind_pipeline_state("kind_fragment"),
+            sampler_then_view_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&sampled_submission(601, VIEW_HANDLE), &allocations)
+        .expect("an Srv table must skip the sampler at the wire ordinal");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    assert_eq!(stats.render_encoders, 1);
+    assert_eq!(transport.encode_counters().draws, 1);
+    assert_eq!(
+        transport.abi_refusal_count(),
+        0,
+        "a correctly resolved table is not an ABI refusal"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "the resolved slot's kind equals the wire table's kind: {}",
+        census.json_value()
+    );
+
+    transport
+        .wait_for_gpu()
+        .expect("the constant passes should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_eq!(pixels.len(), PIXELS, "target pixel count");
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(
+            *pixel, DRAWN_RGBA,
+            "pixel {index}: the table address must land on the view parameter, not the sampler"
+        );
+    }
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
+    eprintln!(
+        "kind-compatible ordinal proof on {}: draws=1, abi_refusals=0, census={}",
+        info.name_str(),
+        census.json_value()
+    );
+    reset_descriptor_table_refusal_census();
+}
+
+/// Two kind-compatible candidates are ambiguous: the resolver returns `None`,
+/// the caller counts a refusal, and no kind-mismatch key is fabricated. This
+/// keeps the negative control deterministic instead of binding the first table.
+#[test]
+fn two_kind_compatible_candidates_stay_a_counted_refusal() {
+    let Some(_lock) = GpuLock::acquire() else {
+        eprintln!("PARTIAL: another GPU run holds /tmp/victory-gpu.lock; proof skipped");
+        return;
+    };
+    reset_descriptor_table_refusal_census();
+
+    let dir = TempDir::new("descriptor-table-kind-ambiguous");
+    let metallib = compile_metallib(dir.path(), "kindamb", KIND_ORDINAL_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), "target"),
+        )
+        .expect("registry texture must create");
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live 16 KiB-aligned allocation unregistered before
+    // it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_SIDE, 1), side_id);
+
+    const AMBIGUOUS_HANDLE: u64 = 0x7002;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            AMBIGUOUS_HANDLE,
+            &metallib,
+            "kind_vertex",
+            &kind_pipeline_state("kind_fragment"),
+            ambiguous_view_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let error = transport
+        .submit_v3_with_stats(&sampled_submission(602, AMBIGUOUS_HANDLE), &allocations)
+        .expect_err("two compatible candidates must not be guessed");
+    assert!(
+        error
+            .to_string()
+            .contains("a wire root argument is not declared by the converted layout"),
+        "ambiguity keeps the counted declared-parameter refusal: {error}"
+    );
+    assert_eq!(
+        transport.abi_refusal_count(),
+        1,
+        "ambiguity is a counted ABI refusal"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "ambiguity is not a kind-mismatch key: {}",
+        census.json_value()
+    );
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
     reset_descriptor_table_refusal_census();
 }

@@ -9,18 +9,28 @@
 //!
 //! This module owns the single decision used by `device::flush_abi` (and its
 //! descriptor-table build path), so the compatibility rule and the fallback
-//! search can be tested without a device. Seam extraction only: the behaviour
-//! is unchanged from `device::abi_parameter_index`, which this replaces.
+//! search can be tested without a device.
 
-use crate::macos::bindings::{RootParameterKind, RootSignatureLayout};
+use crate::macos::bindings::{DescriptorTableKind, RootParameterKind, RootSignatureLayout};
 
 /// Whether a wire argument kind can address a reflected parameter kind.
 ///
-/// A table is a table; converter reflection cannot distinguish its range kinds
-/// (`Table` is stored as `Unspecified`), so those match any table.
+/// A converter-reflected table is reported only as `"Table"` and is stored as
+/// [`DescriptorTableKind::Unspecified`], so an unspecified table range matches
+/// any concrete table kind. Two *concrete* table kinds must agree: a `Sampler`
+/// range never matches a buffer or texture view range (and the reverse), and a
+/// `Texture` range never matches an address-buffer range. Every non-table kind
+/// stays exact.
 pub(crate) fn kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -> bool {
     match (declared, named) {
-        (RootParameterKind::DescriptorTable(_), RootParameterKind::DescriptorTable(_)) => true,
+        (
+            RootParameterKind::DescriptorTable(declared),
+            RootParameterKind::DescriptorTable(named),
+        ) => {
+            declared == named
+                || declared == DescriptorTableKind::Unspecified
+                || named == DescriptorTableKind::Unspecified
+        }
         (left, right) => left == right,
     }
 }
@@ -33,6 +43,12 @@ pub(crate) fn kinds_compatible(declared: RootParameterKind, named: RootParameter
 /// reflection has no versioned signature map). When the triple is not declared
 /// — or a table's reflected triple is `u32::MAX` — the wire index is the
 /// deterministic identity, never a silent drop.
+///
+/// ADR-062a: the ordinal fast path is taken only when the parameter there is
+/// kind-compatible with `kind`. Otherwise a descriptor table is resolved by
+/// [`unique_compatible_table`] instead of `parameter_by`: the latter binds the
+/// first wildcard table it meets and would let a `u32::MAX` sampler win over the
+/// view table the wire named.
 pub(crate) fn parameter_index(
     layout: &RootSignatureLayout,
     wire_slot: usize,
@@ -44,7 +60,8 @@ pub(crate) fn parameter_index(
     // `u32::MAX`, so every table's reflected triple is identical: a triple
     // lookup would bind the first table twice. The wire index is that path's
     // only identity, and it is checked first whenever the layout agrees with it
-    // (an unknown `u32::MAX` field, or the exact declared pair).
+    // (an unknown `u32::MAX` field, or the exact declared pair) *and* the
+    // parameter's kind is compatible.
     if let Some(parameter) = layout.parameters().get(wire_slot)
         && kinds_compatible(parameter.kind(), kind)
         && (parameter.space() == space || parameter.space() == u32::MAX)
@@ -52,8 +69,166 @@ pub(crate) fn parameter_index(
     {
         return Some(wire_slot);
     }
+    if matches!(kind, RootParameterKind::DescriptorTable(_)) {
+        return unique_compatible_table(layout, space, register, kind);
+    }
     if let Ok(Some(found)) = layout.parameter_by(space, register, kind) {
         return Some(found);
     }
     None
+}
+
+/// The unique descriptor-table parameter that can carry a table of `kind`.
+///
+/// ADR-062a: once the ordinal fast path has missed on kind, the only safe
+/// fallback is a *unique* candidate. A parameter qualifies when its kind is
+/// compatible with `kind` and its reflected `(space, register)` is the
+/// requested pair or a `u32::MAX` wildcard (converter reflection reports every
+/// table that way). Two or more candidates are ambiguous: returning either would
+/// be a guess, so this returns `None` and the caller records a counted refusal.
+pub(crate) fn unique_compatible_table(
+    layout: &RootSignatureLayout,
+    space: u32,
+    register: u32,
+    kind: RootParameterKind,
+) -> Option<usize> {
+    let mut found = None;
+    for (index, parameter) in layout.parameters().iter().enumerate() {
+        if !matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
+            continue;
+        }
+        if !kinds_compatible(parameter.kind(), kind) {
+            continue;
+        }
+        if parameter.space() != space && parameter.space() != u32::MAX {
+            continue;
+        }
+        if parameter.register() != register && parameter.register() != u32::MAX {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kinds_compatible, parameter_index};
+    use crate::macos::bindings::{
+        DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+        RootSignatureLayout,
+    };
+
+    const SRV: RootParameterKind =
+        RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView);
+    const SAMPLER: RootParameterKind =
+        RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler);
+    const TEXTURE: RootParameterKind =
+        RootParameterKind::DescriptorTable(DescriptorTableKind::Texture);
+
+    /// A fragment layout with one descriptor table per `(kind, space, register)`
+    /// declaration, flattened in declaration order.
+    fn table_layout(parameters: &[(RootParameterKind, u32, u32)]) -> RootSignatureLayout {
+        let specs: Vec<RootParameterSpec> = parameters
+            .iter()
+            .map(|(kind, space, register)| RootParameterSpec {
+                kind: *kind,
+                size: 8,
+                register: *register,
+                space: *space,
+            })
+            .collect();
+        RootSignatureLayout::from_parameters(ReflectedStage::Fragment, &specs)
+            .expect("a test root signature must build")
+    }
+
+    #[test]
+    fn an_srv_table_skips_a_sampler_at_the_wire_ordinal() {
+        // Reflection flattens the sampler first; the wire names the SRV view
+        // table at the same ordinal and the same `(space, register)`.
+        let layout = table_layout(&[(SAMPLER, 0, 0), (SRV, 0, 0)]);
+        assert_eq!(parameter_index(&layout, 0, 0, 0, SRV), Some(1));
+    }
+
+    #[test]
+    fn a_sampler_table_resolves_to_the_sampler() {
+        let layout = table_layout(&[(SAMPLER, 0, 0), (SRV, 0, 0)]);
+        assert_eq!(parameter_index(&layout, 0, 0, 0, SAMPLER), Some(0));
+        // Even when the ordinal names the view parameter, the only compatible
+        // table is the sampler.
+        assert_eq!(parameter_index(&layout, 1, 0, 0, SAMPLER), Some(0));
+    }
+
+    #[test]
+    fn a_non_table_ordinal_still_resolves_the_table_the_wire_names() {
+        // The ordinal is a root view, not a table; the table the wire names is
+        // the second parameter.
+        let layout = table_layout(&[(RootParameterKind::ConstantBufferView, 0, 0), (SRV, 0, 0)]);
+        assert_eq!(parameter_index(&layout, 0, 0, 0, SRV), Some(1));
+    }
+
+    #[test]
+    fn two_kind_compatible_candidates_are_ambiguous() {
+        let layout = table_layout(&[(SAMPLER, 0, 0), (SRV, 0, 0), (SRV, 0, 0)]);
+        assert_eq!(
+            parameter_index(&layout, 0, 0, 0, SRV),
+            None,
+            "two SRV candidates must refuse rather than guess"
+        );
+    }
+
+    #[test]
+    fn a_texture_range_and_a_buffer_range_do_not_cross_match() {
+        let texture = table_layout(&[(TEXTURE, 0, 0)]);
+        assert_eq!(
+            parameter_index(&texture, 0, 0, 0, SRV),
+            None,
+            "an SRV table cannot take a Texture parameter"
+        );
+        let view = table_layout(&[(SRV, 0, 0)]);
+        assert_eq!(
+            parameter_index(&view, 0, 0, 0, TEXTURE),
+            None,
+            "a Texture table cannot take an SRV parameter"
+        );
+        assert!(!kinds_compatible(TEXTURE, SRV));
+        assert!(!kinds_compatible(SRV, TEXTURE));
+        // Sampler never crosses a buffer or texture view range in either
+        // direction.
+        assert!(!kinds_compatible(SAMPLER, SRV));
+        assert!(!kinds_compatible(SRV, SAMPLER));
+        assert!(!kinds_compatible(SAMPLER, TEXTURE));
+        assert!(!kinds_compatible(TEXTURE, SAMPLER));
+    }
+
+    #[test]
+    fn unspecified_parameters_keep_matching_any_concrete_kind() {
+        let unspecified = RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified);
+        let unspecified_layout = table_layout(&[(unspecified, 0, 0)]);
+        for kind in [SRV, SAMPLER, TEXTURE] {
+            assert_eq!(
+                parameter_index(&unspecified_layout, 0, 0, 0, kind),
+                Some(0),
+                "an Unspecified reflected table keeps matching {kind:?}"
+            );
+        }
+        // The reverse: a wire `Unspecified` table still matches a concrete
+        // reflected parameter.
+        let concrete = table_layout(&[(SRV, 0, 0)]);
+        assert_eq!(parameter_index(&concrete, 0, 0, 0, unspecified), Some(0));
+    }
+
+    #[test]
+    fn non_table_kinds_stay_exact() {
+        use crate::macos::bindings::RootParameterKind as Kind;
+        assert!(kinds_compatible(Kind::Constants, Kind::Constants));
+        assert!(!kinds_compatible(Kind::Constants, Kind::ConstantBufferView));
+        assert!(!kinds_compatible(
+            Kind::ShaderResourceView,
+            Kind::UnorderedAccessView
+        ));
+    }
 }
