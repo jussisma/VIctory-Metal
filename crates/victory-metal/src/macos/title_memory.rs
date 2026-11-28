@@ -59,6 +59,38 @@ pub(crate) struct TitleMemory {
     generation: u32,
     ranges: Vec<TitleRange>,
     built: Option<Built>,
+    /// Accepted map applications that changed the range set (ADR-058).
+    updates: u64,
+    /// Built tables dropped because the map or an allocation changed.
+    invalidations: u64,
+    /// Flushes that bound a live table.
+    bindings: u64,
+    /// Flushes that needed a table and could not build one (an allocation
+    /// missing or a range outside its buffer), so the zero fallback stayed.
+    misses: u64,
+    /// Pages in the table most recently built; 0 when nothing is built.
+    pages: u64,
+    /// Heap pairs the built table names (one per share allocation).
+    heap_pairs: u64,
+}
+
+/// Exact live-title-memory counters for one device (ADR-058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stats {
+    /// Map applications that changed the range set.
+    pub updates: u64,
+    /// Pages in the table most recently built (a gauge).
+    pub pages: u64,
+    /// Built tables invalidated by a changed map or registration.
+    pub invalidations: u64,
+    /// Flushes that bound a live table.
+    pub bindings: u64,
+    /// Flushes that needed a table and could not build one.
+    pub misses: u64,
+    /// Ranges the installed map names.
+    pub ranges: u64,
+    /// Heap pairs the built table names.
+    pub heap_pairs: u64,
 }
 
 struct Built {
@@ -71,6 +103,10 @@ struct Built {
     table_bytes: u64,
     bitmap_bytes: u64,
     heap_bytes: u64,
+    /// Pages the built table names explicitly (ADR-058 gauge).
+    pages: u64,
+    /// Heap pairs the built table names.
+    heap_pairs: u64,
 }
 
 /// One submission's title-memory bindings: raw handles plus byte sizes.
@@ -93,11 +129,22 @@ impl TitleMemory {
             generation: 0,
             ranges: Vec::new(),
             built: None,
+            updates: 0,
+            invalidations: 0,
+            bindings: 0,
+            misses: 0,
+            pages: 0,
+            heap_pairs: 0,
         }
     }
 
     /// Replaces the map when `generation` is newer; older generations are
     /// ignored and an identical one is idempotent.
+    ///
+    /// A map that arrives before its share allocations are registered is kept
+    /// whole, never discarded: [`Self::binding`] resolves it lazily against the
+    /// current registered buffers. A later identical application changes
+    /// nothing and rebuilds nothing (ADR-058).
     pub fn set_map(&mut self, generation: u32, ranges: Vec<TitleRange>) {
         if generation < self.generation {
             return;
@@ -105,9 +152,34 @@ impl TitleMemory {
         if generation == self.generation && ranges == self.ranges {
             return;
         }
+        if self.built.is_some() {
+            self.invalidations = self.invalidations.saturating_add(1);
+            crate::macos::memory_space_bind::note_invalidation();
+        }
         self.generation = generation;
         self.ranges = ranges;
         self.built = None;
+        self.pages = 0;
+        self.heap_pairs = 0;
+        self.updates = self.updates.saturating_add(1);
+        crate::macos::memory_space_bind::note_map_application(self.ranges.len() as u64);
+    }
+
+    /// Exact counters of this device's live map and built table.
+    ///
+    /// Used by the ADR-058 tests; a future device-state accessor publishes the
+    /// same numbers without touching `DirectMetalTransport`.
+    #[allow(dead_code)]
+    pub fn stats(&self) -> Stats {
+        Stats {
+            updates: self.updates,
+            pages: self.pages,
+            invalidations: self.invalidations,
+            bindings: self.bindings,
+            misses: self.misses,
+            ranges: self.ranges.len() as u64,
+            heap_pairs: self.heap_pairs,
+        }
     }
 
     /// Builds the table and heap if the map changed, or returns the built
@@ -123,10 +195,29 @@ impl TitleMemory {
         }
         if self.built.is_none() {
             match build(device, &self.ranges, buffers)? {
-                Some(built) => self.built = Some(built),
-                None => return Ok(None),
+                Some(built) => {
+                    self.pages = built.pages;
+                    self.heap_pairs = built.heap_pairs;
+                    self.built = Some(built);
+                }
+                None => {
+                    // Every registered allocation was present last time, so a
+                    // refused build means the map or a length changed under a
+                    // live table: drop it and try again on the next flush.
+                    self.misses = self.misses.saturating_add(1);
+                    self.pages = 0;
+                    self.heap_pairs = 0;
+                    crate::macos::memory_space_bind::note_binding(
+                        self.pages,
+                        self.heap_pairs,
+                        false,
+                    );
+                    return Ok(None);
+                }
             }
         }
+        self.bindings = self.bindings.saturating_add(1);
+        crate::macos::memory_space_bind::note_binding(self.pages, self.heap_pairs, true);
         let built = self.built.as_ref().expect("built above");
         let mut resources = vec![
             built.table.as_raw(),
@@ -153,6 +244,62 @@ impl Default for TitleMemory {
     }
 }
 
+/// A map resolved against the currently registered share allocations.
+struct Resolved {
+    /// `(allocation id, raw SRV heap index, buffer)` per allocation, in
+    /// first-use order.
+    pairs: Vec<(u64, u32, Id)>,
+    /// One page-table target per range, naming its allocation's heap pair.
+    targets: Vec<Target>,
+}
+
+/// Resolves every range to a registered allocation and heap pair, or `None`
+/// when any range names an allocation that is not registered yet (or is
+/// shorter than the range). `Ok(None)` keeps the whole map pending instead of
+/// building it from a partial address relation.
+///
+/// Pure: `registered` returns the allocation's `(byte length, raw buffer)`, so
+/// the liveness ordering (map first, allocation later) is testable without a
+/// Metal device.
+fn resolve(
+    ranges: &[TitleRange],
+    mut registered: impl FnMut(u64) -> Option<(usize, Id)>,
+) -> Result<Option<Resolved>, MetalError> {
+    let mut pairs: Vec<(u64, u32, Id)> = Vec::new();
+    for range in ranges {
+        let Some((len, raw)) = registered(range.buffer.0) else {
+            return Ok(None);
+        };
+        let end = range
+            .byte_offset
+            .checked_add(range.length)
+            .ok_or(MetalError::InvalidArg("title-memory range overflows"))?;
+        if end > len as u64 {
+            return Ok(None);
+        }
+        if !pairs.iter().any(|(buffer, _, _)| *buffer == range.buffer.0) {
+            let index = pagetable::FIRST_ALLOCATION_HEAP_INDEX + 2 * pairs.len() as u32;
+            pairs.push((range.buffer.0, index, raw));
+        }
+    }
+
+    let mut targets = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let pair = pairs
+            .iter()
+            .find(|(buffer, _, _)| *buffer == range.buffer.0)
+            .map(|(_, pair, _)| *pair)
+            .expect("every range resolved to a pair above");
+        targets.push(Target {
+            guest_address: range.guest_address,
+            length: range.length,
+            heap_pair: pair,
+            start_low: range.guest_address.wrapping_sub(range.byte_offset) as u32,
+        });
+    }
+    Ok(Some(Resolved { pairs, targets }))
+}
+
 /// Builds the buffers for `ranges`; `None` when an allocation is missing or a
 /// range is out of its buffer.
 fn build(
@@ -160,24 +307,15 @@ fn build(
     ranges: &[TitleRange],
     buffers: &HashMap<u64, RegisteredBuffer>,
 ) -> Result<Option<Built>, MetalError> {
-    // Resolve every allocation to exactly one heap pair, in first-use order.
-    let mut pairs: Vec<(u64, u32, Id)> = Vec::new();
-    for range in ranges {
-        let Some(registered) = buffers.get(&range.buffer.0) else {
-            return Ok(None);
-        };
-        let end = range
-            .byte_offset
-            .checked_add(range.length)
-            .ok_or(MetalError::InvalidArg("title-memory range overflows"))?;
-        if end > registered.len as u64 {
-            return Ok(None);
-        }
-        if !pairs.iter().any(|(buffer, _, _)| *buffer == range.buffer.0) {
-            let index = pagetable::FIRST_ALLOCATION_HEAP_INDEX + 2 * pairs.len() as u32;
-            pairs.push((range.buffer.0, index, registered.buffer.as_raw()));
-        }
-    }
+    let Some(Resolved { pairs, targets }) =
+        resolve(ranges, |id| {
+            buffers
+                .get(&id)
+                .map(|registered| (registered.len, registered.buffer.as_raw()))
+        })?
+    else {
+        return Ok(None);
+    };
 
     let mut null = create_zero_buffer(device, NULL_BYTES)?;
     if null.is_none() {
@@ -201,20 +339,6 @@ fn build(
         let _ = buffer;
     }
 
-    let mut targets = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let pair = pairs
-            .iter()
-            .find(|(buffer, _, _)| *buffer == range.buffer.0)
-            .map(|(_, pair, _)| *pair)
-            .expect("every allocation has a pair");
-        targets.push(Target {
-            guest_address: range.guest_address,
-            length: range.length,
-            heap_pair: pair,
-            start_low: range.guest_address.wrapping_sub(range.byte_offset) as u32,
-        });
-    }
     let table = match pagetable::build(&targets) {
         Ok(table) => table,
         // A map the page table cannot express is refused whole, never
@@ -242,6 +366,8 @@ fn build(
         table_bytes: table.bytes.len() as u64,
         bitmap_bytes: bitmap_bytes as u64,
         heap_bytes: heap.len() as u64,
+        pages: table.pages,
+        heap_pairs: pairs.len() as u64,
         allocations,
     }))
 }
@@ -295,6 +421,92 @@ fn create_zero_buffer(device: Id, len: usize) -> Result<Option<ObjcObject>, Meta
 
 fn gpu_address(buffer: Id) -> u64 {
     unsafe { objc::msg_send_u64_0(buffer, objc::sel(c"gpuAddress")) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGE: u64 = crate::title_map::PAGE_BYTES;
+
+    fn range(address: u64, allocation: u64, offset: u64, length: u64) -> TitleRange {
+        TitleRange {
+            guest_address: address,
+            buffer: VmBufferId(allocation),
+            byte_offset: offset,
+            length,
+        }
+    }
+
+    /// ADR-058: the map may arrive before the share allocations it names. The
+    /// unresolved ranges keep the whole map pending; once the allocation
+    /// registers, the same stored map resolves to its heap pair and target.
+    #[test]
+    fn a_map_applied_before_its_allocation_resolves_after_registration() {
+        let ranges = [range(0x1_0000, 7, 0, PAGE)];
+        let mut lengths: HashMap<u64, usize> = HashMap::new();
+        let raw = 0x1000usize as Id;
+        assert!(
+            resolve(&ranges, |id| lengths.get(&id).map(|len| (*len, raw)))
+                .expect("resolution")
+                .is_none(),
+            "an unregistered allocation keeps the map pending"
+        );
+        lengths.insert(7, 2 * PAGE as usize);
+        let resolved = resolve(&ranges, |id| lengths.get(&id).map(|len| (*len, raw)))
+            .expect("resolution")
+            .expect("the map now resolves");
+        assert_eq!(
+            resolved.pairs,
+            vec![(7, pagetable::FIRST_ALLOCATION_HEAP_INDEX, raw)],
+            "the registered allocation takes the first real heap pair"
+        );
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].guest_address, 0x1_0000);
+        assert_eq!(
+            resolved.targets[0].heap_pair,
+            pagetable::FIRST_ALLOCATION_HEAP_INDEX
+        );
+        assert_eq!(resolved.targets[0].start_low, 0x1_0000);
+    }
+
+    #[test]
+    fn one_unregistered_allocation_refuses_the_whole_map() {
+        let ranges = [
+            range(0x1_0000, 1, 0, PAGE),
+            range(0x2_0000, 2, 0, PAGE),
+        ];
+        let raw = 0x1000usize as Id;
+        let resolved = resolve(&ranges, |id| {
+            (id == 1).then_some((PAGE as usize, raw))
+        })
+        .expect("resolution");
+        assert!(resolved.is_none(), "no partial table is ever built");
+    }
+
+    #[test]
+    fn an_out_of_range_offset_keeps_the_map_pending() {
+        let ranges = [range(0x1_0000, 1, PAGE, 2 * PAGE)];
+        let raw = 0x1000usize as Id;
+        let resolved = resolve(&ranges, |_| Some((PAGE as usize, raw))).expect("resolution");
+        assert!(resolved.is_none(), "a range past its buffer is not built");
+    }
+
+    #[test]
+    fn identical_map_applications_are_idempotent_and_counted() {
+        let mut memory = TitleMemory::new();
+        let ranges = vec![range(0x1_0000, 1, 0, PAGE)];
+        memory.set_map(1, ranges.clone());
+        assert_eq!(memory.stats().updates, 1);
+        assert_eq!(memory.stats().ranges, 1);
+        memory.set_map(1, ranges.clone());
+        assert_eq!(memory.stats().updates, 1, "an identical application is a no-op");
+        memory.set_map(2, ranges.clone());
+        assert_eq!(memory.stats().updates, 2, "a changed generation is an update");
+        memory.set_map(1, Vec::new());
+        assert_eq!(memory.stats().updates, 2, "an older generation is ignored");
+        assert_eq!(memory.stats().ranges, 1);
+    }
 }
 
 fn retain(raw: Id) -> Option<ObjcObject> {
