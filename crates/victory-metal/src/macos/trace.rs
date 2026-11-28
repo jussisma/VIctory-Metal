@@ -233,6 +233,39 @@ pub const OUTCOME_SPLIT: &str = "split";
 /// counted as residue ([`DescriptorTablePartitionResidueKey`]).
 pub const OUTCOME_PARTIAL: &str = "partial";
 
+/// Outcome word: a mixed resource table was bound whole, in wire order, as one
+/// converted descriptor array at a declared `Unspecified` table slot.
+///
+/// Converter reflection reports every range as `"Table"` without a range kind,
+/// so such a slot is the converter's own 24-byte descriptor array and every
+/// entry keeps the index the title gave it. No partition is needed, and none is
+/// dropped: the wire entries are the authoritative shape of each element.
+pub const OUTCOME_MERGED: &str = "merged";
+
+/// Drop reason: the bound pipeline declares no descriptor table at all, so a
+/// wire table has no root parameter it could address.
+pub const DROP_NO_DECLARED_TABLE: &str = "no-declared-table";
+
+/// Drop reason: the bound pipeline declares table parameters, but none names
+/// the resolved slot for a mixed table's partitions.
+pub const DROP_NO_DECLARED_SLOT: &str = "no-declared-slot";
+
+/// Drop reason: the declared range kind of the resolved slot cannot carry any
+/// partition of the mix (a resource view mix under a `Sampler` range, or every
+/// entry shape failing the range kind's descriptor shape).
+pub const DROP_DECLARED_KIND_REJECTS_PARTITIONS: &str = "declared-kind-rejects-partitions";
+
+/// Drop reason: a declared fragment texture/sampler source was dropped as the
+/// residue of a partially bound table.
+pub const DROP_FRAGMENT_SOURCE_RESIDUE: &str = "fragment-source-residue";
+
+/// Drop reason: the fragment declares a texture/sampler source and this draw
+/// bound no texture or sampler entry to it — either no wire table was written
+/// for the pipeline, or the table that was written carries only address
+/// entries. Either way the declared source has no bound entry, and the class is
+/// named instead of inferred.
+pub const DROP_DECLARED_SOURCE_UNFILLED: &str = "declared-source-unfilled";
+
 /// One bounded key of the descriptor-table *kind mismatch* census.
 ///
 /// It names only fixed kind words and counts: the reflected table kind from the
@@ -318,6 +351,44 @@ pub struct DescriptorTablePartitionResidueCount {
     pub count: u64,
 }
 
+/// One bounded key naming *why* a declared table was not bound.
+///
+/// The `mix`/`inert` keys say a table combination was accepted inertly, but not
+/// which early return dropped it. This key answers that in one boot: the
+/// resolved declared range kind(s), how many table slots the pipeline declares,
+/// the entry combination class, and the fixed reason word of the return that
+/// dropped the table. Counts and fixed words only: no handles, register values,
+/// shader bytes or title identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorTableBindingDropKey {
+    /// Host pipeline id the dropped table was selected with.
+    pub pipeline_id: u64,
+    /// Wire `DescriptorTableV3.set` the submission carried.
+    pub wire_set: u16,
+    /// Reflected range kind of the resolved slot
+    /// (`ConstantBufferView`/`ShaderResourceView`/`UnorderedAccessView`/
+    /// `Texture`/`Sampler`/`Unspecified`, or `none` when no slot resolved).
+    pub declared_kind: &'static str,
+    /// Descriptor-table parameters the bound pipeline declares.
+    pub declared_tables: u16,
+    /// Descriptor-table parameters the widest single stage layout declares.
+    pub declared_slots: u16,
+    /// Entry combination class (`single`, `buffer+texture`, `buffer+sampler`,
+    /// `texture+sampler`, `all`, `empty`).
+    pub mix_class: &'static str,
+    /// Fixed reason word: one of the `DROP_*` constants.
+    pub reason: &'static str,
+}
+
+/// One counted descriptor-table binding-drop key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTableBindingDropCount {
+    /// The bounded key.
+    pub key: DescriptorTableBindingDropKey,
+    /// How many dropped tables the key describes in this process.
+    pub count: u64,
+}
+
 /// One counted descriptor-table mix key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescriptorTableMixCount {
@@ -366,6 +437,8 @@ pub struct DescriptorTableRefusalCensus {
     pub mix_keys: Vec<DescriptorTableMixCount>,
     /// Retained mixed-table partition residues in first-observed order.
     pub partition_residues: Vec<DescriptorTablePartitionResidueCount>,
+    /// Retained declared-table binding drops in first-observed order.
+    pub binding_drops: Vec<DescriptorTableBindingDropCount>,
     /// Per-stage fragment ABI observability of the last recorded flush.
     ///
     /// `telemetry.json` embeds this census, so these counters reach the boot
@@ -380,6 +453,7 @@ impl DescriptorTableRefusalCensus {
             && self.kind_mismatches.is_empty()
             && self.mix_keys.is_empty()
             && self.partition_residues.is_empty()
+            && self.binding_drops.is_empty()
     }
 
     /// The census as the `descriptor_table_refusal_census` telemetry member.
@@ -396,15 +470,17 @@ impl DescriptorTableRefusalCensus {
     /// The census as the `descriptor_table_refusal_census` telemetry object.
     ///
     /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`,
-    /// `kind_mismatch_keys`, `mix_keys`, `partition_residues`; each resolution
-    /// key carries `pipeline_id`, `wire_set`, `declared_tables`,
+    /// `kind_mismatch_keys`, `mix_keys`, `partition_residues`, `binding_drops`;
+    /// each resolution key carries `pipeline_id`, `wire_set`, `declared_tables`,
     /// `reflected_tables`, `stage_mask`, `map_tables`, `had_plan`, `plan_kind`,
     /// `outcome` and `count`. Each kind-mismatch key carries `pipeline_id`,
     /// `wire_set`, `reflected_kind`, `wire_kind`, `entry_shape`, `mix_class`,
     /// `outcome` (`"kind-mismatch"`) and `count`. Each mix key carries
     /// `pipeline_id`, `wire_set`, `mix_class`, `outcome` and `count`. Each
     /// partition-residue key carries `pipeline_id`, `wire_set`, `slot_index`,
-    /// `declared_kind`, `entry_shape`, `dropped_entries` and `count`.
+    /// `declared_kind`, `entry_shape`, `dropped_entries` and `count`. Each
+    /// binding-drop key carries `pipeline_id`, `wire_set`, `declared_kind`,
+    /// `declared_tables`, `declared_slots`, `mix_class`, `reason` and `count`.
     pub fn json_value(&self) -> String {
         let keys = self
             .entries
@@ -489,7 +565,9 @@ impl DescriptorTableRefusalCensus {
              \"ps_bound_parameters\": {}, \"ps_bound_constants\": {}, \
              \"ps_bound_views\": {}, \"ps_bound_tables\": {}, \
              \"fragment_texture_sources_declared\": {}, \
-             \"fragment_texture_sources_bound\": {}, \"tables_dropped_inert\": {}, \
+             \"fragment_texture_sources_bound\": {}, \
+             \"fragment_texture_sources_dropped\": {}, \
+             \"fragment_source_drop_reason\": \"{}\", \"tables_dropped_inert\": {}, \
              \"ps_tables_dropped_inert\": {}, \"fragment_source_unreachable\": {}, \
              \"fragment_source_unreachable_reason\": \"{}\"}}",
             self.stage_abi.stage_mask,
@@ -500,21 +578,45 @@ impl DescriptorTableRefusalCensus {
             self.stage_abi.ps_bound_tables,
             self.stage_abi.fragment_texture_sources_declared,
             self.stage_abi.fragment_texture_sources_bound,
+            self.stage_abi.fragment_texture_sources_dropped,
+            self.stage_abi.fragment_source_drop_reason,
             self.stage_abi.tables_dropped_inert,
             self.stage_abi.ps_tables_dropped_inert,
             self.stage_abi.fragment_source_unreachable,
             self.stage_abi.fragment_source_unreachable_reason
         );
+        let binding_drops = self
+            .binding_drops
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"pipeline_id\": {}, \"wire_set\": {}, \"declared_kind\": \"{}\", \
+                     \"declared_tables\": {}, \"declared_slots\": {}, \
+                     \"mix_class\": \"{}\", \"reason\": \"{}\", \"count\": {}}}",
+                    entry.key.pipeline_id,
+                    entry.key.wire_set,
+                    entry.key.declared_kind,
+                    entry.key.declared_tables,
+                    entry.key.declared_slots,
+                    entry.key.mix_class,
+                    entry.key.reason,
+                    entry.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}], \
              \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}], \
-             \"partition_residues\": [{}], \"stage_abi\": {}}}",
+             \"partition_residues\": [{}], \"binding_drops\": [{}], \
+             \"stage_abi\": {}}}",
             self.distinct_keys,
             self.omitted,
             keys,
             kind_mismatches,
             mix_keys,
             partition_residues,
+            binding_drops,
             stage_abi
         )
     }
@@ -526,6 +628,7 @@ struct DescriptorTableRefusalLog {
     kind_mismatches: Vec<(DescriptorTableKindMismatchKey, u64)>,
     mix: Vec<(DescriptorTableMixKey, u64)>,
     residues: Vec<(DescriptorTablePartitionResidueKey, u64)>,
+    drops: Vec<(DescriptorTableBindingDropKey, u64)>,
     omitted: u64,
 }
 
@@ -535,6 +638,7 @@ impl DescriptorTableRefusalLog {
             + self.kind_mismatches.len()
             + self.mix.len()
             + self.residues.len()
+            + self.drops.len()
     }
 }
 
@@ -636,6 +740,27 @@ pub fn note_descriptor_table_partition_residue(key: DescriptorTablePartitionResi
     log.residues.push((key, 1));
 }
 
+/// Counts one dropped declared table under its bounded reason key.
+///
+/// `key.reason` is the fixed word of the early return that dropped it, so a boot
+/// never has to infer the cause from a coarse `inert` outcome. It shares the one
+/// [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`] cap; keys past the cap only bump
+/// `omitted`.
+pub fn note_descriptor_table_binding_drop(key: DescriptorTableBindingDropKey) {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, count)) = log.drops.iter_mut().find(|(known, _)| *known == key) {
+        *count = count.saturating_add(1);
+        return;
+    }
+    if log.retained() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+        log.omitted = log.omitted.saturating_add(1);
+        return;
+    }
+    log.drops.push((key, 1));
+}
+
 /// A copy of the process-wide descriptor-table refusal census.
 pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
     let log = descriptor_table_refusals()
@@ -672,6 +797,14 @@ pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
             .residues
             .iter()
             .map(|(key, count)| DescriptorTablePartitionResidueCount {
+                key: *key,
+                count: *count,
+            })
+            .collect(),
+        binding_drops: log
+            .drops
+            .iter()
+            .map(|(key, count)| DescriptorTableBindingDropCount {
                 key: *key,
                 count: *count,
             })
@@ -811,7 +944,14 @@ static LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAGMENT_TEXTURE_SOURCES_BOUND: AtomicU64 = AtomicU64::new(0);
 static LAST_TABLES_DROPPED_INERT: AtomicU64 = AtomicU64::new(0);
 static LAST_PS_TABLES_DROPPED_INERT: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_TEXTURE_SOURCES_DROPPED: AtomicU64 = AtomicU64::new(0);
 static FRAGMENT_SOURCE_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Fixed reason word of the last fragment texture-source drop.
+///
+/// A `&'static str` cannot live in an atomic, and a flush already takes the
+/// device mutex; this one is written only when the word changes.
+static LAST_FRAGMENT_SOURCE_DROP_REASON: Mutex<&'static str> = Mutex::new("none");
 
 /// Per-stage ABI observability of the last recorded draw.
 ///
@@ -836,6 +976,15 @@ pub struct StageAbiTelemetry {
     pub fragment_texture_sources_declared: u64,
     /// Declared fragment sources a wire table bound.
     pub fragment_texture_sources_bound: u64,
+    /// Declared fragment sources this draw could not bind.
+    ///
+    /// `declared > 0 && bound == 0` always pairs with a non-zero value here, so
+    /// no draw leaves a declared source unbound without a counted reason; the
+    /// word is [`Self::fragment_source_drop_reason`].
+    pub fragment_texture_sources_dropped: u64,
+    /// Fixed reason word for the drop: one of the `DROP_*` constants, or
+    /// `none` when nothing was dropped.
+    pub fragment_source_drop_reason: &'static str,
     /// Inert wire tables in the last flush.
     pub tables_dropped_inert: u64,
     /// Inert wire tables the fragment would have had to consume.
@@ -868,6 +1017,11 @@ pub fn stage_abi_telemetry() -> StageAbiTelemetry {
         fragment_texture_sources_declared: LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED
             .load(Ordering::Relaxed),
         fragment_texture_sources_bound: LAST_FRAGMENT_TEXTURE_SOURCES_BOUND.load(Ordering::Relaxed),
+        fragment_texture_sources_dropped: LAST_FRAGMENT_TEXTURE_SOURCES_DROPPED
+            .load(Ordering::Relaxed),
+        fragment_source_drop_reason: *LAST_FRAGMENT_SOURCE_DROP_REASON
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()),
         tables_dropped_inert: LAST_TABLES_DROPPED_INERT.load(Ordering::Relaxed),
         ps_tables_dropped_inert: LAST_PS_TABLES_DROPPED_INERT.load(Ordering::Relaxed),
         fragment_source_unreachable: unreachable,
@@ -893,6 +1047,10 @@ pub fn reset_stage_abi_telemetry() {
     LAST_FRAGMENT_BOUND_TABLES.store(0, Ordering::Relaxed);
     LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED.store(0, Ordering::Relaxed);
     LAST_FRAGMENT_TEXTURE_SOURCES_BOUND.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_TEXTURE_SOURCES_DROPPED.store(0, Ordering::Relaxed);
+    *LAST_FRAGMENT_SOURCE_DROP_REASON
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = "none";
     LAST_TABLES_DROPPED_INERT.store(0, Ordering::Relaxed);
     LAST_PS_TABLES_DROPPED_INERT.store(0, Ordering::Relaxed);
     FRAGMENT_SOURCE_UNREACHABLE.store(0, Ordering::Relaxed);
@@ -920,6 +1078,18 @@ pub fn note_abi_binding(summary: AbiBindingSummary) {
             u64::from(summary.fragment_texture_sources_bound),
             Ordering::Relaxed,
         );
+        LAST_FRAGMENT_TEXTURE_SOURCES_DROPPED.store(
+            u64::from(summary.fragment_texture_sources_dropped),
+            Ordering::Relaxed,
+        );
+        let reason = if summary.fragment_texture_sources_dropped == 0 {
+            "none"
+        } else {
+            summary.fragment_source_drop_reason
+        };
+        *LAST_FRAGMENT_SOURCE_DROP_REASON
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = reason;
         LAST_TABLES_DROPPED_INERT.store(u64::from(summary.tables_dropped_inert), Ordering::Relaxed);
         LAST_PS_TABLES_DROPPED_INERT
             .store(u64::from(summary.ps_tables_dropped_inert), Ordering::Relaxed);
@@ -1185,6 +1355,14 @@ pub struct AbiBindingSummary {
     /// Those declared fragment sources a wire table with a texture/sampler
     /// entry actually bound.
     pub fragment_texture_sources_bound: u32,
+    /// Declared fragment sources this draw could not bind.
+    ///
+    /// `declared > 0 && bound == 0` always pairs with a non-zero value here so a
+    /// declared source is never unbound without a counted reason; the word is
+    /// [`Self::fragment_source_drop_reason`].
+    pub fragment_texture_sources_dropped: u32,
+    /// Fixed reason word of the drop (one of the `DROP_*` constants, or `none`).
+    pub fragment_source_drop_reason: &'static str,
     /// Wire tables this draw left inert (the bound pipeline declares no root
     /// parameter that can address them).
     pub tables_dropped_inert: u32,
@@ -1269,6 +1447,10 @@ pub struct DrawRecord {
     pub fragment_texture_sources_declared: u32,
     /// Those sources a wire table actually bound.
     pub fragment_texture_sources_bound: u32,
+    /// Declared fragment sources this draw could not bind.
+    pub fragment_texture_sources_dropped: u32,
+    /// Fixed reason word of the drop, or `none`.
+    pub fragment_source_drop_reason: &'static str,
     /// Wire tables this draw left inert.
     pub tables_dropped_inert: u32,
     /// Inert wire tables the fragment would have had to consume.
@@ -1315,6 +1497,7 @@ impl DrawRecord {
             " stage_mask={} ps_abi_parameters={} ps_bound_parameters={} \
              ps_bound_kinds=constants:{},view:{},table:{} \
              fragment_texture_sources_declared={} fragment_texture_sources_bound={} \
+             fragment_texture_sources_dropped={} fragment_source_drop_reason={} \
              tables_dropped_inert={} ps_tables_dropped_inert={} \
              fragment_source_unreachable={}",
             self.stage_mask,
@@ -1325,6 +1508,8 @@ impl DrawRecord {
             self.ps_bound_tables,
             self.fragment_texture_sources_declared,
             self.fragment_texture_sources_bound,
+            self.fragment_texture_sources_dropped,
+            self.fragment_source_drop_reason,
             self.tables_dropped_inert,
             self.ps_tables_dropped_inert,
             self.fragment_source_unreachable
@@ -1638,6 +1823,8 @@ mod tests {
                 ps_bound_tables: 0,
                 fragment_texture_sources_declared: 0,
                 fragment_texture_sources_bound: 0,
+                fragment_texture_sources_dropped: 0,
+                fragment_source_drop_reason: "none",
                 tables_dropped_inert: 0,
                 ps_tables_dropped_inert: 0,
                 fragment_source_unreachable: 0,
@@ -1671,6 +1858,8 @@ mod tests {
                     ps_bound_tables: 0,
                     fragment_texture_sources_declared: 0,
                     fragment_texture_sources_bound: 0,
+                    fragment_texture_sources_dropped: 0,
+                    fragment_source_drop_reason: "none",
                     tables_dropped_inert: 0,
                     ps_tables_dropped_inert: 0,
                     fragment_source_unreachable: 0,
@@ -1764,6 +1953,8 @@ mod tests {
             ps_bound_tables: 1,
             fragment_texture_sources_declared: 1,
             fragment_texture_sources_bound: 1,
+            fragment_texture_sources_dropped: 0,
+            fragment_source_drop_reason: "none",
             tables_dropped_inert: 0,
             ps_tables_dropped_inert: 0,
             fragment_source_unreachable: 0,
@@ -1929,6 +2120,64 @@ mod tests {
 
     /// The mix census names the exact entry combination and how the host
     /// encoded it, counting repeats once per key.
+    #[test]
+    fn the_binding_drop_census_names_the_declared_shape_and_reason() {
+        reset_descriptor_table_refusal_census();
+        let key = DescriptorTableBindingDropKey {
+            pipeline_id: 3,
+            wire_set: 0,
+            declared_kind: "Unspecified",
+            declared_tables: 1,
+            declared_slots: 1,
+            mix_class: "buffer+texture",
+            reason: DROP_DECLARED_KIND_REJECTS_PARTITIONS,
+        };
+        note_descriptor_table_binding_drop(key);
+        note_descriptor_table_binding_drop(key);
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, 1);
+        assert!(census.mix_keys.is_empty(), "a drop key is its own class");
+        assert_eq!(census.binding_drops.len(), 1);
+        assert_eq!(census.binding_drops[0].count, 2);
+        assert_eq!(
+            census.binding_drops[0].key,
+            DescriptorTableBindingDropKey { ..key }
+        );
+        let json = census.json_value();
+        assert!(json.contains("\"binding_drops\""));
+        assert!(json.contains("\"declared_kind\": \"Unspecified\""));
+        assert!(json.contains("\"declared_slots\": 1"));
+        assert!(json.contains("\"reason\": \"declared-kind-rejects-partitions\""));
+        reset_descriptor_table_refusal_census();
+        assert!(descriptor_table_refusal_census().is_empty());
+    }
+
+    #[test]
+    fn the_stage_abi_telemetry_names_a_declared_source_drop() {
+        reset_stage_abi_telemetry();
+        note_abi_binding(AbiBindingSummary {
+            stage_mask: 0b10,
+            ps_abi_parameters: 1,
+            fragment_texture_sources_declared: 1,
+            fragment_texture_sources_bound: 0,
+            fragment_texture_sources_dropped: 1,
+            fragment_source_drop_reason: DROP_FRAGMENT_SOURCE_RESIDUE,
+            ..AbiBindingSummary::default()
+        });
+        let telemetry = stage_abi_telemetry();
+        assert_eq!(telemetry.fragment_texture_sources_declared, 1);
+        assert_eq!(telemetry.fragment_texture_sources_bound, 0);
+        assert_eq!(telemetry.fragment_texture_sources_dropped, 1);
+        assert_eq!(
+            telemetry.fragment_source_drop_reason,
+            DROP_FRAGMENT_SOURCE_RESIDUE
+        );
+        let json = descriptor_table_refusal_census().json_value();
+        assert!(json.contains("\"fragment_texture_sources_dropped\": 1"));
+        assert!(json.contains("\"fragment_source_drop_reason\": \"fragment-source-residue\""));
+        reset_stage_abi_telemetry();
+    }
+
     #[test]
     fn the_mix_census_counts_by_class_and_outcome() {
         reset_descriptor_table_refusal_census();

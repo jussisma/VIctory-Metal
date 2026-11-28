@@ -1526,3 +1526,492 @@ fn a_composition_mixed_table_binds_its_texture_into_the_present_surface_exactly(
         residue.key.slot_index
     );
 }
+
+// ----- Cycle 19C: the one kind-less declared table slot ---------------------
+
+/// The converter's own descriptor type: one 24-byte `{buffer pointer, texture,
+/// i64}` element. Converter reflection reports every D3D12 range as `Type=Table`
+/// with no range kind, so one declared slot is an array of exactly this shape;
+/// entry 0 of the wire table is a buffer range and entry 1 is the texture the
+/// composition fragment samples.
+const UNSPECIFIED_TABLE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ResourceDescriptor {
+    device const float4 *data;
+    texture2d<float> image;
+    long reserved;
+};
+
+struct CompositionAbi {
+    device ResourceDescriptor *sources [[id(0)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut unspecified_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 unspecified_fragment(constant CompositionAbi &abi [[buffer(2)]]) {
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge, coord::normalized);
+    float4 texel = abi.sources[1].image.sample(smp, float2(0.5, 0.5));
+    float4 tint = abi.sources[0].data[0];
+    return float4(texel.r, tint.g, texel.b, 1.0);
+}
+"#;
+
+/// The composition draw's exact shape: a VS+PS pair whose fragment declares ONE
+/// table parameter with no range kind (`DescriptorTableKind::Unspecified`, which
+/// is what converter reflection reports), fed by
+/// `SetDescriptorHeaps` + `SetDescriptorTable` with a wire table whose entries
+/// are `[buffer, texture]`.
+///
+/// The whole table must bind at that one slot in wire order: entry 0 stays the
+/// buffer range and entry 1 stays the texture. The fragment samples entry 1 and
+/// reads entry 0, so a host that renumbered the entries (texture first), dropped
+/// the texture partition, or accepted the table inertly cannot produce the
+/// asserted bytes. The result is written into the presented IOSurface.
+#[test]
+fn a_kindless_declared_table_binds_a_mixed_wire_table_into_the_present_surface() {
+    use victory_metal::macos::trace::{
+        OUTCOME_MERGED, descriptor_table_refusal_census, reset_abi_binding_telemetry,
+        reset_descriptor_table_refusal_census, stage_abi_telemetry,
+    };
+    use victory_metal::wire::BufferBinding;
+
+    reset_descriptor_table_refusal_census();
+    reset_abi_binding_telemetry();
+    let dir = TempDir::new("composition-unspecified-table");
+    let metallib = compile_metallib(dir.path(), "unspecified_table", UNSPECIFIED_TABLE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    transport
+        .register_registry_texture(
+            TEXTURE0,
+            rgba8_desc(TEXTURE_EDGE, TEXTURE_EDGE, TextureUsage::color_attachment(), "texture0"),
+        )
+        .expect("registry texture must create");
+
+    let image = SurfaceImage::create_rgba8(&transport, EDGE, EDGE)
+        .expect("IOSurface-backed rgba8unorm present surface");
+    let surface_id = u64::from(image.surface_id());
+    let surface_target = wrap_surface_texture(&image);
+    let present_texture_id = transport
+        .register_render_target(&surface_target)
+        .expect("register the present surface texture");
+    transport
+        .register_present_surface(surface_id, &surface_target)
+        .expect("register the present surface");
+
+    // Entry 0 of the wire table: a buffer whose first float4 is the tint.
+    let mut buffer_page = HostPage::new(PAGE_BYTES);
+    let tint: Vec<u8> = [40.0f32 / 255.0, 50.0 / 255.0, 60.0 / 255.0, 1.0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    buffer_page.write(0, &tint);
+    // Entry 1: the 4x4 image of COLOR0 the fragment samples.
+    let mut upload = HostPage::new(PAGE_BYTES);
+    let poison = [0xaau8; PAGE_BYTES];
+    upload.write(0, &poison);
+    for row in 0..TEXTURE_EDGE as usize {
+        for column in 0..TEXTURE_EDGE as usize {
+            upload.write(row * ROW_PITCH + column * 4, &COLOR0);
+        }
+    }
+    // SAFETY: both pages are live, 16 KiB-aligned allocations that outlive the
+    // synchronous submission and are unregistered before they drop.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), PAGE_BYTES) }
+        .expect("upload page must register");
+    // SAFETY: same zero-copy contract as the upload page.
+    let buffer_id = unsafe { transport.register_zerocopy(buffer_page.raw(), PAGE_BYTES) }
+        .expect("buffer page must register");
+
+    const ALLOC_BUFFER: u64 = 0x44;
+    let mut allocations = HashMap::new();
+    allocations.insert((present_texture_id.0, 1), VmBufferId(present_texture_id.0));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), upload_id);
+    allocations.insert((ALLOC_BUFFER, 1), buffer_id);
+
+    let vertex = RootSignatureLayout::from_parameters(ReflectedStage::Vertex, &[])
+        .expect("empty vertex layout builds");
+    // One declared table, no range kind: the converter's `Type=Table`.
+    let fragment = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified),
+            size: 8,
+            register: 0,
+            space: 1,
+        }],
+    )
+    .expect("one kind-less table layout builds");
+    let abi = PipelineAbi::graphics(Some(vertex), Some(fragment));
+
+    const HANDLE: u64 = 0x5410;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "unspecified_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("unspecified_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            abi.clone(),
+        )
+        .expect("composition graphics pipeline must register");
+
+    // The title's wire table: one range of buffer entries, then the texture
+    // range. Both ranges are flattened into this one set.
+    let mixed_table = DescriptorTableV3 {
+        set: 0,
+        base_register: 0,
+        kind: DescriptorKind::Srv,
+        bindings: vec![
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: ALLOC_BUFFER,
+                generation: 1,
+                offset: 0,
+                length: 16,
+            }),
+            DescriptorTableEntryV3::Texture(TEXTURE0),
+        ],
+    };
+
+    let submission = SubmissionV3 {
+        sequence: 701,
+        list: None,
+        commands: vec![
+            copy_to_texture(ALLOC_UPLOAD, ALLOC_TEXTURE0, 0),
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(present_texture_id.0, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorHeaps(DescriptorHeapsV3 {
+                cbv_srv_uav: Some(DescriptorHeapRefV3 {
+                    allocation_id: ALLOC_BUFFER,
+                    generation: 1,
+                    offset: 0,
+                    gpu_base: 0,
+                    stride: 32,
+                    count: 2,
+                    active: true,
+                }),
+                sampler: None,
+            }),
+            CommandV3::SetDescriptorTable(mixed_table),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+            CommandV3::Present(Present {
+                surface_id,
+                sync_interval: 0,
+            }),
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("the kind-less table submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "composition status");
+    assert_eq!(stats.render_encoders, 1, "one render encoder draws");
+    assert_eq!(transport.abi_refusal_count(), 0, "the table resolves");
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        0,
+        "a kind-less declared slot binds the table whole"
+    );
+    assert_eq!(
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        0,
+        "the mix is not unrepresentable at a kind-less slot"
+    );
+    assert_eq!(
+        transport.descriptor_table_partial_binding_count(),
+        0,
+        "nothing is dropped: every entry keeps its wire index"
+    );
+    assert_eq!(transport.encode_counters().draws, 1, "the draw encodes");
+
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.binding_drops.is_empty(),
+        "a bound table has no named drop: {}",
+        census.json_value()
+    );
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    assert_eq!(census.mix_keys[0].key.mix_class, "buffer+texture");
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_MERGED);
+
+    let abi = stage_abi_telemetry();
+    assert_eq!(abi.ps_abi_parameters, 1, "the fragment declares one table");
+    assert_eq!(abi.ps_bound_parameters, 1, "the wire table binds it");
+    assert_eq!(abi.ps_bound_tables, 1, "the bound parameter is a table");
+    assert_eq!(
+        abi.fragment_texture_sources_declared, 1,
+        "the fragment declares one texture source"
+    );
+    assert_eq!(
+        abi.fragment_texture_sources_bound, 1,
+        "the wire table's texture entry is bound into that source"
+    );
+    assert_eq!(
+        abi.fragment_texture_sources_dropped, 0,
+        "nothing is dropped, so declared == bound"
+    );
+    assert_eq!(abi.tables_dropped_inert, 0, "the table is bound, not inert");
+
+    transport
+        .wait_for_gpu()
+        .expect("the composition pass should complete");
+    let pixels = transport
+        .read_render_target_rgba8(&surface_target)
+        .expect("present surface readback");
+    // texel.r = COLOR0.r, tint.g = 50, texel.b = COLOR0.b.
+    assert_uniform(&pixels, [COLOR0[0], 50, COLOR0[2], 255], "kind-less table target");
+    assert_eq!(
+        pixels[0],
+        [10, 50, 30, 255],
+        "entry 1 supplied the texture, entry 0 the buffer tint"
+    );
+    assert_ne!(pixels[0], [0, 0, 0, 255], "the composition target is non-black");
+    assert_ne!(pixels[0], [0, 0, 0, 0], "the composition target is not transparent");
+
+    transport
+        .unregister_buffer(upload_id)
+        .expect("unregister the upload page");
+    transport
+        .unregister_buffer(buffer_id)
+        .expect("unregister the buffer page");
+    reset_descriptor_table_refusal_census();
+    eprintln!(
+        "kind-less declared table proof on {}: pixel={:?}, declared/bound={}/{}, \
+         dropped={}, outcome={}",
+        info.name_str(),
+        pixels[0],
+        abi.fragment_texture_sources_declared,
+        abi.fragment_texture_sources_bound,
+        abi.fragment_texture_sources_dropped,
+        census.mix_keys[0].key.outcome
+    );
+}
+
+/// The same pipeline shape with a declared `Sampler` range instead: a resource
+/// table can never fill it. The table stays a counted inert acceptance (the
+/// batch still encodes), and the new binding-drop key names the exact early
+/// return, the declared kind and the slot count, so `declared == 1 && bound ==
+/// 0` is never silent.
+#[test]
+fn an_inert_declared_table_names_its_drop_reason() {
+    use victory_metal::macos::trace::{
+        DROP_DECLARED_KIND_REJECTS_PARTITIONS, OUTCOME_INERT, descriptor_table_refusal_census,
+        reset_abi_binding_telemetry, reset_descriptor_table_refusal_census, stage_abi_telemetry,
+    };
+    use victory_metal::wire::BufferBinding;
+
+    reset_descriptor_table_refusal_census();
+    reset_abi_binding_telemetry();
+    let dir = TempDir::new("composition-inert-table");
+    let metallib = compile_metallib(dir.path(), "inert_source", CONSTANT_FRAGMENT_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+    for (handle, label) in [(TEXTURE0, "texture0"), (TARGET, "target")] {
+        transport
+            .register_registry_texture(
+                handle,
+                rgba8_desc(
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    TextureUsage::color_attachment(),
+                    label,
+                ),
+            )
+            .expect("registry texture must create");
+    }
+    let mut upload = HostPage::new(PAGE_BYTES);
+    upload.write(0, &[0xaau8; PAGE_BYTES]);
+    let buffer_page = HostPage::new(PAGE_BYTES);
+    // SAFETY: both pages are live, 16 KiB-aligned allocations that outlive the
+    // synchronous submission and are unregistered before they drop.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), PAGE_BYTES) }
+        .expect("upload page must register");
+    // SAFETY: same zero-copy contract as the upload page.
+    let buffer_id = unsafe { transport.register_zerocopy(buffer_page.raw(), PAGE_BYTES) }
+        .expect("buffer page must register");
+
+    const ALLOC_BUFFER: u64 = 0x45;
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), upload_id);
+    allocations.insert((ALLOC_BUFFER, 1), buffer_id);
+
+    // A declared `Sampler` slot: no resource partition can ever fill it.
+    let fragment = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+            size: 8,
+            register: 0,
+            space: 1,
+        }],
+    )
+    .expect("one sampler table layout builds");
+
+    const HANDLE: u64 = 0x5411;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "constant_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("constant_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            PipelineAbi::graphics(None, Some(fragment)),
+        )
+        .expect("inert-table graphics pipeline must register");
+
+    let submission = SubmissionV3 {
+        sequence: 702,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(ALLOC_TARGET, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorHeaps(DescriptorHeapsV3 {
+                cbv_srv_uav: Some(DescriptorHeapRefV3 {
+                    allocation_id: ALLOC_BUFFER,
+                    generation: 1,
+                    offset: 0,
+                    gpu_base: 0,
+                    stride: 32,
+                    count: 2,
+                    active: true,
+                }),
+                sampler: None,
+            }),
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![
+                    DescriptorTableEntryV3::Buffer(BufferBinding {
+                        allocation_id: ALLOC_BUFFER,
+                        generation: 1,
+                        offset: 0,
+                        length: 16,
+                    }),
+                    DescriptorTableEntryV3::Texture(TEXTURE0),
+                ],
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("an unrepresentable table must not abort the batch");
+    assert_eq!(reply.status, ReplyStatus::Ok, "inert-table status");
+    assert_eq!(stats.render_encoders, 1, "the draw still encodes");
+    assert_eq!(transport.abi_refusal_count(), 0, "inert is not a refusal");
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        1,
+        "the table is counted inert"
+    );
+
+    let census = descriptor_table_refusal_census();
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_INERT);
+    assert_eq!(
+        census.binding_drops.len(),
+        1,
+        "the drop is named: {}",
+        census.json_value()
+    );
+    let drop = &census.binding_drops[0];
+    assert_eq!(drop.key.pipeline_id, HANDLE);
+    assert_eq!(drop.key.wire_set, 0);
+    assert_eq!(drop.key.declared_kind, "Sampler");
+    assert_eq!(drop.key.declared_tables, 1);
+    assert_eq!(drop.key.declared_slots, 1);
+    assert_eq!(drop.key.mix_class, "buffer+texture");
+    assert_eq!(drop.key.reason, DROP_DECLARED_KIND_REJECTS_PARTITIONS);
+    let json = census.json_value();
+    assert!(json.contains("\"binding_drops\""));
+    assert!(json.contains("\"reason\": \"declared-kind-rejects-partitions\""));
+
+    let abi = stage_abi_telemetry();
+    assert_eq!(abi.fragment_texture_sources_declared, 1);
+    assert_eq!(abi.fragment_texture_sources_bound, 0);
+    assert_eq!(
+        abi.fragment_texture_sources_dropped, 1,
+        "a declared source is never unbound without a counted drop"
+    );
+    assert_eq!(
+        abi.fragment_source_drop_reason,
+        DROP_DECLARED_KIND_REJECTS_PARTITIONS
+    );
+
+    transport
+        .wait_for_gpu()
+        .expect("the inert-table pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_uniform(&pixels, [7, 11, 13, 255], "inert table target");
+
+    transport
+        .unregister_buffer(upload_id)
+        .expect("unregister the upload page");
+    transport
+        .unregister_buffer(buffer_id)
+        .expect("unregister the buffer page");
+    reset_descriptor_table_refusal_census();
+    eprintln!(
+        "inert declared-table proof: declared/bound={}/{}, dropped={}, reason={}, drop_key={:?}",
+        abi.fragment_texture_sources_declared,
+        abi.fragment_texture_sources_bound,
+        abi.fragment_texture_sources_dropped,
+        abi.fragment_source_drop_reason,
+        drop.key
+    );
+}
