@@ -244,7 +244,7 @@ use crate::macos::device::{DirectMetalTransport, PipelineAbi, SamplerDesc, bound
 use crate::macos::objc::{self, ObjcObject};
 use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
-    TextureDimension, TextureFormat, TextureUsage,
+    TextureDimension, TextureFormat, TextureUsage, compute_threadgroup_from_state,
 };
 use crate::macos::vertex_layout::VertexLayout;
 use crate::root_arguments::{RootParameterPlan, decode_root_plan};
@@ -1196,6 +1196,9 @@ pub struct SessionStats {
     pub host_pipeline_translations_refused: u64,
     /// Stages answered from the host pool's content-hashed disk cache.
     pub host_pipeline_cache_hits: u64,
+    /// Compute-pipeline counters (ADR-067 diag): translated stages,
+    /// registered PSOs, threadgroup parsed/missing and dispatch counts.
+    pub compute: ComputeTelemetry,
     /// Graphics pipelines whose descriptor came from the guest's `VMVD` v2
     /// layout.
     pub vertex_layout_guest: u64,
@@ -1266,6 +1269,82 @@ pub struct TitleMapTelemetry {
     pub missing_allocations: u64,
     /// Newest mapping generation applied.
     pub generation: u32,
+}
+
+/// Compute-pipeline counters for one host session (ADR-067 diag, Boot #38).
+///
+/// These separate the three decisions that Boot #37 conflated into one empty
+/// `compute/host-translation` refusal:
+///
+/// * `stages_translated` / `pipelines_registered` say a compute stage was
+///   translated and its PSO registered;
+/// * `threadgroup_parsed` / `threadgroup_missing` say whether the registration
+///   found a `[numthreads]` (a missing size is a counted class, never a
+///   refusal);
+/// * `dispatch_attempted` / `dispatch_encoded` / `dispatch_refused` say whether
+///   a `Dispatch` reached the host and encoded.
+///
+/// `refusal_classes` keeps the named class of every compute refusal, so a boot
+/// can never report `refusals=1` with no reason: the class is a static word and
+/// `last_refusal_reason` is the bounded text that travelled in the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComputeTelemetry {
+    /// Compute stages the host translated (DXIL -> metallib) successfully.
+    pub stages_translated: u64,
+    /// Compute pipelines whose PSO registered on the native device.
+    pub pipelines_registered: u64,
+    /// Compute registrations whose container/state declared a `[numthreads]`.
+    pub threadgroup_parsed: u64,
+    /// Compute registrations that registered without a discoverable size.
+    pub threadgroup_missing: u64,
+    /// Compute registrations refused because the state carried a malformed
+    /// `VCTG` record (truncated, wrong version or a zero dimension).
+    pub threadgroup_invalid: u64,
+    /// `Dispatch1d`/`Dispatch3d` commands seen in an accepted submission.
+    pub dispatch_attempted: u64,
+    /// Compute dispatch commands the executor encoded successfully.
+    pub dispatch_encoded: u64,
+    /// Compute dispatch commands in a submission the executor refused.
+    pub dispatch_refused: u64,
+    /// Refusals by named class (`state`, `stage-set`, `translation`,
+    /// `registration`, `root-signature`).
+    pub refusal_classes: BTreeMap<&'static str, u64>,
+    /// The bounded text of the last compute refusal, when there was one.
+    pub last_refusal_reason: Option<String>,
+}
+
+impl ComputeTelemetry {
+    /// The counters as `telemetry.json` members (no trailing comma).
+    ///
+    /// A telemetry writer interpolates this verbatim, so the additive keys
+    /// reach the boot file without another hand-written field list.
+    pub fn json_fields(&self) -> String {
+        let classes = self
+            .refusal_classes
+            .iter()
+            .map(|(class, count)| format!("\"{class}\": {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = self.last_refusal_reason.as_deref().map_or_else(
+            || "null".to_string(),
+            |reason| format!("\"{}\"", reason.replace('"', "'")),
+        );
+        format!(
+            "\"compute_stages_translated\": {},\n  \"compute_pipelines_registered\": {},\n  \
+             \"compute_threadgroup_parsed\": {},\n  \"compute_threadgroup_missing\": {},\n  \
+             \"compute_threadgroup_invalid\": {},\n  \"compute_dispatches_attempted\": {},\n  \
+             \"compute_dispatches_encoded\": {},\n  \"compute_dispatches_refused\": {},\n  \
+             \"compute_refusal_classes\": {{{classes}}},\n  \"compute_last_refusal_reason\": {reason}",
+            self.stages_translated,
+            self.pipelines_registered,
+            self.threadgroup_parsed,
+            self.threadgroup_missing,
+            self.threadgroup_invalid,
+            self.dispatch_attempted,
+            self.dispatch_encoded,
+            self.dispatch_refused,
+        )
+    }
 }
 
 /// Synchronous single-peer host session.
@@ -1339,12 +1418,29 @@ pub struct IpcHost<E: BatchExecutor> {
     host_pipeline_translations_refused: u64,
     /// Stages answered by the host pool's content-hashed disk cache.
     host_pipeline_cache_hits: u64,
+    /// Compute stages translated (DXIL -> metallib) in this session.
+    host_compute_stages_translated: u64,
+    /// Compute PSOs that registered on the native device in this session.
+    host_compute_pipelines_registered: u64,
     /// Compute pipelines whose translated container declared a threadgroup
     /// size the host parsed and stored.
     host_compute_threadgroup_parsed: u64,
     /// Compute pipelines registered without a discoverable threadgroup size;
     /// their `Dispatch` commands are refused with a named reason.
     host_compute_threadgroup_missing: u64,
+    /// Compute registrations refused because their `VCTG` record was malformed.
+    host_compute_threadgroup_invalid: u64,
+    /// `Dispatch1d`/`Dispatch3d` commands seen in a submitted list.
+    host_compute_dispatch_attempted: u64,
+    /// Those commands the executor encoded successfully.
+    host_compute_dispatch_encoded: u64,
+    /// Those commands in a submission the executor refused.
+    host_compute_dispatch_refused: u64,
+    /// Named compute refusal classes (`state`, `stage-set`, `translation`,
+    /// `registration`, `root-signature`).
+    host_compute_refusal_classes: BTreeMap<&'static str, u64>,
+    /// The bounded text of the last compute refusal.
+    host_compute_refusal_reason: Option<String>,
     /// Graphics pipelines whose descriptor came from the guest's layout.
     vertex_layout_guest: u64,
     /// Graphics pipelines whose descriptor came from the `ISG1` signature.
@@ -1432,8 +1528,16 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_ok: 0,
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
+            host_compute_stages_translated: 0,
+            host_compute_pipelines_registered: 0,
             host_compute_threadgroup_parsed: 0,
             host_compute_threadgroup_missing: 0,
+            host_compute_threadgroup_invalid: 0,
+            host_compute_dispatch_attempted: 0,
+            host_compute_dispatch_encoded: 0,
+            host_compute_dispatch_refused: 0,
+            host_compute_refusal_classes: BTreeMap::new(),
+            host_compute_refusal_reason: None,
             vertex_layout_guest: 0,
             vertex_layout_signature: 0,
             vertex_layout_ia_stride_unknown: 0,
@@ -1545,6 +1649,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_ok: self.host_pipeline_translations_ok,
             host_pipeline_translations_refused: self.host_pipeline_translations_refused,
             host_pipeline_cache_hits: self.host_pipeline_cache_hits,
+            compute: self.compute_telemetry(),
             vertex_layout_guest: self.vertex_layout_guest,
             vertex_layout_signature: self.vertex_layout_signature,
             vertex_layout_ia_stride_unknown: self.vertex_layout_ia_stride_unknown,
@@ -1588,6 +1693,36 @@ impl<E: BatchExecutor> IpcHost<E> {
             self.host_compute_threadgroup_parsed,
             self.host_compute_threadgroup_missing,
         )
+    }
+
+    /// Every compute-pipeline counter of this session as one snapshot.
+    ///
+    /// The telemetry writer publishes [`ComputeTelemetry::json_fields`] (or
+    /// individual members) after [`Self::serve_once`] returns, including after
+    /// an error, so Boot #38 can separate translated stages, registered PSOs,
+    /// threadgroup parsed/missing and dispatch attempted/encoded/refused.
+    pub fn compute_telemetry(&self) -> ComputeTelemetry {
+        ComputeTelemetry {
+            stages_translated: self.host_compute_stages_translated,
+            pipelines_registered: self.host_compute_pipelines_registered,
+            threadgroup_parsed: self.host_compute_threadgroup_parsed,
+            threadgroup_missing: self.host_compute_threadgroup_missing,
+            threadgroup_invalid: self.host_compute_threadgroup_invalid,
+            dispatch_attempted: self.host_compute_dispatch_attempted,
+            dispatch_encoded: self.host_compute_dispatch_encoded,
+            dispatch_refused: self.host_compute_dispatch_refused,
+            refusal_classes: self.host_compute_refusal_classes.clone(),
+            last_refusal_reason: self.host_compute_refusal_reason.clone(),
+        }
+    }
+
+    /// Counts one named compute refusal class (a static word, never title text).
+    fn note_compute_refusal(&mut self, class: &'static str, reason: &str) {
+        self.host_compute_refusal_classes
+            .entry(class)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        self.host_compute_refusal_reason = Some(bounded_gpu_reason(reason));
     }
 
     /// Title-map delivery counters as one snapshot (ADR-058).
@@ -2427,7 +2562,21 @@ impl<E: BatchExecutor> IpcHost<E> {
         allocations: &HashMap<(u64, u32), VmBufferId>,
         plan: Option<&RootParameterPlan>,
     ) -> Reply {
-        match self.executor.submit_v3_with_root_plan(submission, allocations, plan) {
+        // Count the compute dispatch commands this list carries. `attempted`
+        // is every `Dispatch1d`/`Dispatch3d` the guest sent; `encoded` is those
+        // the executor accepted. A boot with `attempted > 0` and `encoded == 0`
+        // therefore names the executor, not the guest registration path.
+        let dispatches = submission
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    CommandV3::Dispatch1d(_) | CommandV3::Dispatch3d(_)
+                )
+            })
+            .count() as u64;
+        let reply = match self.executor.submit_v3_with_root_plan(submission, allocations, plan) {
             Ok(reply) => {
                 if reply.status != ReplyStatus::Ok {
                     self.note_refusal(
@@ -2449,7 +2598,19 @@ impl<E: BatchExecutor> IpcHost<E> {
                     status: ReplyStatus::ExecutionFailed,
                 }
             }
+        };
+        if dispatches != 0 {
+            self.host_compute_dispatch_attempted =
+                self.host_compute_dispatch_attempted.saturating_add(dispatches);
+            if reply.status == ReplyStatus::Ok {
+                self.host_compute_dispatch_encoded =
+                    self.host_compute_dispatch_encoded.saturating_add(dispatches);
+            } else {
+                self.host_compute_dispatch_refused =
+                    self.host_compute_dispatch_refused.saturating_add(dispatches);
+            }
         }
+        reply
     }
 
     fn v3_references_valid(&self, submission: &SubmissionV3) -> bool {
@@ -2958,7 +3119,18 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// metallibs reuse the existing per-stage registry path.
     fn register_pipeline_v3(&mut self, request: &PipelineRequestV3) -> Vec<u8> {
         self.last_pipeline_rejection = None;
+        let compute = request.kind == PIPELINE_KIND_COMPUTE;
         if let Err(reason) = validate_pipeline_v3(request) {
+            if compute {
+                let class = if reason.contains("threadgroup") {
+                    self.host_compute_threadgroup_invalid =
+                        self.host_compute_threadgroup_invalid.saturating_add(1);
+                    "state"
+                } else {
+                    "stage-set"
+                };
+                self.note_compute_refusal(class, reason);
+            }
             return self.reject_host_translation(reason);
         }
         // The translated root signature is the authoritative slot ->
@@ -2968,6 +3140,12 @@ impl<E: BatchExecutor> IpcHost<E> {
             Some(name) => match read_stage_file(&self.share_dir, name) {
                 Ok(bytes) => Some(bytes),
                 Err(_) => {
+                    if compute {
+                        self.note_compute_refusal(
+                            "root-signature",
+                            "the root-signature file is missing or unreadable",
+                        );
+                    }
                     return self.reject_host_translation(
                         "the root-signature file is missing or unreadable",
                     );
@@ -2980,10 +3158,14 @@ impl<E: BatchExecutor> IpcHost<E> {
             match read_stage_file(&self.share_dir, &stage.file) {
                 Ok(bytes) => dxil.push(bytes),
                 Err(_) => {
-                    return self.reject_host_translation(format!(
+                    let reason = format!(
                         "the {} stage file is missing or unreadable",
                         pipeline_stage_label(stage.stage)
-                    ));
+                    );
+                    if compute {
+                        self.note_compute_refusal("stage-file", &reason);
+                    }
+                    return self.reject_host_translation(reason);
                 }
             }
         }
@@ -3027,11 +3209,27 @@ impl<E: BatchExecutor> IpcHost<E> {
                 .worker_stderr_for_telemetry()
                 .map(|stderr| format!(": {stderr}"))
                 .unwrap_or_default();
-            return self.reject_host_translation(format!(
+            let reason = format!(
                 "{} stage translation failed: {}{detail}",
                 pipeline_stage_label(stage.stage),
                 pool_error_category(error)
-            ));
+            );
+            if compute {
+                self.note_compute_refusal("translation", &reason);
+            }
+            return self.reject_host_translation(reason);
+        }
+        // Translation is its own decision: every compute stage that reached a
+        // metallib is counted here, before registration, so a later registration
+        // refusal cannot hide a successful translation.
+        if compute {
+            let translated = request
+                .stages
+                .iter()
+                .filter(|stage| stage.stage == PIPELINE_STAGE_COMPUTE)
+                .count() as u64;
+            self.host_compute_stages_translated =
+                self.host_compute_stages_translated.saturating_add(translated);
         }
         let reflections: Vec<&[u8]> = results
             .iter()
@@ -3045,7 +3243,12 @@ impl<E: BatchExecutor> IpcHost<E> {
             .collect();
         let abi = match abi_from_converter_reflections(request, &reflections) {
             Ok(abi) => abi,
-            Err(reason) => return self.reject_host_translation(reason),
+            Err(reason) => {
+                if compute {
+                    self.note_compute_refusal("reflection", &reason);
+                }
+                return self.reject_host_translation(reason);
+            }
         };
         let abi = match translated_root_signature {
             Some(bytes) => match RootParameterMap::from_versioned_blob(&bytes) {
@@ -3075,29 +3278,33 @@ impl<E: BatchExecutor> IpcHost<E> {
             // The translated compute container's `PSV0` is the authoritative
             // `[numthreads]` source: the guest cannot be trusted to declare it,
             // and the ABI reflection carries no threadgroup field. A missing
-            // size is a named, counted class, never a `[1, 1, 1]` default.
-            let threadgroup = request
+            // size is a named, counted class, never a `[1, 1, 1]` default and
+            // never a registration refusal.
+            let from_container = request
                 .stages
                 .iter()
                 .position(|stage| stage.stage == PIPELINE_STAGE_COMPUTE)
                 .and_then(|index| {
                     crate::macos::registry::compute_threadgroup_from_dxil_container(&dxil[index])
                 });
-            match threadgroup {
+            // A guest-encoded `VCTG` chunk is still a real witness when the
+            // host's own container parse finds no `PSV0` (a pre-translated or
+            // opaque container): keep it rather than counting a size it holds
+            // as missing.
+            let from_state = compute_threadgroup_from_state(&state).ok().flatten();
+            match from_container.or(from_state) {
                 Some(size) => {
                     self.host_compute_threadgroup_parsed =
                         self.host_compute_threadgroup_parsed.saturating_add(1);
-                    state = crate::macos::registry::encode_compute_threadgroup_state(size);
+                    if from_container.is_some() {
+                        state = crate::macos::registry::encode_compute_threadgroup_state(size);
+                    }
                 }
                 None => {
-                    // Keep a size the guest already encoded, if any; otherwise
-                    // the registry registers the pipeline with an unknown size.
-                    if matches!(
-                        crate::macos::registry::compute_threadgroup_from_state(&state),
-                        Ok(None) | Err(_)
-                    ) {
-                        state.clear();
-                    }
+                    // No witness anywhere: register with empty state so the
+                    // registry records `missing`; the guest's `Dispatch` keeps
+                    // its named refusal.
+                    state.clear();
                     self.host_compute_threadgroup_missing =
                         self.host_compute_threadgroup_missing.saturating_add(1);
                     tracing::warn!(
@@ -3194,10 +3401,14 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
         if let Err(error) = outcome {
             self.release_content_pipeline_handle(handle);
-            return self.reject_host_translation(format!(
+            let reason = format!(
                 "{} pipeline registration failed: {error}",
                 pipeline_kind_label(request.kind)
-            ));
+            );
+            if compute {
+                self.note_compute_refusal("registration", &reason);
+            }
+            return self.reject_host_translation(reason);
         }
 
         self.host_pipeline_translations_ok = self.host_pipeline_translations_ok.saturating_add(1);
@@ -3208,12 +3419,25 @@ impl<E: BatchExecutor> IpcHost<E> {
                     self.host_translated_stages[index].saturating_add(1);
             }
         }
+        if compute {
+            self.host_compute_pipelines_registered =
+                self.host_compute_pipelines_registered.saturating_add(1);
+        }
         pipeline_reply_ok(handle)
     }
 
     /// Records and answers one version 3 refusal with a bounded category.
     fn reject_host_translation(&mut self, reason: impl AsRef<str>) -> Vec<u8> {
         let reason = bounded_gpu_reason(reason.as_ref());
+        // A reply reason is never empty: the legacy 1-byte status and the
+        // `VCTG`-shaped rejection both need a bounded, non-empty word. Boot #37
+        // reported `compute/host-translation` with an empty reason, which is
+        // itself the defect: a refusal the boot cannot name.
+        let reason = if reason.is_empty() {
+            "host translation refused without a named reason".to_string()
+        } else {
+            reason
+        };
         self.host_pipeline_translations_refused =
             self.host_pipeline_translations_refused.saturating_add(1);
         self.host_translation_reason = Some(reason.clone());
@@ -3234,7 +3458,13 @@ fn pipeline_reply_ok(id: u64) -> Vec<u8> {
 /// The older v1/v2 frames keep their one-byte rejection; only the new frame
 /// carries a reason, so no existing guest decodes a different shape.
 fn pipeline_reply_rejected(reason: &str) -> Vec<u8> {
-    let reason = bounded_gpu_reason(reason);
+    let mut reason = bounded_gpu_reason(reason);
+    if reason.is_empty() {
+        // A zero-length reason frame is decoded as a malformed reply by the
+        // guest, which is indistinguishable from an empty refusal. Never send
+        // one: the named fallback keeps the class diagnosable.
+        reason = "host translation refused without a named reason".to_string();
+    }
     let bytes = reason.as_bytes();
     let len = bytes.len().min(MAX_PIPELINE_REJECTION_REASON);
     let mut reply = Vec::with_capacity(1 + 2 + len);
@@ -3924,6 +4154,28 @@ fn decode_pipeline_request_v3(payload: &[u8]) -> Option<PipelineRequestV3> {
     })
 }
 
+/// Validates a compute pipeline's opaque `state` blob.
+///
+/// Compute state has always been opaque: an empty blob and a historical
+/// non-`VCTG` blob both register, and the registry records the threadgroup size
+/// as `missing` rather than rejecting the pipeline. ADR-067 added a `VCTG`
+/// chunk, and Boot #37 proved the old "must decode as `VPS1`" check turned that
+/// valid chunk into `compute/host-translation: the compute pipeline state is
+/// not a valid VPS1 blob`, refusing an otherwise translatable compute stage.
+///
+/// Only a `VCTG`-prefixed record that contradicts itself (truncated, another
+/// version, or a zero dimension) is refused, with its own named reason; a
+/// container without the metadata is never a refusal.
+fn validate_compute_state(state: &[u8]) -> Result<(), &'static str> {
+    if state.is_empty() {
+        return Ok(());
+    }
+    match compute_threadgroup_from_state(state) {
+        Ok(_) => Ok(()),
+        Err(_) => Err("the compute pipeline threadgroup record is malformed"),
+    }
+}
+
 /// Validates a version 3 request before any file is opened or GPU work exists.
 fn validate_pipeline_v3(request: &PipelineRequestV3) -> Result<(), &'static str> {
     let mut seen = Vec::with_capacity(request.stages.len());
@@ -3956,12 +4208,7 @@ fn validate_pipeline_v3(request: &PipelineRequestV3) -> Result<(), &'static str>
                 return Err("a compute pipeline needs exactly one stage");
             }
             index_of(PIPELINE_STAGE_COMPUTE).ok_or("a compute pipeline needs a compute stage")?;
-            if !request.state.is_empty()
-                && PipelineState::decode_for(&request.state, RegistryPipelineStage::Compute)
-                    .is_err()
-            {
-                return Err("the compute pipeline state is not a valid VPS1 blob");
-            }
+            validate_compute_state(&request.state)?;
         }
         PIPELINE_KIND_GRAPHICS => {
             if stage_count != 2
@@ -4064,12 +4311,10 @@ fn validate_pipeline_v2(request: &PipelineRequestV2) -> Result<PipelineAbi, ()> 
                 return Err(());
             }
             index_of(PIPELINE_STAGE_COMPUTE).ok_or(())?;
-            if !request.state.is_empty()
-                && PipelineState::decode_for(&request.state, RegistryPipelineStage::Compute)
-                    .is_err()
-            {
-                return Err(());
-            }
+            // The version 2 frame has no reason field, so a malformed record is
+            // still a named class on the host side, but a compute state with
+            // no `VCTG` metadata is accepted exactly like the v3 frame.
+            validate_compute_state(&request.state).map_err(|_| ())?;
         }
         PIPELINE_KIND_GRAPHICS => {
             if stage_count != 2
@@ -7844,6 +8089,188 @@ exit 0
         let (result, host) = server.handle.join().expect("server thread");
         assert!(result.is_ok());
         assert!(host.executor.state().compute_pipelines.is_empty());
+    }
+
+    // ---- ADR-067 regression: compute state is never validated as VPS1 ----
+
+    /// The exact Boot #37 shape: a valid ADR-067 `VCTG` compute state is not a
+    /// `VPS1` blob, and the old check refused the whole stage. Every compute
+    /// state with no `VPS1` shape must validate; only a self-contradicting
+    /// `VCTG` record is a named refusal.
+    #[test]
+    fn validate_pipeline_v3_accepts_compute_states_that_are_not_vps1() {
+        let file = stage_name(b"compute-validate-state");
+        let request = |state: &[u8]| {
+            let payload = pipeline_request_v3(
+                PIPELINE_KIND_COMPUTE,
+                &[(PIPELINE_STAGE_COMPUTE, file.as_str(), "main")],
+                state,
+                None,
+            );
+            match decode_pipeline_request(&payload) {
+                Some(PipelineRequest::V3(request)) => request,
+                _ => panic!("the frame does not decode as a version 3 request"),
+            }
+        };
+
+        assert!(validate_pipeline_v3(&request(&[])).is_ok(), "empty state");
+        let threadgroup = crate::macos::registry::encode_compute_threadgroup_state([64, 1, 1]);
+        assert!(
+            validate_pipeline_v3(&request(&threadgroup)).is_ok(),
+            "the ADR-067 VCTG state is not a VPS1 blob and must validate"
+        );
+        assert!(
+            validate_pipeline_v3(&request(b"VPS1 opaque compute state")).is_ok(),
+            "historical opaque compute state stays accepted"
+        );
+
+        let mut malformed = threadgroup;
+        malformed.pop();
+        let error = validate_pipeline_v3(&request(&malformed))
+            .expect_err("a truncated VCTG record is a named refusal");
+        assert!(
+            error.contains("threadgroup record is malformed"),
+            "{error}"
+        );
+    }
+
+    /// A rejected reply always carries a non-empty bounded reason, even when the
+    /// caller supplies none.
+    #[test]
+    fn a_rejected_pipeline_reply_never_carries_an_empty_reason() {
+        let dir = TestDir::new();
+        let mut host = host(&dir, StubExecutor::new(4096));
+        let reply = host.reject_host_translation("");
+        assert_eq!(reply.first().copied(), Some(PIPELINE_REPLY_REJECTED));
+        let len = usize::from(u16::from_le_bytes([reply[1], reply[2]]));
+        assert!(len > 0, "a rejection carries a named reason, not zero bytes");
+        let reason = std::str::from_utf8(&reply[3..]).expect("the reason is UTF-8");
+        assert!(!reason.trim().is_empty(), "the reason is not whitespace");
+        assert_eq!(host.session_stats().host_pipeline_translations_refused, 1);
+        assert_eq!(
+            host.session_stats().host_translation_reason.as_deref(),
+            Some(reason)
+        );
+    }
+
+    /// A version 3 compute registration with a `VCTG` state registers, counts a
+    /// parsed threadgroup and never reports a translation refusal.
+    #[test]
+    fn a_version_3_compute_registration_accepts_the_vctg_state() {
+        let dir = TestDir::new();
+        let name = write_stage(&dir, b"compute-dxil-for-host-translation");
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let state = crate::macos::registry::encode_compute_threadgroup_state([64, 1, 1]);
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, name.as_str(), "main")],
+            &state,
+            None,
+        );
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_OK, "reason: {reason:?}");
+        assert!(id.is_some_and(|id| id != 0));
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("the session ends cleanly");
+        let stats = host.session_stats();
+        assert_eq!(stats.host_pipeline_translations_ok, 1);
+        assert_eq!(stats.host_pipeline_translations_refused, 0);
+        assert_eq!(stats.host_translated_stages[4], 1, "compute stage counted");
+        assert_eq!(stats.compute.stages_translated, 1);
+        assert_eq!(stats.compute.pipelines_registered, 1);
+        assert_eq!(stats.compute.threadgroup_parsed, 1);
+        assert_eq!(stats.compute.threadgroup_missing, 0);
+        assert!(stats.compute.refusal_classes.is_empty());
+        let recorded = host.executor.state().compute_pipelines[0].2.clone();
+        assert_eq!(
+            crate::macos::registry::compute_threadgroup_from_state(&recorded)
+                .ok()
+                .flatten(),
+            Some([64, 1, 1]),
+            "the registered state carries the threadgroup"
+        );
+    }
+
+    /// A version 3 compute registration with no threadgroup metadata still
+    /// registers: the host counts `missing` and never refuses the stage.
+    #[test]
+    fn a_version_3_compute_without_threadgroup_metadata_registers_as_missing() {
+        let dir = TestDir::new();
+        let name = write_stage(&dir, b"compute-dxil-without-threadgroup");
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, name.as_str(), "main")],
+            &[],
+            None,
+        );
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_OK, "reason: {reason:?}");
+        assert!(id.is_some());
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("the session ends cleanly");
+        let stats = host.session_stats();
+        assert_eq!(stats.host_pipeline_translations_ok, 1);
+        assert_eq!(stats.host_pipeline_translations_refused, 0);
+        assert_eq!(stats.compute.stages_translated, 1);
+        assert_eq!(stats.compute.pipelines_registered, 1);
+        assert_eq!(stats.compute.threadgroup_parsed, 0);
+        assert_eq!(stats.compute.threadgroup_missing, 1);
+        assert!(stats.compute.refusal_classes.is_empty());
+        let recorded = host.executor.state().compute_pipelines[0].2.clone();
+        assert!(recorded.is_empty(), "no size is recorded: {recorded:?}");
+    }
+
+    /// A malformed `VCTG` record is the one compute-state refusal, and it is
+    /// named in both the reply and the counters.
+    #[test]
+    fn a_malformed_compute_threadgroup_record_is_a_named_refusal() {
+        let dir = TestDir::new();
+        let name = write_stage(&dir, b"compute-dxil-malformed-threadgroup");
+        let pool = host_translation_pool(&dir);
+        let server = start(host(&dir, StubExecutor::new(4096)).with_compiler_pool(pool));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let mut state = crate::macos::registry::encode_compute_threadgroup_state([64, 1, 1]);
+        state.pop();
+        let request = pipeline_request_v3(
+            PIPELINE_KIND_COMPUTE,
+            &[(PIPELINE_STAGE_COMPUTE, name.as_str(), "main")],
+            &state,
+            None,
+        );
+        let (status, id, reason) = send_v3_pipeline(&mut client, &request);
+        assert_eq!(status, PIPELINE_REPLY_REJECTED);
+        assert!(id.is_none());
+        let reason = reason.expect("a named reason");
+        assert!(reason.contains("threadgroup record is malformed"), "{reason}");
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("the session ends cleanly");
+        assert!(host.executor.state().compute_pipelines.is_empty());
+        let stats = host.session_stats();
+        assert_eq!(stats.host_pipeline_translations_refused, 1);
+        assert_eq!(stats.compute.pipelines_registered, 0);
+        assert_eq!(stats.compute.threadgroup_invalid, 1);
+        assert_eq!(stats.compute.refusal_classes.get("state"), Some(&1));
+        assert_eq!(
+            stats.compute.last_refusal_reason.as_deref(),
+            Some(reason.as_str())
+        );
     }
 
     fn title_range(allocation_id: u64) -> crate::title_map::Range {

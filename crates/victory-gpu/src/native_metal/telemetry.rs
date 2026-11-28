@@ -100,6 +100,42 @@ pub fn graphics_root_argument_counts() -> (u64, u64) {
     )
 }
 
+/// `Dispatch` calls the guest producer attempted this session.
+///
+/// An attempt is counted before any validation, so a dispatch the producer
+/// refuses still appears. It is the guest half of Boot #38's question: a boot
+/// with `attempted > 0` and `encoded == 0` has a refusal class, not a title
+/// that never dispatched.
+static COMPUTE_DISPATCH_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+/// `Dispatch` calls that produced a wire `Dispatch3d` command.
+static COMPUTE_DISPATCH_ENCODED: AtomicU64 = AtomicU64::new(0);
+/// `Dispatch` calls the producer refused (unknown size, zero count, no pipeline).
+static COMPUTE_DISPATCH_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Records one attempted `Dispatch` (before its validation).
+pub fn note_compute_dispatch_attempted() {
+    COMPUTE_DISPATCH_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one `Dispatch` that encoded a wire command.
+pub fn note_compute_dispatch_encoded() {
+    COMPUTE_DISPATCH_ENCODED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one `Dispatch` the producer refused under a named class.
+pub fn note_compute_dispatch_refused() {
+    COMPUTE_DISPATCH_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(attempted, encoded, refused)` compute dispatch counts for this session.
+pub fn compute_dispatch_counts() -> (u64, u64, u64) {
+    (
+        COMPUTE_DISPATCH_ATTEMPTED.load(Ordering::Relaxed),
+        COMPUTE_DISPATCH_ENCODED.load(Ordering::Relaxed),
+        COMPUTE_DISPATCH_REFUSED.load(Ordering::Relaxed),
+    )
+}
+
 /// Maximum bytes of a host error reason kept in telemetry and logged.
 ///
 /// Matches [`victory_metal::wire::MAX_REPLY_REASON_BYTES`] so the guest never
@@ -1680,6 +1716,12 @@ impl std::fmt::Display for TelemetrySnapshot {
             self.graphics_root_arguments_dropped
         )?;
         write!(f, ", {}", self.pipeline_census.fields())?;
+        let (attempted, encoded, refused) = compute_dispatch_counts();
+        write!(
+            f,
+            ", compute_dispatch_attempted={attempted} compute_dispatch_encoded={encoded} \
+             compute_dispatch_refused={refused}"
+        )?;
         write!(f, ", {}", self.heaps.fields())?;
         write!(f, "{}", opcode_list(&self.opcodes, "opcodes"))?;
         write!(f, "{}", opcode_list(&self.refusals, "refusals"))?;
