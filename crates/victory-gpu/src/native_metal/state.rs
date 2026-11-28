@@ -458,12 +458,75 @@ pub fn rasterizer_state(desc: &RasterizerDesc) -> Result<RasterizerState, GuestS
     })
 }
 
-/// Render state recorded by the guest and lowered on demand.
+/// Bounded per-value census of the numbers the title sends to
+/// `IASetPrimitiveTopology` (ADR-065).
 ///
-/// Each setter stores the D3D12 value and returns the converted wire value, so
-/// a caller can either keep raw state or forward it immediately. Nothing is
-/// emitted until [`GuestRenderState::state_commands`] is asked for the ordered
-/// command list.
+/// The old census lumped every value Wire v3 could not express into one
+/// `topology_hints` counter, so a real Xbox rect list (`17`) was invisible.
+/// This census keeps one counter per D3D12 value (`0..=64`) plus one for a
+/// value outside the enum, so a boot log names exactly which numbers the title
+/// uses. It is bounded (66 fixed counters) and never allocates.
+pub mod topology_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Values `0..=64` are the whole D3D12 topology enum.
+    pub const TOPOLOGY_VALUES: usize = 65;
+    /// Counter for a value outside `0..=64`.
+    pub const OUT_OF_RANGE: usize = TOPOLOGY_VALUES;
+
+    static COUNTS: [AtomicU64; TOPOLOGY_VALUES + 1] =
+        [const { AtomicU64::new(0) }; TOPOLOGY_VALUES + 1];
+
+    /// Counts one value and logs it at powers of two, so a boot log stays
+    /// bounded however many times the title sets topology.
+    pub fn note(value: u32) -> u64 {
+        let index = if (value as usize) < TOPOLOGY_VALUES {
+            value as usize
+        } else {
+            OUT_OF_RANGE
+        };
+        let count = COUNTS[index].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            tracing::info!(topology_value = value, count, "topology value census");
+        }
+        count
+    }
+
+    /// The counters in value order, then [`OUT_OF_RANGE`].
+    pub fn counts() -> [u64; TOPOLOGY_VALUES + 1] {
+        std::array::from_fn(|index| COUNTS[index].load(Relaxed))
+    }
+
+    /// A stable one-line snapshot naming every nonzero value:
+    /// `topology_values=[0:1,4:120,5:8,17:3] out_of_range=0`.
+    pub fn line() -> String {
+        let counts = counts();
+        let mut text = String::from("topology_values=[");
+        let mut first = true;
+        for (value, count) in counts.iter().enumerate().take(TOPOLOGY_VALUES) {
+            if *count == 0 {
+                continue;
+            }
+            if !first {
+                text.push(',');
+            }
+            first = false;
+            text.push_str(&format!("{value}:{count}"));
+        }
+        text.push_str(&format!("] out_of_range={}", counts[OUT_OF_RANGE]));
+        text
+    }
+
+    /// Clears the census (tests start from a known state).
+    #[cfg(test)]
+    pub fn reset() {
+        for count in &COUNTS {
+            count.store(0, Relaxed);
+        }
+    }
+}
+
+/// The state Wire v3 has a command for, recorded before it is emitted.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GuestRenderState {
     blend: Option<BlendState>,
@@ -1335,5 +1398,27 @@ mod tests {
             GuestInputLayout::from_elements(vec![element(11, 2, 0, 0)], &zero).unwrap_err(),
             GuestLayoutError::ZeroStride(0)
         );
+    }
+
+    /// ADR-065: the per-value census names the exact numbers, so the title's
+    /// rect list (`17`) is visible instead of folded into a hint total.
+    #[test]
+    fn topology_census_counts_each_value_and_names_the_rect_list() {
+        topology_census::reset();
+        for expected in 1..=3 {
+            assert_eq!(topology_census::note(17), expected);
+        }
+        topology_census::note(4);
+        topology_census::note(999);
+        let counts = topology_census::counts();
+        assert_eq!(counts[17], 3, "rect list count");
+        assert_eq!(counts[4], 1, "triangle list count");
+        assert_eq!(counts[topology_census::OUT_OF_RANGE], 1);
+        let line = topology_census::line();
+        assert!(line.contains("4:1"), "{line}");
+        assert!(line.contains("17:3"), "{line}");
+        assert!(line.contains("out_of_range=1"), "{line}");
+        topology_census::reset();
+        assert!(topology_census::line().contains("topology_values=[]"));
     }
 }

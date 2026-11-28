@@ -30,8 +30,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use victory_metal::wire::BufferBinding;
 use victory_metal::wire_v3::{
-    DescriptorKind, DescriptorTableEntryV3, DescriptorTableV3, IndexBufferBinding, IndexFormat,
-    MAX_DESCRIPTOR_BINDINGS_V3,
+    DescriptorHeapRefV3, DescriptorHeapsV3, DescriptorKind, DescriptorTableEntryV3,
+    DescriptorTableV3, IndexBufferBinding, IndexFormat, MAX_DESCRIPTOR_BINDINGS_V3,
     MAX_ROOT_CONSTANT_BYTES_V3, RootBufferView, RootConstantsV3, VertexBuffer,
 };
 use victory_metal::wire::MAX_RESOURCE_LEN;
@@ -304,6 +304,24 @@ pub enum TableRunError {
         /// Kind of the slot that ended the run.
         next_kind: DescriptorKind,
     },
+    /// The table's base handle does not fall on a descriptor of an active
+    /// heap. ADR-064: once a list bound `SetDescriptorHeaps`, a table outside
+    /// those heaps is a named refusal, never the registry fallback.
+    OutsideHeap {
+        /// The handle the title passed.
+        handle: u64,
+    },
+    /// A descriptor inside the requested heap range names nothing. The range
+    /// is the root signature's table (or the rest of the heap when its size is
+    /// unknown), so an empty slot is a refusal rather than an early end.
+    EmptyInHeap {
+        /// Index of the empty descriptor in the table run (the base is 0).
+        index: usize,
+        /// Descriptors the run covers.
+        count: usize,
+    },
+    /// The heap geometry itself cannot describe a table.
+    InvalidHeap(&'static str),
 }
 
 impl std::fmt::Display for TableRunError {
@@ -326,6 +344,16 @@ impl std::fmt::Display for TableRunError {
                 "the descriptor table mixes {run_kind:?} and {next_kind:?} entries; \
                  bind each range as its own root descriptor table"
             ),
+            Self::OutsideHeap { handle } => write!(
+                f,
+                "descriptor table handle 0x{handle:016x} is outside the active descriptor heaps"
+            ),
+            Self::EmptyInHeap { index, count } => write!(
+                f,
+                "descriptor table slot {index} of {count} holds no live descriptor; \
+                 the active-heap run is not truncated at an empty slot"
+            ),
+            Self::InvalidHeap(why) => write!(f, "invalid descriptor heap: {why}"),
         }
     }
 }
@@ -351,6 +379,9 @@ pub enum TableRunBoundary {
         /// Kind of the slot that ended the run.
         kind: DescriptorKind,
     },
+    /// The requested range reached the end of the active heap (ADR-064): the
+    /// normal end of a run whose table size is unknown.
+    HeapEnd,
 }
 
 /// One homogeneous run of consecutive buffer descriptors in register order.
@@ -602,6 +633,259 @@ where
         kind,
         entries,
         boundary,
+    })
+}
+
+/// One raw descriptor read from an active heap, classified by its RDNA 2
+/// bits (ADR-064).
+///
+/// Guest descriptors this backend wrote carry a [`crate::descriptor::VIEW_TAG`]
+/// record and resolve through the live-slot registry instead. A descriptor the
+/// title wrote or copied as console bytes has no such record: the RDNA 2 image,
+/// buffer or sampler bits are all there is. The bits distinguish an image from
+/// a buffer and a sampler from either, but not CBV/SRV/UAV (D3D12 stores no
+/// such discriminator in the descriptor); those come from the registry record
+/// when present.
+pub const RDNA2_VIEW_DESCRIPTOR_WORDS: usize = 8;
+/// Words of one RDNA 2 sampler descriptor (16 bytes).
+pub const RDNA2_SAMPLER_DESCRIPTOR_WORDS: usize = 4;
+
+/// GFX10 image descriptor `TYPE` is `word 3 [31:28]`; 8..=15 are images.
+const RDNA2_IMAGE_TYPE_FIRST: u32 = 8;
+const RDNA2_IMAGE_TYPE_LAST: u32 = 15;
+
+/// Classifies one raw view-heap descriptor (`32` bytes) as a buffer range or a
+/// texture address.
+pub fn rdna2_view_descriptor_slot(words: &[u32; 8]) -> DescriptorSlot {
+    if words.iter().all(|&word| word == 0) {
+        return DescriptorSlot::Empty;
+    }
+    let kind = words[3] >> 28;
+    if (RDNA2_IMAGE_TYPE_FIRST..=RDNA2_IMAGE_TYPE_LAST).contains(&kind) {
+        // BASE_ADDRESS is in 256-byte units, bits 39:8.
+        let address = (u64::from(words[0]) | (u64::from(words[1] & 0xFF) << 32)) << 8;
+        if address == 0 {
+            return DescriptorSlot::Unresolvable(
+                "a raw RDNA 2 image descriptor names no memory",
+            );
+        }
+        // The resource's guest memory base is the host's texture identity; a
+        // table entry the session has not registered is refused later by
+        // `require_registered_handles`, never replaced by a default texture.
+        return DescriptorSlot::Texture(DescriptorKind::Srv, address);
+    }
+    let address = u64::from(words[0]) | (u64::from(words[1] & 0xFFFF) << 32);
+    let stride = u64::from((words[1] >> 16) & 0x3FFF);
+    let records = u64::from(words[2]);
+    let len = if stride == 0 {
+        records
+    } else {
+        stride.saturating_mul(records)
+    };
+    if address == 0 || len == 0 {
+        return DescriptorSlot::Unresolvable("a raw RDNA 2 buffer descriptor is empty");
+    }
+    // A V# carries no CBV/SRV/UAV discriminator; the registry record or the
+    // reflected range names that. Buffer ranges bind alike on the host.
+    DescriptorSlot::Live(
+        DescriptorKind::Srv,
+        GuestBinding {
+            address,
+            len: len.min(victory_metal::wire::MAX_RESOURCE_LEN),
+        },
+    )
+}
+
+/// Maps one GFX10 sampler address code to `MTLSamplerAddressMode`.
+fn rdna2_address_mode(code: u32) -> Option<u32> {
+    Some(match code {
+        0 => 2,     // WRAP -> repeat
+        1 => 3,     // MIRROR -> mirrorRepeat
+        2 | 4 => 0, // CLAMP / CLAMP_BORDER? -> clampToEdge
+        5 => 1,     // MIRROR_ONCE -> mirrorClampToEdge
+        6 => 4,     // BORDER -> clampToZero
+        _ => return None,
+    })
+}
+
+/// Classifies one raw sampler descriptor (`16` bytes) as a registered sampler
+/// handle, converting its GFX10 S# filter and addressing fields.
+pub fn rdna2_sampler_descriptor_slot(words: &[u32; 4]) -> DescriptorSlot {
+    if words.iter().all(|&word| word == 0) {
+        return DescriptorSlot::Empty;
+    }
+    // `[14:12]` is the depth-compare function; nonzero is a comparison
+    // sampler, which the host's reduced `MTLSamplerState` cannot express.
+    if (words[0] >> 12) & 7 != 0 {
+        return DescriptorSlot::Unresolvable("a raw RDNA 2 comparison sampler has no host shape");
+    }
+    let Some(s) = rdna2_address_mode(words[0] & 7) else {
+        return DescriptorSlot::Unresolvable("a raw RDNA 2 sampler address mode is unknown");
+    };
+    let Some(t) = rdna2_address_mode((words[0] >> 3) & 7) else {
+        return DescriptorSlot::Unresolvable("a raw RDNA 2 sampler address mode is unknown");
+    };
+    let Some(r) = rdna2_address_mode((words[0] >> 6) & 7) else {
+        return DescriptorSlot::Unresolvable("a raw RDNA 2 sampler address mode is unknown");
+    };
+    // MAG/MIN filter: 1 (bilinear) and 3 (anisotropic linear) are linear.
+    let mag = u32::from(((words[2] >> 20) & 3) & 1 == 1);
+    let min = u32::from(((words[2] >> 22) & 3) & 1 == 1);
+    let desc = crate::native_metal::sampler::SamplerStateDesc {
+        min_filter: min,
+        mag_filter: mag,
+        s_address_mode: s,
+        t_address_mode: t,
+        r_address_mode: r,
+    };
+    match crate::native_metal::sampler::sampler_handle(&desc) {
+        Ok(handle) if handle != 0 => DescriptorSlot::Sampler(handle),
+        Ok(_) => DescriptorSlot::Unresolvable("a raw RDNA 2 sampler produced handle zero"),
+        Err(_) => DescriptorSlot::Unresolvable(
+            "a raw RDNA 2 sampler has no host sampler-state slot",
+        ),
+    }
+}
+
+/// The end of an active heap's descriptor range, if its geometry is valid.
+fn heap_end(heap: &DescriptorHeapRefV3) -> Option<u64> {
+    let span = u64::from(heap.stride).checked_mul(u64::from(heap.count))?;
+    heap.gpu_base.checked_add(span)
+}
+
+/// The active heap `handle` belongs to, with whether it is the sampler heap.
+///
+/// A handle is in a heap when it lies in `[gpu_base, end)` at a whole stride.
+/// The view heap is tried first; the two ranges never overlap when the title
+/// is well-formed.
+pub fn heap_for_handle(
+    heaps: &DescriptorHeapsV3,
+    handle: u64,
+) -> Option<(DescriptorHeapRefV3, bool)> {
+    for (heap, samplers) in [
+        (heaps.cbv_srv_uav.as_ref(), false),
+        (heaps.sampler.as_ref(), true),
+    ] {
+        let Some(heap) = heap else { continue };
+        if !heap.active {
+            continue;
+        }
+        let Some(end) = heap_end(heap) else { continue };
+        let stride = u64::from(heap.stride);
+        if handle >= heap.gpu_base
+            && handle < end
+            && stride != 0
+            && (handle - heap.gpu_base).is_multiple_of(stride)
+        {
+            return Some((*heap, samplers));
+        }
+    }
+    None
+}
+
+/// Enumerates a table from an active descriptor heap (ADR-064).
+///
+/// `base_handle` is indexed by `(handle - heap.gpu_base) / heap.stride`; the
+/// run covers `table_size` descriptors, or the rest of the heap when the
+/// root signature's table size is unknown. It never stops at the first empty
+/// slot: an empty or unresolvable slot inside the requested range refuses the
+/// whole table with its index, so no table is silently inert. `read` maps a
+/// guest handle to the slot the descriptor names (the registry record for
+/// views this backend wrote, or [`rdna2_view_descriptor_slot`]/
+/// [`rdna2_sampler_descriptor_slot`] for raw console bytes).
+pub fn enumerate_descriptor_table_in_heap<F>(
+    base_handle: u64,
+    heap: &DescriptorHeapRefV3,
+    samplers: bool,
+    table_size: Option<usize>,
+    mut read: F,
+) -> Result<TypedDescriptorTableRun, TableRunError>
+where
+    F: FnMut(u64) -> DescriptorSlot,
+{
+    if base_handle == 0 {
+        return Err(TableRunError::HandleZero);
+    }
+    if heap.stride == 0 {
+        return Err(TableRunError::InvalidHeap(
+            "the descriptor stride is zero",
+        ));
+    }
+    if heap.count == 0 {
+        return Err(TableRunError::InvalidHeap(
+            "the descriptor heap holds no descriptors",
+        ));
+    }
+    let stride = u64::from(heap.stride);
+    let Some(offset) = base_handle.checked_sub(heap.gpu_base) else {
+        return Err(TableRunError::OutsideHeap {
+            handle: base_handle,
+        });
+    };
+    if !offset.is_multiple_of(stride) {
+        return Err(TableRunError::OutsideHeap {
+            handle: base_handle,
+        });
+    }
+    let first = offset / stride;
+    if first >= u64::from(heap.count) {
+        return Err(TableRunError::OutsideHeap {
+            handle: base_handle,
+        });
+    }
+    let remaining = (u64::from(heap.count) - first) as usize;
+    let count = table_size.unwrap_or(remaining);
+    if count == 0 || count > remaining {
+        return Err(TableRunError::OutsideHeap {
+            handle: base_handle,
+        });
+    }
+    if count > MAX_DESCRIPTOR_BINDINGS_V3 {
+        return Err(TableRunError::OverCap { count });
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut run_kind: Option<DescriptorKind> = None;
+    for index in 0..count {
+        let handle = heap.gpu_base + (first + index as u64) * stride;
+        let (kind, entry) = match read(handle) {
+            DescriptorSlot::Live(kind, binding) => (kind, DescriptorEntry::Buffer(binding)),
+            DescriptorSlot::Texture(kind, handle) => (kind, DescriptorEntry::Texture(handle)),
+            DescriptorSlot::Sampler(handle) => {
+                (DescriptorKind::Sampler, DescriptorEntry::Sampler(handle))
+            }
+            DescriptorSlot::Empty => {
+                return Err(TableRunError::EmptyInHeap { index, count });
+            }
+            DescriptorSlot::Unresolvable(why) => {
+                return Err(TableRunError::UnsupportedAt { index, why });
+            }
+        };
+        if samplers != (kind == DescriptorKind::Sampler) {
+            return Err(TableRunError::UnsupportedAt {
+                index,
+                why: if samplers {
+                    "a sampler heap holds a view descriptor"
+                } else {
+                    "a view heap holds a sampler descriptor"
+                },
+            });
+        }
+        if let Some(run_kind) = run_kind {
+            if run_kind != kind {
+                return Err(TableRunError::UnsupportedAt {
+                    index,
+                    why: "the active-heap run changes descriptor kind",
+                });
+            }
+        } else {
+            run_kind = Some(kind);
+        }
+        entries.push(entry);
+    }
+    Ok(TypedDescriptorTableRun {
+        kind: run_kind.expect("a non-empty run names its kind"),
+        entries,
+        boundary: TableRunBoundary::HeapEnd,
     })
 }
 
@@ -2650,5 +2934,193 @@ mod tests {
                 "the plan has trailing bytes after its last record"
             ))
         );
+    }
+
+    /// ADR-064: descriptors built as raw RDNA 2 bytes in guest memory
+    /// enumerate as texture and buffer entries from an active view heap,
+    /// without the live-slot registry.
+    #[test]
+    fn active_view_heap_enumerates_raw_texture_and_buffer_descriptors() {
+        const BASE: u64 = 0x1000_0000;
+        let mut memory = vec![0u32; 4 * RDNA2_VIEW_DESCRIPTOR_WORDS];
+        // Slot 0: a 2D image at 0x12_3456_7800 (type 9, 256x128, RGBA8).
+        let texture_address: u64 = 0x12_3456_7800;
+        let image = rdna2_image_words(texture_address, 9, 256, 128, 1, 1);
+        memory[..8].copy_from_slice(&image);
+        // Slot 1: a raw 16-byte-stride buffer of 64 records at 0x2000_0000.
+        let buffer_address: u64 = 0x2000_0000;
+        let buffer = rdna2_buffer_words(buffer_address, 16, 64);
+        memory[8..12].copy_from_slice(&buffer);
+        let heap = DescriptorHeapRefV3 {
+            allocation_id: 7,
+            generation: 1,
+            offset: 0,
+            gpu_base: memory.as_ptr() as u64,
+            stride: 32,
+            count: 4,
+            active: true,
+        };
+        let heaps = DescriptorHeapsV3 {
+            cbv_srv_uav: Some(heap),
+            sampler: None,
+        };
+        let (found, samplers) =
+            heap_for_handle(&heaps, heap.gpu_base + 32).expect("slot 1 is in the view heap");
+        assert_eq!(found.allocation_id, 7);
+        assert!(!samplers);
+        let run = enumerate_descriptor_table_in_heap(
+            heap.gpu_base,
+            &found,
+            false,
+            Some(2),
+            |handle| {
+                let mut words = [0u32; 8];
+                let index = ((handle - heap.gpu_base) / 32) as usize;
+                // SAFETY: the synthetic guest heap holds four 32-byte slots.
+                words.copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(memory.as_ptr().add(index * 8), 8)
+                });
+                rdna2_view_descriptor_slot(&words)
+            },
+        )
+        .expect("the raw descriptors enumerate");
+        assert_eq!(run.kind, DescriptorKind::Srv);
+        assert_eq!(
+            run.entries,
+            vec![
+                DescriptorEntry::Texture(texture_address),
+                DescriptorEntry::Buffer(GuestBinding {
+                    address: buffer_address,
+                    len: 16 * 64,
+                }),
+            ]
+        );
+        assert_eq!(run.boundary, TableRunBoundary::HeapEnd);
+    }
+
+    /// ADR-064: a raw RDNA 2 sampler descriptor in an active sampler heap
+    /// yields a registered sampler entry (not a buffer).
+    #[test]
+    fn active_sampler_heap_enumerates_a_raw_sampler_descriptor() {
+        let mut memory = [0u32; RDNA2_SAMPLER_DESCRIPTOR_WORDS];
+        // WRAP/WRAP/WRAP, no comparison, bilinear MAG and MIN.
+        memory[0] = 0;
+        memory[2] = 1 << 20 | 1 << 22;
+        let heap = DescriptorHeapRefV3 {
+            allocation_id: 9,
+            generation: 1,
+            offset: 0,
+            gpu_base: memory.as_ptr() as u64,
+            stride: 16,
+            count: 1,
+            active: true,
+        };
+        let heaps = DescriptorHeapsV3 {
+            cbv_srv_uav: None,
+            sampler: Some(heap),
+        };
+        let (found, samplers) =
+            heap_for_handle(&heaps, heap.gpu_base).expect("slot 0 is in the sampler heap");
+        assert!(samplers);
+        let run = enumerate_descriptor_table_in_heap(
+            heap.gpu_base,
+            &found,
+            true,
+            Some(1),
+            |_| rdna2_sampler_descriptor_slot(&memory),
+        )
+        .expect("the raw sampler enumerates");
+        assert_eq!(run.kind, DescriptorKind::Sampler);
+        match run.entries.as_slice() {
+            [DescriptorEntry::Sampler(handle)] => assert_ne!(*handle, 0),
+            other => panic!("expected one sampler entry, got {other:?}"),
+        }
+        assert_eq!(run.boundary, TableRunBoundary::HeapEnd);
+    }
+
+    /// ADR-064: a table base outside every active heap is a named refusal,
+    /// and an empty slot inside the requested range is too (never a silent
+    /// prefix, never an inert table).
+    #[test]
+    fn active_heap_tables_refuse_outside_bases_and_empty_slots() {
+        let heap = DescriptorHeapRefV3 {
+            allocation_id: 3,
+            generation: 1,
+            offset: 0,
+            gpu_base: 0x1000,
+            stride: 32,
+            count: 4,
+            active: true,
+        };
+        let heaps = DescriptorHeapsV3 {
+            cbv_srv_uav: Some(heap),
+            sampler: None,
+        };
+        assert!(heap_for_handle(&heaps, 0x800).is_none());
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x800, &heap, false, None, |_| {
+                DescriptorSlot::Empty
+            }),
+            Err(TableRunError::OutsideHeap { handle: 0x800 })
+        );
+        // Aligned but past the end.
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x1080, &heap, false, None, |_| {
+                DescriptorSlot::Empty
+            }),
+            Err(TableRunError::OutsideHeap { handle: 0x1080 })
+        );
+        // In range, but the second slot names nothing.
+        let error = enumerate_descriptor_table_in_heap(0x1000, &heap, false, Some(2), |handle| {
+            if handle == 0x1000 {
+                DescriptorSlot::Live(
+                    DescriptorKind::Cbv,
+                    GuestBinding {
+                        address: 0x20_0000,
+                        len: 16,
+                    },
+                )
+            } else {
+                DescriptorSlot::Empty
+            }
+        })
+        .expect_err("an empty slot in the range refuses the table");
+        assert_eq!(
+            error,
+            TableRunError::EmptyInHeap {
+                index: 1,
+                count: 2
+            }
+        );
+    }
+
+    fn rdna2_image_words(
+        address: u64,
+        image_type: u32,
+        width: u32,
+        height: u32,
+        mips: u32,
+        format: u32,
+    ) -> [u32; 8] {
+        let (w, h) = (width.max(1) - 1, height.max(1) - 1);
+        [
+            (address >> 8) as u32,
+            (((address >> 40) as u32) & 0xFF) | (format & 0x1FF) << 20 | (w & 3) << 30,
+            (w >> 2) & 0xFFF | (h & 0x3FFF) << 14,
+            (mips.saturating_sub(1) & 0xF) << 16 | image_type << 28,
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    fn rdna2_buffer_words(address: u64, stride: u32, records: u32) -> [u32; 4] {
+        [
+            address as u32,
+            ((address >> 32) as u32 & 0xFFFF) | (stride & 0x3FFF) << 16,
+            records,
+            0,
+        ]
     }
 }

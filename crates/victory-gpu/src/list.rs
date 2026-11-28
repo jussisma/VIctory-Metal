@@ -718,6 +718,173 @@ fn bind_index_buffer(this: This, address: u64, len: u64, format: u32) {
     }
 }
 
+/// The active descriptor heaps a list bound, if it ever called
+/// `SetDescriptorHeaps` (ADR-064).
+///
+/// `None` means the list never bound a heap, so root descriptor tables keep
+/// the live-slot registry fallback. `Some` is authoritative: a table outside
+/// those heaps is refused by name instead of silently falling back.
+#[cfg(windows)]
+fn active_descriptor_heaps(this: This) -> Option<victory_metal::wire_v3::DescriptorHeapsV3> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
+    metal.as_ref()?.producer().descriptor_heaps().copied()
+}
+
+/// One descriptor read from an active heap: this backend's live-slot record
+/// when present, otherwise the raw RDNA 2 descriptor the title wrote.
+#[cfg(windows)]
+fn heap_descriptor_slot(
+    samplers: bool,
+    stride: u32,
+    handle: u64,
+) -> crate::native_metal::bindings::DescriptorSlot {
+    let words = (stride as usize / 4).clamp(1, 8);
+    let mut raw = [0u32; 8];
+    // SAFETY: the heap enumerator proved `handle` is a whole-stride descriptor
+    // inside an active heap, whose memory lives while the list records; the
+    // slice never reads past that descriptor.
+    raw[..words].copy_from_slice(unsafe {
+        std::slice::from_raw_parts(handle as *const u32, words)
+    });
+    if raw[0] == crate::descriptor::VIEW_TAG {
+        // Our own record: the registry knows the exact CBV/SRV/UAV/sampler.
+        return descriptor_slot(handle);
+    }
+    if samplers {
+        crate::native_metal::bindings::rdna2_sampler_descriptor_slot(
+            &[raw[0], raw[1], raw[2], raw[3]],
+        )
+    } else {
+        crate::native_metal::bindings::rdna2_view_descriptor_slot(&raw)
+    }
+}
+
+/// Enumerates one root descriptor table: from the active heaps when the list
+/// bound any, through the live-slot registry otherwise (ADR-064).
+#[cfg(windows)]
+fn enumerate_table_run(
+    this: This,
+    handle: u64,
+) -> Result<
+    crate::native_metal::bindings::TypedDescriptorTableRun,
+    crate::native_metal::bindings::TableRunError,
+> {
+    use crate::native_metal::bindings::{self, TableRunError};
+    match active_descriptor_heaps(this) {
+        None => bindings::enumerate_descriptor_table_typed(handle, descriptor_slot),
+        Some(heaps) => {
+            let Some((heap, samplers)) = bindings::heap_for_handle(&heaps, handle) else {
+                crate::native_metal::telemetry::note_named_refusal(
+                    "a descriptor table base is outside the active descriptor heaps",
+                );
+                return Err(TableRunError::OutsideHeap { handle });
+            };
+            bindings::enumerate_descriptor_table_in_heap(
+                handle,
+                &heap,
+                samplers,
+                // The root signature's table size is not tracked on this path;
+                // the run then covers the rest of the heap, never stopping at
+                // the first empty descriptor.
+                None,
+                |descriptor| heap_descriptor_slot(samplers, heap.stride, descriptor),
+            )
+        }
+    }
+}
+
+/// Records the title's `SetDescriptorHeaps` on the native producer (ADR-064).
+///
+/// Each non-null heap is classified by its D3D12 kind and forwarded with the
+/// backing identity the guest knows (the share allocation when the descriptor
+/// memory is shared, otherwise the heap's own start address and generation
+/// `1`), the guest GPU handle base, its descriptor stride and count, and the
+/// active flag. A null slot is a legal unbind and leaves that kind unbound; a
+/// heap with no stride or count is a counted, named refusal.
+#[cfg(windows)]
+fn record_active_heaps(this: This, heaps: &[This]) {
+    use crate::native_metal::bindings::PAGE;
+    use victory_metal::wire_v3::{DescriptorHeapRefV3, DescriptorHeapsV3};
+
+    let mut set = DescriptorHeapsV3::default();
+    for &handle in heaps {
+        if handle.is_null() {
+            // Counted by the existing heap-binding census; both kinds stay
+            // unbound for this call.
+            continue;
+        }
+        let heap = crate::descriptor::heap(handle);
+        let Some(stride) = heap.descriptor_stride() else {
+            crate::native_metal::telemetry::note_named_refusal(
+                "a bound descriptor heap has no descriptor stride",
+            );
+            continue;
+        };
+        let count = heap.descriptor_count();
+        if stride == 0 || count == 0 {
+            crate::native_metal::telemetry::note_named_refusal(
+                "a bound descriptor heap has no descriptors",
+            );
+            continue;
+        }
+        let start = heap.start;
+        let samplers = heap.samplers();
+        // Only CBV_SRV_UAV (32-byte views) and sampler (16-byte) heaps are
+        // expressible: a render-target or depth heap is a named refusal, never
+        // forwarded as a view heap.
+        if !samplers && u64::from(stride) != crate::native_metal::bindings::VIEW_DESCRIPTOR_INCREMENT
+        {
+            crate::native_metal::telemetry::note_named_refusal(
+                "a bound descriptor heap is not a CBV_SRV_UAV or sampler heap",
+            );
+            continue;
+        }
+        if samplers && u64::from(stride) != crate::native_metal::bindings::SAMPLER_DESCRIPTOR_INCREMENT
+        {
+            crate::native_metal::telemetry::note_named_refusal(
+                "a bound sampler heap has a non-sampler descriptor stride",
+            );
+            continue;
+        }
+        let mut allocation_id = start;
+        let mut generation = 1u32;
+        let mut offset = 0u64;
+        // The host names the heap by the identity its registry knows. When the
+        // descriptor memory is not in the share table, the guest's provisional
+        // identity (its own start, generation 1) is still a valid nonzero key.
+        if let Some(resolver) = crate::native_metal::bindings::resolver()
+            && let Ok(range) = resolver.resolve(start, 1)
+            && range.allocation_id != 0
+            && range.generation != 0
+        {
+            allocation_id = range.allocation_id;
+            generation = range.generation;
+            offset = range.byte_offset + (start & (PAGE - 1));
+            let _ = crate::native_metal::queue::register_resolved_range(&range);
+        }
+        let reference = DescriptorHeapRefV3 {
+            allocation_id,
+            generation,
+            offset,
+            gpu_base: start,
+            stride,
+            count,
+            active: true,
+        };
+        if heap.samplers() {
+            set.sampler = Some(reference);
+        } else {
+            set.cbv_srv_uav = Some(reference);
+        }
+    }
+    with_metal(this, |producer| producer.set_descriptor_heaps(set));
+}
+
 /// One descriptor slot as the guest's descriptor memory describes it.
 ///
 /// The slot record (`[tag, index, generation]`) is read at `handle`; a slot
@@ -1177,10 +1344,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match bindings::enumerate_descriptor_table_typed(
-        handle,
-        descriptor_slot,
-    ) {
+    let run = match enumerate_table_run(this, handle) {
         Ok(run) => run,
         Err(error) => {
             crate::native_metal::telemetry::note_graphics_root_argument_dropped();
@@ -1295,7 +1459,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match bindings::enumerate_descriptor_table_typed(handle, descriptor_slot) {
+    let run = match enumerate_table_run(this, handle) {
         Ok(run) => run,
         Err(error) => {
             tracing::warn!(%error, "a compute descriptor table could not be enumerated");
@@ -3624,6 +3788,9 @@ mod state {
         #[cfg(windows)]
         if metal() {
             crate::draw::State::record_native_heaps(slots);
+            // ADR-064: the active heaps must reach the producer even though
+            // the native backend has no host D3D12 list.
+            super::record_active_heaps(this, slots);
             return;
         }
         with_state(this, |_, s| s.set_heaps(slots));

@@ -95,6 +95,7 @@ use victory_metal::wire_v3::{
     BeginRenderPass, ColorAttachment, CommandV3, CopyBuffer, CopyBufferToTexture, CopyTexture,
     CopyTextureRegion as WireCopyTextureRegion, DepthStencilAttachment, DescriptorKind,
     DescriptorTableEntryV3, DescriptorTableV3,
+    DescriptorHeapsV3,
     DrawIndexedInstanced, DrawInstanced, ExecuteIndirectDispatch, ExecuteIndirectDispatchMesh,
     ExecuteIndirectDraw, ExecuteIndirectDrawIndexed, IndirectArguments,
     IndexBufferBinding, IndexFormat, LoadOp, PipelineRef, Present, PrimitiveTopology,
@@ -202,9 +203,11 @@ enum TopologyChange {
 /// `IASetPrimitiveTopology`'s number as a [`TopologyChange`].
 ///
 /// The full D3D12 enum is accepted: `0` is undefined (no change), `1..=5` map
-/// to the five Wire v3 topologies, adjacency (`10..=13`), control-point patch
-/// lists (`33..=64`) and the reserved gaps are named state hints, never
-/// refusals. A value outside `0..=64` is the only refusal.
+/// to the five PC Wire v3 topologies, `17` is the console's rect list (ADR-065)
+/// and maps to [`PrimitiveTopology::RectList`], adjacency (`10..=13`),
+/// control-point patch lists (`33..=64`) and the remaining reserved gaps are
+/// named state hints, never refusals. A value outside `0..=64` is the only
+/// refusal.
 fn primitive_topology(value: u32) -> Result<TopologyChange, ProducerError> {
     Ok(match value {
         0 => TopologyChange::Undefined,
@@ -213,12 +216,15 @@ fn primitive_topology(value: u32) -> Result<TopologyChange, ProducerError> {
         3 => TopologyChange::Map(PrimitiveTopology::LineStrip),
         4 => TopologyChange::Map(PrimitiveTopology::TriangleList),
         5 => TopologyChange::Map(PrimitiveTopology::TriangleStrip),
+        // The console's rect list (AMD DI_PT_RECTLIST, `IASetPrimitiveTopology(17)`):
+        // three vertices of a rectangle, the fourth implied. ADR-065.
+        17 => TopologyChange::Map(PrimitiveTopology::RectList),
         10 => TopologyChange::Named("LINELIST_ADJ"),
         11 => TopologyChange::Named("LINESTRIP_ADJ"),
         12 => TopologyChange::Named("TRIANGLELIST_ADJ"),
         13 => TopologyChange::Named("TRIANGLESTRIP_ADJ"),
         33..=64 => TopologyChange::Named("a control-point patch list"),
-        6..=9 | 14..=32 => TopologyChange::Named("a reserved D3D12 topology value"),
+        6..=9 | 14..=16 | 18..=32 => TopologyChange::Named("a reserved D3D12 topology value"),
         _ => {
             return Err(ProducerError::unsupported_opcode(
                 "IASetPrimitiveTopology: topology value outside the D3D12 enum",
@@ -889,6 +895,10 @@ pub struct MetalProducer {
     /// Declared roots-constant blocks, per stage: `(graphics, root parameter,
     /// space)` to the translated block's dword count.
     root_constant_blocks: BTreeMap<(bool, u16, u16), u32>,
+    /// The active descriptor heaps once the list called `SetDescriptorHeaps`
+    /// (ADR-064). `None` means the list never bound one, so root descriptor
+    /// tables keep resolving through the live-slot registry fallback.
+    descriptor_heaps: Option<DescriptorHeapsV3>,
 }
 
 impl MetalProducer {
@@ -914,6 +924,7 @@ impl MetalProducer {
             commands: Vec::new(),
             root_arguments: Vec::new(),
             root_constant_blocks: BTreeMap::new(),
+            descriptor_heaps: None,
         })
     }
 
@@ -1383,6 +1394,9 @@ impl MetalProducer {
     /// non-expressible values (adjacency, patch lists, reserved gaps) are
     /// counted hints rather than a refusal of the whole list.
     pub fn set_topology_value(&mut self, topology: u32) -> Result<(), ProducerError> {
+        // ADR-065: a bounded per-value census, so a boot names the real rect
+        // list (17) instead of folding it into one hint total.
+        crate::native_metal::state::topology_census::note(topology);
         match primitive_topology(topology)? {
             TopologyChange::Map(topology) => self.set_topology(topology),
             TopologyChange::Undefined => {
@@ -1754,6 +1768,32 @@ impl MetalProducer {
     }
 
     /// A compute descriptor table (already resolved to buffer ranges).
+    /// `SetDescriptorHeaps`: records the active CBV_SRV_UAV and sampler heaps
+    /// and emits the Wire v3 command the host uses for heap identity (ADR-064).
+    ///
+    /// The guest stays authoritative for table contents: later table binds
+    /// enumerate from these heaps and emit already-resolved entries. A bind
+    /// recorded inside an open pass splits the pass so the heap command is a
+    /// list-state command outside it, as D3D12 intends.
+    pub fn set_descriptor_heaps(
+        &mut self,
+        heaps: DescriptorHeapsV3,
+    ) -> Result<(), ProducerError> {
+        self.flush_pending_clears()?;
+        self.close_pass()?;
+        self.descriptor_heaps = Some(heaps);
+        self.push(CommandV3::SetDescriptorHeaps(heaps))
+    }
+
+    /// The active descriptor heaps, once this list has bound any.
+    ///
+    /// `None` means the list never called `SetDescriptorHeaps`, so table
+    /// enumeration keeps the live-slot registry fallback.
+    pub const fn descriptor_heaps(&self) -> Option<&DescriptorHeapsV3> {
+        self.descriptor_heaps.as_ref()
+    }
+
+    /// `SetComputeRootDescriptorTable(root parameter, base descriptor)`.
     pub fn set_compute_descriptor_table(
         &mut self,
         table: DescriptorTableV3,
@@ -3200,6 +3240,11 @@ impl MetalList {
     /// The producer calls record into.
     pub fn producer_mut(&mut self) -> &mut MetalProducer {
         &mut self.producer
+    }
+
+    /// The producer, read-only (the active descriptor heaps, ADR-064).
+    pub const fn producer(&self) -> &MetalProducer {
+        &self.producer
     }
 
     /// Remembers the first refused call for `Close` to return.
@@ -5476,6 +5521,11 @@ mod tests {
                     mapped += 1;
                     Some(PrimitiveTopology::TriangleStrip)
                 }
+                17 => {
+                    // ADR-065: the Xbox rect list is a real topology, not a hint.
+                    mapped += 1;
+                    Some(PrimitiveTopology::RectList)
+                }
                 _ => {
                     hints += 1;
                     None
@@ -5488,7 +5538,7 @@ mod tests {
             let after = hint_census::counts();
             assert_eq!(
                 after[hint_census::TOPOLOGY_HINTS] > before[hint_census::TOPOLOGY_HINTS],
-                value > 5,
+                !matches!(value, 0 | 1..=5 | 17),
                 "topology {value} hint count"
             );
             assert_eq!(
@@ -5501,7 +5551,7 @@ mod tests {
                 "topology {value} emits no command before a draw"
             );
         }
-        assert_eq!((mapped, hints, undefined), (5, 59, 1));
+        assert_eq!((mapped, hints, undefined), (6, 58, 1));
         assert_eq!(
             crate::native_metal::telemetry::named_refusal_histogram(),
             refusals_before,
@@ -5719,6 +5769,47 @@ mod tests {
             sink.submissions().len(),
             1,
             "the frame is still carried exactly once"
+        );
+    }
+
+    /// ADR-064: `SetDescriptorHeaps` is recorded as list state and carried as
+    /// one wire command; a later table bind can read the active heaps.
+    #[test]
+    fn set_descriptor_heaps_is_recorded_and_emitted() {
+        let view = victory_metal::wire_v3::DescriptorHeapRefV3 {
+            allocation_id: 31,
+            generation: 2,
+            offset: 128,
+            gpu_base: 0x1_0000_0000,
+            stride: 32,
+            count: 1024,
+            active: true,
+        };
+        let sampler = victory_metal::wire_v3::DescriptorHeapRefV3 {
+            allocation_id: 32,
+            generation: 1,
+            offset: 0,
+            gpu_base: 0x2_0000_0000,
+            stride: 16,
+            count: 64,
+            active: true,
+        };
+        let heaps = DescriptorHeapsV3 {
+            cbv_srv_uav: Some(view),
+            sampler: Some(sampler),
+        };
+        let mut producer = MetalProducer::new(43, 1).expect("producer");
+        assert!(producer.descriptor_heaps().is_none());
+        producer
+            .set_descriptor_heaps(heaps)
+            .expect("the heaps record");
+        assert_eq!(producer.descriptor_heaps(), Some(&heaps));
+        let submission = flush_for_wire(&mut producer);
+        assert!(
+            submission.commands.iter().any(|command| {
+                matches!(command, CommandV3::SetDescriptorHeaps(recorded) if *recorded == heaps)
+            }),
+            "the heaps command is on the wire"
         );
     }
 }

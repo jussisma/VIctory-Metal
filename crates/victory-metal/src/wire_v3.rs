@@ -54,6 +54,7 @@
 //! | 29 | `CopyBuffer` |
 //! | 30 | `CopyTexture` |
 //! | 31 | `Present` |
+//! | 54 | `SetDescriptorHeaps` |
 //!
 //! # Version 3 command payloads
 //!
@@ -502,6 +503,10 @@ pub const OP_CLEAR_RENDER_TARGET_VIEW: u16 = 51;
 pub const OP_CLEAR_DEPTH_STENCIL_VIEW: u16 = 52;
 pub const OP_COPY_BUFFER_TO_TEXTURE: u16 = 53;
 
+// ADR-064 descriptor-heap identity band (54+). Additive: a frame that never
+// carries it decodes byte-compatibly with every earlier v3 reader.
+pub const OP_SET_DESCRIPTOR_HEAPS: u16 = 54;
+
 /// Maximum per-render-target blend entries in one `SetBlendState`.
 pub const MAX_BLEND_ATTACHMENTS_V3: usize = 8;
 
@@ -544,6 +549,8 @@ pub enum CommandV3 {
     SetRootConstants(RootConstantsV3),
     /// Descriptor table at a base register.
     SetDescriptorTable(DescriptorTableV3),
+    /// The active CBV_SRV_UAV and sampler descriptor heaps (ADR-064).
+    SetDescriptorHeaps(DescriptorHeapsV3),
     /// Opens a render pass, ending any active encoder segment first.
     BeginRenderPass(BeginRenderPass),
     /// Closes the active render pass.
@@ -729,6 +736,51 @@ pub enum PrimitiveTopology {
     TriangleList,
     /// Connected triangle strip.
     TriangleStrip,
+    /// Xbox's rect list (AMD `DI_PT_RECTLIST`, `IASetPrimitiveTopology(17)`):
+    /// three vertices of an axis-aligned rectangle, the fourth implied. The
+    /// host expands each rect into two triangles (ADR-065).
+    RectList,
+}
+
+/// One descriptor heap the guest bound, as far as the host needs it to index
+/// that heap's descriptor memory (ADR-064).
+///
+/// The guest stays authoritative for resolution: every
+/// `SetDescriptorTable` entry it emits is already a resolved
+/// buffer/texture/sampler, so this is heap *identity*, not another table.
+/// `allocation_id`/`generation` name the backing the descriptor bytes live in
+/// (the guest's provisional identity when no share allocation covers it),
+/// `offset` is descriptor 0's byte offset in that allocation, `gpu_base` the
+/// guest GPU address `GetGPUDescriptorHandleForHeapStart` returns, and
+/// `stride`/`count` the RDNA 2 descriptor geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorHeapRefV3 {
+    /// Backing allocation identity; never zero.
+    pub allocation_id: u64,
+    /// Allocation generation; never zero.
+    pub generation: u32,
+    /// Byte offset of descriptor 0 in the backing allocation.
+    pub offset: u64,
+    /// Guest GPU address of descriptor 0 (the handle base).
+    pub gpu_base: u64,
+    /// Bytes between consecutive descriptors (32 for views, 16 for samplers).
+    pub stride: u32,
+    /// Descriptors in the heap; never zero.
+    pub count: u32,
+    /// Whether the heap is active for its kind.
+    pub active: bool,
+}
+
+/// The two descriptor heaps `SetDescriptorHeaps` binds.
+///
+/// D3D12 allows at most one heap of each type; `None` is a legal unbind (a
+/// null slot or a call with fewer than two heaps), never an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DescriptorHeapsV3 {
+    /// The active `D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV` heap.
+    pub cbv_srv_uav: Option<DescriptorHeapRefV3>,
+    /// The active `D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER` heap.
+    pub sampler: Option<DescriptorHeapRefV3>,
 }
 
 /// One vertex buffer binding.
@@ -1563,6 +1615,7 @@ impl CommandV3 {
             Self::SetPipeline(_) => OP_SET_PIPELINE,
             Self::SetRootConstants(_) => OP_ROOT_CONSTANTS,
             Self::SetDescriptorTable(_) => OP_DESCRIPTOR_TABLE,
+            Self::SetDescriptorHeaps(_) => OP_SET_DESCRIPTOR_HEAPS,
             Self::BeginRenderPass(_) => OP_BEGIN_RENDER_PASS,
             Self::EndRenderPass => OP_END_RENDER_PASS,
             Self::SetViewport(_) => OP_SET_VIEWPORT,
@@ -1982,6 +2035,7 @@ fn empty_command(opcode: u16) -> Result<CommandV3, WireError> {
             kind: DescriptorKind::Cbv,
             bindings: Vec::new(),
         }),
+        OP_SET_DESCRIPTOR_HEAPS => CommandV3::SetDescriptorHeaps(DescriptorHeapsV3::default()),
         OP_BEGIN_RENDER_PASS => CommandV3::BeginRenderPass(BeginRenderPass {
             colors: Vec::new(),
             depth_stencil: None,
@@ -2189,6 +2243,7 @@ fn read_command_payload(
         CommandV3::SetPipeline(set_pipeline) => read_set_pipeline(reader, set_pipeline),
         CommandV3::SetRootConstants(constants) => read_root_constants(reader, constants),
         CommandV3::SetDescriptorTable(table) => read_descriptor_table(reader, table),
+        CommandV3::SetDescriptorHeaps(heaps) => read_descriptor_heaps(reader, heaps),
         CommandV3::BeginRenderPass(pass) => read_begin_render_pass(reader, pass),
         CommandV3::EndRenderPass => Ok(()),
         CommandV3::SetViewport(viewport) => read_viewport(reader, viewport),
@@ -2487,6 +2542,92 @@ fn read_descriptor_table(
     table.base_register = base_register;
     table.kind = kind;
     Ok(())
+}
+
+/// The per-heap payload width, in bytes: presence and active words, a reserved
+/// word, then the identity and geometry.
+const DESCRIPTOR_HEAP_REF_LEN: usize = 48;
+/// `SetDescriptorHeaps`: two heap records after the 4-byte command prefix.
+const SET_DESCRIPTOR_HEAPS_LEN: usize = 4 + 2 * DESCRIPTOR_HEAP_REF_LEN;
+
+/// Reads one heap record (`None` for an unbound slot) and validates the
+/// geometry and identity the host would otherwise dereference.
+fn read_descriptor_heap(
+    reader: &mut ReaderV3<'_>,
+    out: &mut Option<DescriptorHeapRefV3>,
+) -> Result<(), WireError> {
+    let present = reader.u16()?;
+    let active = reader.u16()?;
+    reader.reserved_u32()?;
+    let allocation_id = reader.u64()?;
+    let generation = reader.u32()?;
+    let stride = reader.u32()?;
+    let offset = reader.u64()?;
+    let gpu_base = reader.u64()?;
+    let count = reader.u32()?;
+    reader.reserved_u32()?;
+    match present {
+        0 => {
+            // An unbound heap carries no identity: the whole record is zero.
+            if active != 0
+                || allocation_id != 0
+                || generation != 0
+                || stride != 0
+                || offset != 0
+                || gpu_base != 0
+                || count != 0
+            {
+                return Err(WireError::NonZeroReserved);
+            }
+            *out = None;
+        }
+        1 => {
+            if active > 1 {
+                return Err(WireError::InvalidEnumCode {
+                    field: "descriptor heap active",
+                    code: active,
+                });
+            }
+            validate_handle(allocation_id, generation)?;
+            if stride == 0 {
+                return Err(WireError::ZeroExtent {
+                    field: "descriptor heap stride",
+                });
+            }
+            if count == 0 {
+                return Err(WireError::ZeroExtent {
+                    field: "descriptor heap count",
+                });
+            }
+            u64::from(count)
+                .checked_mul(u64::from(stride))
+                .ok_or(WireError::OffsetOverflow)?;
+            *out = Some(DescriptorHeapRefV3 {
+                allocation_id,
+                generation,
+                offset,
+                gpu_base,
+                stride,
+                count,
+                active: active == 1,
+            });
+        }
+        other => {
+            return Err(WireError::InvalidEnumCode {
+                field: "descriptor heap present",
+                code: other,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_descriptor_heaps(
+    reader: &mut ReaderV3<'_>,
+    heaps: &mut DescriptorHeapsV3,
+) -> Result<(), WireError> {
+    read_descriptor_heap(reader, &mut heaps.cbv_srv_uav)?;
+    read_descriptor_heap(reader, &mut heaps.sampler)
 }
 
 fn read_begin_render_pass(
@@ -3263,6 +3404,7 @@ fn command_encoded_len(command: &CommandV3) -> Result<usize, WireError> {
         CommandV3::SetPipeline(set_pipeline) => set_pipeline_encoded_len(set_pipeline),
         CommandV3::SetRootConstants(constants) => root_constants_encoded_len(constants),
         CommandV3::SetDescriptorTable(table) => descriptor_table_encoded_len(table),
+        CommandV3::SetDescriptorHeaps(heaps) => descriptor_heaps_encoded_len(heaps),
         CommandV3::BeginRenderPass(pass) => begin_render_pass_encoded_len(pass),
         CommandV3::EndRenderPass => Ok(END_RENDER_PASS_LEN),
         CommandV3::SetViewport(_) => Ok(SET_VIEWPORT_LEN),
@@ -3489,6 +3631,35 @@ fn descriptor_table_encoded_len(table: &DescriptorTableV3) -> Result<usize, Wire
     bindings_len
         .checked_add(DESCRIPTOR_TABLE_HEADER_LEN)
         .ok_or(WireError::FrameTooLarge)
+}
+
+/// Validates one heap record the encoder is about to write.
+fn validate_descriptor_heap(heap: &DescriptorHeapRefV3) -> Result<(), WireError> {
+    validate_handle(heap.allocation_id, heap.generation)?;
+    if heap.stride == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "descriptor heap stride",
+        });
+    }
+    if heap.count == 0 {
+        return Err(WireError::ZeroExtent {
+            field: "descriptor heap count",
+        });
+    }
+    u64::from(heap.count)
+        .checked_mul(u64::from(heap.stride))
+        .ok_or(WireError::OffsetOverflow)?;
+    Ok(())
+}
+
+fn descriptor_heaps_encoded_len(heaps: &DescriptorHeapsV3) -> Result<usize, WireError> {
+    if let Some(heap) = &heaps.cbv_srv_uav {
+        validate_descriptor_heap(heap)?;
+    }
+    if let Some(heap) = &heaps.sampler {
+        validate_descriptor_heap(heap)?;
+    }
+    Ok(SET_DESCRIPTOR_HEAPS_LEN)
 }
 
 /// The legacy single-kind tag one entry would use on its own.
@@ -3967,6 +4138,10 @@ fn write_command(out: &mut Vec<u8>, command: &CommandV3) {
                 other => unreachable!("unexpected descriptor table tag {other}"),
             }
         }
+        CommandV3::SetDescriptorHeaps(heaps) => {
+            write_descriptor_heap(out, heaps.cbv_srv_uav.as_ref());
+            write_descriptor_heap(out, heaps.sampler.as_ref());
+        }
         CommandV3::BeginRenderPass(pass) => {
             write_u16(out, pass.colors.len() as u16);
             write_u16(out, u16::from(pass.depth_stencil.is_some()));
@@ -4317,6 +4492,37 @@ fn write_table_tagged_entries(out: &mut Vec<u8>, entries: &[DescriptorTableEntry
     }
 }
 
+/// Writes one heap record: a zeroed record for an unbound slot, so a decoder
+/// can reject any non-zero identity in it.
+fn write_descriptor_heap(out: &mut Vec<u8>, heap: Option<&DescriptorHeapRefV3>) {
+    match heap {
+        Some(heap) => {
+            write_u16(out, 1);
+            write_u16(out, u16::from(heap.active));
+            write_u32(out, 0);
+            write_u64(out, heap.allocation_id);
+            write_u32(out, heap.generation);
+            write_u32(out, heap.stride);
+            write_u64(out, heap.offset);
+            write_u64(out, heap.gpu_base);
+            write_u32(out, heap.count);
+            write_u32(out, 0);
+        }
+        None => {
+            write_u16(out, 0);
+            write_u16(out, 0);
+            write_u32(out, 0);
+            write_u64(out, 0);
+            write_u32(out, 0);
+            write_u32(out, 0);
+            write_u64(out, 0);
+            write_u64(out, 0);
+            write_u32(out, 0);
+            write_u32(out, 0);
+        }
+    }
+}
+
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -4462,6 +4668,7 @@ fn topology_code(topology: PrimitiveTopology) -> u16 {
         PrimitiveTopology::LineStrip => 2,
         PrimitiveTopology::TriangleList => 3,
         PrimitiveTopology::TriangleStrip => 4,
+        PrimitiveTopology::RectList => 5,
     }
 }
 
@@ -4472,6 +4679,7 @@ fn topology_from_code(code: u16) -> Result<PrimitiveTopology, WireError> {
         2 => Ok(PrimitiveTopology::LineStrip),
         3 => Ok(PrimitiveTopology::TriangleList),
         4 => Ok(PrimitiveTopology::TriangleStrip),
+        5 => Ok(PrimitiveTopology::RectList),
         other => Err(WireError::InvalidEnumCode {
             field: "primitive topology",
             code: other,
@@ -4936,6 +5144,26 @@ mod tests {
                 slice: 2,
                 origin: [1, 2, 0],
             }),
+            CommandV3::SetDescriptorHeaps(DescriptorHeapsV3 {
+                cbv_srv_uav: Some(DescriptorHeapRefV3 {
+                    allocation_id: 21,
+                    generation: 1,
+                    offset: 64,
+                    gpu_base: 0x1_0000_0000,
+                    stride: 32,
+                    count: 64,
+                    active: true,
+                }),
+                sampler: Some(DescriptorHeapRefV3 {
+                    allocation_id: 22,
+                    generation: 1,
+                    offset: 4096,
+                    gpu_base: 0x2_0000_0000,
+                    stride: 16,
+                    count: 16,
+                    active: true,
+                }),
+            }),
             CommandV3::Present(Present {
                 surface_id: 1,
                 sync_interval: 1,
@@ -4993,7 +5221,7 @@ mod tests {
         let submission = rich_submission();
         let decoded = decode_submission_v3(&encoded_rich()).expect("rich frame decodes");
         assert_eq!(decoded, submission);
-        assert_eq!(decoded.commands.len(), 40);
+        assert_eq!(decoded.commands.len(), 41);
 
         let opcodes: std::collections::BTreeSet<u16> =
             decoded.commands.iter().map(CommandV3::opcode).collect();
@@ -5036,6 +5264,7 @@ mod tests {
             OP_CLEAR_RENDER_TARGET_VIEW,
             OP_CLEAR_DEPTH_STENCIL_VIEW,
             OP_COPY_BUFFER_TO_TEXTURE,
+            OP_SET_DESCRIPTOR_HEAPS,
             OP_PRESENT,
         ] {
             assert!(opcodes.contains(&opcode), "opcode {opcode} missing");
@@ -5455,6 +5684,71 @@ mod tests {
         );
         copy_texture.depth = 1;
         assert_roundtrip(&submission_with(vec![CommandV3::CopyTexture(copy_texture)]));
+    }
+
+    /// ADR-064: one view heap plus one sampler heap round-trips with its
+    /// identity and geometry; an unbind is two zero records; a replacement is
+    /// a different identity at the same kind.
+    #[test]
+    fn wire_v3_descriptor_heaps_roundtrip_bind_unbind_and_replace() {
+        let view = DescriptorHeapRefV3 {
+            allocation_id: 0xdead_beef,
+            generation: 3,
+            offset: 0x2000,
+            gpu_base: 0x1_0000_0000,
+            stride: 32,
+            count: 4096,
+            active: true,
+        };
+        let sampler = DescriptorHeapRefV3 {
+            allocation_id: 0xfeed_face,
+            generation: 1,
+            offset: 0x4000,
+            gpu_base: 0x2_0000_0000,
+            stride: 16,
+            count: 256,
+            active: true,
+        };
+        assert_roundtrip(&submission_with(vec![CommandV3::SetDescriptorHeaps(
+            DescriptorHeapsV3 {
+                cbv_srv_uav: Some(view),
+                sampler: Some(sampler),
+            },
+        )]));
+
+        // Null unbind: both slots legally unbound.
+        assert_roundtrip(&submission_with(vec![CommandV3::SetDescriptorHeaps(
+            DescriptorHeapsV3::default(),
+        )]));
+
+        // Heap replacement: the same kinds, new identities.
+        let replacement = DescriptorHeapRefV3 {
+            allocation_id: view.allocation_id + 1,
+            gpu_base: view.gpu_base + 0x10_0000,
+            ..view
+        };
+        assert_roundtrip(&submission_with(vec![CommandV3::SetDescriptorHeaps(
+            DescriptorHeapsV3 {
+                cbv_srv_uav: Some(replacement),
+                sampler: None,
+            },
+        )]));
+    }
+
+    /// ADR-065: the Xbox rect list is its own wire code, so the host never
+    /// receives it as a triangle list by accident.
+    #[test]
+    fn wire_v3_rect_list_topology_roundtrips_on_its_own_code() {
+        let frame = single_frame(CommandV3::SetPrimitiveTopology(
+            PrimitiveTopology::RectList,
+        ));
+        assert_eq!(topology_code(PrimitiveTopology::RectList), 5);
+        assert_eq!(
+            decode_submission_v3(&frame).expect("rect list decodes"),
+            submission_with(vec![CommandV3::SetPrimitiveTopology(
+                PrimitiveTopology::RectList
+            )])
+        );
     }
 
     #[test]
