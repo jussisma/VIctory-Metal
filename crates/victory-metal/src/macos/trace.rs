@@ -228,6 +228,11 @@ pub const OUTCOME_KIND_MISMATCH: &str = "kind-mismatch";
 /// its declared consecutive table parameters.
 pub const OUTCOME_SPLIT: &str = "split";
 
+/// Outcome word: a mixed resource table was bound to the declared slots whose
+/// ranges could carry its entries, and the entries no slot could address were
+/// counted as residue ([`DescriptorTablePartitionResidueKey`]).
+pub const OUTCOME_PARTIAL: &str = "partial";
+
 /// One bounded key of the descriptor-table *kind mismatch* census.
 ///
 /// It names only fixed kind words and counts: the reflected table kind from the
@@ -273,9 +278,44 @@ pub struct DescriptorTableMixKey {
     /// Entry combination class (`single`, `buffer+texture`, `buffer+sampler`,
     /// `texture+sampler`, `all` or `empty`).
     pub mix_class: &'static str,
-    /// Outcome word: [`OUTCOME_SPLIT`], [`OUTCOME_INERT`] or
-    /// [`OUTCOME_REFUSED`].
+    /// Outcome word: [`OUTCOME_SPLIT`], [`OUTCOME_PARTIAL`],
+    /// [`OUTCOME_INERT`] or [`OUTCOME_REFUSED`].
     pub outcome: &'static str,
+}
+
+/// One bounded key of the descriptor-table *partition residue* census.
+///
+/// A mixed resource table whose declared layout has fewer matching table slots
+/// than entry shapes binds the entries the slots can address and drops the
+/// rest. Every dropped partition is named here with the declared slot index it
+/// could not fill and its entry count, so the drop is observable in telemetry
+/// instead of vanishing behind an inert acceptance. Counts and fixed shape
+/// words only: no handles, payloads or title identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorTablePartitionResidueKey {
+    /// Host pipeline id the table was selected with.
+    pub pipeline_id: u64,
+    /// Wire `DescriptorTableV3.set` the submission carried.
+    pub wire_set: u16,
+    /// Flattened parameter index of the declared slot that could not carry the
+    /// partition.
+    pub slot_index: u16,
+    /// Reflected range kind of that declared slot.
+    pub declared_kind: &'static str,
+    /// Entry variant shape of the dropped partition (`buffer`/`texture`/
+    /// `sampler`).
+    pub entry_shape: &'static str,
+    /// Entries the partition carried and the host dropped.
+    pub dropped_entries: u16,
+}
+
+/// One counted descriptor-table partition-residue key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTablePartitionResidueCount {
+    /// The bounded key.
+    pub key: DescriptorTablePartitionResidueKey,
+    /// How many partitions the key describes in this process.
+    pub count: u64,
 }
 
 /// One counted descriptor-table mix key.
@@ -324,6 +364,8 @@ pub struct DescriptorTableRefusalCensus {
     pub kind_mismatches: Vec<DescriptorTableKindMismatchCount>,
     /// Retained mixed-table keys in first-observed order.
     pub mix_keys: Vec<DescriptorTableMixCount>,
+    /// Retained mixed-table partition residues in first-observed order.
+    pub partition_residues: Vec<DescriptorTablePartitionResidueCount>,
     /// Per-stage fragment ABI observability of the last recorded flush.
     ///
     /// `telemetry.json` embeds this census, so these counters reach the boot
@@ -334,7 +376,10 @@ pub struct DescriptorTableRefusalCensus {
 impl DescriptorTableRefusalCensus {
     /// Whether no descriptor table was refused or accepted as inert.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.kind_mismatches.is_empty() && self.mix_keys.is_empty()
+        self.entries.is_empty()
+            && self.kind_mismatches.is_empty()
+            && self.mix_keys.is_empty()
+            && self.partition_residues.is_empty()
     }
 
     /// The census as the `descriptor_table_refusal_census` telemetry member.
@@ -351,13 +396,15 @@ impl DescriptorTableRefusalCensus {
     /// The census as the `descriptor_table_refusal_census` telemetry object.
     ///
     /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`,
-    /// `kind_mismatch_keys`, `mix_keys`; each resolution key carries
-    /// `pipeline_id`, `wire_set`, `declared_tables`, `reflected_tables`,
-    /// `stage_mask`, `map_tables`, `had_plan`, `plan_kind`, `outcome` and
-    /// `count`. Each kind-mismatch key carries `pipeline_id`, `wire_set`,
-    /// `reflected_kind`, `wire_kind`, `entry_shape`, `mix_class`, `outcome`
-    /// (`"kind-mismatch"`) and `count`. Each mix key carries `pipeline_id`,
-    /// `wire_set`, `mix_class`, `outcome` and `count`.
+    /// `kind_mismatch_keys`, `mix_keys`, `partition_residues`; each resolution
+    /// key carries `pipeline_id`, `wire_set`, `declared_tables`,
+    /// `reflected_tables`, `stage_mask`, `map_tables`, `had_plan`, `plan_kind`,
+    /// `outcome` and `count`. Each kind-mismatch key carries `pipeline_id`,
+    /// `wire_set`, `reflected_kind`, `wire_kind`, `entry_shape`, `mix_class`,
+    /// `outcome` (`"kind-mismatch"`) and `count`. Each mix key carries
+    /// `pipeline_id`, `wire_set`, `mix_class`, `outcome` and `count`. Each
+    /// partition-residue key carries `pipeline_id`, `wire_set`, `slot_index`,
+    /// `declared_kind`, `entry_shape`, `dropped_entries` and `count`.
     pub fn json_value(&self) -> String {
         let keys = self
             .entries
@@ -418,6 +465,25 @@ impl DescriptorTableRefusalCensus {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let partition_residues = self
+            .partition_residues
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"pipeline_id\": {}, \"wire_set\": {}, \"slot_index\": {}, \
+                     \"declared_kind\": \"{}\", \"entry_shape\": \"{}\", \
+                     \"dropped_entries\": {}, \"count\": {}}}",
+                    entry.key.pipeline_id,
+                    entry.key.wire_set,
+                    entry.key.slot_index,
+                    entry.key.declared_kind,
+                    entry.key.entry_shape,
+                    entry.key.dropped_entries,
+                    entry.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let stage_abi = format!(
             "{{\"stage_mask\": {}, \"ps_abi_parameters\": {}, \
              \"ps_bound_parameters\": {}, \"ps_bound_constants\": {}, \
@@ -441,8 +507,15 @@ impl DescriptorTableRefusalCensus {
         );
         format!(
             "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}], \
-             \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}], \"stage_abi\": {}}}",
-            self.distinct_keys, self.omitted, keys, kind_mismatches, mix_keys, stage_abi
+             \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}], \
+             \"partition_residues\": [{}], \"stage_abi\": {}}}",
+            self.distinct_keys,
+            self.omitted,
+            keys,
+            kind_mismatches,
+            mix_keys,
+            partition_residues,
+            stage_abi
         )
     }
 }
@@ -452,12 +525,16 @@ struct DescriptorTableRefusalLog {
     entries: Vec<(DescriptorTableRefusalKey, u64)>,
     kind_mismatches: Vec<(DescriptorTableKindMismatchKey, u64)>,
     mix: Vec<(DescriptorTableMixKey, u64)>,
+    residues: Vec<(DescriptorTablePartitionResidueKey, u64)>,
     omitted: u64,
 }
 
 impl DescriptorTableRefusalLog {
     fn retained(&self) -> usize {
-        self.entries.len() + self.kind_mismatches.len() + self.mix.len()
+        self.entries.len()
+            + self.kind_mismatches.len()
+            + self.mix.len()
+            + self.residues.len()
     }
 }
 
@@ -536,6 +613,29 @@ pub fn note_descriptor_table_mix(key: DescriptorTableMixKey) {
     log.mix.push((key, 1));
 }
 
+/// Counts one mixed-table partition the declared slots could not address.
+///
+/// The table is still bound (the entries a slot *can* carry are uploaded), so
+/// this is not an inert acceptance: the residue is its own named class so a
+/// boot can see exactly how many entries the composition path dropped, at
+/// which declared slot index and of which entry shape. It shares the one
+/// [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`] cap; keys past the cap only bump
+/// `omitted`.
+pub fn note_descriptor_table_partition_residue(key: DescriptorTablePartitionResidueKey) {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, count)) = log.residues.iter_mut().find(|(known, _)| *known == key) {
+        *count = count.saturating_add(1);
+        return;
+    }
+    if log.retained() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+        log.omitted = log.omitted.saturating_add(1);
+        return;
+    }
+    log.residues.push((key, 1));
+}
+
 /// A copy of the process-wide descriptor-table refusal census.
 pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
     let log = descriptor_table_refusals()
@@ -564,6 +664,14 @@ pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
             .mix
             .iter()
             .map(|(key, count)| DescriptorTableMixCount {
+                key: *key,
+                count: *count,
+            })
+            .collect(),
+        partition_residues: log
+            .residues
+            .iter()
+            .map(|(key, count)| DescriptorTablePartitionResidueCount {
                 key: *key,
                 count: *count,
             })

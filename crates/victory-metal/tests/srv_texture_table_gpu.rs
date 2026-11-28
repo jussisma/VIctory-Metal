@@ -41,14 +41,16 @@ use victory_metal::macos::bindings::{
     DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
 };
 use victory_metal::macos::device::{DirectMetalTransport, EncoderStats, PipelineAbi, SamplerDesc};
+use victory_metal::macos::present::SurfaceImage;
+use victory_metal::macos::render::RenderTarget;
 use victory_metal::macos::registry::{
     PipelineStage, PipelineState, TextureDesc, TextureDimension, TextureFormat, TextureUsage,
 };
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, CopyBufferToTexture, DescriptorKind,
-    DescriptorTableEntryV3, DescriptorTableV3, DrawState, LoadOp, PipelineRef, PrimitiveTopology,
-    ScissorRect, StoreOp, SubmissionV3, Viewport,
+    BeginRenderPass, ColorAttachment, CommandV3, CopyBufferToTexture, DescriptorHeapRefV3,
+    DescriptorHeapsV3, DescriptorKind, DescriptorTableEntryV3, DescriptorTableV3, DrawState, LoadOp,
+    PipelineRef, Present, PrimitiveTopology, ScissorRect, StoreOp, SubmissionV3, Viewport,
 };
 
 const EDGE: u32 = 16;
@@ -1215,5 +1217,312 @@ fn a_wire_texture_source_with_no_declared_fragment_parameter_is_inert_and_named(
         abi.tables_dropped_inert,
         abi.fragment_source_unreachable,
         abi.fragment_source_unreachable_reason
+    );
+}
+
+// ----- Cycle 19B: one-slot composition table with buffer residue -----------
+
+/// The composition pipeline's translated fragment: ONE declared `Texture`
+/// table parameter. The PS samples the wire table's texture entry exactly; the
+/// wire table itself also carries a buffer range that the one declared slot
+/// cannot address, so that partition must be counted residue, not accepted
+/// inertly.
+const COMPOSITION_TABLE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TextureDescriptor {
+    texture2d<float> primary;
+    texture2d<float> duplicate;
+    long reserved;
+};
+
+struct CompositionAbi {
+    device TextureDescriptor *textures [[id(0)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut composition_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 composition_fragment(constant CompositionAbi &abi [[buffer(2)]]) {
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge, coord::normalized);
+    return abi.textures[0].primary.sample(smp, float2(0.5, 0.5));
+}
+"#;
+
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_msgSend();
+    fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+}
+
+/// +1 retain of the IOSurface texture, so it can wrap as a `RenderTarget`.
+fn retained_texture(raw: *mut c_void) -> *mut c_void {
+    assert!(!raw.is_null(), "present surface texture is nil");
+    // SAFETY: `raw` is a live `MTLTexture`; `retain` returns the same object +1.
+    unsafe {
+        let selector = sel_registerName(c"retain".as_ptr());
+        let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        send(raw, selector)
+    }
+}
+
+fn wrap_surface_texture(image: &SurfaceImage) -> RenderTarget {
+    let retained = retained_texture(image.texture_raw());
+    // SAFETY: `retained` is a +1 retained `MTLTexture` over the IOSurface.
+    unsafe { RenderTarget::from_retained_raw(retained) }
+        .expect("surface texture should wrap as a render target")
+}
+
+/// Cycle 19B proof: a VS+PS composition pipeline whose fragment declares ONE
+/// `Texture` table slot binds the wire table's texture entry and counts the
+/// buffer entry as named residue. The sampled colour is written into the
+/// registered present surface and read back as exact bytes.
+#[test]
+fn a_composition_mixed_table_binds_its_texture_into_the_present_surface_exactly() {
+    use victory_metal::macos::trace::{
+        OUTCOME_PARTIAL, descriptor_table_refusal_census, reset_abi_binding_telemetry,
+        reset_descriptor_table_refusal_census, stage_abi_telemetry,
+    };
+    use victory_metal::wire::BufferBinding;
+
+    reset_descriptor_table_refusal_census();
+    reset_abi_binding_telemetry();
+    let dir = TempDir::new("composition-mixed-table");
+    let metallib = compile_metallib(dir.path(), "composition_table", COMPOSITION_TABLE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    // The sampled source texture: 4x4 of COLOR0.
+    transport
+        .register_registry_texture(
+            TEXTURE0,
+            rgba8_desc(TEXTURE_EDGE, TEXTURE_EDGE, TextureUsage::color_attachment(), "texture0"),
+        )
+        .expect("registry texture must create");
+
+    // The composition draw writes straight into the presented target.
+    let image = SurfaceImage::create_rgba8(&transport, EDGE, EDGE)
+        .expect("IOSurface-backed rgba8unorm present surface");
+    let surface_id = u64::from(image.surface_id());
+    let surface_target = wrap_surface_texture(&image);
+    let present_texture_id = transport
+        .register_render_target(&surface_target)
+        .expect("register the present surface texture");
+    transport
+        .register_present_surface(surface_id, &surface_target)
+        .expect("register the present surface");
+
+    // The image upload page and the buffer range the wire table carries but
+    // the one declared Texture slot cannot address.
+    let mut upload = HostPage::new(PAGE_BYTES);
+    let poison = [0xaau8; PAGE_BYTES];
+    upload.write(0, &poison);
+    for row in 0..TEXTURE_EDGE as usize {
+        for column in 0..TEXTURE_EDGE as usize {
+            upload.write(row * ROW_PITCH + column * 4, &COLOR0);
+        }
+    }
+    let buffer_page = HostPage::new(PAGE_BYTES);
+    // SAFETY: both pages are live, 16 KiB-aligned allocations that outlive the
+    // synchronous submission and are unregistered before they drop.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), PAGE_BYTES) }
+        .expect("upload page must register");
+    // SAFETY: same zero-copy contract as the upload page.
+    let buffer_id = unsafe { transport.register_zerocopy(buffer_page.raw(), PAGE_BYTES) }
+        .expect("buffer page must register");
+
+    const ALLOC_BUFFER: u64 = 0x43;
+    let mut allocations = HashMap::new();
+    allocations.insert((present_texture_id.0, 1), VmBufferId(present_texture_id.0));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), upload_id);
+    allocations.insert((ALLOC_BUFFER, 1), buffer_id);
+
+    let vertex = RootSignatureLayout::from_parameters(ReflectedStage::Vertex, &[])
+        .expect("empty vertex layout builds");
+    let fragment = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+            size: 8,
+            register: 0,
+            space: 1,
+        }],
+    )
+    .expect("one-slot texture table layout builds");
+
+    const HANDLE: u64 = 0x5310;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "composition_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("composition_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            PipelineAbi::graphics(Some(vertex), Some(fragment)),
+        )
+        .expect("composition graphics pipeline must register");
+
+    // One wire table mixing a buffer range (first) and the texture (second).
+    // The one declared slot is a Texture range, so only the texture partition
+    // can bind; the buffer partition must be counted residue.
+    let mixed_table = DescriptorTableV3 {
+        set: 0,
+        base_register: 0,
+        kind: DescriptorKind::Srv,
+        bindings: vec![
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: ALLOC_BUFFER,
+                generation: 1,
+                offset: 0,
+                length: 16,
+            }),
+            DescriptorTableEntryV3::Texture(TEXTURE0),
+        ],
+    };
+
+    let submission = SubmissionV3 {
+        sequence: 601,
+        list: None,
+        commands: vec![
+            copy_to_texture(ALLOC_UPLOAD, ALLOC_TEXTURE0, 0),
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(present_texture_id.0, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            // The wire path a composition draw takes: the CBV_SRV_UAV heap is
+            // announced, then the root descriptor table names its slice.
+            CommandV3::SetDescriptorHeaps(DescriptorHeapsV3 {
+                cbv_srv_uav: Some(DescriptorHeapRefV3 {
+                    allocation_id: ALLOC_BUFFER,
+                    generation: 1,
+                    offset: 0,
+                    gpu_base: 0,
+                    stride: 32,
+                    count: 2,
+                    active: true,
+                }),
+                sampler: None,
+            }),
+            CommandV3::SetDescriptorTable(mixed_table),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+            CommandV3::Present(Present {
+                surface_id,
+                sync_interval: 0,
+            }),
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("the composition mixed-table submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "composition status");
+    assert_eq!(stats.render_encoders, 1, "one render encoder draws");
+    assert_eq!(transport.abi_refusal_count(), 0, "the table resolves");
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        0,
+        "a table with a bindable partition is not accepted inertly"
+    );
+    assert_eq!(
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        0,
+        "the texture partition fits the declared slot"
+    );
+    assert_eq!(
+        transport.descriptor_table_partial_binding_count(),
+        1,
+        "the table is bound partially, not dropped"
+    );
+    assert_eq!(
+        transport.descriptor_table_partition_residue_entry_count(),
+        1,
+        "exactly the one buffer entry is residue"
+    );
+    assert_eq!(transport.encode_counters().draws, 1, "the draw encodes");
+
+    let census = descriptor_table_refusal_census();
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    assert_eq!(census.mix_keys[0].key.mix_class, "buffer+texture");
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_PARTIAL);
+    assert_eq!(
+        census.partition_residues.len(),
+        1,
+        "the dropped buffer partition is named: {}",
+        census.json_value()
+    );
+    let residue = &census.partition_residues[0];
+    assert_eq!(residue.key.wire_set, 0);
+    assert_eq!(residue.key.slot_index, 0, "the one declared slot index");
+    assert_eq!(residue.key.declared_kind, "Texture");
+    assert_eq!(residue.key.entry_shape, "buffer");
+    assert_eq!(residue.key.dropped_entries, 1);
+
+    let abi = stage_abi_telemetry();
+    assert_eq!(abi.ps_abi_parameters, 1, "the fragment declares one table");
+    assert_eq!(abi.ps_bound_parameters, 1, "the wire table binds it");
+    assert_eq!(abi.ps_bound_tables, 1, "the bound parameter is a table");
+    assert_eq!(
+        abi.fragment_texture_sources_declared, 1,
+        "the fragment declares one texture source"
+    );
+    assert_eq!(
+        abi.fragment_texture_sources_bound, 1,
+        "the texture partition is bound into that source"
+    );
+    assert_eq!(abi.tables_dropped_inert, 0, "the table is bound, not inert");
+    assert_eq!(abi.fragment_source_unreachable, 0);
+
+    transport
+        .wait_for_gpu()
+        .expect("the composition pass should complete");
+    let pixels = transport
+        .read_render_target_rgba8(&surface_target)
+        .expect("present surface readback");
+    assert_uniform(&pixels, COLOR0, "composition present surface");
+    assert_ne!(pixels[0], [0, 0, 0, 255], "the composition target is non-black");
+    assert_eq!(pixels[0], COLOR0, "exact sampled bytes in the present target");
+
+    transport
+        .unregister_buffer(upload_id)
+        .expect("unregister the upload page");
+    transport
+        .unregister_buffer(buffer_id)
+        .expect("unregister the buffer page");
+    reset_descriptor_table_refusal_census();
+    eprintln!(
+        "composition mixed-table proof on {}: pixel={:?}, declared/bound={}/{}, residue={} at slot {}",
+        info.name_str(),
+        pixels[0],
+        abi.fragment_texture_sources_declared,
+        abi.fragment_texture_sources_bound,
+        residue.key.dropped_entries,
+        residue.key.slot_index
     );
 }
