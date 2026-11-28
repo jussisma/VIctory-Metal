@@ -1839,12 +1839,280 @@ pub(crate) fn texture_subresource(
 }
 
 /// A texture's top-level extent, for the native presenter registration.
+///
+/// This is the one call the presenter makes while installing its surface
+/// (`queue` present path), so it also records the surface identity in the
+/// bounded [`present_surface_census`]. The side effect is counts only: no
+/// content, no title asset and no raw address leaves the census line.
 pub(crate) fn texture_extent(this: This) -> Option<(u32, u32)> {
-    let (_, desc) = texture_memory(this)?;
+    let (base, desc) = texture_memory(this)?;
+    note_present_surface(base as u64, &desc);
     Some((
         u32::try_from(desc.width).ok()?,
         desc.height,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Present-surface identity census
+// ---------------------------------------------------------------------------
+//
+// One bounded process-wide answer to "is the texture the guest registered as
+// its present surface the same object that draws and copies target?". The
+// surface handle is the guest memory base (`texture_memory`) the presenter
+// installs; every render-pass attachment and copy destination is compared with
+// it. Entries are keyed by that handle and bounded to
+// [`PRESENT_SURFACE_MAX`], so a long boot cannot grow the census.
+
+/// Distinct present surfaces the census remembers.
+pub(crate) const PRESENT_SURFACE_MAX: usize = 8;
+
+/// Distinct foreign pass/copy targets the census remembers.
+pub(crate) const PRESENT_TARGET_MAX: usize = 16;
+
+/// Lines the census emits at most, so a boot log stays bounded.
+const PRESENT_CENSUS_MAX_LINES: u64 = 12;
+
+#[derive(Debug, Clone, Copy)]
+struct PresentSurfaceFacts {
+    handle: u64,
+    format: u32,
+    width: u64,
+    height: u32,
+    flags: u32,
+    pass_binds: u64,
+    copy_writes: u64,
+    descriptor_mismatch: bool,
+}
+
+impl PresentSurfaceFacts {
+    fn matches(&self, desc: &ResourceDesc) -> bool {
+        self.format == desc.format
+            && self.width == desc.width
+            && self.height == desc.height
+            && self.flags == desc.flags
+    }
+}
+
+#[derive(Debug, Default)]
+struct PresentSurfaceCensus {
+    surfaces: Vec<PresentSurfaceFacts>,
+    /// Distinct attachment handles that are not the present surface.
+    pass_targets_not_surface: Vec<u64>,
+    /// Distinct copy/upload destinations that are not the present surface.
+    copy_targets_not_surface: Vec<u64>,
+    registered_twice: u64,
+    descriptor_mismatch: u64,
+    dropped_surfaces: u64,
+    emitted: u64,
+}
+
+static PRESENT_SURFACE_CENSUS: std::sync::OnceLock<std::sync::Mutex<PresentSurfaceCensus>> =
+    std::sync::OnceLock::new();
+
+fn present_surface_census() -> &'static std::sync::Mutex<PresentSurfaceCensus> {
+    PRESENT_SURFACE_CENSUS.get_or_init(|| std::sync::Mutex::new(PresentSurfaceCensus::default()))
+}
+
+/// The DXGI usage class of a texture, named rather than numbered.
+fn usage_class(flags: u32) -> &'static str {
+    if flags & 0x1 != 0 {
+        "color"
+    } else if flags & 0x2 != 0 {
+        "depth"
+    } else if flags & 0x4 != 0 {
+        "storage"
+    } else {
+        "sampled"
+    }
+}
+
+/// Formats one census snapshot as a stable `present_surface_census=...` line.
+fn present_surface_census_line_locked(census: &PresentSurfaceCensus) -> String {
+    let targeted_by_pass = census
+        .surfaces
+        .iter()
+        .filter(|surface| surface.pass_binds > 0)
+        .count();
+    let targeted_by_copy = census
+        .surfaces
+        .iter()
+        .filter(|surface| surface.copy_writes > 0)
+        .count();
+    let mut words = String::new();
+    for (index, surface) in census.surfaces.iter().enumerate() {
+        words.push_str(&format!(
+            " surface{index}={}x{}:fmt{}:{}:pass{}:copy{}",
+            surface.width,
+            surface.height,
+            surface.format,
+            usage_class(surface.flags),
+            u8::from(surface.pass_binds > 0),
+            u8::from(surface.copy_writes > 0),
+        ));
+    }
+    format!(
+        "present_surface_census=surfaces={} targeted_by_pass={} targeted_by_copy={} \
+         registered_twice={} descriptor_mismatch={} pass_targets_not_surface={} \
+         copy_targets_not_surface={} dropped_surfaces={}{}",
+        census.surfaces.len(),
+        targeted_by_pass,
+        targeted_by_copy,
+        census.registered_twice,
+        census.descriptor_mismatch,
+        census.pass_targets_not_surface.len(),
+        census.copy_targets_not_surface.len(),
+        census.dropped_surfaces,
+        words,
+    )
+}
+
+/// The census as one stable `present_surface_census=...` line (counts only).
+pub(crate) fn present_surface_census_line() -> String {
+    let census = present_surface_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    present_surface_census_line_locked(&census)
+}
+
+/// Emits the census at most [`PRESENT_CENSUS_MAX_LINES`] times per process.
+fn emit_present_surface_census(census: &mut PresentSurfaceCensus) {
+    if census.emitted >= PRESENT_CENSUS_MAX_LINES {
+        return;
+    }
+    census.emitted = census.emitted.saturating_add(1);
+    tracing::info!("{}", present_surface_census_line_locked(census));
+}
+
+/// Records the texture the presenter installed as its surface.
+pub(crate) fn note_present_surface(handle: u64, desc: &ResourceDesc) {
+    if handle == 0 {
+        return;
+    }
+    let mut census = present_surface_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match census
+        .surfaces
+        .iter()
+        .position(|surface| surface.handle == handle)
+    {
+        Some(index) => {
+            let first_mismatch = {
+                let surface = &mut census.surfaces[index];
+                let changed = !surface.matches(desc);
+                let first_mismatch = changed && !surface.descriptor_mismatch;
+                if changed {
+                    surface.descriptor_mismatch = true;
+                    surface.format = desc.format;
+                    surface.width = desc.width;
+                    surface.height = desc.height;
+                    surface.flags = desc.flags;
+                }
+                first_mismatch
+            };
+            census.registered_twice = census.registered_twice.saturating_add(1);
+            if first_mismatch {
+                census.descriptor_mismatch = census.descriptor_mismatch.saturating_add(1);
+            }
+        }
+        None => {
+            if census.surfaces.len() >= PRESENT_SURFACE_MAX {
+                census.dropped_surfaces = census.dropped_surfaces.saturating_add(1);
+                return;
+            }
+            census.surfaces.push(PresentSurfaceFacts {
+                handle,
+                format: desc.format,
+                width: desc.width,
+                height: desc.height,
+                flags: desc.flags,
+                pass_binds: 0,
+                copy_writes: 0,
+                descriptor_mismatch: false,
+            });
+        }
+    }
+    // A surface registration always prints its descriptor, even when the
+    // foreign-target line budget is already spent.
+    tracing::info!("{}", present_surface_census_line_locked(&census));
+}
+
+fn note_surface_descriptor_mismatch(census: &mut PresentSurfaceCensus) {
+    census.descriptor_mismatch = census.descriptor_mismatch.saturating_add(1);
+}
+
+/// Records one texture bound as a render-pass attachment.
+pub(crate) fn note_pass_attachment(handle: u64, desc: &ResourceDesc) {
+    if handle == 0 {
+        return;
+    }
+    let mut census = present_surface_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut known = false;
+    let mut mismatch = false;
+    if let Some(surface) = census
+        .surfaces
+        .iter_mut()
+        .find(|surface| surface.handle == handle)
+    {
+        known = true;
+        surface.pass_binds = surface.pass_binds.saturating_add(1);
+        if !surface.matches(desc) && !surface.descriptor_mismatch {
+            surface.descriptor_mismatch = true;
+            mismatch = true;
+        }
+    }
+    if mismatch {
+        note_surface_descriptor_mismatch(&mut census);
+    }
+    if !known {
+        if census.pass_targets_not_surface.contains(&handle) {
+            return;
+        }
+        if census.pass_targets_not_surface.len() < PRESENT_TARGET_MAX {
+            census.pass_targets_not_surface.push(handle);
+        }
+    }
+    emit_present_surface_census(&mut census);
+}
+
+/// Records one texture written as a copy or upload destination.
+pub(crate) fn note_copy_destination(handle: u64) {
+    if handle == 0 {
+        return;
+    }
+    let mut census = present_surface_census()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match census
+        .surfaces
+        .iter()
+        .position(|surface| surface.handle == handle)
+    {
+        Some(index) => {
+            let surface = &mut census.surfaces[index];
+            surface.copy_writes = surface.copy_writes.saturating_add(1);
+        }
+        None => {
+            if census.copy_targets_not_surface.contains(&handle) {
+                return;
+            }
+            if census.copy_targets_not_surface.len() < PRESENT_TARGET_MAX {
+                census.copy_targets_not_surface.push(handle);
+            }
+        }
+    }
+    emit_present_surface_census(&mut census);
+}
+
+/// Clears the present-surface census (tests).
+#[cfg(test)]
+pub(crate) fn reset_present_surface_census() {
+    if let Ok(mut census) = present_surface_census().lock() {
+        *census = PresentSurfaceCensus::default();
+    }
 }
 
 /// The resource-shape fields a whole-resource `CopyResource` must compare.
@@ -5392,5 +5660,56 @@ mod tests {
         assert!(lines.iter().any(|line| line == &reserved_row), "{lines:?}");
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
+    #[test]
+    fn present_surface_census_names_pass_copy_and_foreign_targets() {
+        reset_present_surface_census();
+        let surface = test_texture_desc(3840, 2160, 28, 0x1);
+        note_present_surface(0x1273_3000, &surface);
+        let line = present_surface_census_line();
+        assert!(line.contains("surfaces=1"), "{line}");
+        assert!(line.contains("targeted_by_pass=0"), "{line}");
+        assert!(line.contains("targeted_by_copy=0"), "{line}");
+        assert!(line.contains("3840x2160:fmt28:color"), "{line}");
+
+        // The title's offscreen target is a different object: nothing targets
+        // the registered surface.
+        let offscreen = test_texture_desc(3840, 2160, 28, 0x1);
+        note_pass_attachment(0x1300_0000, &offscreen);
+        let line = present_surface_census_line();
+        assert!(line.contains("targeted_by_pass=0"), "{line}");
+        assert!(line.contains("pass_targets_not_surface=1"), "{line}");
+
+        // Binding and copying the surface itself flips both verdicts.
+        note_pass_attachment(0x1273_3000, &surface);
+        note_copy_destination(0x1273_3000);
+        let line = present_surface_census_line();
+        assert!(line.contains("targeted_by_pass=1"), "{line}");
+        assert!(line.contains("targeted_by_copy=1"), "{line}");
+
+        // A second registration with a changed descriptor is a mismatch.
+        let changed = test_texture_desc(1920, 1080, 28, 0x1);
+        note_present_surface(0x1273_3000, &changed);
+        let line = present_surface_census_line();
+        assert!(line.contains("registered_twice=1"), "{line}");
+        assert!(line.contains("descriptor_mismatch=1"), "{line}");
+        reset_present_surface_census();
+    }
+
+    #[test]
+    fn present_surface_census_is_bounded() {
+        reset_present_surface_census();
+        for index in 0..(PRESENT_SURFACE_MAX + 3) {
+            let desc = test_texture_desc(64, 64, 28, 0x1);
+            note_present_surface(0x2000_0000 + index as u64, &desc);
+        }
+        let line = present_surface_census_line();
+        assert!(
+            line.contains(&format!("surfaces={PRESENT_SURFACE_MAX}")),
+            "{line}"
+        );
+        assert!(line.contains("dropped_surfaces=3"), "{line}");
+        reset_present_surface_census();
     }
 }

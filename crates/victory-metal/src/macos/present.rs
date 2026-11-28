@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use crate::macos::blit;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
+use crate::macos::trace;
 
 /// `MTLPixelFormatBGRA8Unorm`, matching the IOSurface `'BGRA'` format below.
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
@@ -301,6 +302,44 @@ struct PresentTraceKey {
     fallback_clear: bool,
 }
 
+/// The immutable descriptor of a texture the present path showed.
+///
+/// Counts and shapes only: a format, an extent and a usage mask. No content,
+/// no title asset name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceDescriptor {
+    format: usize,
+    width: usize,
+    height: usize,
+    usage: usize,
+}
+
+/// One presented source texture in the bounded identity census.
+///
+/// The key is the texture's process-local address, which is counted only; it
+/// never reaches telemetry. `received_copy` and `seen_as_pass` answer "did any
+/// host copy or traced render pass name this exact object?".
+#[derive(Debug, Clone, Copy)]
+struct SurfaceCensusEntry {
+    texture: usize,
+    descriptor: SurfaceDescriptor,
+    received_copy: bool,
+    seen_as_pass: bool,
+    descriptor_mismatch: bool,
+}
+
+/// One distinct pass target the draw tracer observed at a present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassTargetFacts {
+    format: &'static str,
+    width: u32,
+    height: u32,
+    /// The pass target is one of the host's registered surfaces.
+    swapchain: bool,
+    /// The pass target is the exact texture the present showed.
+    is_presented_surface: bool,
+}
+
 #[derive(Debug, Default)]
 struct PresentTrace {
     frames: u64,
@@ -313,6 +352,22 @@ struct PresentTrace {
     /// a copy from an earlier frame is not counted again.
     source_copies: Vec<(usize, u64)>,
     dropped_sources: u64,
+    /// Distinct presented source textures, each with its descriptor and the
+    /// copy/pass verdict. Bounded to [`PRESENT_TRACE_MAX_KEYS`].
+    surfaces: Vec<SurfaceCensusEntry>,
+    /// Distinct pass targets observed at present time, bounded.
+    pass_targets: Vec<(PassTargetFacts, u64)>,
+    /// A source texture appeared again with a different descriptor.
+    surface_registered_twice: u64,
+    /// A pass target named the presented texture with a different descriptor,
+    /// or a presented texture's descriptor changed while it was shown.
+    surface_descriptor_mismatch: u64,
+    /// Distinct pass targets that are another registered surface.
+    surface_pass_target_other_surface: u64,
+    /// Distinct pass targets that are unregistered (offscreen) textures.
+    surface_pass_target_offscreen: u64,
+    /// Presented textures whose census entry did not fit the bound.
+    dropped_surfaces: u64,
 }
 
 static PRESENT_TRACE: OnceLock<Mutex<PresentTrace>> = OnceLock::new();
@@ -321,17 +376,145 @@ fn present_trace() -> &'static Mutex<PresentTrace> {
     PRESENT_TRACE.get_or_init(|| Mutex::new(PresentTrace::default()))
 }
 
+/// Reads the immutable descriptor of a live `MTLTexture`.
+///
+/// Only called on real textures: the unit tests hand [`record_present_trace`]
+/// synthetic addresses and pass `None` here.
+fn surface_descriptor_of(texture: objc::Id) -> Option<SurfaceDescriptor> {
+    if texture.is_null() {
+        return None;
+    }
+    // SAFETY: `texture` is a live `MTLTexture`; each accessor only reads an
+    // immutable property.
+    Some(unsafe {
+        SurfaceDescriptor {
+            format: objc::msg_send_usize_0(texture, objc::sel(c"pixelFormat")),
+            width: objc::msg_send_usize_0(texture, objc::sel(c"width")),
+            height: objc::msg_send_usize_0(texture, objc::sel(c"height")),
+            usage: objc::msg_send_usize_0(texture, objc::sel(c"usage")),
+        }
+    })
+}
+
+/// The pass target the draw tracer observed, when it is armed.
+///
+/// The sampled pass is preferred (its pixels were summarized), then the most
+/// recent described draw. Both are `None` with the tracer off, which the
+/// present trace records as "unarmed" rather than as "no pass".
+fn observed_pass_target() -> Option<trace::TraceTarget> {
+    trace::last_sample()
+        .and_then(|sample| sample.target)
+        .or_else(|| trace::last_record().and_then(|record| record.target))
+}
+
+/// Updates the bounded surface census for one presented source texture.
+fn note_surface_census(
+    trace: &mut PresentTrace,
+    source: objc::Id,
+    descriptor: Option<SurfaceDescriptor>,
+    pass_target: Option<trace::TraceTarget>,
+    copy_total: u64,
+) {
+    let Some(descriptor) = descriptor else {
+        return;
+    };
+    if source.is_null() {
+        return;
+    }
+    let texture = source as usize;
+    let index = trace.surfaces.iter().position(|entry| entry.texture == texture);
+    let index = match index {
+        Some(index) => {
+            let entry = &mut trace.surfaces[index];
+            if entry.descriptor != descriptor {
+                trace.surface_registered_twice = trace.surface_registered_twice.saturating_add(1);
+                if !entry.descriptor_mismatch {
+                    entry.descriptor_mismatch = true;
+                    trace.surface_descriptor_mismatch =
+                        trace.surface_descriptor_mismatch.saturating_add(1);
+                }
+                entry.descriptor = descriptor;
+            }
+            index
+        }
+        None => {
+            if trace.surfaces.len() >= PRESENT_TRACE_MAX_KEYS {
+                trace.dropped_surfaces = trace.dropped_surfaces.saturating_add(1);
+                return;
+            }
+            trace.surfaces.push(SurfaceCensusEntry {
+                texture,
+                descriptor,
+                received_copy: false,
+                seen_as_pass: false,
+                descriptor_mismatch: false,
+            });
+            trace.surfaces.len() - 1
+        }
+    };
+
+    if copy_total > 0 {
+        trace.surfaces[index].received_copy = true;
+    }
+
+    let Some(target) = pass_target else {
+        return;
+    };
+    let facts = PassTargetFacts {
+        format: target.format,
+        width: target.width,
+        height: target.height,
+        swapchain: target.swapchain,
+        is_presented_surface: target.texture == texture,
+    };
+    if facts.is_presented_surface {
+        trace.surfaces[index].seen_as_pass = true;
+        let descriptor_matches = facts.format == pixel_format_name(trace.surfaces[index].descriptor.format)
+            && usize::try_from(facts.width).ok() == Some(trace.surfaces[index].descriptor.width)
+            && usize::try_from(facts.height).ok() == Some(trace.surfaces[index].descriptor.height);
+        if !descriptor_matches && !trace.surfaces[index].descriptor_mismatch {
+            trace.surfaces[index].descriptor_mismatch = true;
+            trace.surface_descriptor_mismatch = trace.surface_descriptor_mismatch.saturating_add(1);
+        }
+    } else if facts.swapchain {
+        if !trace
+            .pass_targets
+            .iter()
+            .any(|(seen, _)| seen.swapchain && !seen.is_presented_surface)
+        {
+            trace.surface_pass_target_other_surface =
+                trace.surface_pass_target_other_surface.saturating_add(1);
+        }
+    } else if !trace.pass_targets.iter().any(|(seen, _)| !seen.swapchain) {
+        trace.surface_pass_target_offscreen =
+            trace.surface_pass_target_offscreen.saturating_add(1);
+    }
+    match trace.pass_targets.iter_mut().find(|(seen, _)| *seen == facts) {
+        Some((_, count)) => *count = count.saturating_add(1),
+        None => {
+            if trace.pass_targets.len() < PRESENT_TRACE_MAX_KEYS {
+                trace.pass_targets.push((facts, 1));
+            }
+        }
+    }
+}
+
 /// Records one presented frame.
 ///
 /// `source` is the texture `Present` was asked to show, `presented` is the
 /// texture the window server actually shows, and `probe_sampled` is the
 /// texture the probe read (`None` when it did not sample this frame). The
 /// source and presented tokens are object identity, not pixel payload.
+/// `descriptor` is the source's immutable shape (read from the live texture,
+/// `None` for a synthetic test token) and `pass_target` is the render-pass
+/// attachment the draw tracer last observed.
 fn record_present_trace(
     source: objc::Id,
     presented: objc::Id,
     probe_sampled: Option<objc::Id>,
     fallback_clear: bool,
+    descriptor: Option<SurfaceDescriptor>,
+    pass_target: Option<trace::TraceTarget>,
 ) {
     let copy_total = if source.is_null() {
         0
@@ -395,6 +578,7 @@ fn record_present_trace(
     if fallback_clear {
         trace.fallback_clear = trace.fallback_clear.saturating_add(1);
     }
+    note_surface_census(&mut trace, source, descriptor, pass_target, copy_total);
     match trace.keys.iter_mut().find(|(seen, _)| *seen == key) {
         Some((_, count)) => *count = count.saturating_add(1),
         None => {
@@ -432,6 +616,61 @@ pub struct PresentTraceReport {
     /// Source textures whose previous-copy state was not retained after the
     /// bound was reached.
     pub dropped_sources: u64,
+    /// Distinct presented source textures and their identity verdict.
+    pub surfaces: Vec<PresentSurfaceEntry>,
+    /// Distinct pass targets the draw tracer observed at present time.
+    pub pass_targets: Vec<PresentPassTargetEntry>,
+    /// Distinct presented surfaces that a traced render pass named.
+    pub surface_targeted_by_pass: u64,
+    /// Distinct presented surfaces that a host copy wrote.
+    pub surface_targeted_by_copy: u64,
+    /// Times a presented source texture appeared with a different descriptor.
+    pub surface_registered_twice: u64,
+    /// Descriptor disagreements between the presented texture and a pass
+    /// target naming the same object.
+    pub surface_descriptor_mismatch: u64,
+    /// Distinct pass targets that were *another* registered surface.
+    pub surface_pass_targets_other_surface: u64,
+    /// Distinct pass targets that were not any registered surface (offscreen).
+    pub surface_pass_targets_not_surface: u64,
+    /// Presented surface descriptors dropped after the bound was reached.
+    pub dropped_surfaces: u64,
+}
+
+/// One presented source texture as the identity census saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentSurfaceEntry {
+    /// Metal pixel-format name (`bgra8unorm`, `rgba8unorm`, `rgba16float`...).
+    pub format: &'static str,
+    /// Level-0 width in texels.
+    pub width: usize,
+    /// Level-0 height in texels.
+    pub height: usize,
+    /// `MTLTextureUsage` mask.
+    pub usage: usize,
+    /// A traced render pass named this exact texture.
+    pub targeted_by_pass: bool,
+    /// A host copy wrote this texture.
+    pub targeted_by_copy: bool,
+    /// The texture's descriptor changed, or disagreed with a pass target.
+    pub descriptor_mismatch: bool,
+}
+
+/// One distinct pass target observed at present time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentPassTargetEntry {
+    /// Metal pixel-format name of the attachment.
+    pub format: &'static str,
+    /// Attachment width in texels.
+    pub width: u32,
+    /// Attachment height in texels.
+    pub height: u32,
+    /// The attachment is one of the host's registered surfaces.
+    pub swapchain: bool,
+    /// The attachment is the exact texture the present showed.
+    pub is_presented_surface: bool,
+    /// Presents that observed this target.
+    pub count: u64,
 }
 
 /// One counted present key.
@@ -462,6 +701,21 @@ pub fn present_trace_report() -> PresentTraceReport {
     let Ok(trace) = present_trace().lock() else {
         return PresentTraceReport::default();
     };
+    let surfaces: Vec<PresentSurfaceEntry> = trace
+        .surfaces
+        .iter()
+        .map(|entry| PresentSurfaceEntry {
+            format: pixel_format_name(entry.descriptor.format),
+            width: entry.descriptor.width,
+            height: entry.descriptor.height,
+            usage: entry.descriptor.usage,
+            targeted_by_pass: entry.seen_as_pass,
+            targeted_by_copy: entry.received_copy,
+            descriptor_mismatch: entry.descriptor_mismatch,
+        })
+        .collect();
+    let surface_targeted_by_pass = surfaces.iter().filter(|entry| entry.targeted_by_pass).count() as u64;
+    let surface_targeted_by_copy = surfaces.iter().filter(|entry| entry.targeted_by_copy).count() as u64;
     PresentTraceReport {
         frames: trace.frames,
         copied_into_source: trace.copied_into_source,
@@ -480,6 +734,26 @@ pub fn present_trace_report() -> PresentTraceReport {
             .collect(),
         dropped_keys: trace.dropped_keys,
         dropped_sources: trace.dropped_sources,
+        pass_targets: trace
+            .pass_targets
+            .iter()
+            .map(|(facts, count)| PresentPassTargetEntry {
+                format: facts.format,
+                width: facts.width,
+                height: facts.height,
+                swapchain: facts.swapchain,
+                is_presented_surface: facts.is_presented_surface,
+                count: *count,
+            })
+            .collect(),
+        surface_targeted_by_pass,
+        surface_targeted_by_copy,
+        surface_registered_twice: trace.surface_registered_twice,
+        surface_descriptor_mismatch: trace.surface_descriptor_mismatch,
+        surface_pass_targets_other_surface: trace.surface_pass_target_other_surface,
+        surface_pass_targets_not_surface: trace.surface_pass_target_offscreen,
+        dropped_surfaces: trace.dropped_surfaces,
+        surfaces,
     }
 }
 
@@ -511,7 +785,10 @@ impl PresentTraceReport {
             "present_trace=frames={} copied_into_source={} copy_kind_copy_texture_region={} \
              copy_kind_resolve_subresource={} copy_kind_none={} source_is_presented={} \
              probe_sampled_presented={} probe_source_mismatch={} fallback_clear={} \
-             distinct_keys={} dropped_keys={} dropped_sources={}",
+             distinct_keys={} dropped_keys={} dropped_sources={} distinct_surfaces={} \
+             surface_targeted_by_pass={} surface_targeted_by_copy={} \
+             surface_registered_twice={} surface_descriptor_mismatch={} \
+             surface_pass_targets_not_surface={} surface_pass_targets_other_surface={} {}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -524,7 +801,45 @@ impl PresentTraceReport {
             self.keys.len(),
             self.dropped_keys,
             self.dropped_sources,
+            self.surfaces.len(),
+            self.surface_targeted_by_pass,
+            self.surface_targeted_by_copy,
+            self.surface_registered_twice,
+            self.surface_descriptor_mismatch,
+            self.surface_pass_targets_not_surface,
+            self.surface_pass_targets_other_surface,
+            self.surface_log_fields(),
         )
+    }
+
+    /// The bounded surface identity census as stable `name=value` words.
+    ///
+    /// A descriptor is a format name, an extent and a usage mask: no content
+    /// and no raw object address appears.
+    fn surface_log_fields(&self) -> String {
+        let mut out = String::new();
+        for (index, surface) in self.surfaces.iter().enumerate() {
+            out.push_str(&format!(
+                " surface{index}={}x{}:{}:u{}:pass{}:copy{}",
+                surface.width,
+                surface.height,
+                surface.format,
+                surface.usage,
+                u8::from(surface.targeted_by_pass),
+                u8::from(surface.targeted_by_copy),
+            ));
+        }
+        for (index, target) in self.pass_targets.iter().enumerate() {
+            out.push_str(&format!(
+                " pass_target{index}={}x{}:{}:{}:present{}",
+                target.width,
+                target.height,
+                target.format,
+                if target.swapchain { "surface" } else { "offscreen" },
+                u8::from(target.is_presented_surface),
+            ));
+        }
+        out
     }
 
     /// The report as the `present_trace` telemetry object (counts only).
@@ -550,13 +865,55 @@ impl PresentTraceReport {
             .filter(|entry| entry.probe_sampled_presented)
             .map(|entry| entry.count)
             .fold(0u64, u64::saturating_add);
+        let surfaces = self
+            .surfaces
+            .iter()
+            .map(|surface| {
+                format!(
+                    "{{\"format\": \"{}\", \"width\": {}, \"height\": {}, \"usage\": {}, \
+                     \"targeted_by_pass\": {}, \"targeted_by_copy\": {}, \
+                     \"descriptor_mismatch\": {}}}",
+                    surface.format,
+                    surface.width,
+                    surface.height,
+                    surface.usage,
+                    surface.targeted_by_pass,
+                    surface.targeted_by_copy,
+                    surface.descriptor_mismatch,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pass_targets = self
+            .pass_targets
+            .iter()
+            .map(|target| {
+                format!(
+                    "{{\"format\": \"{}\", \"width\": {}, \"height\": {}, \
+                     \"swapchain\": {}, \"is_presented_surface\": {}, \"count\": {}}}",
+                    target.format,
+                    target.width,
+                    target.height,
+                    target.swapchain,
+                    target.is_presented_surface,
+                    target.count,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "{{\"frames\": {}, \"copied_into_source\": {}, \
              \"copy_kind_copy_texture_region\": {}, \
              \"copy_kind_resolve_subresource\": {}, \"copy_kind_none\": {}, \
              \"source_is_presented\": {}, \"probe_sampled_presented\": {}, \
              \"probe_source_mismatch\": {}, \"fallback_clear\": {}, \
-             \"distinct_keys\": {}, \"dropped_keys\": {}, \"dropped_sources\": {}}}",
+             \"distinct_keys\": {}, \"dropped_keys\": {}, \"dropped_sources\": {}, \
+             \"distinct_surfaces\": {}, \"surface_targeted_by_pass\": {}, \
+             \"surface_targeted_by_copy\": {}, \"surface_registered_twice\": {}, \
+             \"surface_descriptor_mismatch\": {}, \
+             \"surface_pass_targets_not_surface\": {}, \
+             \"surface_pass_targets_other_surface\": {}, \"dropped_surfaces\": {}, \
+             \"surfaces\": [{}], \"pass_targets\": [{}]}}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -569,6 +926,16 @@ impl PresentTraceReport {
             self.keys.len(),
             self.dropped_keys,
             self.dropped_sources,
+            self.surfaces.len(),
+            self.surface_targeted_by_pass,
+            self.surface_targeted_by_copy,
+            self.surface_registered_twice,
+            self.surface_descriptor_mismatch,
+            self.surface_pass_targets_not_surface,
+            self.surface_pass_targets_other_surface,
+            self.dropped_surfaces,
+            surfaces,
+            pass_targets,
         )
     }
 }
@@ -856,6 +1223,8 @@ impl NativeSwapchain {
             target,
             probe_sampled,
             !filled,
+            source.and_then(surface_descriptor_of),
+            observed_pass_target(),
         );
 
         self.presented = self.presented.wrapping_add(1);
@@ -2781,7 +3150,14 @@ impl<'a> PresentPath<'a> {
         // copy trace names whatever wrote it last (for the title path this is
         // the offscreen->swapchain copy/resolve).
         let texture = image.texture_raw();
-        record_present_trace(texture, texture, None, false);
+        record_present_trace(
+            texture,
+            texture,
+            None,
+            false,
+            surface_descriptor_of(texture),
+            observed_pass_target(),
+        );
         self.in_flight = Some(frame);
         if let Err(error) = sink.present(frame) {
             // The sink did not take ownership: nothing is in flight.
@@ -4586,7 +4962,7 @@ mod tests {
         let source = token(0x3000);
         let presented = token(0x4000);
         blit::note_copy_destination(blit::BlitCopyKind::CopyTextureRegion, source);
-        record_present_trace(source, presented, Some(presented), false);
+        record_present_trace(source, presented, Some(presented), false, None, None);
         let report = present_trace_report();
         assert_eq!(report.frames, 1);
         assert_eq!(report.copied_into_source, 1);
@@ -4599,7 +4975,7 @@ mod tests {
         assert!(line.contains("copy_kind_copy_texture_region=1"), "{line}");
         assert!(line.contains("probe_source_mismatch=0"), "{line}");
 
-        record_present_trace(source, presented, Some(token(0x5000)), false);
+        record_present_trace(source, presented, Some(token(0x5000)), false, None, None);
         let report = present_trace_report();
         assert_eq!(report.frames, 2);
         assert_eq!(report.probe_source_mismatch, 1);
@@ -4637,7 +5013,7 @@ mod tests {
                             _ => {}
                         }
                         let probe = probe_presented.then_some(presented);
-                        record_present_trace(source, presented, probe, fallback);
+                        record_present_trace(source, presented, probe, fallback, None, None);
                         recorded += 1;
                     }
                 }

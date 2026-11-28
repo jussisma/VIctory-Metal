@@ -1369,6 +1369,10 @@ fn attachment_resource(
         }
     };
     let handle = registration.handle;
+    if let Some((base, desc)) = crate::resource::texture_memory(resource) {
+        debug_assert_eq!(base as u64, handle, "attachment handle is the memory base");
+        crate::resource::note_pass_attachment(handle, &desc);
+    }
     if registered(handle) {
         return ResourceId::from_guest_address(handle);
     }
@@ -2162,6 +2166,9 @@ fn copy_texture_resource(
         return Err(refuse("CopyResource: source and destination descriptions differ"));
     }
     let subresources = destination.subresources;
+    if let Some((base, _)) = crate::resource::texture_memory(dst) {
+        crate::resource::note_copy_destination(base as u64);
+    }
     tracing::debug!(
         copy_kind = "copy_resource",
         subresources,
@@ -2430,6 +2437,9 @@ extern "system" fn copy_texture_region(
                         victory_metal::wire_v3::OP_COPY_BUFFER_TO_TEXTURE,
                     )
                 })?;
+                if let Some((base, _)) = crate::resource::texture_memory(dst.resource) {
+                    crate::resource::note_copy_destination(base as u64);
+                }
                 return producer.copy_buffer_to_texture(
                     copy.source,
                     copy.destination,
@@ -2486,6 +2496,9 @@ extern "system" fn copy_texture_region(
                 return Err(copy_refused(
                     "CopyTextureRegion: destination box outside its subresource",
                 ));
+            }
+            if let Some((base, _)) = crate::resource::texture_memory(dst.resource) {
+                crate::resource::note_copy_destination(base as u64);
             }
             producer.copy_texture_region(from, to, origin, [x, y, z], size)
         });
@@ -2750,6 +2763,9 @@ extern "system" fn resolve(
         with_metal(this, |producer| {
             let to = metal_subresource(dst, dst_sub)?;
             let from = metal_subresource(src, src_sub)?;
+            if let Some((base, _)) = crate::resource::texture_memory(dst) {
+                crate::resource::note_copy_destination(base as u64);
+            }
             producer.resolve_subresource(from, to)
         });
         return;
