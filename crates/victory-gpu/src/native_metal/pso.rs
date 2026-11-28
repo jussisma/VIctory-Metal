@@ -980,6 +980,178 @@ pub const DEFAULT_OBJECT_THREADGROUP: [u16; 3] = [1, 1, 1];
 /// function that writes any payload needs a non-empty payload allocation.
 pub const DEFAULT_PAYLOAD_MEMORY_LENGTH: u16 = 1024;
 
+/// Magic of the compute threadgroup chunk a compute `PipelineState` carries.
+///
+/// Must equal `victory_metal::macos::registry::COMPUTE_THREADGROUP_MAGIC`: the
+/// host decodes this chunk from the state a version 2/3 frame carries and
+/// stores the size on the registered pipeline.
+pub const COMPUTE_THREADGROUP_MAGIC: [u8; 4] = *b"VCTG";
+/// Version byte of [`COMPUTE_THREADGROUP_MAGIC`]'s chunk.
+pub const COMPUTE_THREADGROUP_VERSION: u8 = 1;
+/// Exact byte length of the compute threadgroup chunk.
+pub const COMPUTE_THREADGROUP_LEN: usize = 11;
+
+/// Encodes a compute `[numthreads(x,y,z)]` as the state chunk both sides share.
+///
+/// An unknown size (`0` in any dimension) encodes as empty bytes: a compute
+/// pipeline with no discoverable size keeps the historical empty state and is
+/// refused at `Dispatch`, never defaulted to `[1, 1, 1]`.
+pub fn encode_compute_threadgroup_state(threadgroup: [u32; 3]) -> Vec<u8> {
+    if threadgroup.iter().any(|&dimension| dimension == 0) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(COMPUTE_THREADGROUP_LEN);
+    out.extend_from_slice(&COMPUTE_THREADGROUP_MAGIC);
+    out.push(COMPUTE_THREADGROUP_VERSION);
+    for value in threadgroup {
+        out.extend_from_slice(
+            &u16::try_from(value)
+                .expect("compute threadgroup dimension exceeds u16")
+                .to_le_bytes(),
+        );
+    }
+    out
+}
+
+/// Decodes the compute threadgroup chunk, if the state carries one.
+///
+/// A state that does not start with the chunk magic is historical opaque
+/// compute state and yields `None`. A magic-prefixed record that is truncated,
+/// has another version or declares a zero dimension also yields `None`; the
+/// caller records that as an unreadable record rather than a size.
+pub fn compute_threadgroup_from_state(state: &[u8]) -> Option<[u32; 3]> {
+    if state.len() < COMPUTE_THREADGROUP_LEN
+        || state[..COMPUTE_THREADGROUP_MAGIC.len()] != COMPUTE_THREADGROUP_MAGIC
+        || state[COMPUTE_THREADGROUP_MAGIC.len()] != COMPUTE_THREADGROUP_VERSION
+    {
+        return None;
+    }
+    let mut dimensions = [0u32; 3];
+    for (index, value) in dimensions.iter_mut().enumerate() {
+        let at = COMPUTE_THREADGROUP_MAGIC.len() + 1 + 2 * index;
+        *value = u32::from(u16::from_le_bytes(
+            state[at..at + 2].try_into().expect("two bytes"),
+        ));
+    }
+    (dimensions.iter().all(|&dimension| dimension != 0)).then_some(dimensions)
+}
+
+/// Reads a compute container's `[numthreads(x,y,z)]` from its `PSV0` runtime
+/// info.
+///
+/// The translated container's `PSV0` runtime info version 2 carries
+/// `NumThreadsX/Y/Z` at bytes 36/40/44. The part must name a compute shader
+/// (stage byte 5) and hold the whole block; otherwise this is `None`, never a
+/// guessed size. This is the guest's authority for the size it sends and the
+/// size it applies to a `Dispatch`.
+pub fn compute_threadgroup_from_container(container: &[u8]) -> Option<[u32; 3]> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let psv = parsed.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(0..4)?.try_into().ok()?) as usize;
+    if size < 48 {
+        return None;
+    }
+    let info = psv.get(4..4 + size)?;
+    if info.get(24).copied() != Some(5) {
+        return None;
+    }
+    let x = u32::from_le_bytes(info.get(36..40)?.try_into().ok()?);
+    let y = u32::from_le_bytes(info.get(40..44)?.try_into().ok()?);
+    let z = u32::from_le_bytes(info.get(44..48)?.try_into().ok()?);
+    (x != 0 && y != 0 && z != 0).then_some([x, y, z])
+}
+
+/// Census of compute threadgroup discovery and application.
+///
+/// A compute pipeline whose `[numthreads]` cannot be read is a named class, not
+/// a silent dispatch refusal: `missing` says how many registered that way, and
+/// `unapplied` says how many `SetComputePipeline` calls had no size to apply.
+pub mod compute_threadgroup_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// A container's `PSV0` declared the size.
+    pub const PARSED: usize = 0;
+    /// The size came from a caller-supplied state chunk.
+    pub const STATE: usize = 1;
+    /// A compute registration had no discoverable size.
+    pub const MISSING: usize = 2;
+    /// `SetComputePipeline` applied a recorded size.
+    pub const APPLIED: usize = 3;
+    /// `SetComputePipeline` found no recorded size.
+    pub const UNAPPLIED: usize = 4;
+
+    /// The static counter names, in the order of the constants above.
+    pub const NAMES: [&str; 5] = [
+        "compute_threadgroup_parsed",
+        "compute_threadgroup_state",
+        "compute_threadgroup_missing",
+        "compute_threadgroup_applied",
+        "compute_threadgroup_unapplied",
+    ];
+
+    static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
+
+    /// Counts one outcome and logs the census at powers of two.
+    pub(crate) fn note(outcome: usize) -> u64 {
+        let count = COUNTS[outcome].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            tracing::info!(?NAMES, counts = ?counts(), "compute threadgroup census");
+        }
+        count
+    }
+
+    /// The counters, in [`NAMES`] order.
+    pub fn counts() -> [u64; NAMES.len()] {
+        std::array::from_fn(|index| COUNTS[index].load(Relaxed))
+    }
+
+    /// Clears every counter (tests only: the counts are session totals).
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        for count in &COUNTS {
+            count.store(0, Relaxed);
+        }
+    }
+}
+
+/// Registered compute pipelines' threadgroup sizes, by host pipeline id.
+///
+/// `SetComputePipeline` consults this so every registered compute PSO applies
+/// its size without a second production call. Process-wide because one guest
+/// process serves one host session; entries are bounded by the number of live
+/// pipelines the title registered.
+static COMPUTE_THREADGROUPS: Mutex<Option<HashMap<u64, [u32; 3]>>> = Mutex::new(None);
+
+/// Records the threadgroup size of a just-registered compute pipeline.
+pub(crate) fn record_compute_threadgroup(pipeline_id: u64, threadgroup: [u32; 3]) {
+    if pipeline_id == 0 || threadgroup.iter().any(|&dimension| dimension == 0) {
+        return;
+    }
+    let mut map = COMPUTE_THREADGROUPS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .insert(pipeline_id, threadgroup);
+}
+
+/// The recorded threadgroup size for `pipeline_id`, if any.
+pub fn compute_threadgroup_for(pipeline_id: u64) -> Option<[u32; 3]> {
+    COMPUTE_THREADGROUPS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&pipeline_id).copied())
+}
+
+/// Clears the recorded sizes (tests only).
+#[cfg(test)]
+pub(crate) fn reset_compute_threadgroups() {
+    *COMPUTE_THREADGROUPS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+
 /// Encodes a graphics `PipelineState` (`VPS1`) for the stage set.
 ///
 /// Mirrors `victory_metal::macos::registry::PipelineState::encode(Graphics)`
@@ -2624,10 +2796,23 @@ fn upload_host_stage(share_dir: &Path, bytes: &[u8]) -> Result<String, PipelineE
     Ok(name)
 }
 
+/// The compute stage's declared `[numthreads]`, from the container it will
+/// register.
+///
+/// A stage set with no compute stage, or a compute container whose `PSV0`
+/// carries no complete threadgroup record, is `None`: the caller counts a
+/// missing size and never guesses one.
+#[cfg(any(windows, test))]
+fn compute_threadgroup_of(programs: &[StageProgram]) -> Option<[u32; 3]> {
+    programs
+        .iter()
+        .find(|program| program.stage == PipelineStage::Compute)
+        .and_then(|program| compute_threadgroup_from_container(&program.dxil))
+}
+
 /// The `PipelineState` blob a host-translated registration carries.
 #[cfg(any(windows, test))]
-fn host_pipeline_state(
-    programs: &[StageProgram],
+fn host_pipeline_state(    programs: &[StageProgram],
     details: &PipelineDetails<'_>,
     kind: PipelineKind,
 ) -> Result<Vec<u8>, PipelineError> {
@@ -2635,8 +2820,12 @@ fn host_pipeline_state(
         return Ok(details.state.to_vec());
     }
     Ok(match kind {
-        // A compute `PipelineState` carries no colour/depth shape.
-        PipelineKind::Compute => Vec::new(),
+        // A compute `PipelineState` carries no colour/depth shape. It does
+        // carry the `[numthreads]` its translated container declared, so the
+        // host stores the same size the guest will apply at `Dispatch`.
+        PipelineKind::Compute => compute_threadgroup_of(programs)
+            .map(encode_compute_threadgroup_state)
+            .unwrap_or_default(),
         PipelineKind::Graphics => {
             let pixel_entry = programs
                 .iter()
@@ -2741,6 +2930,22 @@ fn register_with_host_translation(
 
     // The census memory only records that this content is hosted; a later
     // reconnect must still ask the (new) host session again.
+    if kind == PipelineKind::Compute {
+        match compute_threadgroup_of(programs) {
+            Some(size) => {
+                record_compute_threadgroup(id, size);
+                compute_threadgroup_census::note(compute_threadgroup_census::PARSED);
+            }
+            None => {
+                compute_threadgroup_census::note(compute_threadgroup_census::MISSING);
+                tracing::warn!(
+                    pipeline = id,
+                    "host-translated compute pipeline has no discoverable threadgroup size; \
+                     its Dispatch commands will be refused"
+                );
+            }
+        }
+    }
     let _ = remember(key, id);
     Ok((id, PoolServing { warm: false }, AttemptOutcome::HostTranslated))
 }
@@ -2814,16 +3019,47 @@ fn register_with_details_inner(
         (details.abi, details.root_signature)
     };
 
+    let compute_threadgroup = compute_threadgroup_of(programs);
     let stages: Vec<(PipelineStage, &[u8], &str)> = translated
         .iter()
         .map(|(stage, compiled, entry)| (*stage, compiled.metallib.as_slice(), *entry))
         .collect();
+    // The state the frame carries is the graphics state when there is one.
+    // For a compute pipeline it also carries the `[numthreads]` the translated
+    // container declared, so the host stores the same size the guest applies.
+    let compute_state;
+    let state = if !details.state.is_empty() {
+        details.state
+    } else if let Some(size) = compute_threadgroup {
+        compute_state = encode_compute_threadgroup_state(size);
+        compute_state.as_slice()
+    } else {
+        details.state
+    };
     let translated_details = PipelineDetails {
-        state: details.state,
+        state,
         abi,
         root_signature,
     };
     let (id, outcome) = register_translated_inner(&stages, &translated_details)?;
+    if programs
+        .iter()
+        .any(|program| program.stage == PipelineStage::Compute)
+    {
+        match compute_threadgroup {
+            Some(_) => {
+                compute_threadgroup_census::note(compute_threadgroup_census::PARSED);
+            }
+            None => {
+                compute_threadgroup_census::note(compute_threadgroup_census::MISSING);
+                tracing::warn!(
+                    pipeline = id,
+                    "compute pipeline has no discoverable threadgroup size; its Dispatch \
+                     commands will be refused"
+                );
+            }
+        }
+    }
     Ok((id, PoolServing { warm }, outcome))
 }
 
@@ -2914,6 +3150,7 @@ fn register_translated_inner(
             key,
             crate::native_metal::queue::register_pipeline(metallib, entry).map_err(map_queue_error),
         )?;
+        record_compute_state_threadgroup(id, details.state);
         return Ok((id, remember_outcome(key, id)));
     }
     for (stage, metallib, _) in stages {
@@ -2967,7 +3204,18 @@ fn register_translated_inner(
         )
         .map_err(map_queue_error),
     )?;
+    record_compute_state_threadgroup(id, state);
     Ok((id, remember_outcome(key, id)))
+}
+
+/// Records a registered compute pipeline's size when the state carried the
+/// chunk both sides share.
+#[cfg(any(windows, test))]
+fn record_compute_state_threadgroup(pipeline_id: u64, state: &[u8]) {
+    if let Some(size) = compute_threadgroup_from_state(state) {
+        record_compute_threadgroup(pipeline_id, size);
+        compute_threadgroup_census::note(compute_threadgroup_census::STATE);
+    }
 }
 
 /// Runs one pipeline registration and caches a permanent refusal by content key.
@@ -5246,4 +5494,33 @@ mod tests {
             .filter(|path| path.is_file())
     }
 
+    /// The compute fixture's `PSV0` declares `[numthreads(64, 1, 1)]`; a
+    /// graphics container declares none, and a truncated state chunk is
+    /// unreadable rather than a guessed size.
+    #[test]
+    fn compute_threadgroup_is_read_from_a_compute_container_only() {
+        let compute = fixture(PipelineStage::Compute);
+        assert_eq!(
+            compute_threadgroup_from_container(&compute),
+            Some([64, 1, 1])
+        );
+        let vertex = fixture(PipelineStage::Vertex);
+        assert_eq!(compute_threadgroup_from_container(&vertex), None);
+        assert_eq!(
+            compute_threadgroup_from_container(b"not a container"),
+            None
+        );
+
+        let encoded = encode_compute_threadgroup_state([16, 4, 1]);
+        assert_eq!(encoded.len(), COMPUTE_THREADGROUP_LEN);
+        assert_eq!(compute_threadgroup_from_state(&encoded), Some([16, 4, 1]));
+        assert_eq!(compute_threadgroup_from_state(&[]), None);
+        assert!(
+            encode_compute_threadgroup_state([0, 4, 1]).is_empty(),
+            "an unknown size carries no chunk"
+        );
+        let mut truncated = encoded;
+        truncated.pop();
+        assert_eq!(compute_threadgroup_from_state(&truncated), None);
+    }
 }

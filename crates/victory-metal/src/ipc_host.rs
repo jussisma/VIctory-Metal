@@ -1339,6 +1339,12 @@ pub struct IpcHost<E: BatchExecutor> {
     host_pipeline_translations_refused: u64,
     /// Stages answered by the host pool's content-hashed disk cache.
     host_pipeline_cache_hits: u64,
+    /// Compute pipelines whose translated container declared a threadgroup
+    /// size the host parsed and stored.
+    host_compute_threadgroup_parsed: u64,
+    /// Compute pipelines registered without a discoverable threadgroup size;
+    /// their `Dispatch` commands are refused with a named reason.
+    host_compute_threadgroup_missing: u64,
     /// Graphics pipelines whose descriptor came from the guest's layout.
     vertex_layout_guest: u64,
     /// Graphics pipelines whose descriptor came from the `ISG1` signature.
@@ -1426,6 +1432,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_ok: 0,
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
+            host_compute_threadgroup_parsed: 0,
+            host_compute_threadgroup_missing: 0,
             vertex_layout_guest: 0,
             vertex_layout_signature: 0,
             vertex_layout_ia_stride_unknown: 0,
@@ -1567,6 +1575,19 @@ impl<E: BatchExecutor> IpcHost<E> {
             title_map_ranges: self.title_map.len(),
             title_generation: self.title_generation,
         }
+    }
+
+    /// Compute-pipeline threadgroup counts: `(parsed, missing)`.
+    ///
+    /// `parsed` counts compute pipelines whose translated container declared a
+    /// `[numthreads]` the host read and stored; `missing` counts compute
+    /// pipelines registered without one. A missing size is never guessed: the
+    /// guest's `Dispatch` is refused with its named reason.
+    pub fn compute_threadgroup_counts(&self) -> (u64, u64) {
+        (
+            self.host_compute_threadgroup_parsed,
+            self.host_compute_threadgroup_missing,
+        )
     }
 
     /// Title-map delivery counters as one snapshot (ADR-058).
@@ -2865,6 +2886,21 @@ impl<E: BatchExecutor> IpcHost<E> {
             })
             .collect();
         let handle = self.allocate_content_pipeline_handle();
+        if request.kind == PIPELINE_KIND_COMPUTE {
+            // A version 2 frame carries pre-translated metallibs, not DXIL, so
+            // the only threadgroup witness is the state chunk the guest encoded
+            // from its own container. Count which of the two paths it is.
+            match crate::macos::registry::compute_threadgroup_from_state(&request.state) {
+                Ok(Some(_)) => {
+                    self.host_compute_threadgroup_parsed =
+                        self.host_compute_threadgroup_parsed.saturating_add(1);
+                }
+                _ => {
+                    self.host_compute_threadgroup_missing =
+                        self.host_compute_threadgroup_missing.saturating_add(1);
+                }
+            }
+        }
         let outcome = match request.kind {
             PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
                 handle,
@@ -3035,6 +3071,42 @@ impl<E: BatchExecutor> IpcHost<E> {
         // step rates); only a frame without one falls back to the vertex
         // stage's DXIL `ISG1` signature, and both paths are counted.
         let mut state = request.state.clone();
+        if request.kind == PIPELINE_KIND_COMPUTE {
+            // The translated compute container's `PSV0` is the authoritative
+            // `[numthreads]` source: the guest cannot be trusted to declare it,
+            // and the ABI reflection carries no threadgroup field. A missing
+            // size is a named, counted class, never a `[1, 1, 1]` default.
+            let threadgroup = request
+                .stages
+                .iter()
+                .position(|stage| stage.stage == PIPELINE_STAGE_COMPUTE)
+                .and_then(|index| {
+                    crate::macos::registry::compute_threadgroup_from_dxil_container(&dxil[index])
+                });
+            match threadgroup {
+                Some(size) => {
+                    self.host_compute_threadgroup_parsed =
+                        self.host_compute_threadgroup_parsed.saturating_add(1);
+                    state = crate::macos::registry::encode_compute_threadgroup_state(size);
+                }
+                None => {
+                    // Keep a size the guest already encoded, if any; otherwise
+                    // the registry registers the pipeline with an unknown size.
+                    if matches!(
+                        crate::macos::registry::compute_threadgroup_from_state(&state),
+                        Ok(None) | Err(_)
+                    ) {
+                        state.clear();
+                    }
+                    self.host_compute_threadgroup_missing =
+                        self.host_compute_threadgroup_missing.saturating_add(1);
+                    tracing::warn!(
+                        "compute pipeline registered without a discoverable threadgroup size; \
+                         its Dispatch commands will be refused"
+                    );
+                }
+            }
+        }
         if request.kind == PIPELINE_KIND_GRAPHICS {
             let Some(vertex_index) = request
                 .stages

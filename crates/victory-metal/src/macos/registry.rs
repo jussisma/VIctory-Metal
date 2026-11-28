@@ -2343,6 +2343,109 @@ pub struct PipelineState {
     pub vertex_layout: Option<VertexLayout>,
 }
 
+/// Magic of the compute threadgroup chunk a compute `PipelineState` carries.
+///
+/// A compute `PipelineState` used to be opaque/empty. The chunk is appended to
+/// the state bytes (and therefore participates in the content key) so a
+/// registered compute pipeline records the `[numthreads]` its translated DXIL
+/// declared. Absent bytes keep the historical meaning: the size is unknown.
+pub const COMPUTE_THREADGROUP_MAGIC: [u8; 4] = *b"VCTG";
+/// Version byte of [`COMPUTE_THREADGROUP_MAGIC`]'s chunk.
+pub const COMPUTE_THREADGROUP_VERSION: u8 = 1;
+/// Exact byte length of the compute threadgroup chunk.
+pub const COMPUTE_THREADGROUP_LEN: usize = 11;
+
+/// Encodes the compute threadgroup size as the state chunk a compute pipeline
+/// registers with.
+///
+/// `[0, 0, 0]` (an unknown size) encodes as an empty blob so a state with no
+/// discoverable `numthreads` keeps the historical empty compute state.
+pub fn encode_compute_threadgroup_state(threadgroup: [u32; 3]) -> Vec<u8> {
+    if threadgroup.iter().any(|&dimension| dimension == 0) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(COMPUTE_THREADGROUP_LEN);
+    out.extend_from_slice(&COMPUTE_THREADGROUP_MAGIC);
+    out.push(COMPUTE_THREADGROUP_VERSION);
+    for value in threadgroup {
+        out.extend_from_slice(
+            &u16::try_from(value)
+                .expect("compute threadgroup dimension exceeds u16")
+                .to_le_bytes(),
+        );
+    }
+    out
+}
+
+/// Decodes the compute threadgroup chunk from a compute state blob.
+///
+/// * empty state: `Ok(None)` (no size was recorded);
+/// * a state that is not this chunk: `Ok(None)`, preserving the historical
+///   opaque meaning of compute state bytes;
+/// * a state that starts with the chunk magic but is truncated, has another
+///   version, or declares a zero dimension: a named
+///   [`RegistryError::InvalidState`], never a guessed size.
+pub fn compute_threadgroup_from_state(state: &[u8]) -> Result<Option<[u32; 3]>, RegistryError> {
+    if state.is_empty() {
+        return Ok(None);
+    }
+    if state.len() < COMPUTE_THREADGROUP_MAGIC.len()
+        || state[..COMPUTE_THREADGROUP_MAGIC.len()] != COMPUTE_THREADGROUP_MAGIC
+    {
+        return Ok(None);
+    }
+    if state.len() != COMPUTE_THREADGROUP_LEN {
+        return Err(RegistryError::InvalidState(
+            "compute threadgroup record has the wrong length",
+        ));
+    }
+    if state[COMPUTE_THREADGROUP_MAGIC.len()] != COMPUTE_THREADGROUP_VERSION {
+        return Err(RegistryError::InvalidState(
+            "compute threadgroup record has an unknown version",
+        ));
+    }
+    let mut dimensions = [0u32; 3];
+    for (index, value) in dimensions.iter_mut().enumerate() {
+        let at = COMPUTE_THREADGROUP_MAGIC.len() + 1 + 2 * index;
+        *value = u32::from(u16::from_le_bytes(
+            state[at..at + 2].try_into().expect("two bytes"),
+        ));
+    }
+    if dimensions.iter().any(|&dimension| dimension == 0) {
+        return Err(RegistryError::InvalidState(
+            "compute threadgroup record declares a zero dimension",
+        ));
+    }
+    Ok(Some(dimensions))
+}
+
+/// Reads the compute stage's `[numthreads(x,y,z)]` from a DXBC container's
+/// `PSV0` runtime info.
+///
+/// The translated container's `PSV0` runtime info version 2 carries the
+/// thread-group size at bytes 36/40/44 (`NumThreadsX/Y/Z`). The container must
+/// declare itself a compute shader (`PSV0` stage byte 5) and a runtime info
+/// block large enough to hold all three; anything else is `None`, never a
+/// guessed `[1, 1, 1]`. Graphics containers and runtime-info version 1 blobs
+/// (too short) are rejected.
+pub fn compute_threadgroup_from_dxil_container(container: &[u8]) -> Option<[u32; 3]> {
+    let parsed = victory_shader::Container::parse(container).ok()?;
+    let psv = parsed.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(0..4)?.try_into().ok()?) as usize;
+    if size < 48 {
+        return None;
+    }
+    let info = psv.get(4..4 + size)?;
+    // `PSV0` shader kind 5 is compute (`D3D12_SHADER_VERSION_TYPE_CS`).
+    if info.get(24).copied() != Some(5) {
+        return None;
+    }
+    let x = u32::from_le_bytes(info.get(36..40)?.try_into().ok()?);
+    let y = u32::from_le_bytes(info.get(40..44)?.try_into().ok()?);
+    let z = u32::from_le_bytes(info.get(44..48)?.try_into().ok()?);
+    (x != 0 && y != 0 && z != 0).then_some([x, y, z])
+}
+
 /// Render-state section flag: a [`BlendState`] follows.
 const RENDER_SECTION_BLEND: u8 = 1;
 /// Render-state section flag: a [`DepthStencilState`] follows.
@@ -2812,6 +2915,8 @@ pub struct PipelineEntry {
     state: PipelineState,
     raw_state: Vec<u8>,
     reuse_count: u64,
+    /// Compute `[numthreads(x,y,z)]` decoded from the pipeline's state chunk.
+    compute_threadgroup: Option<[u32; 3]>,
 }
 
 impl PipelineEntry {
@@ -2843,6 +2948,12 @@ impl PipelineEntry {
     /// How many later registrations reused this object.
     pub fn reuse_count(&self) -> u64 {
         self.reuse_count
+    }
+
+    /// The compute `[numthreads(x,y,z)]` this pipeline declared, when its
+    /// translated container's `PSV0` carried one.
+    pub fn compute_threadgroup(&self) -> Option<[u32; 3]> {
+        self.compute_threadgroup
     }
 
     /// Raw `MTLComputePipelineState`/`MTLRenderPipelineState` handle.
@@ -2887,6 +2998,7 @@ impl PipelineRegistry {
         entry: &str,
         state: &[u8],
     ) -> Result<PipelineId, RegistryError> {
+        let compute_threadgroup = compute_threadgroup_from_state(state)?;
         self.register(
             key,
             metallib,
@@ -2894,6 +3006,7 @@ impl PipelineRegistry {
             state,
             PipelineStage::Compute,
             PipelineState::default(),
+            compute_threadgroup,
         )
     }
 
@@ -2910,7 +3023,7 @@ impl PipelineRegistry {
     ) -> Result<PipelineId, RegistryError> {
         let parsed = PipelineState::decode_for(state, PipelineStage::Graphics)?;
         require_entries(&parsed, PipelineStage::Graphics)?;
-        self.register(key, metallib, entry, state, PipelineStage::Graphics, parsed)
+        self.register(key, metallib, entry, state, PipelineStage::Graphics, parsed, None)
     }
 
     /// Registers (or reuses) a mesh pipeline from metallib bytes.
@@ -2927,7 +3040,7 @@ impl PipelineRegistry {
     ) -> Result<PipelineId, RegistryError> {
         let parsed = PipelineState::decode_for(state, PipelineStage::Mesh)?;
         require_entries(&parsed, PipelineStage::Mesh)?;
-        self.register(key, metallib, entry, state, PipelineStage::Mesh, parsed)
+        self.register(key, metallib, entry, state, PipelineStage::Mesh, parsed, None)
     }
 
     /// Registers (or reuses) a graphics pipeline from one library per stage.
@@ -2950,7 +3063,7 @@ impl PipelineRegistry {
             PipelineStage::Graphics,
             &parsed,
         )?;
-        self.register_stages(key, stages, state, PipelineStage::Graphics, parsed)
+        self.register_stages(key, stages, state, PipelineStage::Graphics, parsed, None)
     }
 
     /// Registers (or reuses) a mesh pipeline from one library per stage.
@@ -2976,7 +3089,7 @@ impl PipelineRegistry {
             &[FunctionRole::Mesh, FunctionRole::Fragment]
         };
         validate_stage_set(stages, roles, PipelineStage::Mesh, &parsed)?;
-        self.register_stages(key, stages, state, PipelineStage::Mesh, parsed)
+        self.register_stages(key, stages, state, PipelineStage::Mesh, parsed, None)
     }
 
     /// Registers (or reuses) a compute pipeline from one library per stage.
@@ -2997,12 +3110,14 @@ impl PipelineRegistry {
             PipelineStage::Compute,
             &PipelineState::default(),
         )?;
+        let compute_threadgroup = compute_threadgroup_from_state(state)?;
         self.register_stages(
             key,
             stages,
             state,
             PipelineStage::Compute,
             PipelineState::default(),
+            compute_threadgroup,
         )
     }
 
@@ -3014,6 +3129,7 @@ impl PipelineRegistry {
         state: &[u8],
         stage: PipelineStage,
         parsed_state: PipelineState,
+        compute_threadgroup: Option<[u32; 3]>,
     ) -> Result<PipelineId, RegistryError> {
         if stages.iter().any(|entry| entry.entry.is_empty()) {
             return Err(RegistryError::EntryPointNotFound(String::new()));
@@ -3038,7 +3154,7 @@ impl PipelineRegistry {
             }
             PipelineStage::Compute => create_compute_pso_stages(self.device.as_raw(), stages)?,
         };
-        Ok(self.insert_pipeline(key, stage, object, parsed_state, state))
+        Ok(self.insert_pipeline(key, stage, object, parsed_state, state, compute_threadgroup))
     }
 
     fn register(
@@ -3049,6 +3165,7 @@ impl PipelineRegistry {
         state: &[u8],
         stage: PipelineStage,
         parsed_state: PipelineState,
+        compute_threadgroup: Option<[u32; 3]>,
     ) -> Result<PipelineId, RegistryError> {
         if entry.is_empty() {
             return Err(RegistryError::EntryPointNotFound(String::new()));
@@ -3074,7 +3191,7 @@ impl PipelineRegistry {
             }
         };
 
-        Ok(self.insert_pipeline(key, stage, object, parsed_state, state))
+        Ok(self.insert_pipeline(key, stage, object, parsed_state, state, compute_threadgroup))
     }
 
     /// Records one created object under its content key.
@@ -3085,6 +3202,7 @@ impl PipelineRegistry {
         object: ObjcObject,
         parsed_state: PipelineState,
         state: &[u8],
+        compute_threadgroup: Option<[u32; 3]>,
     ) -> PipelineId {
         let id = PipelineId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -3097,6 +3215,7 @@ impl PipelineRegistry {
             state: parsed_state,
             raw_state: state.to_vec(),
             reuse_count: 0,
+            compute_threadgroup,
         };
         self.by_id.insert(id.0, key.clone());
         self.pipelines.insert(key, entry);
@@ -6033,5 +6152,119 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
             "gpu proof: every creation and view succeeded ({} textures)",
             registry.len()
         );
+    }
+
+    /// The compute threadgroup chunk round-trips and a malformed record is a
+    /// named refusal, never a guessed size.
+    #[test]
+    fn compute_threadgroup_state_round_trips_and_rejects_malformed_records() {
+        assert_eq!(
+            compute_threadgroup_from_state(&[]).unwrap(),
+            None,
+            "an empty compute state records no size"
+        );
+        assert_eq!(
+            compute_threadgroup_from_state(b"VPS1 opaque compute state").unwrap(),
+            None,
+            "historical opaque compute state keeps its meaning"
+        );
+
+        let encoded = encode_compute_threadgroup_state([16, 4, 1]);
+        assert_eq!(encoded.len(), COMPUTE_THREADGROUP_LEN);
+        assert_eq!(
+            compute_threadgroup_from_state(&encoded).unwrap(),
+            Some([16, 4, 1])
+        );
+        assert!(
+            encode_compute_threadgroup_state([0, 4, 1]).is_empty(),
+            "an unknown size contributes no state bytes"
+        );
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(matches!(
+            compute_threadgroup_from_state(&truncated),
+            Err(RegistryError::InvalidState(
+                "compute threadgroup record has the wrong length"
+            ))
+        ));
+
+        let mut bad_version = encoded.clone();
+        bad_version[4] = 9;
+        assert!(matches!(
+            compute_threadgroup_from_state(&bad_version),
+            Err(RegistryError::InvalidState(
+                "compute threadgroup record has an unknown version"
+            ))
+        ));
+
+        let mut zero = encoded;
+        zero[5..7].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            compute_threadgroup_from_state(&zero),
+            Err(RegistryError::InvalidState(
+                "compute threadgroup record declares a zero dimension"
+            ))
+        ));
+    }
+
+    /// The `PSV0` runtime-info parse reads a real compute container's declared
+    /// `numthreads` and refuses a graphics container.
+    #[test]
+    fn compute_threadgroup_from_psv0_reads_only_a_compute_stage() {
+        let psv = |stage: u8, threads: [u16; 3]| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&48u32.to_le_bytes());
+            let mut info = [0u8; 48];
+            info[24] = stage;
+            for (index, value) in threads.into_iter().enumerate() {
+                info[36 + 4 * index..40 + 4 * index].copy_from_slice(&u32::from(value).to_le_bytes());
+            }
+            out.extend_from_slice(&info);
+            out
+        };
+        let container = |psv: &[u8]| {
+            // `DXBC` header + one part table entry, enough for `Container::parse`.
+            const HEADER: usize = 0x20;
+            let table = HEADER + 4;
+            let total = table + 8 + psv.len();
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(b"DXBC");
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&(total as u32).to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(table as u32).to_le_bytes());
+            out.extend_from_slice(b"PSV0");
+            out.extend_from_slice(&(psv.len() as u32).to_le_bytes());
+            out.extend_from_slice(psv);
+            out
+        };
+
+        // Stage 5 is compute; the PSV0 runtime info carries 16x4x1.
+        assert_eq!(
+            compute_threadgroup_from_dxil_container(&container(&psv(5, [16, 4, 1]))),
+            Some([16, 4, 1])
+        );
+        // A pixel shader's PSV0 has no threadgroup fields to read, even when
+        // the bytes at those offsets are nonzero.
+        assert_eq!(
+            compute_threadgroup_from_dxil_container(&container(&psv(0, [16, 4, 1]))),
+            None
+        );
+        // A runtime info block shorter than version 2 is not a source.
+        let mut short = psv(5, [16, 4, 1]);
+        short[0..4].copy_from_slice(&40u32.to_le_bytes());
+        short.truncate(4 + 40);
+        assert_eq!(
+            compute_threadgroup_from_dxil_container(&container(&short)),
+            None
+        );
+        // A container with no PSV0 part is not a source.
+        let mut no_psv = container(&psv(5, [16, 4, 1]));
+        let part_at = 0x20 + 4;
+        no_psv[part_at..part_at + 4].copy_from_slice(b"NOPE");
+        assert_eq!(compute_threadgroup_from_dxil_container(&no_psv), None);
     }
 }

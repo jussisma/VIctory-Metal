@@ -884,6 +884,9 @@ pub struct MetalProducer {
     compute_views: BTreeMap<u16, RootBufferView>,
     compute_tables: BTreeMap<(u16, u16), DescriptorTableV3>,
     compute_local_size: Option<[u32; 3]>,
+    /// Whether `compute_local_size` was applied automatically from the
+    /// registered pipeline (as opposed to set explicitly by a caller).
+    compute_local_size_auto: bool,
     emitted_compute_pipeline: Option<u64>,
     emitted_mesh_pipeline: Option<u64>,
     commands: Vec<CommandV3>,
@@ -919,6 +922,7 @@ impl MetalProducer {
             compute_views: BTreeMap::new(),
             compute_tables: BTreeMap::new(),
             compute_local_size: None,
+            compute_local_size_auto: false,
             emitted_compute_pipeline: None,
             emitted_mesh_pipeline: None,
             commands: Vec::new(),
@@ -2168,7 +2172,12 @@ impl MetalProducer {
     /// than guessed.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), ProducerError> {
         if x == 0 || y == 0 || z == 0 {
-            return Ok(());
+            // A zero group count is refused explicitly: it must never encode a
+            // dispatch the host would silently drop.
+            return Err(ProducerError::unsupported_opcode(
+                "Dispatch: zero group count",
+                OP_DISPATCH_3D,
+            ));
         }
         let Some(pipeline_id) = self.compute_pipeline else {
             return Err(ProducerError::MissingPipeline { stage: "compute" });
@@ -2203,6 +2212,10 @@ impl MetalProducer {
     }
 
     /// The local threads per threadgroup of the compute pipeline.
+    ///
+    /// An explicit call overrides the size the pipeline registration recorded
+    /// and is kept across a later `SetComputePipeline` (a caller that knows the
+    /// size better than the container may set it before or after the bind).
     pub fn set_compute_threadgroup_size(&mut self, size: [u32; 3]) -> Result<(), ProducerError> {
         if size.iter().any(|&dimension| dimension == 0) {
             return Err(ProducerError::unsupported_opcode(
@@ -2211,6 +2224,7 @@ impl MetalProducer {
             ));
         }
         self.compute_local_size = Some(size);
+        self.compute_local_size_auto = false;
         Ok(())
     }
 
@@ -2277,6 +2291,15 @@ impl MetalProducer {
     }
 
     /// Selects the compute pipeline used by [`dispatch`](Self::dispatch).
+    ///
+    /// This is the production caller of
+    /// [`set_compute_threadgroup_size`](Self::set_compute_threadgroup_size): a
+    /// pipeline whose registration discovered its translated `[numthreads]`
+    /// applies that size here automatically. A pipeline with no discoverable
+    /// size leaves the historical refusal in place and is a named, counted
+    /// class — never a `[1, 1, 1]` default. An explicitly set size survives the
+    /// bind; a size auto-applied for a previous pipeline does not leak to one
+    /// with no record.
     pub fn set_compute_pipeline(&mut self, pipeline_id: u64) -> Result<(), ProducerError> {
         if pipeline_id == 0 {
             return Err(ProducerError::InvalidResource {
@@ -2284,6 +2307,25 @@ impl MetalProducer {
             });
         }
         self.compute_pipeline = Some(pipeline_id);
+        match crate::native_metal::pso::compute_threadgroup_for(pipeline_id) {
+            Some(size) => {
+                self.compute_local_size = Some(size);
+                self.compute_local_size_auto = true;
+                crate::native_metal::pso::compute_threadgroup_census::note(
+                    crate::native_metal::pso::compute_threadgroup_census::APPLIED,
+                );
+            }
+            None => {
+                // Do not reuse a size auto-applied for a different pipeline.
+                if self.compute_local_size_auto {
+                    self.compute_local_size = None;
+                    self.compute_local_size_auto = false;
+                }
+                crate::native_metal::pso::compute_threadgroup_census::note(
+                    crate::native_metal::pso::compute_threadgroup_census::UNAPPLIED,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4410,6 +4452,72 @@ mod tests {
             }
             other => panic!("second command is {other:?}"),
         }
+    }
+
+    /// A registered compute pipeline applies the `[numthreads]` its container
+    /// declared, with no explicit `set_compute_threadgroup_size` call.
+    #[test]
+    fn a_registered_compute_pipeline_applies_its_threadgroup_automatically() {
+        let pipeline_id = 0xC20_0001;
+        crate::native_metal::pso::record_compute_threadgroup(pipeline_id, [16, 4, 1]);
+        assert_eq!(
+            crate::native_metal::pso::compute_threadgroup_for(pipeline_id),
+            Some([16, 4, 1])
+        );
+
+        let mut producer = MetalProducer::new(0xC20, 1).expect("producer");
+        producer
+            .set_compute_pipeline(pipeline_id)
+            .expect("compute pipeline");
+        producer.dispatch(2, 1, 1).expect("dispatch");
+        let submission = producer.flush().expect("flush");
+        match &submission.commands[1] {
+            CommandV3::Dispatch3d(dispatch) => {
+                assert_eq!(dispatch.threads_per_group, [16, 4, 1]);
+            }
+            other => panic!("second command is {other:?}"),
+        }
+    }
+
+    /// A pipeline with no discoverable record is refused by name, and a zero
+    /// group count is refused rather than silently dropped.
+    #[test]
+    fn a_missing_threadgroup_record_and_a_zero_group_count_are_named_refusals() {
+        let unknown = 0xC20_00FF;
+        assert_eq!(
+            crate::native_metal::pso::compute_threadgroup_for(unknown),
+            None,
+            "the id carries no record"
+        );
+        let mut producer = MetalProducer::new(0xC21, 1).expect("producer");
+        producer
+            .set_compute_pipeline(unknown)
+            .expect("compute pipeline");
+        let error = producer
+            .dispatch(1, 1, 1)
+            .expect_err("no discoverable threadgroup size");
+        assert_eq!(
+            error.opcode(),
+            Some(OP_DISPATCH_3D),
+            "the refusal names the dispatch site"
+        );
+        assert!(
+            error.to_string().contains("compute threadgroup size not set"),
+            "the refusal names the missing size: {error}"
+        );
+
+        let pipeline_id = 0xC20_0002;
+        crate::native_metal::pso::record_compute_threadgroup(pipeline_id, [8, 1, 1]);
+        producer
+            .set_compute_pipeline(pipeline_id)
+            .expect("compute pipeline");
+        let error = producer
+            .dispatch(0, 1, 1)
+            .expect_err("a zero group count is refused");
+        assert!(
+            error.to_string().contains("zero group count"),
+            "the refusal names the zero group count: {error}"
+        );
     }
 
     /// `flush` is sequence-free: the transport (the native queue at enqueue,
