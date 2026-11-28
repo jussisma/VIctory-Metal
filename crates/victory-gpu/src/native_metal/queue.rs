@@ -144,8 +144,11 @@ pub struct OutboundFrame {
     pub list: Option<ListIdentity>,
     /// Canonical v3 encoded bytes, handed to the sink unchanged.
     pub bytes: Vec<u8>,
-    /// Encoded `VRAB` root-argument plan of the recorded arguments, or `None`
-    /// when the list recorded no root argument.
+    /// Encoded `VRAB` root-argument plan of the recorded arguments.
+    ///
+    /// Every frame this queue enqueues carries a plan section: an empty plan is
+    /// the versioned header alone, never `None`. `None` remains only for a
+    /// frame built by an older path that predates the section.
     pub plan: Option<Vec<u8>>,
     /// The first work/handle-bearing command, for a refusal diagnostic.
     pub(crate) probe: Option<RefusalProbe>,
@@ -420,11 +423,13 @@ impl<S: V3Sink> NativeQueue<S> {
     /// [`Self::enqueue`] with the root-argument plan each submission recorded.
     ///
     /// `plans` is index-aligned with `submissions`: the plan at index `i`
-    /// belongs to the submission at index `i`. A missing plan, or an empty one,
-    /// is not an error and not a section: the frame goes out exactly as it did
-    /// before the plan existed. A plan the encoder refuses fails the whole batch
-    /// with [`NativeQueueError::Plan`] before anything is queued, so a refused
-    /// batch never leaves a partial prefix behind.
+    /// belongs to the submission at index `i`. Every frame carries a plan
+    /// section: a missing or empty plan is encoded as the empty `VRAB` header,
+    /// which the host decodes as "no entries", so a batch that binds no root
+    /// constant still carries the pipeline's declared plan. A plan the encoder
+    /// refuses fails the whole batch with [`NativeQueueError::Plan`] before
+    /// anything is queued, so a refused batch never leaves a partial prefix
+    /// behind.
     pub fn enqueue_with_root_arguments(
         &mut self,
         submissions: &[SubmissionV3],
@@ -443,15 +448,16 @@ impl<S: V3Sink> NativeQueue<S> {
                 // see, or every later frame is a protocol violation.
                 continue;
             }
-            let plan = match plans.get(index) {
-                Some(plan) if !plan.is_empty() => {
-                    Some(
-                        bindings::encode_root_arguments(plan)
-                            .map_err(|error| NativeQueueError::Plan(error.to_string()))?,
-                    )
-                }
-                _ => None,
-            };
+            // Every frame carries a plan section, even when the list recorded no
+            // root argument: an empty plan is the seven-byte `VRAB` header, which
+            // the host decodes as "plan present, no entries". A frame without the
+            // section remains legal for older guests, but this guest never sends
+            // one, so a batch that binds no root constant still describes its
+            // pipeline's declared root arguments.
+            let plan = Some(
+                bindings::encode_root_arguments(plans.get(index).copied().unwrap_or(&[]))
+                    .map_err(|error| NativeQueueError::Plan(error.to_string()))?,
+            );
             // A submitted stream leaves the producer unassigned; assign it
             // here, exactly once, in recorded order. A frame that already
             // carries a sequence keeps it.
@@ -3043,7 +3049,7 @@ mod tests {
                 for status in statuses {
                     let (kind, payload) = read_frame(&mut stream);
                     assert_eq!(kind, KIND_SUBMISSION_V3);
-                    let inner = decode_submission_v3(&payload[16..]).expect("carried v3 frame");
+                    let inner = carried_submission(&payload);
                     sender.send(inner).expect("report the submission");
                     let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
                         sequence: u32::from_le_bytes([
@@ -3105,6 +3111,16 @@ mod tests {
             .expect("server length");
         stream.write_all(payload).expect("server payload");
         stream.flush().expect("server flush");
+    }
+
+    /// The submission inside a version 3 request envelope.
+    ///
+    /// The envelope declares the submission length at bytes 12..16; everything
+    /// after it is the optional root-argument plan section, which is not part of
+    /// the submission frame.
+    fn carried_submission(payload: &[u8]) -> SubmissionV3 {
+        let declared = u32::from_le_bytes(payload[12..16].try_into().expect("four bytes")) as usize;
+        decode_submission_v3(&payload[16..16 + declared]).expect("carried v3 frame")
     }
 
     /// A sink that refuses the first `failures` sends and then records frames.
@@ -3747,7 +3763,7 @@ mod tests {
             write_frame(stream, KIND_ACK, &[0]);
             let (kind, payload) = read_frame(stream);
             assert_eq!(kind, KIND_SUBMISSION_V3);
-            let inner = decode_submission_v3(&payload[16..]).expect("a v3 submission");
+            let inner = carried_submission(&payload);
             carried.send(inner).expect("report the present");
             let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
                 sequence: u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]),
@@ -4878,8 +4894,9 @@ mod tests {
         );
     }
 
-    /// A plan at the entry cap and an empty plan are both carried unchanged; an
-    /// empty plan is not a section at all.
+    /// A plan at the entry cap is carried unchanged, and an empty plan is
+    /// carried as the versioned header alone (the host decodes it as present
+    /// with no entries) instead of being dropped.
     #[test]
     fn a_capped_plan_and_an_empty_plan_are_both_carried() {
         let (recorded, plan) = compute_producer(402, |producer| {
@@ -4914,14 +4931,25 @@ mod tests {
             bindings::MAX_ROOT_ARGUMENTS
         );
 
-        // An empty plan is not sent at all: the frame is exactly the one this
-        // queue carried before the plan existed.
+        // Every submission carries a plan section. An empty plan is the
+        // versioned header alone, which the host decodes as "present, no
+        // entries"; the submission frame itself is unchanged.
         let unplanned = submission(7, 402, 1);
         queue
             .submit_with_root_arguments(std::slice::from_ref(&unplanned), &[&[]])
-            .expect("an empty plan is not a section");
+            .expect("an empty plan is still a plan section");
         let (bytes, carried) = &queue.sink().frames[1];
-        assert!(carried.is_none(), "an empty plan is never a section");
+        let carried = carried.as_ref().expect("the empty plan section is carried");
+        assert_eq!(
+            carried.len(),
+            7,
+            "an empty plan is the seven-byte versioned header"
+        );
+        assert!(
+            bindings::decode_root_arguments(carried)
+                .expect("an empty plan decodes")
+                .is_empty()
+        );
         assert_eq!(
             decode_submission_v3(bytes).expect("the frame decodes"),
             unplanned

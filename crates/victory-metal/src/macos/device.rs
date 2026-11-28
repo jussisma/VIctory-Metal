@@ -3058,6 +3058,21 @@ pub struct PipelineAbi {
     pub root_parameters: Option<RootParameterMap>,
 }
 
+/// Outcome of resolving a wire `DescriptorTableV3.set` against one pipeline.
+///
+/// An ambiguous ordinal is never resolved to one stage's table: two stages
+/// declaring different tables at the same ordinal is a signature this backend
+/// cannot map deterministically, so it is refused by name and counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorTableSet {
+    /// The set names this declared descriptor-table parameter.
+    Declared(RootParameterSlot),
+    /// Two shader stages declare different tables at this ordinal.
+    Ambiguous,
+    /// The signature declares no table at this ordinal.
+    Missing,
+}
+
 impl PipelineAbi {
     /// ABI of a vertex/fragment graphics pipeline.
     pub fn graphics(
@@ -3134,43 +3149,120 @@ impl PipelineAbi {
     /// A wire `DescriptorTableV3.set` is the table's *ordinal* among the
     /// pipeline's descriptor tables, not a flattened root-parameter index
     /// (a signature may declare root constants or root views before it). The
-    /// authoritative map is enumerated in slot order; without one, the stage
-    /// layouts are walked in registration order and a table declared by two
-    /// stages counts once.
+    /// resolution order is [`Self::descriptor_table_for_set`]; this helper keeps
+    /// the legacy `Option` shape for callers that only need the resolved slot.
     pub fn root_parameter_for_table(&self, set: usize) -> Option<RootParameterSlot> {
+        match self.descriptor_table_for_set(set) {
+            DescriptorTableSet::Declared(slot) => Some(slot),
+            DescriptorTableSet::Ambiguous | DescriptorTableSet::Missing => None,
+        }
+    }
+
+    /// Resolves wire descriptor-table set `set` by the documented deterministic
+    /// rule.
+    ///
+    /// 1. The authoritative root-parameter map (the translated versioned root
+    ///    signature) is enumerated in **slot order**; its descriptor tables are
+    ///    ordinals `0..`, and a set that names one resolves to it.
+    /// 2. Tables declared only by a stage's converter reflection are appended in
+    ///    stage registration order (vertex, fragment, mesh, object, compute),
+    ///    de-duplicated against the map and against earlier stages by
+    ///    `(space, register, kind)`; a reflected `u32::MAX` field is a wildcard
+    ///    and matches any value, because the converter reports every table's
+    ///    slot/space that way.
+    /// 3. If two stages declare **different** tables at the same ordinal, the
+    ///    ordinal is ambiguous: it is refused by name rather than resolved to
+    ///    one stage's table.
+    ///
+    /// A set past every declared ordinal is [`DescriptorTableSet::Missing`]; the
+    /// caller may then try it as a flattened root-parameter index, never as a
+    /// guess.
+    pub fn descriptor_table_for_set(&self, set: usize) -> DescriptorTableSet {
+        // 1. Authoritative map ordinal.
+        let mut map_tables = 0usize;
         if let Some(map) = self.root_parameters.as_ref() {
-            let mut ordinal = 0usize;
             for slot in map.slots() {
                 if matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
-                    if ordinal == set {
-                        return Some(*slot);
+                    if map_tables == set {
+                        return DescriptorTableSet::Declared(*slot);
                     }
-                    ordinal += 1;
+                    map_tables += 1;
                 }
             }
-            // The authoritative map may not describe this table (a signature
-            // family whose table the converter reflects differently, or a map
-            // that parsed but declared no table at this ordinal). The stage
-            // layouts are the same fallback the legacy constructors use, so a
-            // valid gate/title pipeline is never dropped for a partial map.
         }
-        let mut tables: Vec<RootParameterSlot> = Vec::new();
+
+        // 2. Stage-layout ordinal, refusing an ordinal two stages describe
+        // differently. A stage with fewer tables than `set` contributes nothing.
+        let mut candidate: Option<RootParameterSlot> = None;
+        let mut ambiguous = false;
         for layout in self.layouts() {
-            for parameter in layout.parameters() {
-                if matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
-                    let candidate = RootParameterSlot::new(
+            let table = layout
+                .parameters()
+                .iter()
+                .filter(|parameter| {
+                    matches!(parameter.kind(), RootParameterKind::DescriptorTable(_))
+                })
+                .nth(set)
+                .map(|parameter| {
+                    RootParameterSlot::new(
                         parameter.space(),
                         parameter.register(),
                         parameter.kind(),
                         parameter.size(),
-                    );
-                    if !tables.contains(&candidate) {
-                        tables.push(candidate);
-                    }
-                }
+                    )
+                });
+            let Some(table) = table else {
+                continue;
+            };
+            match candidate {
+                None => candidate = Some(table),
+                Some(previous) if same_descriptor_table(&previous, &table) => {}
+                Some(_) => ambiguous = true,
             }
         }
-        tables.get(set).copied()
+        if ambiguous {
+            return DescriptorTableSet::Ambiguous;
+        }
+        let Some(candidate) = candidate else {
+            return DescriptorTableSet::Missing;
+        };
+
+        // The candidate is the table at stage ordinal `set`. Ordinals below the
+        // map's table count were already resolved from the map, so this one lies
+        // past every table the authoritative signature describes: it is a
+        // stage-only declaration, appended in ordinal order. A reflected
+        // `u32::MAX` field is a wildcard, so an identity match against a map
+        // table here would wrongly collapse two real tables; position is the
+        // only deterministic identity the reflection retains.
+        DescriptorTableSet::Declared(candidate)
+    }
+
+    /// Number of descriptor tables the pipeline declares.
+    ///
+    /// This is the larger of the authoritative map's table count and the widest
+    /// stage's table count. It is used only by the bounded refusal census, so an
+    /// ambiguous ordinal is attributed, never accepted.
+    pub fn declared_descriptor_table_count(&self) -> usize {
+        let map_tables = self.root_parameters.as_ref().map_or(0, |map| {
+            map.slots()
+                .iter()
+                .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
+                .count()
+        });
+        let widest_stage = self
+            .layouts()
+            .map(|layout| {
+                layout
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| {
+                        matches!(parameter.kind(), RootParameterKind::DescriptorTable(_))
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        map_tables.max(widest_stage)
     }
 
     /// Every stage layout this ABI carries, in registration order.
@@ -3273,6 +3365,34 @@ impl PipelineAbi {
         }
         stages
     }
+}
+
+/// Whether two declared descriptor tables name the same table.
+///
+/// Converter reflection reports a table's slot and space as `u32::MAX`, so
+/// those fields are wildcards: two references that differ only in an unknown
+/// field are the same table, while two concrete declarations with different
+/// `(space, register)` are different tables. Descriptor range kinds obey the
+/// same rule, with [`DescriptorTableKind::Unspecified`] matching any concrete
+/// kind.
+fn same_descriptor_table(left: &RootParameterSlot, right: &RootParameterSlot) -> bool {
+    let (
+        RootParameterKind::DescriptorTable(left_kind),
+        RootParameterKind::DescriptorTable(right_kind),
+    ) = (left.kind(), right.kind())
+    else {
+        return false;
+    };
+    let kind_matches = left_kind == right_kind
+        || left_kind == DescriptorTableKind::Unspecified
+        || right_kind == DescriptorTableKind::Unspecified;
+    let space_matches = left.space() == right.space()
+        || left.space() == u32::MAX
+        || right.space() == u32::MAX;
+    let register_matches = left.register() == right.register()
+        || left.register() == u32::MAX
+        || right.register() == u32::MAX;
+    kind_matches && space_matches && register_matches
 }
 
 /// One sampler created for a converted sampler descriptor table.
@@ -4448,6 +4568,104 @@ fn resolve_wire_root_argument(
 }
 
 
+/// Resolves one wire `SetDescriptorTable` `set` to a declared table parameter.
+///
+/// Order, identical for the compute and graphics arms:
+///
+/// 1. a plan entry for the set wins; a plan entry naming a non-table argument is
+///    a counted ABI refusal (and a census key, because it explains the miss);
+/// 2. the deterministic ordinal rule of
+///    [`PipelineAbi::descriptor_table_for_set`]; an ambiguous ordinal is
+///    refused by name rather than guessed;
+/// 3. the set as a flattened root-parameter index, when that slot really is a
+///    table (the legacy guest shape);
+/// 4. a named, counted refusal.
+fn resolve_descriptor_table_set(
+    transport: &DirectMetalTransport,
+    abi: &PipelineAbi,
+    plan: Option<&RootParameterPlan>,
+    pipeline_id: u64,
+    set: u16,
+) -> Result<RootParameterSlot, PrepareAbort> {
+    let entry = plan.and_then(|plan| plan.entry(set));
+    if let Some(entry) = entry {
+        if entry.kind != PlanArgumentKind::DescriptorTable {
+            note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+            transport.count_abi_refusal();
+            return Err(MetalError::InvalidArg(
+                "descriptor table plan names a non-table root argument",
+            )
+            .into());
+        }
+        return match planned_root_parameter(
+            transport,
+            abi,
+            entry,
+            PlanArgumentKind::DescriptorTable,
+            "descriptor table plan names a non-table root argument",
+        ) {
+            Ok(slot) => Ok(slot),
+            Err(error) => {
+                // A plan entry that names no declared table is still a refusal
+                // this boot must be able to attribute.
+                note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+                Err(error)
+            }
+        };
+    }
+
+    let index = usize::from(set);
+    transport.count_legacy_root_binding();
+    match abi.descriptor_table_for_set(index) {
+        DescriptorTableSet::Declared(slot) => return Ok(slot),
+        DescriptorTableSet::Ambiguous => {
+            note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+            transport.count_abi_refusal();
+            return Err(MetalError::InvalidArg(
+                "descriptor table set is ambiguous across shader stages",
+            )
+            .into());
+        }
+        DescriptorTableSet::Missing => {}
+    }
+
+    // The wire's historical shape names the table's flattened root-parameter
+    // index. Accept it only when the map/layout declares a table there; a
+    // constants or root-view slot is never reinterpreted as a table.
+    if let Some(slot) = abi.root_parameter(index)
+        && matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
+    {
+        return Ok(slot);
+    }
+
+    note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+    transport.count_abi_refusal();
+    Err(MetalError::InvalidArg("descriptor table names no declared root parameter").into())
+}
+
+/// Records one descriptor-table miss under the bounded census key.
+fn note_descriptor_table_refusal(
+    abi: &PipelineAbi,
+    plan: Option<&RootParameterPlan>,
+    pipeline_id: u64,
+    set: u16,
+) {
+    let declared_tables =
+        u16::try_from(abi.declared_descriptor_table_count()).unwrap_or(u16::MAX);
+    let plan_kind = plan
+        .and_then(|plan| plan.entry(set))
+        .map_or("none", |entry| entry.kind.name());
+    crate::macos::trace::note_descriptor_table_refusal(
+        crate::macos::trace::DescriptorTableRefusalKey {
+            pipeline_id,
+            wire_set: set,
+            declared_tables,
+            had_plan: plan.is_some(),
+            plan_kind,
+        },
+    );
+}
+
 fn flush_abi(
     transport: &DirectMetalTransport,
     state: &mut DeviceState,
@@ -5057,18 +5275,21 @@ fn prepare_compute_segment(
     let mut ops = Vec::new();
     let mut abi: Option<PipelineAbi> = None;
     let mut pending = AbiPending::default();
+    let mut current_pipeline_id = 0u64;
     for index in range {
         match &commands[index] {
             CommandV3::SetComputePipeline(pipeline) => {
                 let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
                 pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                current_pipeline_id = pipeline.pipeline_id;
                 ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
             CommandV3::SetPipeline(pipeline) => {
                 let pso = resolve_compute_pipeline(state, pipeline.pipeline_id)?;
                 pending.clear();
                 abi = pipeline_abi(state, pipeline.pipeline_id);
+                current_pipeline_id = pipeline.pipeline_id;
                 ops.push(PreparedComputeOp::Pipeline(pso.raw));
             }
             CommandV3::Dispatch1d(dispatch) => {
@@ -5267,39 +5488,17 @@ fn prepare_compute_segment(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    // A plan entry names the translated table by its
-                    // `(space, base register)`; without one the wire set index
-                    // is the flattened parameter index on this path, and a
-                    // signature that also declares non-table parameters first
-                    // may instead send the table's ordinal. Try the index, then
-                    // the ordinal, and only then refuse.
-                    let set = usize::from(table.set);
-                    let slot = match root_plan.and_then(|plan| plan.entry(table.set)) {
-                        Some(entry) => planned_root_parameter(
-                            transport,
-                            active,
-                            entry,
-                            PlanArgumentKind::DescriptorTable,
-                            "descriptor table plan names a non-table root argument",
-                        )?,
-                        None => {
-                            transport.count_legacy_root_binding();
-                            let Some(slot) = active
-                                .root_parameter(set)
-                                .filter(|slot| {
-                                    matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
-                                })
-                                .or_else(|| active.root_parameter_for_table(set))
-                            else {
-                                transport.count_abi_refusal();
-                                return Err(MetalError::InvalidArg(
-                                    "descriptor table names no declared root parameter",
-                                )
-                                .into());
-                            };
-                            slot
-                        }
-                    };
+                    // The plan entry wins; without one the deterministic
+                    // ordinal rule resolves the set, then the legacy flattened
+                    // index. A set that names none of those is refused by name
+                    // and counted (see `resolve_descriptor_table_set`).
+                    let slot = resolve_descriptor_table_set(
+                        transport,
+                        active,
+                        root_plan,
+                        current_pipeline_id,
+                        table.set,
+                    )?;
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -6203,39 +6402,17 @@ fn build_render_ops(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    // A plan entry names the translated table by its
-                    // `(space, base register)`; without one the wire set index
-                    // is the flattened parameter index on this path, and a
-                    // signature that also declares non-table parameters first
-                    // may instead send the table's ordinal. Try the index, then
-                    // the ordinal, and only then refuse.
-                    let set = usize::from(table.set);
-                    let slot = match root_plan.and_then(|plan| plan.entry(table.set)) {
-                        Some(entry) => planned_root_parameter(
-                            transport,
-                            active,
-                            entry,
-                            PlanArgumentKind::DescriptorTable,
-                            "descriptor table plan names a non-table root argument",
-                        )?,
-                        None => {
-                            transport.count_legacy_root_binding();
-                            let Some(slot) = active
-                                .root_parameter(set)
-                                .filter(|slot| {
-                                    matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
-                                })
-                                .or_else(|| active.root_parameter_for_table(set))
-                            else {
-                                transport.count_abi_refusal();
-                                return Err(MetalError::InvalidArg(
-                                    "descriptor table names no declared root parameter",
-                                )
-                                .into());
-                            };
-                            slot
-                        }
-                    };
+                    // The plan entry wins; without one the deterministic
+                    // ordinal rule resolves the set, then the legacy flattened
+                    // index. A set that names none of those is refused by name
+                    // and counted (see `resolve_descriptor_table_set`).
+                    let slot = resolve_descriptor_table_set(
+                        transport,
+                        active,
+                        root_plan,
+                        current_pipeline_id,
+                        table.set,
+                    )?;
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -9517,6 +9694,139 @@ mod tests {
             Some(RootParameterKind::Constants)
         ));
         assert!(abi.root_parameter_for_table(2).is_none());
+    }
+
+    /// Converter reflection reports every table's slot and space as `u32::MAX`.
+    /// The ordinal comes from the table's position in the stage layout, so two
+    /// reflected tables stay two distinct sets instead of collapsing into one.
+    #[test]
+    fn reflected_wildcard_tables_keep_their_ordinals() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: u32::MAX,
+                    space: u32::MAX,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: u32::MAX,
+                    space: u32::MAX,
+                },
+            ],
+        )
+        .expect("three root parameters");
+        let abi = super::PipelineAbi::graphics(None, Some(layout));
+        assert!(matches!(
+            abi.descriptor_table_for_set(0),
+            super::DescriptorTableSet::Declared(_)
+        ));
+        assert!(matches!(
+            abi.descriptor_table_for_set(1),
+            super::DescriptorTableSet::Declared(_)
+        ));
+        // The flattened slot at index 1 is the constants block, so this must be
+        // the ordinal rule, not the legacy flattened-index lookup.
+        assert!(matches!(
+            abi.root_parameter(1).map(|slot| slot.kind()),
+            Some(RootParameterKind::Constants)
+        ));
+        assert_eq!(abi.declared_descriptor_table_count(), 2);
+        assert!(matches!(
+            abi.descriptor_table_for_set(2),
+            super::DescriptorTableSet::Missing
+        ));
+    }
+
+    /// Two stages declaring different tables at the same ordinal are ambiguous:
+    /// the resolver refuses rather than picking one stage's table.
+    #[test]
+    fn a_table_ordinal_two_stages_disagree_on_is_ambiguous() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        let table = |register: u32, stage: ReflectedStage| {
+            RootSignatureLayout::from_parameters(
+                stage,
+                &[RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register,
+                    space: 1,
+                }],
+            )
+            .expect("one table")
+        };
+        let abi = super::PipelineAbi::graphics(
+            Some(table(0, ReflectedStage::Vertex)),
+            Some(table(1, ReflectedStage::Fragment)),
+        );
+        assert_eq!(
+            abi.descriptor_table_for_set(0),
+            super::DescriptorTableSet::Ambiguous
+        );
+        assert!(abi.root_parameter_for_table(0).is_none());
+    }
+
+    /// Tables the authoritative map describes resolve by map ordinal; a table
+    /// declared only by a stage layout is appended after them.
+    #[test]
+    fn a_stage_only_table_is_appended_after_the_map_tables() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterMap,
+            RootParameterSlot, RootParameterSpec, RootSignatureLayout,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: 1,
+                    space: 1,
+                },
+            ],
+        )
+        .expect("two tables");
+        let map = RootParameterMap::from_slots(vec![
+            RootParameterSlot::new(0, 0, RootParameterKind::Constants, 16),
+            RootParameterSlot::new(
+                1,
+                0,
+                RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                8,
+            ),
+        ]);
+        let abi = super::PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map);
+        let first = abi
+            .root_parameter_for_table(0)
+            .expect("map ordinal 0");
+        assert_eq!(first.register(), 0);
+        let second = abi
+            .root_parameter_for_table(1)
+            .expect("appended stage table");
+        assert_eq!(second.register(), 1);
+        assert_eq!(abi.declared_descriptor_table_count(), 2);
     }
 
     /// Encoder state is applied once per change: repeating the same wire state

@@ -942,6 +942,87 @@ impl MetalProducer {
         crate::native_metal::bindings::encode_root_arguments(&self.root_arguments)
     }
 
+    /// The plan every submission of this list carries.
+    ///
+    /// Every root argument the title actually set is already recorded. This
+    /// method also synthesises the plan entries the producer can prove without a
+    /// `Set*Root*` call:
+    ///
+    /// * each root-constants block a selected pipeline declared through
+    ///   [`Self::declare_root_constant_block`], so a batch that never writes
+    ///   constants still describes the signature's constants slot;
+    /// * each descriptor table the list currently holds for graphics or compute,
+    ///   so a table bound before a flush keeps its `(space, register)` identity
+    ///   in every later submission.
+    ///
+    /// Entries are appended after the recorded ones and de-duplicated by
+    /// `(root_parameter, space, kind)`, so a recorded argument always wins and a
+    /// declaration never changes what the title actually bound.
+    pub fn plan_for_submission(&self) -> Vec<RootArgument> {
+        fn contains(
+            plan: &[RootArgument],
+            root_parameter: u16,
+            space: u16,
+            kind: RootArgumentKind,
+        ) -> bool {
+            plan.iter().any(|argument| {
+                argument.root_parameter == root_parameter
+                    && argument.space == space
+                    && argument.kind == kind
+            })
+        }
+
+        let mut plan = self.root_arguments.clone();
+        for (&(_, root_parameter, space), &dwords) in &self.root_constant_blocks {
+            if contains(
+                &plan,
+                root_parameter,
+                space,
+                RootArgumentKind::Constants,
+            ) {
+                continue;
+            }
+            if let Ok(argument) = RootArgument::constants(
+                root_parameter,
+                space,
+                0,
+                usize::try_from(dwords).unwrap_or(usize::MAX),
+            ) {
+                plan.push(argument);
+            }
+        }
+        for table in self
+            .graphics
+            .tables
+            .values()
+            .chain(self.compute_tables.values())
+        {
+            let (kind, space) = if table.kind == DescriptorKind::Sampler {
+                (
+                    RootArgumentKind::SamplerTable,
+                    victory_shader::emit::SAMPLER_SPACE as u16,
+                )
+            } else {
+                (
+                    RootArgumentKind::DescriptorTable,
+                    victory_shader::emit::ROOT_CBV_SPACE as u16,
+                )
+            };
+            if contains(&plan, table.set, space, kind) {
+                continue;
+            }
+            let entries = u32::try_from(table.bindings.len()).unwrap_or(u32::MAX);
+            plan.push(RootArgument::descriptor_table(
+                table.set,
+                space,
+                table.base_register,
+                kind,
+                entries,
+            ));
+        }
+        plan
+    }
+
     /// Declares the translated root-constants block a pipeline gives
     /// `(root_parameter, space)` on a stage.
     ///
@@ -2479,7 +2560,8 @@ impl MetalProducer {
     pub fn submit<S: WireV3Sink + ?Sized>(&mut self, sink: &mut S) -> Result<Reply, ProducerError> {
         let mut submission = self.flush()?;
         ensure_sequence(&mut submission)?;
-        let reply = sink.submit_with_root_arguments(&submission, &self.root_arguments)?;
+        let plan = self.plan_for_submission();
+        let reply = sink.submit_with_root_arguments(&submission, &plan)?;
         if reply.sequence != submission.sequence {
             return Err(ProducerError::ReplySequenceMismatch {
                 expected: submission.sequence,
@@ -3151,9 +3233,10 @@ impl MetalList {
                 submission.sequence, UNASSIGNED_SEQUENCE,
                 "a list closes a submission before the transport assigns its sequence"
             );
-            // The plan the list recorded travels with the submission it
-            // describes; it is encoded by the bridge, not here.
-            let root_arguments = self.producer.root_arguments().to_vec();
+            // The plan the list recorded (plus the signature declarations it
+            // can prove) travels with the submission it describes; it is
+            // encoded by the bridge, not here.
+            let root_arguments = self.producer.plan_for_submission();
             self.pending.push(RecordedSubmission {
                 submission,
                 root_arguments,
