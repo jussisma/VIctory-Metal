@@ -4184,11 +4184,26 @@ fn resource_gpu_id(resource: objc::Id) -> u64 {
 }
 
 /// Wire table kind a converted range kind requires.
+///
+/// Reflection supplies the *declared* range kind; the wire supplies the
+/// guest's descriptor type. The converter uses one 24-byte descriptor for
+/// every buffer range — a constant buffer view, a buffer shader resource view
+/// and a buffer unordered access view all encode `{device_address, 0, 0}` — so
+/// a title's CBV/SRV/UAV buffer range and a declared CBV/SRV/UAV range are
+/// shape-compatible in any combination. Only texture ids (`{id, id, 0}`) and
+/// sampler ids (`{id, 0, 0}`) are different shapes, and those stay exact:
+/// a sampler range accepts sampler entries only, and a `Texture` range accepts
+/// SRV/UAV entries only. `Unspecified` is the converter's `"Table"` with no
+/// caller-attached kind, so every wire kind is expressible and
+/// [`descriptor_table_shape`] decides from the entry variants.
 fn table_kind_accepts_wire(kind: DescriptorTableKind, wire_kind: DescriptorKind) -> bool {
     match kind {
-        DescriptorTableKind::ConstantBufferView => wire_kind == DescriptorKind::Cbv,
-        DescriptorTableKind::ShaderResourceView => wire_kind == DescriptorKind::Srv,
-        DescriptorTableKind::UnorderedAccessView => wire_kind == DescriptorKind::Uav,
+        DescriptorTableKind::ConstantBufferView
+        | DescriptorTableKind::ShaderResourceView
+        | DescriptorTableKind::UnorderedAccessView => matches!(
+            wire_kind,
+            DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav
+        ),
         DescriptorTableKind::Texture => {
             matches!(wire_kind, DescriptorKind::Srv | DescriptorKind::Uav)
         }
@@ -4197,6 +4212,114 @@ fn table_kind_accepts_wire(kind: DescriptorTableKind, wire_kind: DescriptorKind)
         // converter descriptor shape, so every wire kind is expressible here.
         DescriptorTableKind::Unspecified => true,
     }
+}
+
+/// Stable wire-kind name used by the kind-mismatch refusal and census.
+fn descriptor_kind_name(kind: DescriptorKind) -> &'static str {
+    match kind {
+        DescriptorKind::Cbv => "Cbv",
+        DescriptorKind::Srv => "Srv",
+        DescriptorKind::Uav => "Uav",
+        DescriptorKind::Sampler => "Sampler",
+    }
+}
+
+/// Entry variant shape of one wire table, for the kind-mismatch census.
+///
+/// The variants are known before any handle is resolved, so the key can
+/// distinguish a buffer-entry table from a texture/sampler one (and from a
+/// genuinely mixed table) without reading payloads.
+fn descriptor_table_entry_shape(table: &crate::wire_v3::DescriptorTableV3) -> &'static str {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    let mut shape: Option<&'static str> = None;
+    for entry in &table.bindings {
+        let current = match entry {
+            DescriptorTableEntryV3::Buffer(_) => "buffer",
+            DescriptorTableEntryV3::Texture(_) => "texture",
+            DescriptorTableEntryV3::Sampler(_) => "sampler",
+        };
+        match shape {
+            Some(previous) if previous != current => return "mixed",
+            _ => shape = Some(current),
+        }
+    }
+    shape.unwrap_or("empty")
+}
+
+/// Records one kind-mismatch in the bounded descriptor-table census.
+fn note_descriptor_table_kind_mismatch(
+    pipeline_id: u64,
+    table: &crate::wire_v3::DescriptorTableV3,
+    reflected_kind: DescriptorTableKind,
+) {
+    crate::macos::trace::note_descriptor_table_kind_mismatch(
+        crate::macos::trace::DescriptorTableKindMismatchKey {
+            pipeline_id,
+            wire_set: table.set,
+            reflected_kind: reflected_kind.name(),
+            wire_kind: descriptor_kind_name(table.kind),
+            entry_shape: descriptor_table_entry_shape(table),
+        },
+    );
+}
+
+/// Static, pair-named refusal for a wire kind that cannot fill a range kind.
+///
+/// `MetalError::InvalidArg` carries a `&'static str`, so every genuinely
+/// impossible pair has its own literal. The enum pair is also named in the
+/// bounded kind-mismatch census.
+fn table_kind_mismatch_message(
+    kind: DescriptorTableKind,
+    wire_kind: DescriptorKind,
+) -> &'static str {
+    match (kind, wire_kind) {
+        (DescriptorTableKind::ConstantBufferView, DescriptorKind::Sampler) => {
+            "descriptor table wire kind Sampler cannot fill a reflected ConstantBufferView range"
+        }
+        (DescriptorTableKind::ShaderResourceView, DescriptorKind::Sampler) => {
+            "descriptor table wire kind Sampler cannot fill a reflected ShaderResourceView range"
+        }
+        (DescriptorTableKind::UnorderedAccessView, DescriptorKind::Sampler) => {
+            "descriptor table wire kind Sampler cannot fill a reflected UnorderedAccessView range"
+        }
+        (DescriptorTableKind::Texture, DescriptorKind::Cbv) => {
+            "descriptor table wire kind Cbv cannot fill a reflected Texture range"
+        }
+        (DescriptorTableKind::Texture, DescriptorKind::Sampler) => {
+            "descriptor table wire kind Sampler cannot fill a reflected Texture range"
+        }
+        (DescriptorTableKind::Sampler, DescriptorKind::Cbv) => {
+            "descriptor table wire kind Cbv cannot fill a reflected Sampler range"
+        }
+        (DescriptorTableKind::Sampler, DescriptorKind::Srv) => {
+            "descriptor table wire kind Srv cannot fill a reflected Sampler range"
+        }
+        (DescriptorTableKind::Sampler, DescriptorKind::Uav) => {
+            "descriptor table wire kind Uav cannot fill a reflected Sampler range"
+        }
+        _ => "descriptor table wire kind cannot fill the reflected range kind",
+    }
+}
+
+/// Gate of [`build_descriptor_table`]: the wire table kind must fill the
+/// declared range kind's descriptor shape.
+///
+/// A rejection is named after both kinds and counted only in the bounded
+/// kind-mismatch census; the transport's `abi_refusals` counter belongs to
+/// root-argument resolution, which already succeeded for this table.
+fn check_table_kind(
+    pipeline_id: u64,
+    table: &crate::wire_v3::DescriptorTableV3,
+    kind: DescriptorTableKind,
+) -> Result<(), MetalError> {
+    if table_kind_accepts_wire(kind, table.kind) {
+        return Ok(());
+    }
+    note_descriptor_table_kind_mismatch(pipeline_id, table, kind);
+    Err(MetalError::InvalidArg(table_kind_mismatch_message(
+        kind, table.kind,
+    )))
 }
 
 /// The converted descriptor shape one table actually uses.
@@ -4307,6 +4430,7 @@ fn build_descriptor_table(
     allocations: &HashMap<(u64, u32), VmBufferId>,
     table: &crate::wire_v3::DescriptorTableV3,
     slot: RootParameterSlot,
+    pipeline_id: u64,
 ) -> Result<PendingAbiBinding, PrepareAbort> {
     use crate::wire_v3::DescriptorTableEntryV3;
 
@@ -4316,13 +4440,22 @@ fn build_descriptor_table(
         )
         .into());
     };
-    if !table_kind_accepts_wire(kind, table.kind) {
-        return Err(MetalError::InvalidArg(
-            "descriptor table kind does not match the reflected range kind",
-        )
-        .into());
-    }
-    let shape = descriptor_table_shape(table, kind)?;
+    // A mismatch here is not a root-argument resolution failure: the table
+    // already resolved to a declared parameter. It is a named refusal,
+    // counted only in the bounded kind-mismatch census.
+    check_table_kind(pipeline_id, table, kind)?;
+    let shape = match descriptor_table_shape(table, kind) {
+        Ok(shape) => shape,
+        Err(error) => {
+            // The kinds passed the gate but the entry variants contradict the
+            // declared range shape (a buffer entry under a `Texture` range, a
+            // mixed table, a sampler entry under a view table). That is the
+            // genuinely ambiguous half of the same class: keep the named error
+            // and count it in the same bounded census.
+            note_descriptor_table_kind_mismatch(pipeline_id, table, kind);
+            return Err(error.into());
+        }
+    };
     let usage = match table.kind {
         DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
         _ => MTL_RESOURCE_USAGE_READ,
@@ -5713,6 +5846,7 @@ fn prepare_compute_segment(
                         allocations,
                         table,
                         slot,
+                        current_pipeline_id,
                     )?);
                 } else {
                     if table.kind == DescriptorKind::Sampler {
@@ -6633,6 +6767,7 @@ fn build_render_ops(
                         allocations,
                         table,
                         slot,
+                        current_pipeline_id,
                     )?);
                 } else {
                     if table.kind == DescriptorKind::Sampler {
@@ -11783,6 +11918,223 @@ mod async_pipeline_tests {
         assert_eq!(
             bounded_gpu_reason("line one\n\tline two"),
             "line one line two"
+        );
+    }
+}
+
+/// CPU-only tests for the descriptor-table kind gate and descriptor shape.
+///
+/// They encode the converter descriptor layout directly: CBV/SRV/UAV buffer
+/// ranges share one 24-byte `{device_address, 0, 0}` descriptor, texture ids
+/// are `{id, id, 0}` and sampler ids are `{id, 0, 0}`. Only a mismatch across
+/// those shapes is refused.
+#[cfg(test)]
+mod descriptor_table_kind_tests {
+    use super::{
+        DescriptorTableKind, check_table_kind, descriptor_table_entry_shape,
+        descriptor_table_shape, table_kind_accepts_wire,
+    };
+    use crate::wire::BufferBinding;
+    use crate::wire_v3::{
+        DescriptorKind, DescriptorTableEntryV3, DescriptorTableV3,
+    };
+
+    const BUFFER_ENTRY: DescriptorTableEntryV3 = DescriptorTableEntryV3::Buffer(BufferBinding {
+        allocation_id: 7,
+        generation: 1,
+        offset: 0,
+        length: 16,
+    });
+
+    fn table(kind: DescriptorKind, entries: Vec<DescriptorTableEntryV3>) -> DescriptorTableV3 {
+        DescriptorTableV3 {
+            set: 3,
+            base_register: 0,
+            kind,
+            bindings: entries,
+        }
+    }
+
+    fn buffer_table(kind: DescriptorKind) -> DescriptorTableV3 {
+        table(kind, vec![BUFFER_ENTRY, BUFFER_ENTRY])
+    }
+
+    fn texture_table(kind: DescriptorKind) -> DescriptorTableV3 {
+        table(
+            kind,
+            vec![
+                DescriptorTableEntryV3::Texture(0x1000),
+                DescriptorTableEntryV3::Texture(0x1008),
+            ],
+        )
+    }
+
+    fn sampler_table() -> DescriptorTableV3 {
+        table(
+            DescriptorKind::Sampler,
+            vec![DescriptorTableEntryV3::Sampler(0x2000)],
+        )
+    }
+
+    /// Every buffer-entry wire kind fills every address range kind: the
+    /// converter writes the same 24-byte address descriptor for a CBV, a buffer
+    /// SRV and a buffer UAV range.
+    #[test]
+    fn every_address_range_accepts_every_buffer_entry_wire_kind() {
+        for reflected in [
+            DescriptorTableKind::ConstantBufferView,
+            DescriptorTableKind::ShaderResourceView,
+            DescriptorTableKind::UnorderedAccessView,
+        ] {
+            for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
+                assert!(
+                    table_kind_accepts_wire(reflected, wire),
+                    "{reflected:?} must accept a {wire:?} buffer table"
+                );
+                let wire_table = buffer_table(wire);
+                assert_eq!(
+                    descriptor_table_shape(&wire_table, reflected)
+                        .expect("a buffer-entry address table is legal"),
+                    reflected,
+                    "shape keeps the declared address kind"
+                );
+                assert!(
+                    check_table_kind(2, &wire_table, reflected).is_ok(),
+                    "the gate must encode {reflected:?} + {wire:?}"
+                );
+            }
+            assert!(
+                !table_kind_accepts_wire(reflected, DescriptorKind::Sampler),
+                "{reflected:?} must refuse a sampler id where an address is expected"
+            );
+            let refused = check_table_kind(2, &sampler_table(), reflected)
+                .expect_err("a sampler table cannot fill an address range");
+            let named = refused.to_string();
+            assert!(
+                named.contains("Sampler") && named.contains(reflected.name()),
+                "the refusal names both kinds: {named}"
+            );
+        }
+    }
+
+    /// A `Texture` range takes texture ids only: SRV/UAV entries encode, a CBV
+    /// (address) or sampler table does not.
+    #[test]
+    fn a_texture_range_accepts_only_srv_and_uav_wire_kinds() {
+        for wire in [DescriptorKind::Srv, DescriptorKind::Uav] {
+            assert!(table_kind_accepts_wire(DescriptorTableKind::Texture, wire));
+            let wire_table = texture_table(wire);
+            assert_eq!(
+                descriptor_table_shape(&wire_table, DescriptorTableKind::Texture)
+                    .expect("texture entries fill a texture range"),
+                DescriptorTableKind::Texture
+            );
+            assert!(check_table_kind(2, &wire_table, DescriptorTableKind::Texture).is_ok());
+        }
+        for wire in [DescriptorKind::Cbv, DescriptorKind::Sampler] {
+            assert!(
+                !table_kind_accepts_wire(DescriptorTableKind::Texture, wire),
+                "a texture range must refuse {wire:?}"
+            );
+            let wire_table = match wire {
+                DescriptorKind::Sampler => sampler_table(),
+                _ => buffer_table(wire),
+            };
+            check_table_kind(2, &wire_table, DescriptorTableKind::Texture)
+                .expect_err("a texture range needs texture ids");
+        }
+        // A buffer entry under a `Texture` range passes the kind gate (Srv) but
+        // the entry shape contradicts the range; the shape rule refuses by name.
+        let error = descriptor_table_shape(
+            &buffer_table(DescriptorKind::Srv),
+            DescriptorTableKind::Texture,
+        )
+        .expect_err("a buffer entry cannot fill a texture range");
+        assert!(error.to_string().contains("reflected range kind"));
+    }
+
+    /// A sampler range is exact: only sampler entries encode.
+    #[test]
+    fn a_sampler_range_accepts_only_sampler_wire_kinds() {
+        assert!(table_kind_accepts_wire(
+            DescriptorTableKind::Sampler,
+            DescriptorKind::Sampler
+        ));
+        assert!(check_table_kind(2, &sampler_table(), DescriptorTableKind::Sampler).is_ok());
+        for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
+            assert!(!table_kind_accepts_wire(DescriptorTableKind::Sampler, wire));
+            let error = check_table_kind(2, &buffer_table(wire), DescriptorTableKind::Sampler)
+                .expect_err("an address table cannot fill a sampler range");
+            assert!(error.to_string().contains("Sampler"));
+        }
+    }
+
+    /// `Unspecified` is the converter's plain `"Table"`: every wire kind is
+    /// expressible and the entry variants pick the descriptor shape.
+    #[test]
+    fn an_unspecified_range_accepts_every_wire_kind_and_uses_the_entry_shape() {
+        for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
+            assert!(table_kind_accepts_wire(DescriptorTableKind::Unspecified, wire));
+            assert_eq!(
+                descriptor_table_shape(&buffer_table(wire), DescriptorTableKind::Unspecified)
+                    .expect("buffer entries resolve to the default address descriptor"),
+                DescriptorTableKind::Unspecified
+            );
+        }
+        assert!(table_kind_accepts_wire(
+            DescriptorTableKind::Unspecified,
+            DescriptorKind::Sampler
+        ));
+        assert_eq!(
+            descriptor_table_shape(&sampler_table(), DescriptorTableKind::Unspecified)
+                .expect("sampler entries resolve to a sampler table"),
+            DescriptorTableKind::Sampler
+        );
+    }
+
+    /// Entry variants that contradict their own wire kind are named refusals,
+    /// never a silent reinterpretation.
+    #[test]
+    fn contradicted_entry_shapes_are_named_refusals() {
+        let sampler_under_srv = table(
+            DescriptorKind::Srv,
+            vec![DescriptorTableEntryV3::Sampler(0x2000)],
+        );
+        let error = descriptor_table_shape(&sampler_under_srv, DescriptorTableKind::Unspecified)
+            .expect_err("a sampler entry needs a sampler table");
+        assert!(error.to_string().contains("sampler entry"));
+
+        let texture_under_cbv = texture_table(DescriptorKind::Cbv);
+        let error = descriptor_table_shape(&texture_under_cbv, DescriptorTableKind::Unspecified)
+            .expect_err("a texture entry needs an SRV/UAV table");
+        assert!(error.to_string().contains("texture entry"));
+
+        let mixed = table(
+            DescriptorKind::Srv,
+            vec![BUFFER_ENTRY, DescriptorTableEntryV3::Texture(0x1000)],
+        );
+        let error = descriptor_table_shape(&mixed, DescriptorTableKind::Unspecified)
+            .expect_err("a mixed entry table has no single descriptor shape");
+        assert!(error.to_string().contains("mixes"));
+    }
+
+    /// The census key shape is derived from entry variants, which are known
+    /// before any handle resolves.
+    #[test]
+    fn the_entry_shape_name_is_bounded_and_content_free() {
+        assert_eq!(descriptor_table_entry_shape(&buffer_table(DescriptorKind::Cbv)), "buffer");
+        assert_eq!(descriptor_table_entry_shape(&texture_table(DescriptorKind::Srv)), "texture");
+        assert_eq!(descriptor_table_entry_shape(&sampler_table()), "sampler");
+        assert_eq!(
+            descriptor_table_entry_shape(&table(
+                DescriptorKind::Srv,
+                vec![BUFFER_ENTRY, DescriptorTableEntryV3::Texture(0x1000)],
+            )),
+            "mixed"
+        );
+        assert_eq!(
+            descriptor_table_entry_shape(&table(DescriptorKind::Cbv, Vec::new())),
+            "empty"
         );
     }
 }

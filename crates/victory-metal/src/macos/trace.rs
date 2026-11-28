@@ -219,6 +219,42 @@ pub const OUTCOME_STALE: &str = "stale";
 /// parameter.
 pub const OUTCOME_INERT: &str = "inert";
 
+/// Outcome word: the table resolved to a declared parameter, but its wire kind
+/// cannot fill the descriptor shape that parameter's reflected range kind
+/// requires.
+pub const OUTCOME_KIND_MISMATCH: &str = "kind-mismatch";
+
+/// One bounded key of the descriptor-table *kind mismatch* census.
+///
+/// It names only fixed kind words and counts: the reflected table kind from the
+/// resolved root parameter, the wire `DescriptorTableV3.kind`, and the entry
+/// variant shape (`buffer`, `texture`, `sampler`, `mixed` or `empty`). No
+/// handles, register values, shader bytes or resource contents appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorTableKindMismatchKey {
+    /// Host pipeline id the refused table was selected with.
+    pub pipeline_id: u64,
+    /// Wire `DescriptorTableV3.set` the submission carried.
+    pub wire_set: u16,
+    /// Reflected range kind of the resolved root parameter
+    /// (`ConstantBufferView`/`ShaderResourceView`/`UnorderedAccessView`/
+    /// `Texture`/`Sampler`/`Unspecified`).
+    pub reflected_kind: &'static str,
+    /// Wire table kind (`Cbv`/`Srv`/`Uav`/`Sampler`).
+    pub wire_kind: &'static str,
+    /// Entry variant shape (`buffer`/`texture`/`sampler`/`mixed`/`empty`).
+    pub entry_shape: &'static str,
+}
+
+/// One counted kind-mismatch key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTableKindMismatchCount {
+    /// The bounded key.
+    pub key: DescriptorTableKindMismatchKey,
+    /// How many refusals the key describes in this process.
+    pub count: u64,
+}
+
 /// One counted key of the descriptor-table refusal census.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescriptorTableRefusalCount {
@@ -236,18 +272,21 @@ pub struct DescriptorTableRefusalCount {
 /// the draw tracer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DescriptorTableRefusalCensus {
-    /// Distinct keys retained (`<= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`).
+    /// Distinct keys retained across both classes
+    /// (`<= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`).
     pub distinct_keys: u64,
-    /// Refusals whose key did not fit the cap.
+    /// Events whose key did not fit the cap.
     pub omitted: u64,
-    /// Retained keys in first-observed order.
+    /// Retained resolution keys in first-observed order.
     pub entries: Vec<DescriptorTableRefusalCount>,
+    /// Retained kind-mismatch keys in first-observed order.
+    pub kind_mismatches: Vec<DescriptorTableKindMismatchCount>,
 }
 
 impl DescriptorTableRefusalCensus {
-    /// Whether no descriptor table was refused.
+    /// Whether no descriptor table was refused or accepted as inert.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.kind_mismatches.is_empty()
     }
 
     /// The census as the `descriptor_table_refusal_census` telemetry member.
@@ -263,10 +302,12 @@ impl DescriptorTableRefusalCensus {
 
     /// The census as the `descriptor_table_refusal_census` telemetry object.
     ///
-    /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`;
-    /// each key carries `pipeline_id`, `wire_set`, `declared_tables`,
-    /// `reflected_tables`, `stage_mask`, `map_tables`, `had_plan`,
-    /// `plan_kind`, `outcome` and `count`.
+    /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`,
+    /// `kind_mismatch_keys`; each resolution key carries `pipeline_id`,
+    /// `wire_set`, `declared_tables`, `reflected_tables`, `stage_mask`,
+    /// `map_tables`, `had_plan`, `plan_kind`, `outcome` and `count`. Each
+    /// kind-mismatch key carries `pipeline_id`, `wire_set`, `reflected_kind`,
+    /// `wire_kind`, `entry_shape`, `outcome` (`"kind-mismatch"`) and `count`.
     pub fn json_value(&self) -> String {
         let keys = self
             .entries
@@ -291,9 +332,29 @@ impl DescriptorTableRefusalCensus {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let kind_mismatches = self
+            .kind_mismatches
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"pipeline_id\": {}, \"wire_set\": {}, \"reflected_kind\": \"{}\", \
+                     \"wire_kind\": \"{}\", \"entry_shape\": \"{}\", \"outcome\": \"{}\", \
+                     \"count\": {}}}",
+                    entry.key.pipeline_id,
+                    entry.key.wire_set,
+                    entry.key.reflected_kind,
+                    entry.key.wire_kind,
+                    entry.key.entry_shape,
+                    OUTCOME_KIND_MISMATCH,
+                    entry.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
-            "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}]}}",
-            self.distinct_keys, self.omitted, keys
+            "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}], \
+             \"kind_mismatch_keys\": [{}]}}",
+            self.distinct_keys, self.omitted, keys, kind_mismatches
         )
     }
 }
@@ -301,7 +362,14 @@ impl DescriptorTableRefusalCensus {
 #[derive(Default)]
 struct DescriptorTableRefusalLog {
     entries: Vec<(DescriptorTableRefusalKey, u64)>,
+    kind_mismatches: Vec<(DescriptorTableKindMismatchKey, u64)>,
     omitted: u64,
+}
+
+impl DescriptorTableRefusalLog {
+    fn retained(&self) -> usize {
+        self.entries.len() + self.kind_mismatches.len()
+    }
 }
 
 static DESCRIPTOR_TABLE_REFUSALS: OnceLock<Mutex<DescriptorTableRefusalLog>> = OnceLock::new();
@@ -325,11 +393,36 @@ pub fn note_descriptor_table_refusal(key: DescriptorTableRefusalKey) {
         *count = count.saturating_add(1);
         return;
     }
-    if log.entries.len() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+    if log.retained() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
         log.omitted = log.omitted.saturating_add(1);
         return;
     }
     log.entries.push((key, 1));
+}
+
+/// Counts one descriptor-table kind-mismatch event under its bounded key.
+///
+/// The class is distinct from a resolution refusal: the table already named a
+/// declared parameter, so `abi_refusals` must not move. It shares the one
+/// [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`] cap with the resolution keys; keys past
+/// the cap only bump `omitted`.
+pub fn note_descriptor_table_kind_mismatch(key: DescriptorTableKindMismatchKey) {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, count)) = log
+        .kind_mismatches
+        .iter_mut()
+        .find(|(known, _)| *known == key)
+    {
+        *count = count.saturating_add(1);
+        return;
+    }
+    if log.retained() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+        log.omitted = log.omitted.saturating_add(1);
+        return;
+    }
+    log.kind_mismatches.push((key, 1));
 }
 
 /// A copy of the process-wide descriptor-table refusal census.
@@ -338,12 +431,20 @@ pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     DescriptorTableRefusalCensus {
-        distinct_keys: log.entries.len() as u64,
+        distinct_keys: log.retained() as u64,
         omitted: log.omitted,
         entries: log
             .entries
             .iter()
             .map(|(key, count)| DescriptorTableRefusalCount {
+                key: *key,
+                count: *count,
+            })
+            .collect(),
+        kind_mismatches: log
+            .kind_mismatches
+            .iter()
+            .map(|(key, count)| DescriptorTableKindMismatchCount {
                 key: *key,
                 count: *count,
             })
@@ -993,6 +1094,58 @@ mod tests {
         assert_eq!(census.omitted, 1);
         reset_descriptor_table_refusal_census();
         assert!(descriptor_table_refusal_census().is_empty());
+    }
+
+    fn kind_key(wire_set: u16) -> DescriptorTableKindMismatchKey {
+        DescriptorTableKindMismatchKey {
+            pipeline_id: 2,
+            wire_set,
+            reflected_kind: "ShaderResourceView",
+            wire_kind: "Cbv",
+            entry_shape: "buffer",
+        }
+    }
+
+    #[test]
+    fn the_kind_mismatch_census_counts_and_names_the_class() {
+        reset_descriptor_table_refusal_census();
+        note_descriptor_table_kind_mismatch(kind_key(1));
+        note_descriptor_table_kind_mismatch(kind_key(1));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, 1);
+        assert_eq!(census.omitted, 0);
+        assert!(census.entries.is_empty(), "a kind mismatch is not a refusal key");
+        assert_eq!(census.kind_mismatches.len(), 1);
+        let entry = &census.kind_mismatches[0];
+        assert_eq!(entry.count, 2);
+        assert_eq!(entry.key.pipeline_id, 2);
+        assert_eq!(entry.key.wire_set, 1);
+        assert_eq!(entry.key.reflected_kind, "ShaderResourceView");
+        assert_eq!(entry.key.wire_kind, "Cbv");
+        assert_eq!(entry.key.entry_shape, "buffer");
+        let json = census.json_value();
+        assert!(json.contains("\"kind_mismatch_keys\""));
+        assert!(json.contains("\"reflected_kind\": \"ShaderResourceView\""));
+        assert!(json.contains("\"wire_kind\": \"Cbv\""));
+        assert!(json.contains("\"entry_shape\": \"buffer\""));
+        assert!(json.contains("\"outcome\": \"kind-mismatch\""));
+        assert!(json.contains("\"count\": 2"));
+        reset_descriptor_table_refusal_census();
+        assert!(descriptor_table_refusal_census().is_empty());
+    }
+
+    #[test]
+    fn kind_mismatch_keys_share_the_resolution_cap() {
+        reset_descriptor_table_refusal_census();
+        for set in 0..MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u16 {
+            note_descriptor_table_refusal(key(set));
+        }
+        note_descriptor_table_kind_mismatch(kind_key(1));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u64);
+        assert!(census.kind_mismatches.is_empty(), "the cap is shared");
+        assert_eq!(census.omitted, 1);
+        reset_descriptor_table_refusal_census();
     }
 
     #[test]

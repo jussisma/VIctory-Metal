@@ -184,6 +184,18 @@ pub enum DescriptorTableKind {
 }
 
 impl DescriptorTableKind {
+    /// Stable name used by counters, refusals and the telemetry census.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ConstantBufferView => "ConstantBufferView",
+            Self::ShaderResourceView => "ShaderResourceView",
+            Self::UnorderedAccessView => "UnorderedAccessView",
+            Self::Texture => "Texture",
+            Self::Sampler => "Sampler",
+            Self::Unspecified => "Unspecified",
+        }
+    }
+
     /// Default stride of one descriptor of this kind in converted memory.
     ///
     /// Every converted table element is a 24-byte descriptor. Address tables
