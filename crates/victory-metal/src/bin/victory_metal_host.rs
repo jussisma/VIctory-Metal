@@ -532,6 +532,10 @@ struct Stats {
     host_pipeline_cache_hits: u64,
     /// Last bounded host-translation refusal reason.
     host_translation_reason: Option<String>,
+    /// Kind 8 texture registrations refused by the host.
+    texture_registration_refusals: u64,
+    /// Last bounded texture-registration refusal reason.
+    texture_registration_reason: Option<String>,
     /// Shared translator-pool status: `ready`, `cache-only` or `skipped`.
     pool_status: &'static str,
     /// Shared translator-pool counters.
@@ -579,6 +583,8 @@ impl Default for Stats {
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
             host_translation_reason: None,
+            texture_registration_refusals: 0,
+            texture_registration_reason: None,
             pool_status: "skipped",
             pool: victory_metal::compiler_pool::PoolStats::default(),
             draws_encoded: 0,
@@ -1034,6 +1040,12 @@ fn publish_session_stats(stats: &Arc<Mutex<Stats>>, session: &SessionStats) {
     if let Some(reason) = &session.host_translation_reason {
         stats.host_translation_reason = Some(reason.clone());
     }
+    stats.texture_registration_refusals = stats
+        .texture_registration_refusals
+        .saturating_add(session.texture_registration_refusals);
+    if let Some(reason) = &session.texture_registration_reason {
+        stats.texture_registration_reason = Some(reason.clone());
+    }
     stats.pool_status = session.pool_status;
     stats.pool = session.pool;
 }
@@ -1339,6 +1351,11 @@ fn write_telemetry(
         || "null".to_string(),
         |message| format!("\"{}\"", json_escape(message)),
     );
+    let texture_registration_reason =
+        stats.texture_registration_reason.as_deref().map_or_else(
+            || "null".to_string(),
+            |message| format!("\"{}\"", json_escape(message)),
+        );
     let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
     let draw_trace = draw_trace_json();
@@ -1385,6 +1402,8 @@ fn write_telemetry(
             "  \"host_pipeline_translations_refused\": {host_refused},\n",
             "  \"host_pipeline_cache_hits\": {host_cache_hits},\n",
             "  \"host_translation_reason\": {host_translation_reason},\n",
+            "  \"texture_registration_refusals\": {texture_refusals},\n",
+            "  \"texture_registration_reason\": {texture_registration_reason},\n",
             "  \"draws_encoded\": {draws_encoded},\n",
             "  \"draw_indexed_encoded\": {draw_indexed_encoded},\n",
             "  \"dispatches_encoded\": {dispatches_encoded},\n",
@@ -1443,6 +1462,8 @@ fn write_telemetry(
         host_refused = stats.host_pipeline_translations_refused,
         host_cache_hits = stats.host_pipeline_cache_hits,
         host_translation_reason = host_translation_reason,
+        texture_refusals = stats.texture_registration_refusals,
+        texture_registration_reason = texture_registration_reason,
         draws_encoded = stats.draws_encoded,
         draw_indexed_encoded = stats.draws_indexed_encoded,
         dispatches_encoded = stats.dispatches_encoded,
@@ -1743,6 +1764,8 @@ impl Clone for Stats {
             host_pipeline_translations_refused: self.host_pipeline_translations_refused,
             host_pipeline_cache_hits: self.host_pipeline_cache_hits,
             host_translation_reason: self.host_translation_reason.clone(),
+            texture_registration_refusals: self.texture_registration_refusals,
+            texture_registration_reason: self.texture_registration_reason.clone(),
             pool_status: self.pool_status,
             pool: self.pool,
             draws_encoded: self.draws_encoded,
@@ -2022,7 +2045,7 @@ mod draw_trace_json_tests {
         let json = std::fs::read_to_string(&path).expect("telemetry reads");
         let _ = std::fs::remove_file(&path);
 
-        const KEYS: [&str; 55] = [
+        const KEYS: [&str; 57] = [
             "host",
             "pid",
             "port",
@@ -2062,6 +2085,8 @@ mod draw_trace_json_tests {
             "host_pipeline_translations_refused",
             "host_pipeline_cache_hits",
             "host_translation_reason",
+            "texture_registration_refusals",
+            "texture_registration_reason",
             "draws_encoded",
             "draw_indexed_encoded",
             "dispatches_encoded",

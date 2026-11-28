@@ -2383,8 +2383,10 @@ impl NativeTextureRegistration {
 
     /// Sends this registration to the live host session.
     #[cfg(any(windows, test, target_os = "macos"))]
-    fn send(self) -> Result<bool, crate::native_metal::queue::NativeQueueError> {
-        crate::native_metal::queue::register_texture(
+    fn send(
+        self,
+    ) -> Result<(bool, Option<String>), crate::native_metal::queue::NativeQueueError> {
+        crate::native_metal::queue::register_texture_with_reason(
             self.id,
             self.generation,
             self.dimension,
@@ -2397,6 +2399,40 @@ impl NativeTextureRegistration {
             self.mip_levels,
             self.array_layers,
         )
+    }
+}
+
+/// The D3D12 descriptor shape a creation-time refusal logs.
+///
+/// Raw `ResourceDesc` fields are kept beside the kind-8 codes so a refusal is
+/// unambiguous even when [`native_texture_registration`] rejected the shape
+/// before it produced codes.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetTextureShape {
+    id: u64,
+    dimension: u32,
+    format: u32,
+    flags: u32,
+    sample_count: u32,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+}
+
+#[cfg(any(windows, test))]
+fn target_texture_shape(id: u64, desc: &ResourceDesc) -> TargetTextureShape {
+    TargetTextureShape {
+        id,
+        dimension: desc.dimension,
+        format: desc.format,
+        flags: desc.flags,
+        sample_count: desc.sample_count,
+        width: desc.width,
+        height: desc.height,
+        depth_or_array_size: desc.depth_or_array_size,
+        mip_levels: desc.mip_levels,
     }
 }
 
@@ -2434,12 +2470,28 @@ pub(crate) fn texture_registration_refusals() -> u64 {
 /// same named reason (see `list.rs`). The refusal is logged and counted here,
 /// so it is never silent and never falls back to D3DMetal.
 #[cfg(any(windows, test))]
-fn refuse_target_texture_registration(id: u64, reason: &str) -> HRESULT {
+fn refuse_target_texture_registration(
+    shape: TargetTextureShape,
+    reason: &str,
+    codes: Option<(u8, u8, u8)>,
+) -> HRESULT {
     let refusals = TEXTURE_REGISTRATION_REFUSALS
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);
+    let (dimension_code, format_code, usage_code) = codes.unwrap_or((u8::MAX, u8::MAX, u8::MAX));
     tracing::warn!(
-        id = format_args!("{id:#x}"),
+        id = format_args!("{:#x}", shape.id),
+        dimension = shape.dimension,
+        format = shape.format,
+        flags = shape.flags,
+        sample_count = shape.sample_count,
+        width = shape.width,
+        height = shape.height,
+        depth_or_array_size = shape.depth_or_array_size,
+        mip_levels = shape.mip_levels,
+        dimension_code,
+        format_code,
+        usage_code,
         reason,
         texture_registration_refusals = refusals,
         "VICTORY_BACKEND=metal: target texture registration refused at creation; \
@@ -2450,33 +2502,39 @@ fn refuse_target_texture_registration(id: u64, reason: &str) -> HRESULT {
 
 /// Settles a creation-time target texture registration, never failing creation.
 ///
-/// `send` is the transport call (injected in tests): `Ok(true)` registered,
-/// `Ok(false)` is the host's refusal, `Err` is a transport refusal. Every
-/// non-success outcome is a named, counted registration refusal and still
-/// `S_OK`. A description with no host code ([`native_texture_registration`]'s
-/// `Err`) is the same named refusal, not a creation failure.
+/// `send` is the transport call (injected in tests): `Ok((true, _))` registered,
+/// `Ok((false, reason))` is the host's named refusal, `Err` is a transport
+/// refusal. Every non-success outcome is a named, counted registration refusal
+/// and still `S_OK`. A description with no host code
+/// ([`native_texture_registration`]'s `Err`) is the same named refusal, not a
+/// creation failure.
 #[cfg(any(windows, test))]
 fn settle_native_texture_registration(
-    id: u64,
+    shape: TargetTextureShape,
     registration: Option<Result<NativeTextureRegistration, &'static str>>,
     send: impl FnOnce(
         NativeTextureRegistration,
-    ) -> Result<bool, crate::native_metal::queue::NativeQueueError>,
+    ) -> Result<(bool, Option<String>), crate::native_metal::queue::NativeQueueError>,
 ) -> HRESULT {
     let Some(registration) = registration else {
         return S_OK;
     };
     let request = match registration {
         Ok(request) => request,
-        Err(reason) => return refuse_target_texture_registration(id, reason),
+        Err(reason) => return refuse_target_texture_registration(shape, reason, None),
     };
+    let codes = Some((request.dimension, request.format, request.usage));
     match send(request) {
-        Ok(true) => {
-            tracing::debug!(id = format_args!("{id:#x}"), "native texture registered");
+        Ok((true, _)) => {
+            tracing::debug!(id = format_args!("{:#x}", shape.id), "native texture registered");
             S_OK
         }
-        Ok(false) => refuse_target_texture_registration(id, "the host refused the registration"),
-        Err(error) => refuse_target_texture_registration(id, &error.to_string()),
+        Ok((false, reason)) => refuse_target_texture_registration(
+            shape,
+            reason.as_deref().unwrap_or("the host refused the registration"),
+            codes,
+        ),
+        Err(error) => refuse_target_texture_registration(shape, &error.to_string(), codes),
     }
 }
 
@@ -2722,9 +2780,11 @@ fn register_native_buffer(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
 #[cfg(windows)]
 fn register_native_texture(resource: &Resource, desc: &ResourceDesc) -> HRESULT {
     let id = resource.data() as u64;
-    settle_native_texture_registration(id, native_texture_request(id, desc), |request| {
-        request.send()
-    })
+    settle_native_texture_registration(
+        target_texture_shape(id, desc),
+        native_texture_request(id, desc),
+        |request| request.send(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3765,10 +3825,14 @@ mod tests {
         );
         let before = texture_registration_refusals();
         let mut seen = None;
-        let hr = settle_native_texture_registration(0xe2e_190000u64, Some(Ok(request)), |sent| {
-            seen = Some(sent);
-            Ok(false)
-        });
+        let hr = settle_native_texture_registration(
+            target_texture_shape(0xe2e_190000u64, &desc),
+            Some(Ok(request)),
+            |sent| {
+                seen = Some(sent);
+                Ok((false, Some("the host refused the registration".to_string())))
+            },
+        );
         assert_eq!(hr, S_OK, "a host refusal must not fail creation");
         assert_eq!(seen, Some(request), "the request reached the registration");
         assert_eq!(texture_registration_refusals(), before + 1);
@@ -3789,9 +3853,11 @@ mod tests {
             Some(Err("texture registration: format has no host code"))
         );
         let before = texture_registration_refusals();
-        let hr = settle_native_texture_registration(0x1234, request, |_| {
-            panic!("a format with no host code must not reach register_texture")
-        });
+        let hr = settle_native_texture_registration(
+            target_texture_shape(0x1234, &desc),
+            request,
+            |_| panic!("a format with no host code must not reach register_texture"),
+        );
         assert_eq!(hr, S_OK);
         assert_eq!(texture_registration_refusals(), before + 1);
     }

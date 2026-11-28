@@ -1092,11 +1092,6 @@ impl TextureDesc {
                         "1D textures cannot be multisampled",
                     ));
                 }
-                if self.usage.render_target || self.usage.depth_stencil {
-                    return Err(RegistryError::InvalidDesc(
-                        "1D textures cannot be render or depth attachments",
-                    ));
-                }
             }
             D2 => {
                 if self.depth != 1 || self.array_layers != 1 {
@@ -1391,14 +1386,17 @@ impl ViewPlan {
                         "render/depth views cover exactly one mip and one array layer",
                     ));
                 }
-                if matches!(desc.dimension, D1 | D3) {
+                if matches!(desc.dimension, D3) {
                     return Err(RegistryError::InvalidSubresource(
-                        "render/depth views require a 2D, array or cube texture",
+                        "render/depth views require a 1D, 2D, array or cube texture",
                     ));
                 }
-                // One attachment layer: 2D, or 2D multisample when the source
-                // texture is multisampled.
-                canonical_texture_type(D2Array, desc.sample_count, 1)
+                // One attachment layer: 1D, 2D, or 2D multisample when the
+                // source texture is multisampled.
+                match desc.dimension {
+                    D1 => canonical_texture_type(D1, desc.sample_count, 1),
+                    _ => canonical_texture_type(D2Array, desc.sample_count, 1),
+                }
             }
             TextureViewKind::Srv => match desc.dimension {
                 D1 => canonical_texture_type(D1, desc.sample_count, sub.array_layer_count),
@@ -4725,6 +4723,192 @@ mod tests {
         assert!(matches!(error, RegistryError::KeyMismatch));
         assert!(registry.is_empty());
         assert_eq!(registry.created_count(), 0);
+    }
+
+    /// A legal 1D colour target is accepted (Metal `MTLTextureType1D`), and
+    /// its RTV view resolves to the same 1D type. No GPU is touched.
+    #[test]
+    fn a_one_dimensional_render_target_is_accepted() {
+        let mut one_d = desc();
+        one_d.width = 256;
+        one_d.height = 1;
+        one_d.dimension = TextureDimension::D1;
+        one_d.usage = TextureUsage::color_attachment();
+        assert!(one_d.validate().is_ok());
+        assert_eq!(one_d.mtl_texture_type(), MTL_TEXTURE_TYPE_1D);
+        let view = ViewPlan::resolve(
+            &one_d,
+            TextureViewKind::Rtv,
+            TextureSubresource::single(0, 0),
+        )
+        .expect("a 1D colour target must resolve an RTV view");
+        assert_eq!(view.texture_type, MTL_TEXTURE_TYPE_1D);
+    }
+
+    /// The offscreen target shapes the title path uses: a mipmapped 2D array
+    /// RGBA8 target, a mipmapped RGBA16F target, and a 4x multisampled target
+    /// all validate and produce the expected `MTLTextureType`. No GPU is
+    /// touched.
+    #[test]
+    fn offscreen_colour_target_shapes_validate() {
+        let mut rgba8_mips = desc();
+        rgba8_mips.width = 256;
+        rgba8_mips.height = 128;
+        rgba8_mips.mip_levels = 8;
+        rgba8_mips.dimension = TextureDimension::D2Array;
+        rgba8_mips.array_layers = 4;
+        rgba8_mips.usage = TextureUsage::color_attachment();
+        assert!(rgba8_mips.validate().is_ok());
+        assert_eq!(
+            rgba8_mips.mtl_texture_type(),
+            MTL_TEXTURE_TYPE_2D_ARRAY,
+            "four layers with one sample select a 2D array"
+        );
+
+        let mut fp16_mips = desc();
+        fp16_mips.width = 640;
+        fp16_mips.height = 360;
+        fp16_mips.mip_levels = 10;
+        fp16_mips.format = TextureFormat::Rgba16Float;
+        fp16_mips.usage = TextureUsage::color_attachment();
+        assert!(fp16_mips.validate().is_ok());
+
+        let mut msaa = desc();
+        msaa.width = 1280;
+        msaa.height = 720;
+        msaa.sample_count = 4;
+        msaa.usage = TextureUsage::color_attachment();
+        assert!(msaa.validate().is_ok());
+        assert_eq!(
+            msaa.mtl_texture_type(),
+            MTL_TEXTURE_TYPE_2D_MULTISAMPLE
+        );
+        let view = ViewPlan::resolve(
+            &msaa,
+            TextureViewKind::Rtv,
+            TextureSubresource::single(0, 0),
+        )
+        .expect("a 4x target must resolve an RTV view");
+        assert_eq!(view.texture_type, MTL_TEXTURE_TYPE_2D_MULTISAMPLE);
+    }
+
+    /// GPU proof: register an offscreen RGBA8 and RGBA16Float colour target
+    /// with a real mip chain, plus a 4x multisampled RGBA8 target, create the
+    /// RTV, and read the cleared RGBA8 texel back exactly. Ignored by default;
+    /// run under the GPU lock with `--ignored`.
+    #[test]
+    #[ignore = "GPU proof; run under .swarm/bin/gpu-lock with --ignored"]
+    fn gpu_registers_offscreen_colour_targets_with_mips_and_samples() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let mut registry = TextureRegistry::new(&transport).expect("texture registry");
+
+        let mut target = desc();
+        target.width = 256;
+        target.height = 128;
+        target.usage = TextureUsage::color_attachment();
+
+        let mut rgba8 = target.clone();
+        rgba8.mip_levels = 5;
+        registry.register(1, rgba8.clone()).expect("RGBA8 mipmapped target");
+        assert_eq!(registry.get(1).expect("registered").desc(), &rgba8);
+        let view = registry
+            .create_view(1, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("RGBA8 RTV");
+        registry
+            .clear_color(&view, [0.25, 0.5, 0.75, 1.0])
+            .expect("clear RGBA8 target");
+        let pixels = registry.read_view_rgba8(&view).expect("read RGBA8 target");
+        assert_eq!(pixels.len(), 256 * 128);
+        assert_eq!(pixels[0], [64, 128, 191, 255]);
+
+        let mut fp16 = target.clone();
+        fp16.format = TextureFormat::Rgba16Float;
+        fp16.mip_levels = 5;
+        registry.register(2, fp16.clone()).expect("RGBA16F mipmapped target");
+        assert_eq!(registry.get(2).expect("registered").desc(), &fp16);
+        registry
+            .create_view(2, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("RGBA16F RTV");
+
+        let mut msaa = target.clone();
+        msaa.width = 128;
+        msaa.height = 128;
+        msaa.sample_count = 4;
+        registry.register(3, msaa.clone()).expect("4x RGBA8 target");
+        assert_eq!(registry.get(3).expect("registered").desc(), &msaa);
+        registry
+            .create_view(3, TextureViewKind::Rtv, TextureSubresource::single(0, 0))
+            .expect("4x RTV");
+    }
+
+    /// Every descriptor the registry refuses names a reason; none collapses to
+    /// a bare boolean. 3D attachments and block-compressed targets keep their
+    /// own named refusals.
+    #[test]
+    fn texture_refusals_are_named() {
+        let mut volume = desc();
+        volume.dimension = TextureDimension::D3;
+        volume.depth = 4;
+        volume.usage = TextureUsage::color_attachment();
+        assert!(matches!(
+            volume.validate(),
+            Err(RegistryError::InvalidDesc(
+                "3D textures cannot be render or depth attachments here"
+            ))
+        ));
+
+        let mut bc_target = desc();
+        bc_target.width = 64;
+        bc_target.height = 64;
+        bc_target.format = TextureFormat::Bc1Rgba;
+        bc_target.usage = TextureUsage::color_attachment();
+        assert!(matches!(
+            bc_target.validate(),
+            Err(RegistryError::InvalidDesc(
+                "block-compressed textures are read-only samples"
+            ))
+        ));
+
+        let mut depth_as_colour = desc();
+        depth_as_colour.format = TextureFormat::Depth32Float;
+        depth_as_colour.usage = TextureUsage::color_attachment();
+        assert!(matches!(
+            depth_as_colour.validate(),
+            Err(RegistryError::InvalidDesc(
+                "a depth format cannot be registered as a colour render target"
+            ))
+        ));
+    }
+
+    /// Re-registering the same handle with the same descriptor is idempotent
+    /// on the executor, so a guest reconnect or a re-created resource cannot
+    /// turn a live handle into an `UnknownHandle`. A different descriptor is
+    /// still a named conflict.
+    #[test]
+    fn re_registering_the_same_handle_is_idempotent() {
+        let transport = DirectMetalTransport::new().expect("Metal device should open");
+        let mut first = desc();
+        first.width = 256;
+        first.height = 128;
+        first.usage = TextureUsage::color_attachment();
+        transport
+            .register_registry_texture(41, first.clone())
+            .expect("first registration");
+        transport
+            .register_registry_texture(41, first)
+            .expect("the same descriptor must be reused, not refused");
+
+        let mut different = desc();
+        different.width = 64;
+        different.height = 64;
+        different.usage = TextureUsage::color_attachment();
+        let error = transport
+            .register_registry_texture(41, different)
+            .expect_err("a different descriptor is a conflict");
+        assert!(
+            error.to_string().contains("already registered with a different descriptor"),
+            "the conflict is named: {error}"
+        );
     }
 
     #[test]

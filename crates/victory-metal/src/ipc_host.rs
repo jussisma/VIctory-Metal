@@ -284,6 +284,15 @@ pub const KIND_SURFACE_REG: u8 = 9;
 pub const KIND_SAMPLER_REG: u8 = 10;
 /// Exact length of a texture registration payload.
 pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
+/// Length of the extended texture registration payload: the classic 32 bytes
+/// plus one flags byte that advertises the guest can decode a refusal reason.
+pub const TEXTURE_REG_PAYLOAD_LEN_V2: usize = TEXTURE_REG_PAYLOAD_LEN + 1;
+/// Extended-payload flag requesting a length-prefixed refusal reason in the
+/// kind 8 acknowledgement. An older guest omits the byte and still gets the
+/// classic one-byte status.
+pub const TEXTURE_REG_WANT_REASON: u8 = 0x01;
+/// Upper bound on the refusal reason the host puts on the wire.
+pub const TEXTURE_REG_REASON_MAX: usize = 512;
 /// Exact length of a present-surface registration payload.
 pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
 /// Exact length of a sampler registration payload (`handle` plus five `u32`s).
@@ -1120,6 +1129,10 @@ pub struct SessionStats {
     pub host_pipeline_cache_hits: u64,
     /// Last bounded host-translation refusal reason.
     pub host_translation_reason: Option<String>,
+    /// Kind 8 texture registrations refused during the session.
+    pub texture_registration_refusals: u64,
+    /// Last bounded texture-registration refusal reason, or `None`.
+    pub texture_registration_reason: Option<String>,
     /// Pool status: `ready`, `cache-only` or `skipped`.
     pub pool_status: &'static str,
     /// Shared pool counters (all zero when the pool was never created).
@@ -1199,6 +1212,10 @@ pub struct IpcHost<E: BatchExecutor> {
     host_pipeline_cache_hits: u64,
     /// Last bounded host-translation refusal reason.
     host_translation_reason: Option<String>,
+    /// Kind 8 texture registrations refused during this session.
+    texture_registration_refusals: u64,
+    /// Last bounded texture-registration refusal reason, or `None`.
+    last_texture_refusal_reason: Option<String>,
     ledger: ListLedger,
 }
 
@@ -1248,6 +1265,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
             host_translation_reason: None,
+            texture_registration_refusals: 0,
+            last_texture_refusal_reason: None,
             ledger: ListLedger::new(),
         })
     }
@@ -1343,6 +1362,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_refused: self.host_pipeline_translations_refused,
             host_pipeline_cache_hits: self.host_pipeline_cache_hits,
             host_translation_reason: self.host_translation_reason.clone(),
+            texture_registration_refusals: self.texture_registration_refusals,
+            texture_registration_reason: self.last_texture_refusal_reason.clone(),
             // A host that never used its own pool reports the process-wide
             // state: a later session in the same daemon sees the live pool.
             pool_status: match self.compiler_pool.as_ref() {
@@ -1432,8 +1453,19 @@ impl<E: BatchExecutor> IpcHost<E> {
                 }
                 KIND_SUBMISSION_ASYNC => self.serve_async_submission(&payload)?,
                 KIND_TEXTURE_REG => {
-                    let status = self.register_texture(&payload);
-                    write_frame(&mut stream, KIND_ACK, &[status])?;
+                    let reply = self.register_texture(&payload);
+                    let status = reply.status;
+                    if reply.wants_reason {
+                        let reason = reply.reason.as_deref().unwrap_or("").as_bytes();
+                        let len = reason.len().min(TEXTURE_REG_REASON_MAX).min(u16::MAX as usize);
+                        let mut body = Vec::with_capacity(1 + 2 + len);
+                        body.push(status);
+                        body.extend_from_slice(&(len as u16).to_le_bytes());
+                        body.extend_from_slice(&reason[..len]);
+                        write_frame(&mut stream, KIND_ACK, &body)?;
+                    } else {
+                        write_frame(&mut stream, KIND_ACK, &[status])?;
+                    }
                 }
                 KIND_SAMPLER_REG => {
                     let status = self.register_sampler(&payload);
@@ -1560,27 +1592,47 @@ impl<E: BatchExecutor> IpcHost<E> {
 
     /// Registers a texture through the executor's ADR-013 registry.
     ///
-    /// Returns the kind-128 status byte. Every validation failure is an
-    /// explicit rejection rather than a session close, and no executor call is
-    /// made unless the descriptor is fully validated, so a refused registration
-    /// can never create GPU work or replace an existing handle.
-    fn register_texture(&mut self, payload: &[u8]) -> u8 {
+    /// Returns the kind-128 status byte plus a bounded named reason. Every
+    /// validation failure is an explicit rejection rather than a session close,
+    /// and no executor call is made unless the descriptor is fully validated,
+    /// so a refused registration can never create GPU work or replace an
+    /// existing handle.
+    fn register_texture(&mut self, payload: &[u8]) -> TextureRegistrationReply {
         let Some(request) = decode_texture_request(payload) else {
-            return REGISTRATION_REJECTED;
+            return self.refuse_texture_registration(
+                None,
+                "malformed kind 8 texture registration payload",
+                false,
+            );
         };
+        let wants_reason = request.wants_reason;
+        let shape = TextureRefusalShape::from_desc(request.id, request.generation, &request.desc);
         if request.id == 0 || request.generation == 0 {
-            return REGISTRATION_REJECTED;
+            return self.refuse_texture_registration(
+                Some(shape),
+                "texture handle and generation must be nonzero",
+                wants_reason,
+            );
         }
         // One handle space: a texture may not shadow a buffer allocation or an
         // earlier texture, and the snapshot key `(id, generation)` must be
         // unambiguous.
-        if self.allocations.contains_key(&request.id)
-            || self.textures.contains_key(&request.id)
-        {
-            return REGISTRATION_REJECTED;
+        if self.allocations.contains_key(&request.id) {
+            return self.refuse_texture_registration(
+                Some(shape),
+                "texture handle collides with a buffer allocation in this session",
+                wants_reason,
+            );
         }
-        if self.executor.register_texture(request.id, request.desc).is_err() {
-            return REGISTRATION_REJECTED;
+        if self.textures.contains_key(&request.id) {
+            return self.refuse_texture_registration(
+                Some(shape),
+                "texture handle is already registered in this session",
+                wants_reason,
+            );
+        }
+        if let Err(error) = self.executor.register_texture(request.id, request.desc) {
+            return self.refuse_texture_registration(Some(shape), &error.to_string(), wants_reason);
         }
         self.textures.insert(
             request.id,
@@ -1588,7 +1640,62 @@ impl<E: BatchExecutor> IpcHost<E> {
                 generation: request.generation,
             },
         );
-        REGISTRATION_ACCEPTED
+        TextureRegistrationReply {
+            status: REGISTRATION_ACCEPTED,
+            wants_reason,
+            reason: None,
+        }
+    }
+
+    /// Records one kind 8 refusal: a bounded counter, the last bounded reason,
+    /// and one warning carrying the received descriptor shape and the exact
+    /// reason. Never contains resource contents.
+    fn refuse_texture_registration(
+        &mut self,
+        shape: Option<TextureRefusalShape>,
+        reason: &str,
+        wants_reason: bool,
+    ) -> TextureRegistrationReply {
+        let reason = bounded_gpu_reason(reason);
+        let reason = if reason.len() > TEXTURE_REG_REASON_MAX {
+            let mut cut = TEXTURE_REG_REASON_MAX;
+            while cut > 0 && !reason.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            reason[..cut].to_string()
+        } else {
+            reason
+        };
+        self.texture_registration_refusals = self.texture_registration_refusals.saturating_add(1);
+        self.last_texture_refusal_reason = Some(reason.clone());
+        match shape {
+            Some(shape) => tracing::warn!(
+                id = format_args!("{:#x}", shape.id),
+                generation = shape.generation,
+                dimension = shape.dimension,
+                format = shape.format,
+                usage = shape.usage,
+                sample_count = shape.sample_count,
+                width = shape.width,
+                height = shape.height,
+                depth = shape.depth,
+                mip_levels = shape.mip_levels,
+                array_layers = shape.array_layers,
+                reason,
+                texture_registration_refusals = self.texture_registration_refusals,
+                "VICTORY_BACKEND=metal: host refused a texture registration"
+            ),
+            None => tracing::warn!(
+                reason,
+                texture_registration_refusals = self.texture_registration_refusals,
+                "VICTORY_BACKEND=metal: host refused a texture registration"
+            ),
+        }
+        TextureRegistrationReply {
+            status: REGISTRATION_REJECTED,
+            wants_reason,
+            reason: Some(reason),
+        }
     }
 
     /// Registers a reduced `MTLSamplerState` (kind 10).
@@ -3427,6 +3534,8 @@ struct TextureRequest {
     id: u64,
     generation: u32,
     desc: TextureDesc,
+    /// The guest sent the extended payload and can decode a refusal reason.
+    wants_reason: bool,
 }
 
 /// Decodes a kind 8 payload into a validated [`TextureDesc`].
@@ -3435,9 +3544,11 @@ struct TextureRequest {
 /// zero mip/layer counts and unsupported sample counts are refused before the
 /// executor is called.
 fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
-    if payload.len() != TEXTURE_REG_PAYLOAD_LEN {
-        return None;
-    }
+    let wants_reason = match payload.len() {
+        TEXTURE_REG_PAYLOAD_LEN => false,
+        TEXTURE_REG_PAYLOAD_LEN_V2 => payload[TEXTURE_REG_PAYLOAD_LEN] & TEXTURE_REG_WANT_REASON != 0,
+        _ => return None,
+    };
     let id = read_u64(payload, 0);
     let generation = read_u32(payload, 8);
     let dimension = texture_dimension_from_code(payload[12])?;
@@ -3473,7 +3584,73 @@ fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
             usage,
             label: None,
         },
+        wants_reason,
     })
+}
+
+/// What a kind 8 refusal tells the guest.
+struct TextureRegistrationReply {
+    status: u8,
+    wants_reason: bool,
+    reason: Option<String>,
+}
+
+/// The received descriptor shape a kind 8 refusal logs. Codes are the wire
+/// codes on the request, so a refusal names exactly what arrived.
+struct TextureRefusalShape {
+    id: u64,
+    generation: u32,
+    dimension: u8,
+    format: u8,
+    usage: u8,
+    sample_count: u8,
+    width: u32,
+    height: u32,
+    depth: u32,
+    mip_levels: u16,
+    array_layers: u16,
+}
+
+impl TextureRefusalShape {
+    fn from_desc(id: u64, generation: u32, desc: &TextureDesc) -> Self {
+        Self {
+            id,
+            generation,
+            // Reverse the decoded registry enums just for the log line.
+            dimension: texture_dimension_code(desc.dimension),
+            format: desc.format.wire_code(),
+            usage: texture_usage_code(desc.usage),
+            sample_count: u8::try_from(desc.sample_count).unwrap_or(u8::MAX),
+            width: desc.width,
+            height: desc.height,
+            depth: desc.depth,
+            mip_levels: u16::try_from(desc.mip_levels).unwrap_or(u16::MAX),
+            array_layers: u16::try_from(desc.array_layers).unwrap_or(u16::MAX),
+        }
+    }
+}
+
+fn texture_dimension_code(dimension: TextureDimension) -> u8 {
+    match dimension {
+        TextureDimension::D1 => 0,
+        TextureDimension::D2 => 1,
+        TextureDimension::D2Array => 2,
+        TextureDimension::Cube => 3,
+        TextureDimension::CubeArray => 4,
+        TextureDimension::D3 => 5,
+    }
+}
+
+fn texture_usage_code(usage: TextureUsage) -> u8 {
+    if usage.depth_stencil {
+        2
+    } else if usage.shader_write && !usage.render_target {
+        3
+    } else if usage.render_target {
+        1
+    } else {
+        0
+    }
 }
 
 /// One decoded kind 10 sampler registration.
@@ -6104,6 +6281,78 @@ mod tests {
         payload[28..30].copy_from_slice(&1u16.to_le_bytes()); // mip levels
         payload[30..32].copy_from_slice(&1u16.to_le_bytes()); // array layers
         payload
+    }
+
+    /// The extended payload advertises the reason extension and decodes with
+    /// the same descriptor as the classic shape.
+    #[test]
+    fn the_extended_texture_payload_requests_a_reason() {
+        let classic = texture_registration_payload(9);
+        let mut extended = [0u8; TEXTURE_REG_PAYLOAD_LEN_V2];
+        extended[..TEXTURE_REG_PAYLOAD_LEN].copy_from_slice(&classic);
+        extended[TEXTURE_REG_PAYLOAD_LEN] = TEXTURE_REG_WANT_REASON;
+
+        let request = decode_texture_request(&extended).expect("extended payload decodes");
+        assert!(request.wants_reason);
+        assert_eq!(request.id, 0x21);
+        assert_eq!(request.desc, decode_texture_request(&classic).unwrap().desc);
+
+        extended[TEXTURE_REG_PAYLOAD_LEN] = 0;
+        assert!(!decode_texture_request(&extended).unwrap().wants_reason);
+    }
+
+    /// A host refusal puts the executor's exact reason on the wire, after the
+    /// status byte, only for a guest that advertised the extension.
+    #[test]
+    fn a_texture_refusal_returns_the_executor_reason_on_the_wire() {
+        let dir = TestDir::new();
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+
+        let classic = texture_registration_payload(9);
+        let mut payload = vec![0u8; TEXTURE_REG_PAYLOAD_LEN_V2];
+        payload[..TEXTURE_REG_PAYLOAD_LEN].copy_from_slice(&classic);
+        payload[TEXTURE_REG_PAYLOAD_LEN] = TEXTURE_REG_WANT_REASON;
+        write_frame(&mut client, KIND_TEXTURE_REG, &classic).expect("send classic register");
+        expect_ack(&mut client, true);
+        write_frame(&mut client, KIND_TEXTURE_REG, &payload).expect("send extended register");
+
+        let (kind, body) = read_frame(&mut client)
+            .expect("read ack")
+            .expect("an ack frame");
+        assert_eq!(kind, KIND_ACK);
+        assert_eq!(body[0], REGISTRATION_REJECTED);
+        let len = usize::from(u16::from_le_bytes([body[1], body[2]]));
+        let reason = std::str::from_utf8(&body[3..3 + len]).expect("utf8 reason");
+        assert!(
+            reason.contains("already registered in this session"),
+            "the host's reason reaches the guest: {reason}"
+        );
+    }
+
+    /// The classic one-byte request keeps the one-byte reply, so an older guest
+    /// never sees an extension it cannot parse.
+    #[test]
+    fn a_classic_texture_request_keeps_the_one_byte_reply() {
+        let dir = TestDir::new();
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(
+            &mut client,
+            KIND_TEXTURE_REG,
+            &texture_registration_payload(9),
+        )
+        .expect("send classic register");
+        expect_ack(&mut client, true);
+        write_frame(
+            &mut client,
+            KIND_TEXTURE_REG,
+            &texture_registration_payload(9),
+        )
+        .expect("send the duplicate classic register");
+        expect_ack(&mut client, false);
     }
 
     /// Guest kind 8 code 9 is the title's FP16 present target: the host

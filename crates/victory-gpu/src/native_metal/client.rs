@@ -434,6 +434,13 @@ pub const KIND_SAMPLER_REG: u8 = 10;
 pub const FENCE_PAGE_REGISTER_PAYLOAD_LEN: usize = 8;
 /// Exact length of a texture registration payload.
 pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
+/// Extended texture registration payload: the classic 32 bytes plus one flags
+/// byte. The host accepts both shapes, so an older guest keeps working.
+pub const TEXTURE_REG_PAYLOAD_LEN_V2: usize = TEXTURE_REG_PAYLOAD_LEN + 1;
+/// Extended-payload flag asking the host to append a bounded refusal reason.
+pub const TEXTURE_REG_WANT_REASON: u8 = 0x01;
+/// Upper bound the host puts on a refusal reason.
+pub const TEXTURE_REG_REASON_MAX: usize = 512;
 /// Exact length of a present-surface registration payload.
 pub const SURFACE_REG_PAYLOAD_LEN: usize = 16;
 /// Exact length of a sampler registration payload: handle then five `u32`s.
@@ -969,6 +976,11 @@ pub struct WireV3Client {
     last_pipeline_ticket: u64,
     /// Native pipeline ids returned by kind 129, by ticket.
     pipelines: std::collections::BTreeMap<u64, u64>,
+    /// The host's bounded reason for the last refused kind 8 registration.
+    ///
+    /// Cleared by a later accepted registration. `None` for an older host that
+    /// answers with the classic one-byte status.
+    last_texture_refusal: Option<String>,
 }
 
 impl WireV3Client {
@@ -1053,6 +1065,7 @@ impl WireV3Client {
             last_allocation: 0,
             last_pipeline_ticket: 0,
             pipelines: std::collections::BTreeMap::new(),
+            last_texture_refusal: None,
         };
         let mut stream = client.handshake()?;
         client.register_fence_page(&mut stream, client.fence_page_path.clone());
@@ -1182,6 +1195,7 @@ impl WireV3Client {
         self.textures.clear();
         self.samplers.clear();
         self.surfaces.clear();
+        self.last_texture_refusal = None;
         self.allocations.clear();
         self.last_allocation = 0;
         self.last_pipeline_ticket = 0;
@@ -1253,7 +1267,7 @@ impl WireV3Client {
                 "texture registration needs a nonzero id and generation".to_string(),
             ));
         }
-        let mut payload = [0u8; TEXTURE_REG_PAYLOAD_LEN];
+        let mut payload = [0u8; TEXTURE_REG_PAYLOAD_LEN_V2];
         payload[0..8].copy_from_slice(&id.to_le_bytes());
         payload[8..12].copy_from_slice(&generation.to_le_bytes());
         payload[12] = dimension;
@@ -1265,10 +1279,15 @@ impl WireV3Client {
         payload[24..28].copy_from_slice(&depth.to_le_bytes());
         payload[28..30].copy_from_slice(&mip_levels.to_le_bytes());
         payload[30..32].copy_from_slice(&array_layers.to_le_bytes());
-        let status = self.registration(KIND_TEXTURE_REG, &payload, "register texture")?;
+        payload[32] = TEXTURE_REG_WANT_REASON;
+        let (status, reason) =
+            self.registration_reply(KIND_TEXTURE_REG, &payload, "register texture")?;
         let accepted = status == REGISTRATION_ACCEPTED;
         if accepted {
             self.textures.insert(id);
+            self.last_texture_refusal = None;
+        } else {
+            self.last_texture_refusal = reason;
         }
         Ok(accepted)
     }
@@ -1715,13 +1734,31 @@ impl WireV3Client {
         payload: &[u8],
         operation: &'static str,
     ) -> Result<u8, NativeQueueError> {
+        self.registration_reply(kind, payload, operation)
+            .map(|(status, _)| status)
+    }
+
+    /// One registration request plus a reply that may append a bounded,
+    /// length-prefixed refusal reason.
+    ///
+    /// A one-byte reply is the classic shape and decodes with no reason, so an
+    /// older host keeps working. A malformed trailing reason decodes as empty
+    /// rather than failing the registration.
+    fn registration_reply(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        operation: &'static str,
+    ) -> Result<(u8, Option<String>), NativeQueueError> {
         let result = self.with_stream(|stream| {
             write_frame(stream, kind, payload, operation, self.timeout).and_then(|()| {
                 read_frame(stream, operation, MAX_PAYLOAD_LEN as usize, self.timeout)
             })
         });
         match result {
-            Ok((KIND_ACK, status)) if status.len() == 1 => Ok(status[0]),
+            Ok((KIND_ACK, status)) if !status.is_empty() => {
+                Ok((status[0], decode_registration_reason(&status[1..])))
+            }
             Ok((actual, _)) => {
                 self.close();
                 Err(NativeQueueError::Transport(
@@ -1738,6 +1775,11 @@ impl WireV3Client {
                 Err(error)
             }
         }
+    }
+
+    /// The host's bounded reason for the last refused texture registration.
+    pub fn last_texture_refusal_reason(&self) -> Option<&str> {
+        self.last_texture_refusal.as_deref()
     }
 
     /// Builds one kind 5 request from an encoded v3 submission.
@@ -2308,6 +2350,20 @@ fn io_error(operation: &'static str, timeout: Duration, source: io::Error) -> Tr
     }
 }
 
+/// Decodes the optional refusal reason appended to a kind 8 acknowledgement.
+///
+/// The bytes are `u16 LE length` followed by UTF-8. A missing or truncated
+/// reason decodes as `None`, so a one-byte classic reply and a malformed
+/// extension both leave the status meaningful.
+fn decode_registration_reason(bytes: &[u8]) -> Option<String> {
+    let len = usize::from(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]));
+    let reason = bytes.get(2..2usize.checked_add(len)?)?;
+    if reason.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(reason).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read, Write};
@@ -2710,6 +2766,72 @@ mod tests {
         assert!(
             decode_reply_with_reason(&oversized).is_err(),
             "an overlong trailer must be refused"
+        );
+    }
+
+    #[test]
+    fn a_texture_refusal_carries_the_host_reason_and_requests_it() {
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let (kind, payload) = TestHost::read_frame(&mut stream);
+            assert_eq!(kind, KIND_TEXTURE_REG);
+            assert_eq!(
+                payload.len(),
+                TEXTURE_REG_PAYLOAD_LEN_V2,
+                "the guest advertises the reason extension"
+            );
+            assert_eq!(payload[TEXTURE_REG_PAYLOAD_LEN], TEXTURE_REG_WANT_REASON);
+
+            let reason = b"invalid texture descriptor: multisampled textures cannot have mipmaps";
+            let mut body = vec![1u8];
+            body.extend_from_slice(&(reason.len() as u16).to_le_bytes());
+            body.extend_from_slice(reason);
+            TestHost::write_frame(&mut stream, KIND_ACK, &body);
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        let mut client =
+            WireV3Client::connect_with_timeout(&host.endpoint(), &SECRET, TEST_TIMEOUT)
+                .expect("connect");
+        let accepted = client
+            .register_texture(0x1234, 1, 1, 0, 1, 1, 64, 64, 1, 1, 1)
+            .expect("the extended reply decodes");
+        assert!(!accepted);
+        assert_eq!(
+            client.last_texture_refusal_reason(),
+            Some("invalid texture descriptor: multisampled textures cannot have mipmaps")
+        );
+    }
+
+    #[test]
+    fn a_classic_one_byte_texture_reply_still_decodes() {
+        let host = TestHost::spawn(move |listener| {
+            let mut stream = accept_authenticated(&listener, &SECRET);
+            let (kind, _payload) = TestHost::read_frame(&mut stream);
+            assert_eq!(kind, KIND_TEXTURE_REG);
+            TestHost::write_frame(&mut stream, KIND_ACK, &[0]);
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        let mut client =
+            WireV3Client::connect_with_timeout(&host.endpoint(), &SECRET, TEST_TIMEOUT)
+                .expect("connect");
+        let accepted = client
+            .register_texture(0x1234, 1, 1, 0, 1, 1, 64, 64, 1, 1, 1)
+            .expect("an older one-byte reply decodes");
+        assert!(accepted);
+        assert_eq!(client.last_texture_refusal_reason(), None);
+    }
+
+    #[test]
+    fn a_missing_or_truncated_registration_reason_decodes_as_empty() {
+        assert_eq!(decode_registration_reason(&[]), None);
+        assert_eq!(decode_registration_reason(&[0]), None);
+        assert_eq!(decode_registration_reason(&[0, 0]), None);
+        assert_eq!(decode_registration_reason(&[4, 0, b'a']), None);
+        assert_eq!(
+            decode_registration_reason(&[2, 0, b'o', b'k']),
+            Some("ok".to_string())
         );
     }
 
