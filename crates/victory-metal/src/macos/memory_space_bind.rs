@@ -66,10 +66,16 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 static RANGES: AtomicU64 = AtomicU64::new(0);
 /// Heap pairs the built table names; a gauge.
 static HEAP_PAIRS: AtomicU64 = AtomicU64::new(0);
+/// Stage lists (per ABI flush) in which at least one stage declared
+/// `MEMORY_SPACE`; separates "no shader needs title memory" from "the table
+/// never bound".
+static DECLARED_STAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Exact process-wide live-`MEMORY_SPACE` counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemorySpaceTelemetry {
+    /// ABI flushes in which a stage declared `MEMORY_SPACE`.
+    pub declared_stages: u64,
     /// Map applications that changed the range set.
     pub updates: u64,
     /// Pages in the table most recently built (a gauge; 0 when none).
@@ -89,6 +95,7 @@ pub struct MemorySpaceTelemetry {
 /// A snapshot of the live counters.
 pub fn telemetry() -> MemorySpaceTelemetry {
     MemorySpaceTelemetry {
+        declared_stages: DECLARED_STAGES.load(Ordering::Relaxed),
         updates: UPDATES.load(Ordering::Relaxed),
         pages: PAGES.load(Ordering::Relaxed),
         invalidations: INVALIDATIONS.load(Ordering::Relaxed),
@@ -106,12 +113,16 @@ pub fn telemetry() -> MemorySpaceTelemetry {
 /// the `(stage, reflected layout)` list those functions already build for
 /// `flush_abi`.
 pub fn declares_memory_space(stages: &[(ShaderStage, RootSignatureLayout)]) -> bool {
-    stages.iter().any(|(_, layout)| {
+    let declared = stages.iter().any(|(_, layout)| {
         layout
             .parameters()
             .iter()
             .any(|parameter| parameter.space() == victory_shader::emit::MEMORY_SPACE)
-    })
+    });
+    if declared {
+        DECLARED_STAGES.fetch_add(1, Ordering::Relaxed);
+    }
+    declared
 }
 
 /// Records a map application that changed the range set; `ranges` is the new
