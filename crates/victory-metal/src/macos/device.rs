@@ -4089,16 +4089,23 @@ fn abi_parameter_index(
     binding: &PendingAbiBinding,
 ) -> Option<usize> {
     let slot = binding.slot();
-    if let Ok(Some(index)) = layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
+    let index = binding.wire_slot();
+    // Converter reflection reports a descriptor table's Slot/Space as
+    // `u32::MAX`, so every table's reflected triple is identical: a triple
+    // lookup would bind the first table twice. The wire index is that path's
+    // only identity, and it is checked first whenever the layout agrees with it
+    // (an unknown `u32::MAX` field, or the exact declared pair).
+    if let Some(parameter) = layout.parameters().get(index)
+        && abi_kinds_compatible(parameter.kind(), slot.kind())
+        && (parameter.space() == slot.space() || parameter.space() == u32::MAX)
+        && (parameter.register() == slot.register() || parameter.register() == u32::MAX)
+    {
         return Some(index);
     }
-    let index = binding.wire_slot();
-    let parameter = layout.parameters().get(index)?;
-    if abi_kinds_compatible(parameter.kind(), slot.kind()) {
-        Some(index)
-    } else {
-        None
+    if let Ok(Some(found)) = layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
+        return Some(found);
     }
+    None
 }
 
 /// Whether a wire argument kind can address a reflected parameter kind.
