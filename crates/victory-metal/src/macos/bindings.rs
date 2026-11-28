@@ -802,9 +802,13 @@ impl RootSignatureLayout {
     ///
     /// The wire protocol addresses a root argument by its root-parameter slot,
     /// while the converter flattens parameters into the argument buffer in its
-    /// own order. This lookup is the bridge: it is deterministic, requires an
-    /// exact `space`/`register` match, and refuses a layout that declares the
-    /// same `(space, register, kind)` twice instead of silently picking one.
+    /// own order. This lookup is the bridge: it requires an exact `space` and
+    /// `register` match. A converted layout may legitimately declare the same
+    /// `(space, register, kind)` more than once (two stages sharing one
+    /// parameter, or a reflection that lists a table twice); the first
+    /// declaration in flattened order wins deterministically, which is the
+    /// parameter the converter itself addresses first. Refusing outright would
+    /// drop a valid pipeline, as the Synthetic pre-boot gate proved.
     ///
     /// `Ok(None)` means the layout does not declare the argument. A table kind
     /// of [`DescriptorTableKind::Unspecified`] matches any concrete table kind,
@@ -816,7 +820,6 @@ impl RootSignatureLayout {
         register: u32,
         kind: RootParameterKind,
     ) -> Result<Option<usize>, MetalError> {
-        let mut found = None;
         for (index, parameter) in self.parameters.iter().enumerate() {
             // Converter reflection reports `Slot`/`Space` as `u32::MAX` for a
             // descriptor table; the root signature is the only source of that
@@ -827,15 +830,10 @@ impl RootSignatureLayout {
             let register_matches =
                 parameter.register == register || (table && parameter.register == u32::MAX);
             if space_matches && register_matches && root_kind_matches(parameter.kind, kind) {
-                if found.is_some() {
-                    return Err(MetalError::InvalidArg(
-                        "root signature declares duplicate space, register and kind parameters",
-                    ));
-                }
-                found = Some(index);
+                return Ok(Some(index));
             }
         }
-        Ok(found)
+        Ok(None)
     }
 
     /// Metal buffer index used by `setBytes` root constants, when opted in.
@@ -3115,14 +3113,18 @@ mod tests {
             Some(0)
         );
         // Two tables at the same space/register with different kinds make an
-        // unspecified lookup ambiguous, which must refuse rather than pick one.
-        assert!(layout
-            .parameter_by(
-                0,
-                0,
-                RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
-            )
-            .is_err());
+        // unspecified lookup ambiguous; the first flattened declaration wins
+        // deterministically instead of refusing the whole pipeline.
+        assert_eq!(
+            layout
+                .parameter_by(
+                    0,
+                    0,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
+                )
+                .expect("ambiguous table kind resolves deterministically"),
+            Some(3)
+        );
         // Converter reflection gives a table `u32::MAX` slot/space; the root
         // signature supplies the concrete pair, so the lookup must still match.
         let reflected_tables = compute_layout();
@@ -3172,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn parameter_by_refuses_a_duplicate_declaration() {
+    fn parameter_by_takes_the_first_of_a_repeated_declaration() {
         let layout = RootSignatureLayout::from_parameters(
             ReflectedStage::Compute,
             &[
@@ -3191,10 +3193,14 @@ mod tests {
             ],
         )
         .expect("the flattening layer allows repeated declarations");
-        assert!(matches!(
-            layout.parameter_by(0, 0, RootParameterKind::Constants),
-            Err(MetalError::InvalidArg(_))
-        ));
+        // Deterministic first match; refusing would drop a valid pipeline (the
+        // Synthetic pre-boot gate's multi-entry signature repeats a parameter).
+        assert_eq!(
+            layout
+                .parameter_by(0, 0, RootParameterKind::Constants)
+                .expect("a repeated declaration resolves"),
+            Some(0)
+        );
     }
 
     #[test]
