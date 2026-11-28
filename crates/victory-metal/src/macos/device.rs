@@ -1190,6 +1190,15 @@ pub struct DirectMetalTransport {
     memory_space_bound: std::sync::atomic::AtomicU64,
     /// Bytes allocated for those default MEMORY_SPACE buffers.
     memory_space_bytes: std::sync::atomic::AtomicU64,
+    /// Plan-less descriptor-table sets accepted as inert because the bound
+    /// pipeline's reflected/translated signature declares no table parameter.
+    ///
+    /// A named acceptance, never an `abi_refusal`: the batch encodes, and this
+    /// counter (with the census `outcome: "inert"`) keeps it visible.
+    descriptor_table_inert_acceptances: std::sync::atomic::AtomicU64,
+    /// Descriptor-table sets a plan named as tables that the bound pipeline
+    /// declares none of (a genuinely stale/correlated set).
+    descriptor_table_stale_refusals: std::sync::atomic::AtomicU64,
 }
 
 impl DirectMetalTransport {
@@ -1258,6 +1267,8 @@ impl DirectMetalTransport {
             legacy_root_bindings: std::sync::atomic::AtomicU64::new(0),
             memory_space_bound: std::sync::atomic::AtomicU64::new(0),
             memory_space_bytes: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_inert_acceptances: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_stale_refusals: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1284,6 +1295,34 @@ impl DirectMetalTransport {
 
     fn count_abi_refusal(&self) {
         self.abi_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Plan-less descriptor-table sets accepted as inert by name.
+    ///
+    /// A translated root signature never declares a table, so a set that names
+    /// none cannot address a root parameter; accepting it keeps the batch's
+    /// draws encodable and this counter/census keeps the class visible.
+    pub fn descriptor_table_inert_acceptance_count(&self) -> u64 {
+        self.descriptor_table_inert_acceptances
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_descriptor_table_inert_acceptance(&self) {
+        self.descriptor_table_inert_acceptances
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Descriptor-table sets a plan named as tables that the bound pipeline
+    /// declares none of (stale/correlated), counted apart from
+    /// [`Self::abi_refusal_count`].
+    pub fn descriptor_table_stale_refusal_count(&self) -> u64 {
+        self.descriptor_table_stale_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_descriptor_table_stale_refusal(&self) {
+        self.descriptor_table_stale_refusals
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3243,14 +3282,13 @@ impl PipelineAbi {
     /// stage's table count. It is used only by the bounded refusal census, so an
     /// ambiguous ordinal is attributed, never accepted.
     pub fn declared_descriptor_table_count(&self) -> usize {
-        let map_tables = self.root_parameters.as_ref().map_or(0, |map| {
-            map.slots()
-                .iter()
-                .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
-                .count()
-        });
-        let widest_stage = self
-            .layouts()
+        self.map_descriptor_table_count()
+            .max(self.widest_stage_descriptor_table_count())
+    }
+
+    /// Descriptor tables the widest single stage layout declares.
+    pub fn widest_stage_descriptor_table_count(&self) -> usize {
+        self.layouts()
             .map(|layout| {
                 layout
                     .parameters()
@@ -3261,8 +3299,87 @@ impl PipelineAbi {
                     .count()
             })
             .max()
-            .unwrap_or(0);
-        map_tables.max(widest_stage)
+            .unwrap_or(0)
+    }
+
+    /// Descriptor tables the authoritative translated root-parameter map
+    /// declares.
+    ///
+    /// The translated signature from `victory-shader` never declares a table:
+    /// it lowers every title table to directly indexed heap access, so this is
+    /// `0` for a translated pipeline. A pipeline registered without the map (a
+    /// legacy constructor) is also `0`.
+    pub fn map_descriptor_table_count(&self) -> usize {
+        self.root_parameters.as_ref().map_or(0, |map| {
+            map.slots()
+                .iter()
+                .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
+                .count()
+        })
+    }
+
+    /// Descriptor-table parameters converter reflection reports, summed over
+    /// every stage layout.
+    ///
+    /// Converter reflection reports a table as `"Table"`/`"Sampler"` with
+    /// wildcard `Slot`/`Space`; those still count here, so this is the count
+    /// that proves whether the reflected signature expresses any table at all.
+    pub fn reflected_descriptor_table_total(&self) -> usize {
+        self.layouts()
+            .map(|layout| {
+                layout
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| {
+                        matches!(parameter.kind(), RootParameterKind::DescriptorTable(_))
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Reflected descriptor-table parameters per stage, in registration order:
+    /// vertex, fragment, mesh, object, compute.
+    pub fn reflected_descriptor_table_counts(&self) -> [usize; 5] {
+        [
+            self.vertex.as_ref(),
+            self.fragment.as_ref(),
+            self.mesh.as_ref(),
+            self.object.as_ref(),
+            self.compute.as_ref(),
+        ]
+        .map(|layout| {
+            layout.map_or(0, |layout| {
+                layout
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| {
+                        matches!(parameter.kind(), RootParameterKind::DescriptorTable(_))
+                    })
+                    .count()
+            })
+        })
+    }
+
+    /// Bit mask of the stage layouts this ABI carries: bit 0 vertex, bit 1
+    /// fragment, bit 2 mesh, bit 3 object, bit 4 compute.
+    pub fn stage_presence_mask(&self) -> u8 {
+        let mut mask = 0u8;
+        for (bit, present) in [
+            self.vertex.is_some(),
+            self.fragment.is_some(),
+            self.mesh.is_some(),
+            self.object.is_some(),
+            self.compute.is_some(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if present {
+                mask |= 1 << bit;
+            }
+        }
+        mask
     }
 
     /// Every stage layout this ABI carries, in registration order.
@@ -4570,56 +4687,102 @@ fn resolve_wire_root_argument(
 
 /// Resolves one wire `SetDescriptorTable` `set` to a declared table parameter.
 ///
-/// Order, identical for the compute and graphics arms:
+/// The rule is total and identical for the compute and graphics arms:
 ///
 /// 1. a plan entry for the set wins; a plan entry naming a non-table argument is
 ///    a counted ABI refusal (and a census key, because it explains the miss);
-/// 2. the deterministic ordinal rule of
+/// 2. a plan entry naming a table the bound pipeline declares none of is a
+///    genuine stale/correlated set: a NEW named refusal
+///    (`descriptor table set names a table the bound pipeline does not declare`)
+///    counted in [`DirectMetalTransport::descriptor_table_stale_refusal_count`],
+///    never confused with "no declared root parameter";
+/// 3. without a plan entry, the deterministic ordinal rule of
 ///    [`PipelineAbi::descriptor_table_for_set`]; an ambiguous ordinal is
 ///    refused by name rather than guessed;
-/// 3. the set as a flattened root-parameter index, when that slot really is a
+/// 4. the set as a flattened root-parameter index, when that slot really is a
 ///    table (the legacy guest shape);
-/// 4. a named, counted refusal.
+/// 5. a set that names none of those on a signature that declares **no table at
+///    all** is a named, counted **inert acceptance** (`Ok(None)`): the
+///    translated signature lowers every title table to directly indexed heap
+///    access, so no root parameter can address it. The batch encodes and
+///    `abi_refusals` stays 0; [`DirectMetalTransport::count_descriptor_table_inert_acceptance`]
+///    and the census `outcome: "inert"` keep the class visible. Nothing is
+///    silently dropped;
+/// 6. any other set is a named, counted refusal.
 fn resolve_descriptor_table_set(
     transport: &DirectMetalTransport,
     abi: &PipelineAbi,
     plan: Option<&RootParameterPlan>,
     pipeline_id: u64,
     set: u16,
-) -> Result<RootParameterSlot, PrepareAbort> {
+) -> Result<Option<RootParameterSlot>, PrepareAbort> {
     let entry = plan.and_then(|plan| plan.entry(set));
     if let Some(entry) = entry {
         if entry.kind != PlanArgumentKind::DescriptorTable {
-            note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+            note_descriptor_table_event(
+                abi,
+                plan,
+                pipeline_id,
+                set,
+                crate::macos::trace::OUTCOME_REFUSED,
+            );
             transport.count_abi_refusal();
             return Err(MetalError::InvalidArg(
                 "descriptor table plan names a non-table root argument",
             )
             .into());
         }
-        return match planned_root_parameter(
-            transport,
-            abi,
-            entry,
+        if let Some(slot) = abi.root_parameter_for_argument(
+            entry.space,
+            entry.register,
             PlanArgumentKind::DescriptorTable,
-            "descriptor table plan names a non-table root argument",
         ) {
-            Ok(slot) => Ok(slot),
-            Err(error) => {
-                // A plan entry that names no declared table is still a refusal
-                // this boot must be able to attribute.
-                note_descriptor_table_refusal(abi, plan, pipeline_id, set);
-                Err(error)
-            }
-        };
+            return Ok(Some(slot));
+        }
+        if abi.declared_descriptor_table_count() == 0 {
+            // The guest's plan says this is a table of the bound pipeline, but
+            // that pipeline declares no table at all. This is the stale /
+            // wrong-pipeline correlation class, not a missing ordinal.
+            note_descriptor_table_event(
+                abi,
+                plan,
+                pipeline_id,
+                set,
+                crate::macos::trace::OUTCOME_STALE,
+            );
+            transport.count_descriptor_table_stale_refusal();
+            transport.count_abi_refusal();
+            return Err(MetalError::InvalidArg(
+                "descriptor table set names a table the bound pipeline does not declare",
+            )
+            .into());
+        }
+        note_descriptor_table_event(
+            abi,
+            plan,
+            pipeline_id,
+            set,
+            crate::macos::trace::OUTCOME_REFUSED,
+        );
+        transport.count_abi_refusal();
+        return Err(MetalError::InvalidArg(
+            "a wire root argument names a translated parameter the root signature does not declare",
+        )
+        .into());
     }
 
     let index = usize::from(set);
     transport.count_legacy_root_binding();
     match abi.descriptor_table_for_set(index) {
-        DescriptorTableSet::Declared(slot) => return Ok(slot),
+        DescriptorTableSet::Declared(slot) => return Ok(Some(slot)),
         DescriptorTableSet::Ambiguous => {
-            note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+            note_descriptor_table_event(
+                abi,
+                plan,
+                pipeline_id,
+                set,
+                crate::macos::trace::OUTCOME_REFUSED,
+            );
             transport.count_abi_refusal();
             return Err(MetalError::InvalidArg(
                 "descriptor table set is ambiguous across shader stages",
@@ -4635,23 +4798,48 @@ fn resolve_descriptor_table_set(
     if let Some(slot) = abi.root_parameter(index)
         && matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
     {
-        return Ok(slot);
+        return Ok(Some(slot));
     }
 
-    note_descriptor_table_refusal(abi, plan, pipeline_id, set);
+    if abi.declared_descriptor_table_count() == 0 {
+        // A translated signature expresses no table at all: there is no root
+        // parameter a plan-less set could name, so the binding is inert. This
+        // is a named acceptance, not an ABI refusal, so the batch encodes.
+        note_descriptor_table_event(
+            abi,
+            plan,
+            pipeline_id,
+            set,
+            crate::macos::trace::OUTCOME_INERT,
+        );
+        transport.count_descriptor_table_inert_acceptance();
+        return Ok(None);
+    }
+
+    note_descriptor_table_event(
+        abi,
+        plan,
+        pipeline_id,
+        set,
+        crate::macos::trace::OUTCOME_REFUSED,
+    );
     transport.count_abi_refusal();
     Err(MetalError::InvalidArg("descriptor table names no declared root parameter").into())
 }
 
-/// Records one descriptor-table miss under the bounded census key.
-fn note_descriptor_table_refusal(
+/// Records one descriptor-table census event under the bounded key.
+fn note_descriptor_table_event(
     abi: &PipelineAbi,
     plan: Option<&RootParameterPlan>,
     pipeline_id: u64,
     set: u16,
+    outcome: &'static str,
 ) {
     let declared_tables =
         u16::try_from(abi.declared_descriptor_table_count()).unwrap_or(u16::MAX);
+    let reflected_tables =
+        u16::try_from(abi.reflected_descriptor_table_total()).unwrap_or(u16::MAX);
+    let map_tables = u16::try_from(abi.map_descriptor_table_count()).unwrap_or(u16::MAX);
     let plan_kind = plan
         .and_then(|plan| plan.entry(set))
         .map_or("none", |entry| entry.kind.name());
@@ -4660,8 +4848,12 @@ fn note_descriptor_table_refusal(
             pipeline_id,
             wire_set: set,
             declared_tables,
+            reflected_tables,
+            stage_mask: abi.stage_presence_mask(),
+            map_tables,
             had_plan: plan.is_some(),
             plan_kind,
+            outcome,
         },
     );
 }
@@ -5495,13 +5687,19 @@ fn prepare_compute_segment(
                     // ordinal rule resolves the set, then the legacy flattened
                     // index. A set that names none of those is refused by name
                     // and counted (see `resolve_descriptor_table_set`).
-                    let slot = resolve_descriptor_table_set(
+                    let Some(slot) = resolve_descriptor_table_set(
                         transport,
                         active,
                         root_plan,
                         current_pipeline_id,
                         table.set,
-                    )?;
+                    )?
+                    else {
+                        // Named, counted inert acceptance: the bound pipeline
+                        // declares no table, so this set addresses no root
+                        // parameter. The batch still encodes.
+                        continue;
+                    };
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -6409,13 +6607,19 @@ fn build_render_ops(
                     // ordinal rule resolves the set, then the legacy flattened
                     // index. A set that names none of those is refused by name
                     // and counted (see `resolve_descriptor_table_set`).
-                    let slot = resolve_descriptor_table_set(
+                    let Some(slot) = resolve_descriptor_table_set(
                         transport,
                         active,
                         root_plan,
                         current_pipeline_id,
                         table.set,
-                    )?;
+                    )?
+                    else {
+                        // Named, counted inert acceptance: the bound pipeline
+                        // declares no table, so this set addresses no root
+                        // parameter. The batch still encodes.
+                        continue;
+                    };
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -9830,6 +10034,92 @@ mod tests {
             .expect("appended stage table");
         assert_eq!(second.register(), 1);
         assert_eq!(abi.declared_descriptor_table_count(), 2);
+    }
+
+    /// Converter reflection reports a table's slot/space as `u32::MAX`; those
+    /// wildcards still count as reflected tables, and the authoritative map's
+    /// tables are counted separately so the census can tell a wildcard
+    /// reflection from an empty one.
+    #[test]
+    fn wildcard_reflected_tables_are_counted_and_attributed_per_stage() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterMap,
+            RootParameterSlot, RootParameterSpec, RootSignatureLayout,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: u32::MAX,
+                    space: u32::MAX,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("wildcard table layout");
+        let map = RootParameterMap::from_slots(vec![RootParameterSlot::new(
+            0,
+            0,
+            RootParameterKind::Constants,
+            16,
+        )]);
+        let abi = super::PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map);
+        assert_eq!(abi.reflected_descriptor_table_total(), 1, "wildcard counts");
+        assert_eq!(abi.reflected_descriptor_table_counts(), [0, 1, 0, 0, 0]);
+        assert_eq!(abi.map_descriptor_table_count(), 0, "the map names none");
+        assert_eq!(abi.declared_descriptor_table_count(), 1);
+        assert_eq!(abi.stage_presence_mask(), 0b10, "fragment layout only");
+        assert!(matches!(
+            abi.descriptor_table_for_set(0),
+            super::DescriptorTableSet::Declared(_)
+        ));
+    }
+
+    /// A translated signature never declares a table: every stage may carry
+    /// root constants/views only. The census must say "0 reflected, 0 map",
+    /// and the ordinal rule must be `Missing` for every set (which the resolver
+    /// then turns into a named inert acceptance, never a guess).
+    #[test]
+    fn an_empty_table_declaration_is_missing_and_attributed() {
+        use crate::macos::bindings::{
+            ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::ConstantBufferView,
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("zero-table layout");
+        let abi = super::PipelineAbi::graphics(Some(layout.clone()), Some(layout));
+        assert_eq!(abi.reflected_descriptor_table_total(), 0);
+        assert_eq!(abi.reflected_descriptor_table_counts(), [0, 0, 0, 0, 0]);
+        assert_eq!(abi.map_descriptor_table_count(), 0);
+        assert_eq!(abi.declared_descriptor_table_count(), 0);
+        assert_eq!(abi.stage_presence_mask(), 0b11, "vertex and fragment");
+        assert_eq!(
+            abi.descriptor_table_for_set(0),
+            super::DescriptorTableSet::Missing,
+            "a zero-table signature has no ordinal to resolve"
+        );
     }
 
     /// Encoder state is applied once per change: repeating the same wire state
