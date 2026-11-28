@@ -503,3 +503,232 @@ fn a_plan_less_descriptor_table_set_resolves_by_ordinal() {
         transport.abi_refusal_count()
     );
 }
+
+// ----- Cycle 18C: the content-key depth state is applied, not invented ------
+
+/// Fullscreen triangle at `z = 0.5` and a constant colour, so a depth test's
+/// outcome is a whole-target exact pixel.
+const DEPTH_STATE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut depth_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.5, 1.0);
+    return out;
+}
+
+fragment float4 depth_fragment() {
+    return float4(7.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0);
+}
+"#;
+
+const DEPTH_TARGET: u64 = 0x2100;
+const DEPTH_PLANE: u64 = 0x2200;
+const DEPTH_COLOR_HANDLE: u64 = 0x5300;
+const DEPTH_NONE_HANDLE: u64 = 0x5301;
+const ALLOC_COLOR: u64 = 0x31;
+const ALLOC_DEPTH_PLANE: u64 = 0x32;
+const DRAWN_DEPTH_RGBA: [u8; 4] = [7, 11, 13, 255];
+
+fn depth32_desc(label: &str) -> TextureDesc {
+    TextureDesc {
+        width: EDGE,
+        height: EDGE,
+        depth: 1,
+        mip_levels: 1,
+        sample_count: 1,
+        array_layers: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsage::depth_attachment(),
+        label: Some(label.to_string()),
+    }
+}
+
+fn stencil_keep() -> victory_metal::wire_v3::StencilFaceState {
+    use victory_metal::wire_v3::{CompareFunction, StencilOperation, StencilFaceState};
+    StencilFaceState {
+        fail: StencilOperation::Keep,
+        depth_fail: StencilOperation::Keep,
+        pass: StencilOperation::Keep,
+        func: CompareFunction::Always,
+        read_mask: 0xff,
+        write_mask: 0xff,
+    }
+}
+
+fn wire_depth_state(compare: victory_metal::wire_v3::CompareFunction) -> victory_metal::wire_v3::DepthStencilState {
+    victory_metal::wire_v3::DepthStencilState {
+        depth_enable: true,
+        depth_write: true,
+        depth_func: compare,
+        stencil_enable: false,
+        front: stencil_keep(),
+        back: stencil_keep(),
+    }
+}
+
+fn depth_pass(
+    sequence: u32,
+    pipeline: u64,
+    color_clear: [f64; 4],
+    depth_clear: f32,
+) -> SubmissionV3 {
+    SubmissionV3 {
+        sequence,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(ALLOC_COLOR, color_clear)],
+                depth_stencil: Some(victory_metal::wire_v3::DepthStencilAttachment {
+                    allocation_id: ALLOC_DEPTH_PLANE,
+                    generation: 1,
+                    mip_level: 0,
+                    slice: 0,
+                    depth_load: LoadOp::Clear,
+                    depth_store: StoreOp::Store,
+                    clear_depth: depth_clear,
+                    stencil_load: LoadOp::DontCare,
+                    stencil_store: StoreOp::DontCare,
+                    clear_stencil: 0,
+                }),
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: pipeline,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    }
+}
+
+/// A content-hashed PSO whose carried depth state is `Greater` must apply that
+/// comparison, and a PSO that carries none must leave no depth gate. The old
+/// invented `Less` default fails both halves: `z=0.5` against a `1.0` clear
+/// would pass (writing over the clear), and against `0.0` would fail (leaving
+/// the clear).
+#[test]
+fn the_content_key_depth_state_applies_and_absent_state_leaves_no_gate() {
+    use victory_metal::wire_v3::CompareFunction;
+
+    let dir = TempDir::new("depth-state-wire");
+    let metallib = compile_metallib(dir.path(), "depth_state", DEPTH_STATE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    for (handle, label) in [(DEPTH_TARGET, "color"), (DEPTH_PLANE, "depth")] {
+        transport
+            .register_registry_texture(
+                handle,
+                if handle == DEPTH_TARGET {
+                    rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), label)
+                } else {
+                    depth32_desc(label)
+                },
+            )
+            .expect("registry texture must create");
+    }
+
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_COLOR, 1), VmBufferId(DEPTH_TARGET));
+    allocations.insert((ALLOC_DEPTH_PLANE, 1), VmBufferId(DEPTH_PLANE));
+
+    let greater_state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: Some(TextureFormat::Depth32Float),
+        fragment_entry: Some("depth_fragment".to_string()),
+        depth_stencil: Some(wire_depth_state(CompareFunction::Greater)),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+    transport
+        .register_content_hashed_graphics_pipeline(
+            DEPTH_COLOR_HANDLE,
+            &metallib,
+            "depth_vertex",
+            &greater_state,
+            PipelineAbi::default(),
+        )
+        .expect("the Greater pipeline must register");
+
+    let absent_state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: Some(TextureFormat::Depth32Float),
+        fragment_entry: Some("depth_fragment".to_string()),
+        depth_stencil: None,
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+    transport
+        .register_content_hashed_graphics_pipeline(
+            DEPTH_NONE_HANDLE,
+            &metallib,
+            "depth_vertex",
+            &absent_state,
+            PipelineAbi::default(),
+        )
+        .expect("the no-depth-state pipeline must register");
+
+    let run = |sequence: u32, pipeline: u64, color: [f64; 4], depth: f32| {
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&depth_pass(sequence, pipeline, color, depth), &allocations)
+            .expect("the depth pass must encode");
+        assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok, "status");
+        assert_eq!(stats.render_encoders, 1, "one render encoder");
+        transport.wait_for_gpu().expect("the depth pass completes");
+        transport
+            .read_registered_texture_rgba8(DEPTH_TARGET)
+            .expect("target readback")
+    };
+
+    // Greater, depth cleared to 1.0: 0.5 > 1.0 is false, so the clear stays.
+    let pixels = run(701u32, DEPTH_COLOR_HANDLE, [1.0, 0.0, 0.0, 1.0], 1.0);
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(
+            *pixel,
+            [255, 0, 0, 255],
+            "Greater must reject z=0.5 against a 1.0 clear (pixel {index})"
+        );
+    }
+
+    // Greater, depth cleared to 0.0: 0.5 > 0.0 is true, so the draw writes.
+    let pixels = run(702u32, DEPTH_COLOR_HANDLE, [0.0, 0.0, 0.0, 1.0], 0.0);
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(
+            *pixel, DRAWN_DEPTH_RGBA,
+            "Greater must accept z=0.5 against a 0.0 clear (pixel {index})"
+        );
+    }
+
+    // No carried depth state, depth cleared to 0.0: no gate, so an invented
+    // Less test would reject and leave the clear; the draw must write.
+    let pixels = run(703u32, DEPTH_NONE_HANDLE, [0.0, 0.0, 0.0, 1.0], 0.0);
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(
+            *pixel, DRAWN_DEPTH_RGBA,
+            "no carried depth state must leave no depth gate (pixel {index})"
+        );
+    }
+
+    eprintln!(
+        "content-key depth-state proof on {}: greater_reject=clear, greater_accept={:?}, \
+         no_state={:?}",
+        info.name_str(),
+        DRAWN_DEPTH_RGBA,
+        pixels[0]
+    );
+}

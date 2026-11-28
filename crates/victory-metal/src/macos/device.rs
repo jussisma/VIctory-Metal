@@ -28,7 +28,7 @@ use crate::macos::render::{
     PixelFormat, PrimitiveType, RawColorAttachment, RawDepthAttachment, RenderAttachment,
     RenderEncoder, RenderPass, RenderTarget, ScissorRect as RenderScissorRect, SegmentKind,
     StoreAction, Viewport as RenderViewport, build_mrt_render_pass_descriptor,
-    new_less_depth_state, plan_encoder_segments, texture_info,
+    plan_encoder_segments, texture_info,
 };
 use crate::macos::residency::ResidencySet;
 use crate::macos::retire::{BackpressureBudget, RetireQueue};
@@ -3412,6 +3412,32 @@ impl PipelineAbi {
         tables
     }
 
+    /// Fragment table parameters whose range kind can carry a texture or
+    /// sampler source.
+    ///
+    /// A reflected `Unspecified` table counts: converter reflection reports
+    /// every table as `"Table"` without a range kind. A root `SRV`/`CBV`/`UAV`
+    /// does not: a wire `SetRootBufferView` fills it with a buffer address, and
+    /// the tested wire tables address table parameters only.
+    pub fn fragment_texture_source_parameter_count(&self) -> usize {
+        self.fragment.as_ref().map_or(0, |layout| {
+            layout
+                .parameters()
+                .iter()
+                .filter(|parameter| {
+                    matches!(
+                        parameter.kind(),
+                        RootParameterKind::DescriptorTable(
+                            DescriptorTableKind::Texture
+                                | DescriptorTableKind::Sampler
+                                | DescriptorTableKind::Unspecified
+                        )
+                    )
+                })
+                .count()
+        })
+    }
+
     /// Number of descriptor tables the pipeline declares.
     ///
     /// This is the larger of the authoritative map's table count and the widest
@@ -3775,6 +3801,32 @@ impl DepthState {
             Self::Owned(object) => object.as_raw(),
         }
     }
+}
+
+/// Builds the content-hashed pipeline's depth state from the **wire** state it
+/// carries in its content key.
+///
+/// A PSO that carries no `depth_stencil` description gets `None`: no depth
+/// gate and no depth write, which is Metal's fresh-encoder default and D3D12's
+/// zeroed `D3D12_DEPTH_STENCIL_DESC` (`DepthEnable = FALSE`). The previous
+/// invented `Less` + write default zeroed every content-hashed draw against a
+/// zeroed depth plane (C18B-DRAW-OUTPUT-GATE-1). `DepthEnable = FALSE` is
+/// normalised to `Always` + no write because `new_depth_stencil_state` encodes
+/// the compare function unconditionally.
+fn content_hashed_depth_state(
+    transport: &DirectMetalTransport,
+    state: &crate::wire_v3::DepthStencilState,
+) -> Result<ObjcObject, MetalError> {
+    let effective = if state.depth_enable {
+        *state
+    } else {
+        crate::wire_v3::DepthStencilState {
+            depth_write: false,
+            depth_func: crate::wire_v3::CompareFunction::Always,
+            ..*state
+        }
+    };
+    state::new_depth_stencil_state(transport, &effective)
 }
 
 /// One validated render-segment command.
@@ -4267,6 +4319,10 @@ enum PendingAbiBinding {
         count: u32,
         stride: usize,
         resources: Vec<(objc::Id, usize)>,
+        /// The table carries at least one texture or sampler entry, so a bound
+        /// slot at a fragment table parameter is a real fragment texture
+        /// source.
+        texture_source: bool,
     },
 }
 
@@ -4280,15 +4336,58 @@ enum PendingAbiBinding {
 #[derive(Default)]
 struct AbiPending {
     bindings: Vec<PendingAbiBinding>,
+    /// Wire tables accepted inertly for the bound pipeline. D3D12 root state
+    /// persists until overwritten, so an inert set stays visible on every
+    /// following draw of the same pipeline.
+    inert: Vec<InertTableRecord>,
+}
+
+/// One wire table the bound pipeline cannot address at any root parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InertTableRecord {
+    /// Wire `DescriptorTableV3.set` the command named.
+    wire_set: u16,
 }
 
 impl AbiPending {
     fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
+        self.bindings.is_empty() && self.inert.is_empty()
     }
 
     fn clear(&mut self) {
         self.bindings.clear();
+        self.inert.clear();
+    }
+
+    /// Records one inert wire table set, replacing a previous one.
+    fn note_inert(&mut self, wire_set: u16) {
+        if !self.inert.iter().any(|record| record.wire_set == wire_set) {
+            self.inert.push(InertTableRecord { wire_set });
+        }
+    }
+
+    /// A table set that now resolves is no longer inert.
+    fn clear_inert(&mut self, wire_set: u16) {
+        self.inert.retain(|record| record.wire_set != wire_set);
+    }
+
+    /// Wire tables the current draw leaves unaddressed.
+    fn inert_count(&self) -> u32 {
+        u32::try_from(self.inert.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Inert wire tables the fragment stage would have had to consume while
+    /// the layout declares no table parameter the wire could fill.
+    ///
+    /// Every inert table counts, not only one whose entries are textures: the
+    /// fragment stage has no root-parameter path for **any** descriptor table
+    /// in that shape, and the wire has no descriptor-heap command that could
+    /// carry it instead.
+    fn unreachable_fragment_sources(&self, fragment_sources_declared: u32) -> u32 {
+        if fragment_sources_declared > 0 {
+            return 0;
+        }
+        self.inert_count()
     }
 
     /// Records one title write, replacing the previous value of its slot.
@@ -4309,6 +4408,11 @@ impl AbiPending {
     /// D3D12 persist-until-overwritten rule without refusing a pipeline that
     /// legitimately dropped a parameter. Returns how many entries were dropped.
     fn retain_declared(&mut self, stages: &[(ShaderStage, RootSignatureLayout)]) -> usize {
+        // An inert table was judged against the previous pipeline's layout; a
+        // new layout may declare the parameter, but the wire table itself is
+        // not retained. Drop the record so a stale miss cannot be reported as
+        // this pipeline's inert table.
+        self.inert.clear();
         let before = self.bindings.len();
         self.bindings.retain(|binding| {
             stages
@@ -4756,6 +4860,10 @@ fn build_descriptor_table_entries(
         count: table_binding.count,
         stride: table_binding.stride,
         resources,
+        texture_source: matches!(
+            shape,
+            DescriptorTableKind::Texture | DescriptorTableKind::Sampler
+        ),
     })
 }
 
@@ -5345,6 +5453,58 @@ fn resolve_wire_root_argument(
 }
 
 
+/// One declared table parameter a stage layout offers for a wire table.
+///
+/// `set` is tried both as the layout's flattened parameter index (the legacy
+/// wire shape) and as the index among that stage's table parameters (the
+/// converter's table ordinal). A declaration is a candidate only when the wire
+/// kind fills its range kind *and* every entry encodes the declared descriptor
+/// shape. Only a unique candidate is returned; two different declarations are
+/// `None` so the caller keeps its named refusal rather than guessing.
+fn unique_stage_table_candidate(
+    abi: &PipelineAbi,
+    set: usize,
+    table: &crate::wire_v3::DescriptorTableV3,
+) -> Option<RootParameterSlot> {
+    let mut candidate: Option<RootParameterSlot> = None;
+    for layout in [
+        abi.vertex.as_ref(),
+        abi.fragment.as_ref(),
+        abi.mesh.as_ref(),
+        abi.object.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let at_index = layout.parameters().get(set);
+        let at_ordinal = layout
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                matches!(parameter.kind(), RootParameterKind::DescriptorTable(_))
+            })
+            .nth(set);
+        for parameter in [at_index, at_ordinal].into_iter().flatten() {
+            let RootParameterKind::DescriptorTable(kind) = parameter.kind() else {
+                continue;
+            };
+            if !crate::macos::root_arguments::wire_kind_fills_table(kind, table.kind) {
+                continue;
+            }
+            if descriptor_table_shape(table, kind).is_err() {
+                continue;
+            }
+            let slot = parameter_slot(parameter);
+            match candidate {
+                None => candidate = Some(slot),
+                Some(existing) if same_descriptor_table(&existing, &slot) => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    candidate
+}
+
 /// Resolves one wire `SetDescriptorTable` `set` to a declared table parameter.
 ///
 /// The rule is total and identical for the compute and graphics arms:
@@ -5376,9 +5536,10 @@ fn resolve_descriptor_table_set(
     abi: &PipelineAbi,
     plan: Option<&RootParameterPlan>,
     pipeline_id: u64,
-    set: u16,
-    wire_kind: DescriptorKind,
+    table: &crate::wire_v3::DescriptorTableV3,
 ) -> Result<Option<RootParameterSlot>, PrepareAbort> {
+    let set = table.set;
+    let wire_kind = table.kind;
     let entry = plan.and_then(|plan| plan.entry(set));
     if let Some(entry) = entry {
         if entry.kind != PlanArgumentKind::DescriptorTable {
@@ -5464,6 +5625,15 @@ fn resolve_descriptor_table_set(
         return Ok(Some(slot));
     }
 
+    // A table parameter a *stage layout* declares at this set (flattened index
+    // or table ordinal) can still address the wire table when the authoritative
+    // map does not describe it. Only a unique kind/shape-compatible candidate
+    // is bound: two different declarations stay the named refusal below instead
+    // of a guess.
+    if let Some(slot) = unique_stage_table_candidate(abi, index, table) {
+        return Ok(Some(slot));
+    }
+
     if abi.declared_descriptor_table_count() == 0 {
         // A translated signature expresses no table at all: there is no root
         // parameter a plan-less set could name, so the binding is inert. This
@@ -5521,6 +5691,72 @@ fn note_descriptor_table_event(
     );
 }
 
+/// Trace slot of one shader stage: vertex, fragment, mesh, object, compute.
+fn abi_stage_slot(stage: ShaderStage) -> usize {
+    match stage {
+        ShaderStage::Vertex => 0,
+        ShaderStage::Fragment => 1,
+        ShaderStage::Mesh => 2,
+        ShaderStage::Object => 3,
+        ShaderStage::Compute => 4,
+    }
+}
+
+/// Number of a layout's table parameters whose range kind can carry a texture
+/// or sampler source (a reflected `Unspecified` table included).
+fn layout_texture_source_parameters(layout: &RootSignatureLayout) -> u32 {
+    u32::try_from(
+        layout
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                matches!(
+                    parameter.kind(),
+                    RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::Texture
+                            | DescriptorTableKind::Sampler
+                            | DescriptorTableKind::Unspecified
+                    )
+                )
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+/// Fills the declared part of every stage's ABI shape, before any allocation.
+fn fill_stage_declarations(
+    summary: &mut crate::macos::trace::AbiBindingSummary,
+    stages: &[(ShaderStage, RootSignatureLayout)],
+) {
+    for (stage, layout) in stages {
+        let slot = abi_stage_slot(*stage);
+        summary.stage_mask |= 1u8 << slot;
+        let shape = &mut summary.stages[slot];
+        shape.present = true;
+        shape.declared_parameters = u32::try_from(layout.parameters().len()).unwrap_or(u32::MAX);
+        for parameter in layout.parameters() {
+            match parameter.kind() {
+                RootParameterKind::Constants => {
+                    shape.declared_constants = shape.declared_constants.saturating_add(1);
+                }
+                RootParameterKind::ConstantBufferView
+                | RootParameterKind::ShaderResourceView
+                | RootParameterKind::UnorderedAccessView => {
+                    shape.declared_views = shape.declared_views.saturating_add(1);
+                }
+                RootParameterKind::DescriptorTable(_) => {
+                    shape.declared_tables = shape.declared_tables.saturating_add(1);
+                }
+            }
+        }
+        if *stage == ShaderStage::Fragment {
+            summary.ps_abi_parameters = shape.declared_parameters;
+            summary.fragment_texture_sources_declared = layout_texture_source_parameters(layout);
+        }
+    }
+}
+
 fn flush_abi(
     transport: &DirectMetalTransport,
     state: &mut DeviceState,
@@ -5538,6 +5774,17 @@ fn flush_abi(
     let mut buffers = Vec::new();
     let mut bytes_ops = Vec::new();
     let mut summary = crate::macos::trace::AbiBindingSummary::default();
+    // Declared shape and inert state are per draw even when the flush skips
+    // allocating anything, so gate G5/G11 is observable on an empty layout.
+    fill_stage_declarations(&mut summary, stages);
+    summary.tables_dropped_inert = pending.inert_count();
+    summary.ps_tables_dropped_inert = if summary.stage_mask & 0b10 != 0 {
+        summary.tables_dropped_inert
+    } else {
+        0
+    };
+    summary.fragment_source_unreachable =
+        pending.unreachable_fragment_sources(summary.fragment_texture_sources_declared);
     // ADR-060: an empty pending set may skip the whole flush only when no
     // active stage declares a root parameter. A stage that declares one must
     // still receive a zero-filled argument buffer at `buffer(2)`, otherwise a
@@ -5812,6 +6059,7 @@ fn flush_abi(
         // MEMORY_SPACE page-table binding is host-owned, so it also counts as
         // unbound here and is reported separately by `memory_space_counters`).
         let bound_flags = &bound_per_stage[stage_index];
+        let is_fragment = *stage == ShaderStage::Fragment;
         for (index, parameter) in layout.parameters().iter().enumerate() {
             if bound_flags[index] {
                 summary.bound_parameters = summary.bound_parameters.saturating_add(1);
@@ -5826,19 +6074,53 @@ fn flush_abi(
                                 .bound_bytes
                                 .saturating_add(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
                             summary.constants = true;
+                            if is_fragment {
+                                summary.fragment_bound_constants =
+                                    summary.fragment_bound_constants.saturating_add(1);
+                            }
                         }
                         PendingAbiBinding::RootView { .. } => {
                             summary.bound_bytes = summary
                                 .bound_bytes
                                 .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
                             summary.view = true;
+                            if is_fragment {
+                                summary.fragment_bound_views =
+                                    summary.fragment_bound_views.saturating_add(1);
+                                let shape = &mut summary.stages[abi_stage_slot(*stage)];
+                                shape.bound_root_view_offset =
+                                    u32::try_from(parameter.argument_offset()).unwrap_or(u32::MAX);
+                                shape.bound_root_view_size =
+                                    u32::try_from(parameter.size()).unwrap_or(u32::MAX);
+                            }
                         }
-                        PendingAbiBinding::Table { .. } => {
+                        PendingAbiBinding::Table { texture_source, .. } => {
                             summary.bound_bytes = summary
                                 .bound_bytes
                                 .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
                             summary.table = true;
+                            if is_fragment {
+                                summary.fragment_bound_tables =
+                                    summary.fragment_bound_tables.saturating_add(1);
+                                // Only a table the wire actually filled with a
+                                // texture/sampler entry is a bound fragment
+                                // texture source, not an address table.
+                                if *texture_source
+                                    && matches!(
+                                        parameter.kind(),
+                                        RootParameterKind::DescriptorTable(_)
+                                    )
+                                {
+                                    summary.fragment_texture_sources_bound = summary
+                                        .fragment_texture_sources_bound
+                                        .saturating_add(1);
+                                }
+                            }
                         }
+                    }
+                    if is_fragment {
+                        summary.fragment_bound_parameters =
+                            summary.fragment_bound_parameters.saturating_add(1);
                     }
                 }
             } else {
@@ -5846,6 +6128,16 @@ fn flush_abi(
                 summary.unbound_bytes = summary
                     .unbound_bytes
                     .saturating_add(u32::try_from(parameter.size()).unwrap_or(u32::MAX));
+            }
+        }
+        {
+            let shape = &mut summary.stages[abi_stage_slot(*stage)];
+            shape.encoded_parameters =
+                u32::try_from(builder.encoded_parameters()).unwrap_or(u32::MAX);
+            shape.encoded_bytes = u32::try_from(builder.written_bytes()).unwrap_or(u32::MAX);
+            if let Some((start, end)) = builder.written_span() {
+                shape.encoded_start = u32::try_from(start).unwrap_or(u32::MAX);
+                shape.encoded_end = u32::try_from(end).unwrap_or(u32::MAX);
             }
         }
         let mut heap = None;
@@ -5928,6 +6220,18 @@ fn trace_encoded_work(
         abi_unbound_parameters: bindings.unbound_parameters,
         abi_bound_bytes: bindings.bound_bytes,
         abi_bound: bindings.bound_kind(),
+        stage_mask: bindings.stage_mask,
+        ps_abi_parameters: bindings.ps_abi_parameters,
+        ps_bound_parameters: bindings.fragment_bound_parameters,
+        ps_bound_constants: bindings.fragment_bound_constants,
+        ps_bound_views: bindings.fragment_bound_views,
+        ps_bound_tables: bindings.fragment_bound_tables,
+        fragment_texture_sources_declared: bindings.fragment_texture_sources_declared,
+        fragment_texture_sources_bound: bindings.fragment_texture_sources_bound,
+        tables_dropped_inert: bindings.tables_dropped_inert,
+        ps_tables_dropped_inert: bindings.ps_tables_dropped_inert,
+        fragment_source_unreachable: bindings.fragment_source_unreachable,
+        stages: bindings.stages,
         target,
     };
     if let Some(line) = trace.record(record) {
@@ -6027,22 +6331,8 @@ fn flush_render_abi(
         return Ok(summary);
     };
     let stages = abi_render_stages(abi, mesh_family);
-    // ADR-058/ADR-060: the empty-pending shortcut may skip only when no stage
-    // declares a parameter at all. `declares_memory_space` keeps the ADR-058
-    // gate telemetry; the broader `any parameter` test is the G6 condition: a
-    // declared non-MEMORY_SPACE parameter still needs its zero-filled buffer.
-    if pending.is_empty()
-        && !crate::macos::memory_space_bind::declares_memory_space(&stages)
-        && !stages
-            .iter()
-            .any(|(_, layout)| !layout.parameters().is_empty())
-    {
-        let summary = crate::macos::trace::AbiBindingSummary::default();
-        if record {
-            crate::macos::trace::note_abi_binding(summary);
-        }
-        return Ok(summary);
-    }
+    // `flush_abi` keeps the ADR-058/ADR-060 empty-pending shortcut, but now
+    // also fills the per-stage declared/inert counts before it takes it.
     let (buffers, bytes_ops, summary) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
@@ -6075,16 +6365,6 @@ fn flush_compute_abi(
         .into_iter()
         .map(|(stage, layout)| (stage, layout.clone()))
         .collect();
-    if pending.is_empty()
-        && !crate::macos::memory_space_bind::declares_memory_space(&stages)
-        && !stages
-            .iter()
-            .any(|(_, layout)| !layout.parameters().is_empty())
-    {
-        let summary = crate::macos::trace::AbiBindingSummary::default();
-        crate::macos::trace::note_abi_binding(summary);
-        return Ok(summary);
-    }
     let (buffers, bytes_ops, summary) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedComputeOp::ArgumentBuffer(buffer));
@@ -6491,15 +6771,16 @@ fn prepare_compute_segment(
                         active,
                         root_plan,
                         current_pipeline_id,
-                        table.set,
-                        table.kind,
+                        table,
                     )?
                     else {
                         // Named, counted inert acceptance: the bound pipeline
                         // declares no table, so this set addresses no root
                         // parameter. The batch still encodes.
+                        pending.note_inert(table.set);
                         continue;
                     };
+                    pending.clear_inert(table.set);
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -7139,7 +7420,15 @@ fn build_render_ops(
                     selected_blend = Some(None);
                     state_raw = entry.raw();
                     if !depth_overridden && entry.state().depth_format.is_some() {
-                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                        // The wire depth/stencil state carried in the content
+                        // key is authoritative. No carried state means no gate
+                        // (never an invented Less default).
+                        depth_state = match entry.state().depth_stencil.as_ref() {
+                            Some(wire) => Some(DepthState::Owned(
+                                content_hashed_depth_state(transport, wire)?,
+                            )),
+                            None => None,
+                        };
                     }
                 }
                 abi = pipeline_abi(state, pipeline.pipeline_id);
@@ -7187,7 +7476,15 @@ fn build_render_ops(
                     selected_blend = Some(None);
                     state_raw = entry.raw();
                     if !depth_overridden && entry.state().depth_format.is_some() {
-                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                        // The wire depth/stencil state carried in the content
+                        // key is authoritative. No carried state means no gate
+                        // (never an invented Less default).
+                        depth_state = match entry.state().depth_stencil.as_ref() {
+                            Some(wire) => Some(DepthState::Owned(
+                                content_hashed_depth_state(transport, wire)?,
+                            )),
+                            None => None,
+                        };
                     }
                 }
                 abi = pipeline_abi(state, pipeline.pipeline_id);
@@ -7230,7 +7527,15 @@ fn build_render_ops(
                     selected_blend = Some(None);
                     state_raw = entry.raw();
                     if !depth_overridden && entry.state().depth_format.is_some() {
-                        depth_state = Some(DepthState::Owned(new_less_depth_state(transport)?));
+                        // The wire depth/stencil state carried in the content
+                        // key is authoritative. No carried state means no gate
+                        // (never an invented Less default).
+                        depth_state = match entry.state().depth_stencil.as_ref() {
+                            Some(wire) => Some(DepthState::Owned(
+                                content_hashed_depth_state(transport, wire)?,
+                            )),
+                            None => None,
+                        };
                     }
                 }
                 abi = pipeline_abi(state, pipeline.pipeline_id);
@@ -7417,15 +7722,24 @@ fn build_render_ops(
                         active,
                         root_plan,
                         current_pipeline_id,
-                        table.set,
-                        table.kind,
+                        table,
                     )?
                     else {
                         // Named, counted inert acceptance: the bound pipeline
                         // declares no table, so this set addresses no root
                         // parameter. The batch still encodes.
+                        pending.note_inert(table.set);
+                        // Gate G5/G11: if the fragment stage declares no table
+                        // parameter at all, this wire table has no
+                        // root-parameter path. Name the missing wire concept (a
+                        // descriptor-heap command) once per table instead of
+                        // attempting a guess.
+                        if active.fragment_texture_source_parameter_count() == 0 {
+                            crate::macos::trace::note_fragment_source_unreachable();
+                        }
                         continue;
                     };
+                    pending.clear_inert(table.set);
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -9873,6 +10187,10 @@ fn encode_indirect_render_segment(
     for op in ops {
         match op {
             PreparedRenderOp::Pipeline { state, depth_state } => {
+                // The indirect path bypasses `RenderEncoder::set_pipeline_state`
+                // but consumes the same prepared op: `depth_state` is already
+                // the wire state built by `build_render_ops`, and `None` means
+                // this fresh encoder keeps Metal's no-gate default.
                 // SAFETY: both objects are registry-held pipeline states.
                 unsafe {
                     objc::msg_send_void_1(enc, objc::sel(c"setRenderPipelineState:"), *state);
@@ -10730,6 +11048,100 @@ mod tests {
             Some(RootParameterKind::Constants)
         ));
         assert!(abi.root_parameter_for_table(2).is_none());
+    }
+
+    /// Gate G5/G11 CPU proof: the per-stage summary counts the fragment
+    /// stage's declared parameter kinds and its texture/sampler sources, and
+    /// keeps the vertex stage's counts separate.
+    #[test]
+    fn the_per_stage_abi_summary_counts_declared_parameters_and_kinds() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+
+        let vertex = RootSignatureLayout::from_parameters(
+            ReflectedStage::Vertex,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::ShaderResourceView,
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+            ],
+        )
+        .expect("vertex layout");
+        let fragment = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 16,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("fragment layout");
+
+        let stages = vec![
+            (super::ShaderStage::Vertex, vertex),
+            (super::ShaderStage::Fragment, fragment),
+        ];
+        let mut summary = crate::macos::trace::AbiBindingSummary::default();
+        super::fill_stage_declarations(&mut summary, &stages);
+
+        assert_eq!(summary.stage_mask, 0b11, "vertex and fragment are present");
+        assert_eq!(summary.ps_abi_parameters, 3, "fragment declares three");
+        assert_eq!(
+            summary.fragment_texture_sources_declared, 2,
+            "a texture table and a sampler table are both declared sources"
+        );
+        assert_eq!(summary.stages[0].declared_constants, 1);
+        assert_eq!(summary.stages[0].declared_views, 1);
+        assert_eq!(summary.stages[0].declared_tables, 0);
+        assert_eq!(summary.stages[1].declared_constants, 1);
+        assert_eq!(summary.stages[1].declared_views, 0);
+        assert_eq!(summary.stages[1].declared_tables, 2);
+        assert_eq!(summary.fragment_source_unreachable, 0);
+
+        // A fragment that declares no table has no reachable wire source.
+        let bare = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[RootParameterSpec {
+                kind: RootParameterKind::ShaderResourceView,
+                size: 8,
+                register: 0,
+                space: 1,
+            }],
+        )
+        .expect("bare fragment layout");
+        let mut bare_summary = crate::macos::trace::AbiBindingSummary::default();
+        super::fill_stage_declarations(
+            &mut bare_summary,
+            &[(super::ShaderStage::Fragment, bare)],
+        );
+        assert_eq!(bare_summary.ps_abi_parameters, 1);
+        assert_eq!(bare_summary.fragment_texture_sources_declared, 0);
     }
 
     /// Converter reflection reports every table's slot and space as `u32::MAX`.

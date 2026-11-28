@@ -836,3 +836,384 @@ fn a_mixed_resource_table_binds_both_partitions_exactly() {
     );
     reset_descriptor_table_refusal_census();
 }
+
+// ----- Cycle 18C: fragment ABI observability and reachability ---------------
+
+/// One fragment table parameter that samples the wire table's first entry.
+const SINGLE_SOURCE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TextureDescriptor {
+    texture2d<float> primary;
+    texture2d<float> duplicate;
+    long reserved;
+};
+
+struct SingleAbi {
+    device TextureDescriptor *textures [[id(0)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut single_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 single_fragment(constant SingleAbi &abi [[buffer(2)]]) {
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge, coord::normalized);
+    return abi.textures[0].primary.sample(smp, float2(0.5, 0.5));
+}
+"#;
+
+/// A fragment that ignores the wire table, so an inert table cannot abort and
+/// the draw's exact colour still proves the pass encoded.
+const CONSTANT_FRAGMENT_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut constant_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 constant_fragment() {
+    return float4(7.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0);
+}
+"#;
+
+/// The translated VS carries no parameter; the PS declares exactly one texture
+/// table parameter. A wire table with one texture entry must land on it and the
+/// exact sampled pixel proves the fragment source is bound.
+#[test]
+fn a_single_declared_fragment_texture_table_binds_the_wire_entry_exactly() {
+    use victory_metal::macos::trace::{
+        FRAGMENT_SOURCE_UNREACHABLE_REASON, reset_abi_binding_telemetry, stage_abi_telemetry,
+    };
+
+    reset_abi_binding_telemetry();
+    // The GPU lock is taken by the sibling test in this binary; the tests run
+    // serially under `--test-threads=1`.
+    let dir = TempDir::new("fragment-abi-single-source");
+    let metallib = compile_metallib(dir.path(), "single_source", SINGLE_SOURCE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    for (handle, label) in [(TEXTURE0, "texture0"), (TARGET, "target")] {
+        transport
+            .register_registry_texture(
+                handle,
+                rgba8_desc(
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    TextureUsage::color_attachment(),
+                    label,
+                ),
+            )
+            .expect("registry texture must create");
+    }
+
+    let mut upload = HostPage::new(PAGE_BYTES);
+    let poison = [0xaau8; PAGE_BYTES];
+    upload.write(0, &poison);
+    for row in 0..TEXTURE_EDGE as usize {
+        for column in 0..TEXTURE_EDGE as usize {
+            upload.write(row * ROW_PITCH + column * 4, &COLOR0);
+        }
+    }
+    // SAFETY: the page is a live, 16 KiB-aligned allocation that outlives the
+    // synchronous submission and is unregistered before it drops.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), PAGE_BYTES) }
+        .expect("upload page must register");
+
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), upload_id);
+
+    let vertex = RootSignatureLayout::from_parameters(ReflectedStage::Vertex, &[])
+        .expect("empty vertex layout builds");
+    let fragment = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+            size: 8,
+            register: 0,
+            space: 1,
+        }],
+    )
+    .expect("single texture table layout builds");
+    let pipeline_state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("single_fragment".to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+
+    const HANDLE: u64 = 0x5200;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "single_vertex",
+            &pipeline_state,
+            PipelineAbi::graphics(Some(vertex), Some(fragment)),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let submission = SubmissionV3 {
+        sequence: 501,
+        list: None,
+        commands: vec![
+            copy_to_texture(ALLOC_UPLOAD, ALLOC_TEXTURE0, 0),
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(ALLOC_TARGET, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![DescriptorTableEntryV3::Texture(TEXTURE0)],
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("the single texturable source submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "single-source status");
+    assert_eq!(stats.render_encoders, 1, "one render encoder draws");
+    assert_eq!(transport.abi_refusal_count(), 0, "the table resolves");
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        0,
+        "a declared fragment source is bound, not inert"
+    );
+
+    transport
+        .wait_for_gpu()
+        .expect("the single-source pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_uniform(&pixels, COLOR0, "single declared fragment source");
+
+    let abi = stage_abi_telemetry();
+    assert_eq!(abi.stage_mask, 0b11, "vertex and fragment layouts are bound");
+    assert_eq!(abi.ps_abi_parameters, 1, "the fragment declares one table");
+    assert_eq!(abi.ps_bound_parameters, 1, "the wire table binds it");
+    assert_eq!(abi.ps_bound_tables, 1, "the bound parameter is a table");
+    assert_eq!(abi.fragment_texture_sources_declared, 1);
+    assert_eq!(
+        abi.fragment_texture_sources_bound, 1,
+        "the fragment texture source is bound"
+    );
+    assert_eq!(abi.tables_dropped_inert, 0);
+    assert_eq!(abi.fragment_source_unreachable, 0);
+    assert_ne!(abi.fragment_source_unreachable_reason, FRAGMENT_SOURCE_UNREACHABLE_REASON);
+
+    transport
+        .unregister_buffer(upload_id)
+        .expect("unregister the upload page");
+    eprintln!(
+        "fragment ABI single-source proof on {}: pixel={:?}, ps_abi={}, ps_bound={}, \
+         sources={}/{}",
+        info.name_str(),
+        pixels[0],
+        abi.ps_abi_parameters,
+        abi.ps_bound_parameters,
+        abi.fragment_texture_sources_bound,
+        abi.fragment_texture_sources_declared
+    );
+}
+
+/// Boot #32's fragment shape: the pipeline declares **no** table parameter, so
+/// a wire table carrying a texture source has no root-parameter path. The table
+/// stays inertly accepted, the new counter names the missing wire concept, and
+/// the draw still encodes its exact colour (no abort).
+#[test]
+fn a_wire_texture_source_with_no_declared_fragment_parameter_is_inert_and_named() {
+    use victory_metal::macos::trace::{
+        FRAGMENT_SOURCE_UNREACHABLE_REASON, OUTCOME_INERT, descriptor_table_refusal_census,
+        reset_abi_binding_telemetry, reset_descriptor_table_refusal_census, stage_abi_telemetry,
+    };
+
+    reset_descriptor_table_refusal_census();
+    reset_abi_binding_telemetry();
+    let dir = TempDir::new("fragment-abi-unreachable-source");
+    let metallib = compile_metallib(dir.path(), "unreachable_source", CONSTANT_FRAGMENT_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    for (handle, label) in [(TEXTURE0, "texture0"), (TARGET, "target")] {
+        transport
+            .register_registry_texture(
+                handle,
+                rgba8_desc(
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    TextureUsage::color_attachment(),
+                    label,
+                ),
+            )
+            .expect("registry texture must create");
+    }
+
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live, 16 KiB-aligned allocation that outlives the
+    // synchronous submission and is unregistered before it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), side_id);
+
+    // The Boot #32 shape: one root SRV and no table parameter at all.
+    let fragment = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::ShaderResourceView,
+            size: 8,
+            register: 0,
+            space: 1,
+        }],
+    )
+    .expect("zero-table fragment layout builds");
+    assert_eq!(
+        PipelineAbi::graphics(None, Some(fragment.clone())).declared_descriptor_table_count(),
+        0,
+        "the fixture must declare no table"
+    );
+    let pipeline_state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: None,
+        fragment_entry: Some("constant_fragment".to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+
+    const HANDLE: u64 = 0x5201;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "constant_vertex",
+            &pipeline_state,
+            PipelineAbi::graphics(None, Some(fragment)),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let submission = SubmissionV3 {
+        sequence: 502,
+        list: None,
+        commands: vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(ALLOC_TARGET, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![DescriptorTableEntryV3::Texture(TEXTURE0)],
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("an unreachable fragment source must not abort the batch");
+    assert_eq!(reply.status, ReplyStatus::Ok, "inert-source status");
+    assert_eq!(stats.render_encoders, 1, "the draw still encodes");
+    assert_eq!(transport.abi_refusal_count(), 0, "inert is not a refusal");
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        1,
+        "the table is counted inert"
+    );
+    assert_eq!(transport.encode_counters().draws, 1, "the draw encodes");
+
+    let census = descriptor_table_refusal_census();
+    assert_eq!(census.distinct_keys, 1);
+    assert_eq!(census.entries[0].key.outcome, OUTCOME_INERT);
+    assert_eq!(census.entries[0].key.stage_mask, 0b10, "fragment layout only");
+
+    let abi = stage_abi_telemetry();
+    assert_eq!(abi.ps_abi_parameters, 1, "the fragment declares one root SRV");
+    assert_eq!(
+        abi.fragment_texture_sources_declared, 0,
+        "a root SRV is not a table source"
+    );
+    assert_eq!(abi.fragment_texture_sources_bound, 0);
+    assert_eq!(abi.tables_dropped_inert, 1);
+    assert_eq!(abi.ps_tables_dropped_inert, 1);
+    assert_eq!(abi.fragment_source_unreachable, 1);
+    assert_eq!(
+        abi.fragment_source_unreachable_reason,
+        FRAGMENT_SOURCE_UNREACHABLE_REASON,
+        "the missing wire concept is SetDescriptorHeaps"
+    );
+
+    transport
+        .wait_for_gpu()
+        .expect("the inert-source pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_uniform(&pixels, [7, 11, 13, 255], "inert fragment source");
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
+    reset_descriptor_table_refusal_census();
+    eprintln!(
+        "fragment ABI unreachable-source proof on {}: pixel={:?}, ps_abi={}, \
+         sources={}/{}, inert={}, unreachable={}, reason={}",
+        info.name_str(),
+        pixels[0],
+        abi.ps_abi_parameters,
+        abi.fragment_texture_sources_bound,
+        abi.fragment_texture_sources_declared,
+        abi.tables_dropped_inert,
+        abi.fragment_source_unreachable,
+        abi.fragment_source_unreachable_reason
+    );
+}

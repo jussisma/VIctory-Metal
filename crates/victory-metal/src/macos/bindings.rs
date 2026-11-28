@@ -1122,6 +1122,8 @@ pub struct ArgumentBufferBuilder<'a> {
     layout: &'a RootSignatureLayout,
     bytes: Vec<u8>,
     encoded: Vec<bool>,
+    /// `(start, end)` byte range the last write for each parameter covered.
+    written: Vec<Option<(usize, usize)>>,
 }
 
 impl<'a> ArgumentBufferBuilder<'a> {
@@ -1131,6 +1133,7 @@ impl<'a> ArgumentBufferBuilder<'a> {
             layout,
             bytes: vec![0; layout.argument_buffer_len()],
             encoded: vec![false; layout.parameters().len()],
+            written: vec![None; layout.parameters().len()],
         }
     }
 
@@ -1152,6 +1155,38 @@ impl<'a> ArgumentBufferBuilder<'a> {
     /// Number of parameters written.
     pub fn encoded_parameters(&self) -> usize {
         self.encoded.iter().filter(|written| **written).count()
+    }
+
+    /// Byte range the last write for `parameter` covered, when it was written.
+    ///
+    /// Root constants cover their whole reflected block (the partial tail is
+    /// zeroed); a descriptor or table covers only the 8-byte address field, not
+    /// the reflected descriptor size.
+    pub fn written_extent(&self, parameter: usize) -> Option<(usize, usize)> {
+        self.written.get(parameter).copied().flatten()
+    }
+
+    /// `(first, last)` byte offset any parameter write touched, when any was
+    /// written. Bounded to the argument-buffer layout; no payload is exposed.
+    pub fn written_span(&self) -> Option<(usize, usize)> {
+        self.written
+            .iter()
+            .flatten()
+            .copied()
+            .fold(None, |span, (start, end)| match span {
+                None => Some((start, end)),
+                Some((first, last)) => Some((first.min(start), end.max(last))),
+            })
+    }
+
+    /// Total bytes the parameter writes covered (overlapping ranges are not a
+    /// legal layout, so this is an exact sum).
+    pub fn written_bytes(&self) -> usize {
+        self.written
+            .iter()
+            .flatten()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .sum()
     }
 
     /// Writes inline root constants at the reflected offset.
@@ -1191,6 +1226,7 @@ impl<'a> ArgumentBufferBuilder<'a> {
         destination.fill(0);
         destination[..bytes.len()].copy_from_slice(bytes);
         self.encoded[parameter] = true;
+        self.written[parameter] = Some((start, end));
         Ok(())
     }
 
@@ -1263,6 +1299,7 @@ impl<'a> ArgumentBufferBuilder<'a> {
             ))?;
         slot.copy_from_slice(&address.to_le_bytes());
         self.encoded[parameter] = true;
+        self.written[parameter] = Some((start, end));
         Ok(())
     }
 }
@@ -2687,6 +2724,15 @@ mod tests {
         assert!(builder.is_encoded(0));
         assert!(builder.is_encoded(5));
         assert!(!builder.is_encoded(6));
+        // Per-parameter written extents make the draw trace's argument-buffer
+        // byte ranges exact: root constants cover their whole block, a
+        // descriptor/table covers only its 8-byte address field.
+        assert_eq!(builder.written_extent(0), Some((0, 8)));
+        assert_eq!(builder.written_extent(1), Some((8, 16)));
+        assert_eq!(builder.written_extent(4), Some((32, 40)));
+        assert_eq!(builder.written_extent(5), Some((40, 48)));
+        assert_eq!(builder.written_span(), Some((0, 48)));
+        assert_eq!(builder.written_bytes(), 48);
     }
 
     #[test]

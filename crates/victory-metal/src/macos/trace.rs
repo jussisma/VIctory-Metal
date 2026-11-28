@@ -324,6 +324,11 @@ pub struct DescriptorTableRefusalCensus {
     pub kind_mismatches: Vec<DescriptorTableKindMismatchCount>,
     /// Retained mixed-table keys in first-observed order.
     pub mix_keys: Vec<DescriptorTableMixCount>,
+    /// Per-stage fragment ABI observability of the last recorded flush.
+    ///
+    /// `telemetry.json` embeds this census, so these counters reach the boot
+    /// log without the draw tracer being armed.
+    pub stage_abi: StageAbiTelemetry,
 }
 
 impl DescriptorTableRefusalCensus {
@@ -413,10 +418,31 @@ impl DescriptorTableRefusalCensus {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let stage_abi = format!(
+            "{{\"stage_mask\": {}, \"ps_abi_parameters\": {}, \
+             \"ps_bound_parameters\": {}, \"ps_bound_constants\": {}, \
+             \"ps_bound_views\": {}, \"ps_bound_tables\": {}, \
+             \"fragment_texture_sources_declared\": {}, \
+             \"fragment_texture_sources_bound\": {}, \"tables_dropped_inert\": {}, \
+             \"ps_tables_dropped_inert\": {}, \"fragment_source_unreachable\": {}, \
+             \"fragment_source_unreachable_reason\": \"{}\"}}",
+            self.stage_abi.stage_mask,
+            self.stage_abi.ps_abi_parameters,
+            self.stage_abi.ps_bound_parameters,
+            self.stage_abi.ps_bound_constants,
+            self.stage_abi.ps_bound_views,
+            self.stage_abi.ps_bound_tables,
+            self.stage_abi.fragment_texture_sources_declared,
+            self.stage_abi.fragment_texture_sources_bound,
+            self.stage_abi.tables_dropped_inert,
+            self.stage_abi.ps_tables_dropped_inert,
+            self.stage_abi.fragment_source_unreachable,
+            self.stage_abi.fragment_source_unreachable_reason
+        );
         format!(
             "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}], \
-             \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}]}}",
-            self.distinct_keys, self.omitted, keys, kind_mismatches, mix_keys
+             \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}], \"stage_abi\": {}}}",
+            self.distinct_keys, self.omitted, keys, kind_mismatches, mix_keys, stage_abi
         )
     }
 }
@@ -542,6 +568,7 @@ pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
                 count: *count,
             })
             .collect(),
+        stage_abi: stage_abi_telemetry(),
     }
 }
 
@@ -555,6 +582,7 @@ pub fn reset_descriptor_table_refusal_census() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     *log = DescriptorTableRefusalLog::default();
+    reset_stage_abi_telemetry();
 }
 
 /// Maximum bytes kept in the bounded [`TraceReport::failure`] string.
@@ -654,8 +682,140 @@ pub struct AbiBindingTelemetry {
     pub last_bound_kind: &'static str,
 }
 
+/// The exact missing wire concept when a texture/sampler source reaches the
+/// fragment stage through no root parameter.
+///
+/// D3D12 exposes those sources through a descriptor heap. This wire has no
+/// `SetDescriptorHeaps` command, so a pipeline whose converter reflection
+/// lowers tables to directly indexed heap access (`buffer(0)`/`buffer(1)`)
+/// can only be served by a heap command the guest never sends. The counter is
+/// [`StageAbiTelemetry::fragment_source_unreachable`].
+pub const FRAGMENT_SOURCE_UNREACHABLE_REASON: &str =
+    "no wire SetDescriptorHeaps command and the fragment declares no table/texture root parameter";
+
+static LAST_STAGE_MASK: AtomicU64 = AtomicU64::new(0);
+static LAST_PS_ABI_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_BOUND_PARAMETERS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_BOUND_CONSTANTS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_BOUND_VIEWS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_BOUND_TABLES: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAGMENT_TEXTURE_SOURCES_BOUND: AtomicU64 = AtomicU64::new(0);
+static LAST_TABLES_DROPPED_INERT: AtomicU64 = AtomicU64::new(0);
+static LAST_PS_TABLES_DROPPED_INERT: AtomicU64 = AtomicU64::new(0);
+static FRAGMENT_SOURCE_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-stage ABI observability of the last recorded draw.
+///
+/// Always on (relaxed atomics), independent of the opt-in draw tracer, so
+/// `telemetry.json` can answer gate G5/G11 on a boot that did not arm the
+/// trace. Every field is a count or a fixed reason word.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageAbiTelemetry {
+    /// Stage layouts the last flush carried (bit 0 vertex … bit 4 compute).
+    pub stage_mask: u8,
+    /// Declared fragment parameters.
+    pub ps_abi_parameters: u64,
+    /// Fragment parameters a title write bound.
+    pub ps_bound_parameters: u64,
+    /// Bound fragment parameters of kind `Constant`.
+    pub ps_bound_constants: u64,
+    /// Bound fragment parameters of kind `CBV`/`SRV`/`UAV`.
+    pub ps_bound_views: u64,
+    /// Bound fragment parameters of kind `Table`/`Sampler`.
+    pub ps_bound_tables: u64,
+    /// Fragment texture/sampler sources the layout declares.
+    pub fragment_texture_sources_declared: u64,
+    /// Declared fragment sources a wire table bound.
+    pub fragment_texture_sources_bound: u64,
+    /// Inert wire tables in the last flush.
+    pub tables_dropped_inert: u64,
+    /// Inert wire tables the fragment would have had to consume.
+    pub ps_tables_dropped_inert: u64,
+    /// Wire tables the fragment stage cannot address because it declares no
+    /// table parameter (process-wide; see
+    /// [`FRAGMENT_SOURCE_UNREACHABLE_REASON`]).
+    pub fragment_source_unreachable: u64,
+    /// Fixed reason word: the missing wire concept, or `none` when the count
+    /// is zero.
+    pub fragment_source_unreachable_reason: &'static str,
+}
+
+/// Records one wire table whose fragment texture/sampler source no declared
+/// parameter can address.
+pub fn note_fragment_source_unreachable() {
+    FRAGMENT_SOURCE_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The per-stage ABI telemetry of the last recorded flush.
+pub fn stage_abi_telemetry() -> StageAbiTelemetry {
+    let unreachable = FRAGMENT_SOURCE_UNREACHABLE.load(Ordering::Relaxed);
+    StageAbiTelemetry {
+        stage_mask: LAST_STAGE_MASK.load(Ordering::Relaxed) as u8,
+        ps_abi_parameters: LAST_PS_ABI_PARAMETERS.load(Ordering::Relaxed),
+        ps_bound_parameters: LAST_FRAGMENT_BOUND_PARAMETERS.load(Ordering::Relaxed),
+        ps_bound_constants: LAST_FRAGMENT_BOUND_CONSTANTS.load(Ordering::Relaxed),
+        ps_bound_views: LAST_FRAGMENT_BOUND_VIEWS.load(Ordering::Relaxed),
+        ps_bound_tables: LAST_FRAGMENT_BOUND_TABLES.load(Ordering::Relaxed),
+        fragment_texture_sources_declared: LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED
+            .load(Ordering::Relaxed),
+        fragment_texture_sources_bound: LAST_FRAGMENT_TEXTURE_SOURCES_BOUND.load(Ordering::Relaxed),
+        tables_dropped_inert: LAST_TABLES_DROPPED_INERT.load(Ordering::Relaxed),
+        ps_tables_dropped_inert: LAST_PS_TABLES_DROPPED_INERT.load(Ordering::Relaxed),
+        fragment_source_unreachable: unreachable,
+        fragment_source_unreachable_reason: if unreachable == 0 {
+            "none"
+        } else {
+            FRAGMENT_SOURCE_UNREACHABLE_REASON
+        },
+    }
+}
+
+/// Clears the per-stage ABI telemetry.
+///
+/// Test-only: a proof that runs several ABI shapes in one process starts each
+/// case from a clean count. Never called by the host.
+#[doc(hidden)]
+pub fn reset_stage_abi_telemetry() {
+    LAST_STAGE_MASK.store(0, Ordering::Relaxed);
+    LAST_PS_ABI_PARAMETERS.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_BOUND_PARAMETERS.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_BOUND_CONSTANTS.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_BOUND_VIEWS.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_BOUND_TABLES.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED.store(0, Ordering::Relaxed);
+    LAST_FRAGMENT_TEXTURE_SOURCES_BOUND.store(0, Ordering::Relaxed);
+    LAST_TABLES_DROPPED_INERT.store(0, Ordering::Relaxed);
+    LAST_PS_TABLES_DROPPED_INERT.store(0, Ordering::Relaxed);
+    FRAGMENT_SOURCE_UNREACHABLE.store(0, Ordering::Relaxed);
+}
+
 /// Records one ABI flush's binding summary.
 pub fn note_abi_binding(summary: AbiBindingSummary) {
+    // Fragment counters describe the last *fragment* flush: a following
+    // compute dispatch must not overwrite them with zeros.
+    if summary.stage_mask & 0b10 != 0 {
+        LAST_STAGE_MASK.store(u64::from(summary.stage_mask), Ordering::Relaxed);
+        LAST_PS_ABI_PARAMETERS.store(u64::from(summary.ps_abi_parameters), Ordering::Relaxed);
+        LAST_FRAGMENT_BOUND_PARAMETERS
+            .store(u64::from(summary.fragment_bound_parameters), Ordering::Relaxed);
+        LAST_FRAGMENT_BOUND_CONSTANTS
+            .store(u64::from(summary.fragment_bound_constants), Ordering::Relaxed);
+        LAST_FRAGMENT_BOUND_VIEWS.store(u64::from(summary.fragment_bound_views), Ordering::Relaxed);
+        LAST_FRAGMENT_BOUND_TABLES
+            .store(u64::from(summary.fragment_bound_tables), Ordering::Relaxed);
+        LAST_FRAGMENT_TEXTURE_SOURCES_DECLARED.store(
+            u64::from(summary.fragment_texture_sources_declared),
+            Ordering::Relaxed,
+        );
+        LAST_FRAGMENT_TEXTURE_SOURCES_BOUND.store(
+            u64::from(summary.fragment_texture_sources_bound),
+            Ordering::Relaxed,
+        );
+        LAST_TABLES_DROPPED_INERT.store(u64::from(summary.tables_dropped_inert), Ordering::Relaxed);
+        LAST_PS_TABLES_DROPPED_INERT
+            .store(u64::from(summary.ps_tables_dropped_inert), Ordering::Relaxed);
+    }
     ABI_BOUND_PARAMETERS.fetch_add(u64::from(summary.bound_parameters), Ordering::Relaxed);
     ABI_UNBOUND_PARAMETERS.fetch_add(u64::from(summary.unbound_parameters), Ordering::Relaxed);
     ABI_BOUND_BYTES.fetch_add(u64::from(summary.bound_bytes), Ordering::Relaxed);
@@ -680,6 +840,7 @@ pub fn last_abi_binding() -> AbiBindingSummary {
         constants: bits & 0b001 != 0,
         view: bits & 0b010 != 0,
         table: bits & 0b100 != 0,
+        ..AbiBindingSummary::default()
     }
 }
 
@@ -701,6 +862,7 @@ pub fn abi_binding_telemetry() -> AbiBindingTelemetry {
             constants: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b001 != 0,
             view: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b010 != 0,
             table: ABI_LAST_KIND_BITS.load(Ordering::Relaxed) & 0b100 != 0,
+            ..AbiBindingSummary::default()
         }
         .bound_kind(),
     }
@@ -720,6 +882,7 @@ pub fn reset_abi_binding_telemetry() {
     ABI_LAST_UNBOUND_PARAMETERS.store(0, Ordering::Relaxed);
     ABI_LAST_BOUND_BYTES.store(0, Ordering::Relaxed);
     ABI_LAST_KIND_BITS.store(0, Ordering::Relaxed);
+    reset_stage_abi_telemetry();
 }
 
 /// Bounded picture of what the tracer saw, for `telemetry.json`.
@@ -814,6 +977,57 @@ pub struct TraceTarget {
     pub swapchain: bool,
 }
 
+/// Converter ABI stage slots a draw trace may describe, in the same bit order
+/// as the pipeline's stage-presence mask: vertex, fragment, mesh, object,
+/// compute.
+pub const ABI_STAGE_SLOTS: usize = 5;
+
+/// Stable stage label for slot `index` of [`StageAbiShape`].
+pub fn abi_stage_name(index: usize) -> &'static str {
+    match index {
+        0 => "vertex",
+        1 => "fragment",
+        2 => "mesh",
+        3 => "object",
+        4 => "compute",
+        _ => "unknown",
+    }
+}
+
+/// Bounded ABI shape of one stage layout for one encoded draw.
+///
+/// Counts and argument-buffer byte offsets only: no register values, handles
+/// or payload bytes. `encoded_*` describes what the builder actually wrote, so
+/// a declared parameter left at the zero default is visible as a declared /
+/// encoded mismatch instead of an inferred one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageAbiShape {
+    /// The selected pipeline carries this stage layout.
+    pub present: bool,
+    /// Declared parameters in the stage's top-level argument buffer.
+    pub declared_parameters: u32,
+    /// Declared parameters of kind `Constant`.
+    pub declared_constants: u32,
+    /// Declared parameters of kind `CBV`/`SRV`/`UAV`.
+    pub declared_views: u32,
+    /// Declared parameters of kind `Table`/`Sampler`.
+    pub declared_tables: u32,
+    /// Parameters the builder wrote for this draw (title writes and the
+    /// host's MEMORY_SPACE zero defaults).
+    pub encoded_parameters: u32,
+    /// Bytes those writes covered.
+    pub encoded_bytes: u32,
+    /// First byte offset any write touched.
+    pub encoded_start: u32,
+    /// One past the last byte offset any write touched.
+    pub encoded_end: u32,
+    /// Offset of the parameter a bound root view filled (`0` with no bound
+    /// view).
+    pub bound_root_view_offset: u32,
+    /// Reflected size of that parameter (`0` with no bound view).
+    pub bound_root_view_size: u32,
+}
+
 /// What one ABI flush wrote into the top-level argument buffer(s).
 ///
 /// A parameter is **bound** only when a title `SetRootConstants`,
@@ -821,6 +1035,10 @@ pub struct TraceTarget {
 /// parameter without such a write is **unbound** and is filled with the zero
 /// default the builder starts from (`MEMORY_SPACE` host-owned parameters are
 /// also counted here: they are not title writes).
+///
+/// The `fragment_*` fields answer gate G5/G11 of the Boot #32 audit per stage:
+/// what the fragment stage declares, what it actually bound, and how many wire
+/// tables that carry a texture/sampler source could not be bound at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AbiBindingSummary {
     /// Declared parameters that received a title-written argument.
@@ -838,6 +1056,39 @@ pub struct AbiBindingSummary {
     pub view: bool,
     /// At least one bound parameter is a descriptor table.
     pub table: bool,
+    /// Bit mask of the stage layouts the flushed pipeline carries (bit 0
+    /// vertex, bit 1 fragment, bit 2 mesh, bit 3 object, bit 4 compute).
+    pub stage_mask: u8,
+    /// Declared parameters of the fragment stage. `0` when the pipeline has no
+    /// fragment layout.
+    pub ps_abi_parameters: u32,
+    /// Fragment parameters a title root write bound.
+    pub fragment_bound_parameters: u32,
+    /// Bound fragment parameters of kind `Constant`.
+    pub fragment_bound_constants: u32,
+    /// Bound fragment parameters of kind `CBV`/`SRV`/`UAV`.
+    pub fragment_bound_views: u32,
+    /// Bound fragment parameters of kind `Table`/`Sampler`.
+    pub fragment_bound_tables: u32,
+    /// Fragment table parameters whose range kind can carry a texture or
+    /// sampler source (a reflected `Unspecified` table is included: converter
+    /// reflection never names the range kind).
+    pub fragment_texture_sources_declared: u32,
+    /// Those declared fragment sources a wire table with a texture/sampler
+    /// entry actually bound.
+    pub fragment_texture_sources_bound: u32,
+    /// Wire tables this draw left inert (the bound pipeline declares no root
+    /// parameter that can address them).
+    pub tables_dropped_inert: u32,
+    /// Inert wire tables the fragment stage would have had to consume.
+    pub ps_tables_dropped_inert: u32,
+    /// Inert wire tables while the fragment stage declares no table parameter
+    /// at all: the fragment has no root-parameter path to them, and the wire
+    /// carries no descriptor heap. The missing concept is named by
+    /// [`FRAGMENT_SOURCE_UNREACHABLE_REASON`].
+    pub fragment_source_unreachable: u32,
+    /// Per-stage declared/encoded shape, indexed by [`abi_stage_name`].
+    pub stages: [StageAbiShape; ABI_STAGE_SLOTS],
 }
 
 impl AbiBindingSummary {
@@ -893,6 +1144,32 @@ pub struct DrawRecord {
     pub abi_bound_bytes: u32,
     /// `none|constants|view|table` (or a `+`-joined combination).
     pub abi_bound: &'static str,
+    /// Bit mask of the stage layouts the pipeline carries (bit 0 vertex, bit 1
+    /// fragment, bit 2 mesh, bit 3 object, bit 4 compute).
+    pub stage_mask: u8,
+    /// Declared fragment parameters.
+    pub ps_abi_parameters: u32,
+    /// Fragment parameters a title root write bound.
+    pub ps_bound_parameters: u32,
+    /// Bound fragment parameters of kind `Constant`.
+    pub ps_bound_constants: u32,
+    /// Bound fragment parameters of kind `CBV`/`SRV`/`UAV`.
+    pub ps_bound_views: u32,
+    /// Bound fragment parameters of kind `Table`/`Sampler`.
+    pub ps_bound_tables: u32,
+    /// Fragment table parameters that can carry a texture/sampler source.
+    pub fragment_texture_sources_declared: u32,
+    /// Those sources a wire table actually bound.
+    pub fragment_texture_sources_bound: u32,
+    /// Wire tables this draw left inert.
+    pub tables_dropped_inert: u32,
+    /// Inert wire tables the fragment would have had to consume.
+    pub ps_tables_dropped_inert: u32,
+    /// Wire tables carrying a fragment texture/sampler source with no declared
+    /// fragment parameter.
+    pub fragment_source_unreachable: u32,
+    /// Per-stage declared/encoded ABI shape, indexed by [`abi_stage_name`].
+    pub stages: [StageAbiShape; ABI_STAGE_SLOTS],
     /// Attachment the pass renders into, when known.
     pub target: Option<TraceTarget>,
 }
@@ -923,6 +1200,55 @@ impl DrawRecord {
             self.abi_bound_parameters, self.abi_unbound_parameters, self.abi_bound_bytes,
             self.abi_bound
         ));
+        // Per-stage ABI observability (gate G5/G11): what each active stage
+        // declares, what the argument-buffer builder actually wrote, and the
+        // parameter a bound root view filled. Counts and offsets only.
+        out.push_str(&format!(
+            " stage_mask={} ps_abi_parameters={} ps_bound_parameters={} \
+             ps_bound_kinds=constants:{},view:{},table:{} \
+             fragment_texture_sources_declared={} fragment_texture_sources_bound={} \
+             tables_dropped_inert={} ps_tables_dropped_inert={} \
+             fragment_source_unreachable={}",
+            self.stage_mask,
+            self.ps_abi_parameters,
+            self.ps_bound_parameters,
+            self.ps_bound_constants,
+            self.ps_bound_views,
+            self.ps_bound_tables,
+            self.fragment_texture_sources_declared,
+            self.fragment_texture_sources_bound,
+            self.tables_dropped_inert,
+            self.ps_tables_dropped_inert,
+            self.fragment_source_unreachable
+        ));
+        for (index, shape) in self.stages.iter().enumerate() {
+            if !shape.present {
+                continue;
+            }
+            let span = if shape.encoded_parameters == 0 {
+                "none".to_string()
+            } else {
+                format!("{}..{}", shape.encoded_start, shape.encoded_end)
+            };
+            out.push_str(&format!(
+                " abi_stage={} params=constants:{},view:{},table:{} wrote={} bytes={} span={}",
+                abi_stage_name(index),
+                shape.declared_constants,
+                shape.declared_views,
+                shape.declared_tables,
+                shape.encoded_parameters,
+                shape.encoded_bytes,
+                span
+            ));
+            if shape.bound_root_view_size > 0 {
+                out.push_str(&format!(
+                    " bound_view={}:{}",
+                    shape.bound_root_view_offset, shape.bound_root_view_size
+                ));
+            } else {
+                out.push_str(" bound_view=none");
+            }
+        }
         match self.target {
             Some(target) => out.push_str(&format!(" rt={}", target_name(&target))),
             None => out.push_str(" rt=none"),
@@ -1196,6 +1522,18 @@ mod tests {
                 abi_unbound_parameters: 0,
                 abi_bound_bytes: 0,
                 abi_bound: "none",
+                stage_mask: 0,
+                ps_abi_parameters: 0,
+                ps_bound_parameters: 0,
+                ps_bound_constants: 0,
+                ps_bound_views: 0,
+                ps_bound_tables: 0,
+                fragment_texture_sources_declared: 0,
+                fragment_texture_sources_bound: 0,
+                tables_dropped_inert: 0,
+                ps_tables_dropped_inert: 0,
+                fragment_source_unreachable: 0,
+                stages: [StageAbiShape::default(); ABI_STAGE_SLOTS],
                 target: None,
             };
             assert!(state.record(record).is_some());
@@ -1217,6 +1555,18 @@ mod tests {
                     abi_unbound_parameters: 0,
                     abi_bound_bytes: 0,
                     abi_bound: "none",
+                    stage_mask: 0,
+                    ps_abi_parameters: 0,
+                    ps_bound_parameters: 0,
+                    ps_bound_constants: 0,
+                    ps_bound_views: 0,
+                    ps_bound_tables: 0,
+                    fragment_texture_sources_declared: 0,
+                    fragment_texture_sources_bound: 0,
+                    tables_dropped_inert: 0,
+                    ps_tables_dropped_inert: 0,
+                    fragment_source_unreachable: 0,
+                    stages: [StageAbiShape::default(); ABI_STAGE_SLOTS],
                     target: None,
                 })
                 .is_none()
@@ -1298,6 +1648,44 @@ mod tests {
             abi_unbound_parameters: 1,
             abi_bound_bytes: 24,
             abi_bound: "constants+view",
+            stage_mask: 0b11,
+            ps_abi_parameters: 2,
+            ps_bound_parameters: 1,
+            ps_bound_constants: 0,
+            ps_bound_views: 0,
+            ps_bound_tables: 1,
+            fragment_texture_sources_declared: 1,
+            fragment_texture_sources_bound: 1,
+            tables_dropped_inert: 0,
+            ps_tables_dropped_inert: 0,
+            fragment_source_unreachable: 0,
+            stages: {
+                let mut stages = [StageAbiShape::default(); ABI_STAGE_SLOTS];
+                stages[0] = StageAbiShape {
+                    present: true,
+                    declared_parameters: 1,
+                    declared_constants: 1,
+                    encoded_parameters: 1,
+                    encoded_bytes: 16,
+                    encoded_start: 0,
+                    encoded_end: 16,
+                    ..StageAbiShape::default()
+                };
+                stages[1] = StageAbiShape {
+                    present: true,
+                    declared_parameters: 2,
+                    declared_views: 1,
+                    declared_tables: 1,
+                    encoded_parameters: 2,
+                    encoded_bytes: 32,
+                    encoded_start: 0,
+                    encoded_end: 32,
+                    bound_root_view_offset: 8,
+                    bound_root_view_size: 24,
+                    ..StageAbiShape::default()
+                };
+                stages
+            },
             target: Some(TraceTarget {
                 texture: 0,
                 width: 1920,
@@ -1314,7 +1702,45 @@ mod tests {
         assert!(line.contains("abi_unbound_parameters=1"));
         assert!(line.contains("abi_bound_bytes=24"));
         assert!(line.contains("bound=constants+view"));
+        assert!(line.contains("stage_mask=3"));
+        assert!(line.contains("ps_abi_parameters=2"));
+        assert!(line.contains("ps_bound_kinds=constants:0,view:0,table:1"));
+        assert!(line.contains("fragment_texture_sources_declared=1"));
+        assert!(line.contains("fragment_texture_sources_bound=1"));
+        assert!(line.contains("abi_stage=vertex params=constants:1,view:0,table:0"));
+        assert!(line.contains("abi_stage=fragment params=constants:0,view:1,table:1"));
+        assert!(line.contains("bound_view=8:24"));
         assert!(line.contains("rt=offscreen 1920x1080 rgba8unorm"));
+    }
+
+    #[test]
+    fn the_stage_abi_telemetry_names_the_unreachable_fragment_source() {
+        reset_stage_abi_telemetry();
+        note_abi_binding(AbiBindingSummary {
+            stage_mask: 0b10,
+            ps_abi_parameters: 0,
+            fragment_texture_sources_declared: 0,
+            tables_dropped_inert: 2,
+            ps_tables_dropped_inert: 2,
+            fragment_source_unreachable: 2,
+            ..AbiBindingSummary::default()
+        });
+        note_fragment_source_unreachable();
+        let telemetry = stage_abi_telemetry();
+        assert_eq!(telemetry.stage_mask, 0b10);
+        assert_eq!(telemetry.ps_abi_parameters, 0);
+        assert_eq!(telemetry.tables_dropped_inert, 2);
+        assert_eq!(telemetry.fragment_source_unreachable, 1);
+        assert_eq!(
+            telemetry.fragment_source_unreachable_reason,
+            FRAGMENT_SOURCE_UNREACHABLE_REASON
+        );
+        let json = descriptor_table_refusal_census().json_value();
+        assert!(json.contains("\"stage_abi\""));
+        assert!(json.contains("\"ps_abi_parameters\": 0"));
+        assert!(json.contains("\"fragment_texture_sources_bound\": 0"));
+        assert!(json.contains("\"fragment_source_unreachable\": 1"));
+        reset_stage_abi_telemetry();
     }
 
     fn key(set: u16) -> DescriptorTableRefusalKey {
