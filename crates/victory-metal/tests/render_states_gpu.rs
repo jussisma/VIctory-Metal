@@ -1342,3 +1342,296 @@ fn content_hashed_blend_pixels_are_exact() {
          {first:?}/{second:?} (created=2 reused=1), depth/cull/clear preserved"
     );
 }
+
+/// Cycle 18B (Boot #32): the 4K fullscreen draws.
+///
+/// Boot #32 encoded 85 three-vertex fullscreen draws into a 3840x2160 RGBA8
+/// offscreen attachment and the attachment still had one distinct value with
+/// zero non-zero bytes. These two cases pin the host-default half of that gate
+/// on the real GPU at 4K:
+///
+/// 1. No wire blend state and no depth attachment at all: the draw must write
+///    exact pixels. A missing state means "write all colour channels, no
+///    blend", never a zero write mask.
+/// 2. A depth attachment the host has to pair with a depth-stencil state the
+///    wire never sent: the host's old invented `Less` + depth-write default
+///    rejects every fragment when the depth plane is not already less than the
+///    fragment depth. The draw must still write exact pixels, because D3D12's
+///    default depth state is `DepthEnable = FALSE` and Metal's own default is
+///    compare `Always` with no depth writes.
+const FULLSCREEN_4K_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut fullscreen_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 red_fragment() {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+
+fragment float4 green_fragment() {
+    return float4(0.0, 1.0, 0.0, 1.0);
+}
+"#;
+
+const FOUR_K_WIDTH: u32 = 3840;
+const FOUR_K_HEIGHT: u32 = 2160;
+const ALLOC_4K_COLOUR: u64 = 0x4A;
+const ALLOC_4K_DEPTH: u64 = 0x4B;
+
+/// Builds and registers one content-hashed, vertex-buffer-free fullscreen PSO.
+fn fullscreen_4k_pipeline(
+    transport: &DirectMetalTransport,
+    library: &[u8],
+    handle: u64,
+    fragment: &str,
+    depth: bool,
+) {
+    let state = PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm],
+        depth_format: depth.then_some(TextureFormat::Depth32Float),
+        fragment_entry: Some(fragment.to_string()),
+        // No blend state: Metal's descriptor default is blending off and a
+        // full `MTLColorWriteMaskAll` write mask.
+        blend: None,
+        // No depth/stencil state either, so the host has nothing to apply.
+        depth_stencil: None,
+        rasterizer: None,
+        ..PipelineState::default()
+    }
+    .encode(PipelineStage::Graphics);
+    transport
+        .register_content_hashed_graphics_pipeline(
+            handle,
+            library,
+            "fullscreen_vertex",
+            &state,
+            PipelineAbi::default(),
+        )
+        .expect("the content-hashed fullscreen pipeline must register");
+}
+
+fn fullscreen_4k_commands(handle: u64, depth: bool, depth_clear: f32) -> Vec<CommandV3> {
+    vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![ColorAttachment {
+                allocation_id: ALLOC_4K_COLOUR,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                // Transparent black: any non-zero byte comes from the draw.
+                clear_color: [0.0, 0.0, 0.0, 0.0],
+            }],
+            depth_stencil: depth.then(|| DepthStencilAttachment {
+                allocation_id: ALLOC_4K_DEPTH,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                depth_load: LoadOp::Clear,
+                depth_store: StoreOp::Store,
+                clear_depth: depth_clear,
+                stencil_load: LoadOp::DontCare,
+                stencil_store: StoreOp::DontCare,
+                clear_stencil: 0,
+            }),
+        }),
+        CommandV3::SetGraphicsPipeline(PipelineRef {
+            pipeline_id: handle,
+        }),
+        CommandV3::SetViewport(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(FOUR_K_WIDTH),
+            height: f64::from(FOUR_K_HEIGHT),
+            near: 0.0,
+            far: 1.0,
+        }),
+        CommandV3::SetScissor(ScissorRect {
+            x: 0,
+            y: 0,
+            width: FOUR_K_WIDTH,
+            height: FOUR_K_HEIGHT,
+        }),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+    ]
+}
+
+/// The 4K colour target, its optional depth target and the allocation map.
+struct Fullscreen4k {
+    colour: RenderTarget,
+    depth: Option<RenderTarget>,
+    allocations: HashMap<(u64, u32), VmBufferId>,
+}
+
+fn create_4k_targets(transport: &DirectMetalTransport, depth: bool) -> Fullscreen4k {
+    let colour = transport
+        .create_render_target_2d(FOUR_K_WIDTH, FOUR_K_HEIGHT, PixelFormat::Rgba8Unorm)
+        .expect("4K colour target");
+    let colour_handle = transport
+        .register_render_target(&colour)
+        .expect("4K colour target registers");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_4K_COLOUR, 1), VmBufferId(colour_handle.0));
+    let depth_target = depth.then(|| {
+        let depth = transport
+            .create_render_target_2d(FOUR_K_WIDTH, FOUR_K_HEIGHT, PixelFormat::Depth32Float)
+            .expect("4K depth target");
+        let depth_handle = transport
+            .register_render_target(&depth)
+            .expect("4K depth target registers");
+        allocations.insert((ALLOC_4K_DEPTH, 1), VmBufferId(depth_handle.0));
+        depth
+    });
+    Fullscreen4k {
+        colour,
+        depth: depth_target,
+        allocations,
+    }
+}
+
+/// A 4K draw with no wire blend state and no depth attachment writes exactly the
+/// fragment colour on every pixel.
+#[test]
+fn no_wire_state_4k_draw_writes_exact_pixels() {
+    let dir = TempDir::new("fullscreen-4k-nostate");
+    let Some(library) = compile_metallib(dir.path(), "fullscreen_4k", FULLSCREEN_4K_MSL) else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let scene = create_4k_targets(&transport, false);
+    fullscreen_4k_pipeline(&transport, &library, 0x4A00, "red_fragment", false);
+
+    let (reply, _) = transport
+        .submit_v3_with_stats(
+            &SubmissionV3 {
+                sequence: 401,
+                list: Some(list(41)),
+                commands: fullscreen_4k_commands(0x4A00, false, 1.0),
+            },
+            &scene.allocations,
+        )
+        .expect("the 4K no-state submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "submission status");
+    transport.wait_for_gpu().expect("the 4K pass completes");
+
+    let pixels = transport
+        .read_render_target_rgba8(&scene.colour)
+        .expect("4K readback");
+    assert_eq!(pixels.len(), (FOUR_K_WIDTH * FOUR_K_HEIGHT) as usize);
+    let unexpected = pixels
+        .iter()
+        .position(|pixel| *pixel != [255, 0, 0, 255]);
+    assert_eq!(
+        unexpected, None,
+        "every 4K pixel must be the fragment's red with a missing blend/depth state"
+    );
+    eprintln!(
+        "no_wire_state_4k_draw: {}x{} pixels all [255,0,0,255]",
+        FOUR_K_WIDTH, FOUR_K_HEIGHT
+    );
+}
+
+/// A 4K draw into a pass with a depth attachment cleared to `0.0` and no wire
+/// depth-stencil state must not be gated by the host's invented `Less` default.
+#[test]
+fn invented_depth_default_never_gates_a_4k_draw() {
+    let dir = TempDir::new("fullscreen-4k-depth");
+    let Some(library) =
+        compile_metallib(dir.path(), "fullscreen_4k_depth", FULLSCREEN_4K_MSL)
+    else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
+        return;
+    };
+    // Arm the encoder-state trace so the same run proves the depth class the
+    // pass actually ran with, not only the pixels it wrote.
+    // SAFETY: the GPU proofs run with `--test-threads=1`.
+    unsafe {
+        std::env::set_var(
+            victory_metal::macos::render::state_trace::STATE_TRACE_ENV,
+            "1",
+        )
+    };
+    victory_metal::macos::render::state_trace::reset();
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let scene = create_4k_targets(&transport, true);
+    assert!(scene.depth.is_some(), "the 4K depth target exists");
+    fullscreen_4k_pipeline(&transport, &library, 0x4A01, "green_fragment", true);
+
+    // The depth plane is cleared to `0.0` and the fragment writes `z = 0.0`, so
+    // the old invented `Less` + depth-write default rejected every fragment:
+    // `0 < 0` is false. Nothing on the wire asked for a depth test.
+    let (reply, _) = transport
+        .submit_v3_with_stats(
+            &SubmissionV3 {
+                sequence: 402,
+                list: Some(list(42)),
+                commands: fullscreen_4k_commands(0x4A01, true, 0.0),
+            },
+            &scene.allocations,
+        )
+        .expect("the 4K depth submission must execute");
+    assert_eq!(reply.status, ReplyStatus::Ok, "submission status");
+    transport.wait_for_gpu().expect("the 4K depth pass completes");
+
+    let pixels = transport
+        .read_render_target_rgba8(&scene.colour)
+        .expect("4K depth readback");
+    let unexpected = pixels
+        .iter()
+        .position(|pixel| *pixel != [0, 255, 0, 255]);
+    assert_eq!(
+        unexpected, None,
+        "a missing wire depth state must not gate the draw (first mismatch at {unexpected:?})"
+    );
+    eprintln!(
+        "invented_depth_default_4k: {}x{} pixels all [0,255,0,255] with depth cleared to 0.0",
+        FOUR_K_WIDTH, FOUR_K_HEIGHT
+    );
+
+    // The trace must name the exact class the pass ran with: the host built its
+    // `Less` + depth-write default, refused to bind it, and no wire state was
+    // ever sent.
+    let report = victory_metal::macos::render::state_trace::report();
+    assert!(report.enabled, "{report:?}");
+    assert_eq!(report.passes, 1, "{report:?}");
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert_eq!(report.depth_attachment_passes, 1, "{report:?}");
+    assert_eq!(
+        report.depth_bind[3], 1,
+        "the pass ran with the invented default suppressed: {report:?}"
+    );
+    assert_eq!(
+        report.blend_baked_attachments, 0,
+        "no blend attachment was baked for this pipeline: {report:?}"
+    );
+    assert_eq!(report.blend_write_mask_zero, 0, "{report:?}");
+    let pass = report.last_pass.expect("the pass summary is published");
+    assert_eq!(pass.depth_bind, "invented_suppressed", "{pass:?}");
+    assert_eq!(pass.depth_format, "depth32float", "{pass:?}");
+    assert_eq!(pass.depth_load, "clear", "{pass:?}");
+    assert_eq!(pass.topology, "triangle", "{pass:?}");
+    assert!(
+        report.pass_nonzero_after_draw > 0,
+        "the draw wrote colour into the 4K attachment: {report:?}"
+    );
+    eprintln!("state_trace_depth_4k: {}", pass.line());
+}

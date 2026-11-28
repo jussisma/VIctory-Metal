@@ -284,6 +284,11 @@ pub(crate) unsafe fn apply_blend_attachment(
         );
         objc::msg_send_void_usize(attachment, objc::sel(c"setWriteMask:"), mask);
     }
+    // Bounded census: this is the only place the host learns what a title's
+    // blend state and colour write mask will do, because Metal bakes both into
+    // the pipeline state. A `blend_write_mask_zero` count is the one class that
+    // cannot write any colour.
+    crate::macos::render::state_trace::note_blend(state);
     Ok(())
 }
 
@@ -339,11 +344,18 @@ pub(crate) fn new_depth_stencil_state(
             descriptor.as_raw(),
         )
     };
-    ObjcObject::from_retained(state_raw).ok_or_else(|| {
+    let state = ObjcObject::from_retained(state_raw).ok_or_else(|| {
         MetalError::InternalError(
             "MTLDevice.newDepthStencilStateWithDescriptor returned nil".to_string(),
         )
-    })
+    })?;
+    // Built from an explicit `DepthStencilState`, so the bind path applies it
+    // as-is (only the host-invented `Less` default is refused).
+    crate::macos::render::state_trace::note_depth_class(
+        state.as_raw(),
+        crate::macos::render::state_trace::DepthClass::Explicit,
+    );
+    Ok(state)
 }
 
 /// Fills one face descriptor obtained from `depth_descriptor`.
@@ -436,6 +448,9 @@ pub(crate) unsafe fn apply_rasterizer(
             state.depth_bias_clamp,
         );
     }
+    // Recorded here rather than at the caller so both render executors (the
+    // `RenderEncoder` path and the device's indirect path) are counted.
+    crate::macos::render::state_trace::note_rasterizer(state);
     Ok(())
 }
 

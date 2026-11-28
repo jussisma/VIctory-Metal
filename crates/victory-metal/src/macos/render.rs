@@ -122,8 +122,10 @@ struct MTLScissorRect {
     height: usize,
 }
 
-/// Apple `MTLOrigin` (`NSUInteger x, y, z`); only used by the test readback blit.
-#[cfg(test)]
+/// Apple `MTLOrigin` (`NSUInteger x, y, z`).
+///
+/// Used by the test readback blit and by the bounded `state_trace` sample that
+/// copies one 4x4 corner and one 4x4 centre block out of a pass attachment.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MTLOrigin {
@@ -873,7 +875,19 @@ impl GraphicsPipeline {
                 Some(params) => Some(crate::macos::state::new_depth_stencil_state(
                     transport, params,
                 )?),
-                None => Some(new_less_depth_state(transport)?),
+                // The host-API pipeline constructor keeps its documented
+                // `Less` + depth-write default: the caller asked for a depth
+                // attachment on a pipeline it compiled itself, so this is an
+                // explicit request, not the invented default the content-hashed
+                // path falls back to (`RenderEncoder::set_pipeline_state`).
+                None => {
+                    let state = new_less_depth_state(transport)?;
+                    state_trace::note_depth_class(
+                        state.as_raw(),
+                        state_trace::DepthClass::Explicit,
+                    );
+                    Some(state)
+                }
             },
             None => None,
         };
@@ -978,6 +992,10 @@ pub(crate) fn new_less_depth_state(
             "MTLDevice.newDepthStencilStateWithDescriptor returned nil".to_string(),
         )
     })?;
+    // The bind path refuses this class for a pass that never saw a wire depth
+    // state: `Less` against a depth plane that was never cleared rejects every
+    // fragment and zeroes the draw. Recorded even when the trace is off.
+    state_trace::note_depth_class(state.as_raw(), state_trace::DepthClass::Invented);
     Ok(state)
 }
 
@@ -1016,6 +1034,8 @@ pub struct RenderEncoder<'a> {
     cb: objc::Id,
     enc: objc::Id,
     ended: bool,
+    /// Encoder-state trace of this pass, when `VICTORY_METAL_STATE_TRACE` is on.
+    state_trace: Option<state_trace::PassState>,
 }
 
 impl<'a> RenderEncoder<'a> {
@@ -1050,6 +1070,7 @@ impl<'a> RenderEncoder<'a> {
             cb: objc::empty_id(),
             enc: objc::empty_id(),
             ended: false,
+            state_trace: None,
         })
     }
 
@@ -1079,6 +1100,7 @@ impl<'a> RenderEncoder<'a> {
             cb: objc::empty_id(),
             enc: objc::empty_id(),
             ended: false,
+            state_trace: None,
         }
     }
 
@@ -1094,7 +1116,96 @@ impl<'a> RenderEncoder<'a> {
             // SAFETY: `self.enc` is a live render encoder not yet ended.
             unsafe { objc::msg_send_void_0(self.enc, objc::sel(c"endEncoding")) };
             self.ended = true;
+            self.finish_state_trace();
         }
+    }
+
+    /// Publishes this pass's bounded encoder-state record and, when armed,
+    /// appends the after-pass attachment sample to the still-open command
+    /// buffer. Must run after the render encoder ended and before the caller
+    /// commits.
+    fn finish_state_trace(&mut self) {
+        if let Some(pass) = self.state_trace.take() {
+            let sample = if pass.draws() > 0 && state_trace::should_sample() {
+                self.encode_state_sample(pass.sample())
+            } else {
+                None
+            };
+            state_trace::finish(pass, sample);
+        }
+    }
+
+    /// Encodes one 4x4 corner and one 4x4 centre block of colour attachment 0
+    /// into a shared buffer, so the report can read it once the command buffer
+    /// completes without ever blocking the render thread.
+    fn encode_state_sample(
+        &mut self,
+        target: Option<state_trace::SampleTarget>,
+    ) -> Option<state_trace::PendingSample> {
+        let target = target?;
+        let Some(row) = state_trace::sample_row_bytes(&target) else {
+            state_trace::note_sample_failure("attachment format is not sampleable");
+            return None;
+        };
+        let Some(block) = row.checked_mul(state_trace::SAMPLE_EDGE as usize) else {
+            state_trace::note_sample_failure("sample size overflows usize");
+            return None;
+        };
+        let Some(len) = block.checked_mul(state_trace::SAMPLE_BLOCKS) else {
+            state_trace::note_sample_failure("sample size overflows usize");
+            return None;
+        };
+        // SAFETY: `device` is live; storage mode `0` is shared, so the CPU can
+        // read the buffer after the command buffer completes.
+        let buffer = unsafe { objc::msg_send_new_buffer(self.transport.device_raw(), len, 0) };
+        if buffer.is_null() {
+            state_trace::note_sample_failure("sample buffer allocation failed");
+            return None;
+        }
+        // SAFETY: `cb` is the live command buffer whose render encoder just
+        // closed, so a blit encoder can be appended to it.
+        let blit = unsafe { objc::msg_send_id_0(self.cb, objc::sel(c"blitCommandEncoder")) };
+        if blit.is_null() {
+            // SAFETY: `buffer` was just retained by `newBufferWithLength:`.
+            unsafe { objc::msg_send_void_0(buffer, objc::sel(c"release")) };
+            state_trace::note_sample_failure("blit encoder unavailable");
+            return None;
+        }
+        let edge = state_trace::SAMPLE_EDGE;
+        let size = objc::MTLSize {
+            width: edge as usize,
+            height: edge as usize,
+            depth: 1,
+        };
+        let corner = MTLOrigin { x: 0, y: 0, z: 0 };
+        let centre = MTLOrigin {
+            x: (target.width / 2 - edge / 2) as usize,
+            y: (target.height / 2 - edge / 2) as usize,
+            z: 0,
+        };
+        // SAFETY: `blit` is a live blit encoder, `target.texture` is a live
+        // attachment texture at least `SAMPLE_EDGE` square, and `buffer` holds
+        // two blocks with a row pitch that exactly covers one block row.
+        unsafe {
+            msg_send_copy_texture_to_buffer(blit, target.texture, corner, size, buffer, 0, row);
+            msg_send_copy_texture_to_buffer(blit, target.texture, centre, size, buffer, block, row);
+            objc::msg_send_void_0(blit, objc::sel(c"endEncoding"));
+        }
+        // SAFETY: `cb` is live; the extra retain keeps it alive until the
+        // deferred read in `state_trace::report`.
+        let retained = unsafe { objc::msg_send_id_0(self.cb, objc::sel(c"retain")) };
+        if retained.is_null() {
+            // SAFETY: `buffer` was just retained by `newBufferWithLength:`.
+            unsafe { objc::msg_send_void_0(buffer, objc::sel(c"release")) };
+            state_trace::note_sample_failure("command buffer retain failed");
+            return None;
+        }
+        Some(state_trace::PendingSample {
+            cb: retained as usize,
+            buffer: buffer as usize,
+            len,
+            block,
+        })
     }
 
     /// Raw `MTLRenderCommandEncoder`, or null before the first binding.
@@ -1103,18 +1214,37 @@ impl<'a> RenderEncoder<'a> {
     }
 
     /// Sets a raw render pipeline state and its optional depth-stencil state.
+    ///
+    /// A depth state the host invented itself (the hardcoded `Less` + depth
+    /// write default built for a content-hashed pipeline that carried a depth
+    /// format but no wire `SetDepthStencilState`) is *not* bound: D3D12 has no
+    /// such default, and `Less` against an attachment whose depth plane was
+    /// never cleared rejects every fragment, which zeroes the draw while the
+    /// wire has not asked for depth at all. The encoder keeps Metal's own
+    /// default (compare `Always`, no depth writes), which cannot reject.
     pub(crate) fn set_pipeline_state(
         &mut self,
         state: objc::Id,
         depth_state: Option<objc::Id>,
     ) -> Result<(), MetalError> {
         self.ensure_encoder()?;
+        let suppressed = depth_state.is_some_and(|depth_state| {
+            state_trace::depth_class(depth_state) == Some(state_trace::DepthClass::Invented)
+        });
+        let depth_state = if suppressed { None } else { depth_state };
         // SAFETY: `self.enc` is a live render encoder; `state` and
         // `depth_state` are live Metal objects owned by the pipeline registry.
         unsafe {
             objc::msg_send_void_1(self.enc, objc::sel(c"setRenderPipelineState:"), state);
             if let Some(depth_state) = depth_state {
                 objc::msg_send_void_1(self.enc, objc::sel(c"setDepthStencilState:"), depth_state);
+            }
+        }
+        if let Some(pass) = self.state_trace.as_mut() {
+            if depth_state.is_some() {
+                pass.note_depth(state_trace::DepthBind::Explicit);
+            } else if suppressed {
+                pass.note_depth(state_trace::DepthBind::InventedSuppressed);
             }
         }
         Ok(())
@@ -1126,6 +1256,9 @@ impl<'a> RenderEncoder<'a> {
         // SAFETY: `self.enc` is live and `state` is a live cached
         // `MTLDepthStencilState` owned by the device.
         unsafe { objc::msg_send_void_1(self.enc, objc::sel(c"setDepthStencilState:"), state) };
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_depth(state_trace::DepthBind::Wire);
+        }
         Ok(())
     }
 
@@ -1190,7 +1323,11 @@ impl<'a> RenderEncoder<'a> {
         self.ensure_encoder()?;
         // SAFETY: `self.enc` is a live render encoder created by
         // `ensure_encoder`.
-        unsafe { crate::macos::state::apply_rasterizer(self.enc, state) }
+        unsafe { crate::macos::state::apply_rasterizer(self.enc, state) }?;
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_rasterizer(state);
+        }
+        Ok(())
     }
 
     /// Applies the wire stencil reference value.
@@ -1414,6 +1551,9 @@ impl<'a> RenderEncoder<'a> {
                 vertex_count,
             );
         }
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_draw(primitive);
+        }
         Ok(())
     }
 
@@ -1450,6 +1590,9 @@ impl<'a> RenderEncoder<'a> {
                 instance_count,
                 base_instance,
             );
+        }
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_draw(primitive);
         }
         Ok(())
     }
@@ -1599,6 +1742,8 @@ impl<'a> RenderEncoder<'a> {
         // SAFETY: `enc` is a live render encoder that has not been ended yet.
         unsafe { objc::msg_send_void_0(enc, objc::sel(c"endEncoding")) };
         self.ended = true;
+        // The bounded attachment sample must be appended before the commit.
+        self.finish_state_trace();
         // SAFETY: `cb` is a live command buffer with every encoder closed.
         unsafe {
             objc::msg_send_void_0(cb, objc::sel(c"commit"));
@@ -1700,18 +1845,27 @@ impl<'a> RenderEncoder<'a> {
         self.pool = Some(pool);
         self.cb = cb;
         self.enc = enc;
+        if state_trace::enabled() {
+            // The descriptor is the only place a v3 pass's load/store and
+            // attachment formats are visible to the encoder.
+            self.state_trace = read_pass_info(descriptor).and_then(state_trace::begin);
+            if let Some(pass) = self.state_trace.as_mut()
+                && let Some(pipeline) = self.pipeline
+                && pipeline.depth_state_raw().is_some()
+            {
+                // The legacy encoder binds the pipeline's own depth state here.
+                pass.note_depth(state_trace::DepthBind::Explicit);
+            }
+        }
         Ok(())
     }
 }
 
 impl Drop for RenderEncoder<'_> {
     fn drop(&mut self) {
-        if !self.enc.is_null() && !self.ended {
-            // SAFETY: `self.enc` is a live render encoder created by
-            // `ensure_encoder` and not yet ended.
-            unsafe { objc::msg_send_void_0(self.enc, objc::sel(c"endEncoding")) };
-            self.ended = true;
-        }
+        // `end_encoding` also publishes the pass's bounded state record, so an
+        // abandoned encoder does not silently lose its trace entry.
+        self.end_encoding();
     }
 }
 
@@ -1795,6 +1949,92 @@ fn configure_color_attachment(raw: objc::Id, attachment: &RenderAttachment) {
         );
         msg_send_void_clear_color(raw, objc::sel(c"setClearColor:"), clear);
     }
+}
+
+/// Reads the attachment state a live `MTLRenderPassDescriptor` encodes with.
+///
+/// This is the only view [`RenderEncoder`] has of a v3 pass's attachments: the
+/// descriptor is built in the device layer, so formats, load/store actions and
+/// the depth attachment are read back from the object instead of plumbed
+/// through every call. `None` only when the descriptor has no attachment array.
+fn read_pass_info(descriptor: objc::Id) -> Option<state_trace::PassInfo> {
+    // SAFETY: `descriptor` is a live `MTLRenderPassDescriptor`.
+    let attachments = unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"colorAttachments")) };
+    if attachments.is_null() {
+        return None;
+    }
+    let mut color_attachments = 0u32;
+    let mut color_format = None;
+    let mut color_load = 0usize;
+    let mut color_store = 0usize;
+    let mut sample = None;
+    for index in 0..MAX_COLOR_ATTACHMENTS {
+        // SAFETY: `attachments` is the colour attachment array and `index` is
+        // below the declared 1..=8 limit.
+        let attachment = unsafe {
+            msg_send_id_usize(attachments, objc::sel(c"objectAtIndexedSubscript:"), index)
+        };
+        if attachment.is_null() {
+            break;
+        }
+        // SAFETY: `attachment` is a live render pass attachment descriptor.
+        let texture = unsafe { objc::msg_send_id_0(attachment, objc::sel(c"texture")) };
+        if texture.is_null() {
+            break;
+        }
+        // SAFETY: every getter below returns a documented `NSUInteger` field of
+        // a live attachment descriptor or texture.
+        unsafe {
+            let load = objc::msg_send_usize_0(attachment, objc::sel(c"loadAction"));
+            let store = objc::msg_send_usize_0(attachment, objc::sel(c"storeAction"));
+            if index == 0 {
+                let format =
+                    objc::msg_send_usize_0(texture, objc::sel(c"pixelFormat"));
+                let parsed = PixelFormat::from_mtl_pixel_format(format);
+                color_format = parsed;
+                color_load = load;
+                color_store = store;
+                if let Some(parsed) = parsed
+                    && parsed.is_color()
+                {
+                    sample = Some(state_trace::SampleTarget {
+                        texture,
+                        width: objc::msg_send_usize_0(texture, objc::sel(c"width")) as u32,
+                        height: objc::msg_send_usize_0(texture, objc::sel(c"height")) as u32,
+                        bytes_per_texel: parsed.bytes_per_texel(),
+                    });
+                }
+            }
+        }
+        color_attachments += 1;
+    }
+    let mut depth_attachment = false;
+    let mut depth_load = 0usize;
+    let mut depth_format = 0usize;
+    // SAFETY: `descriptor` is a live render pass descriptor.
+    let depth = unsafe { objc::msg_send_id_0(descriptor, objc::sel(c"depthAttachment")) };
+    if !depth.is_null() {
+        // SAFETY: `depth` is a live depth attachment descriptor.
+        let texture = unsafe { objc::msg_send_id_0(depth, objc::sel(c"texture")) };
+        if !texture.is_null() {
+            depth_attachment = true;
+            // SAFETY: every getter returns a documented `NSUInteger` field.
+            unsafe {
+                depth_load = objc::msg_send_usize_0(depth, objc::sel(c"loadAction"));
+                depth_format = objc::msg_send_usize_0(texture, objc::sel(c"pixelFormat"));
+            }
+        }
+    }
+    Some(state_trace::PassInfo {
+        color_attachments,
+        color_format,
+        color_load,
+        color_store,
+        depth_attachment,
+        depth_load,
+        depth_format,
+        sample,
+    })
 }
 
 /// Applies texture/load/store/clear state to an `MTLRenderPassDepthAttachmentDescriptor`.
@@ -2990,7 +3230,6 @@ unsafe fn msg_send_id_texture_descriptor(
     unsafe { f(cls, s, pixel_format, width, height, mipmapped) }
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn msg_send_copy_texture_to_buffer(
     enc: objc::Id,
@@ -3032,6 +3271,917 @@ unsafe fn msg_send_copy_texture_to_buffer(
             bytes_per_row,
             0,
         )
+    }
+}
+
+/// Opt-in, bounded trace of the encoder state a render pass runs with.
+///
+/// `draw_trace` (ADR-053) describes the *work* of a draw (kind, counts,
+/// viewport, scissor, bindings). It cannot say what Metal state the encoder
+/// carried, so Cycle 17's gates G2 (topology), G3 (load/store) and G8
+/// (cull/winding/depth/write mask) were unobservable. This module records that
+/// state per pass, plus a bounded pixel sample of the colour attachment taken
+/// *after* the pass's encoder, so two very different failures separate:
+///
+/// - `pass_nonzero_after_draw == 0`: the draw wrote nothing (state, geometry,
+///   shader or binding).
+/// - `pass_nonzero_after_draw > 0` with `draw_trace.last_offscreen_nonzero_bytes
+///   == 0`: something later in the submission replaced the pixels.
+///
+/// Armed by `VICTORY_METAL_STATE_TRACE=1`. Everything is a counter or a bounded
+/// key; no payloads, no per-draw strings, and at most [`MAX_LOGGED_PASSES`]
+/// log lines and [`MAX_SAMPLED_PASSES`] attachment samples per process.
+pub mod state_trace {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::macos::objc;
+    use crate::macos::render::{PixelFormat, PrimitiveType};
+    use crate::wire_v3::{BlendAttachment, CullMode, FrontFaceWinding, RasterizerState};
+
+    /// Environment flag that arms the encoder-state trace. Off when unset.
+    pub const STATE_TRACE_ENV: &str = "VICTORY_METAL_STATE_TRACE";
+
+    /// Passes that get one log line per process.
+    pub const MAX_LOGGED_PASSES: u64 = 8;
+
+    /// Pass attachments sampled per process.
+    pub const MAX_SAMPLED_PASSES: u64 = 4;
+
+    /// Edge, in texels, of each bounded attachment sample block.
+    pub const SAMPLE_EDGE: u32 = 4;
+
+    /// Sample blocks per pass: one corner and one centre block.
+    pub(crate) const SAMPLE_BLOCKS: usize = 2;
+
+    /// Samples kept in flight before the oldest is dropped.
+    const MAX_PENDING_SAMPLES: usize = MAX_SAMPLED_PASSES as usize;
+
+    /// Depth-state classifications kept for exact bind-time attribution.
+    ///
+    /// One host submission selects a pipeline per prepared op, so a ring of
+    /// this size always covers a whole submission; the oldest entry is dropped
+    /// beyond it, which can only downgrade a classification to "unclassified".
+    const MAX_DEPTH_CLASSES: usize = 1024;
+
+    static ENABLED: AtomicU8 = AtomicU8::new(0);
+
+    /// Environment flag that arms the trace, read once.
+    pub fn enabled() -> bool {
+        match ENABLED.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let value = enabled_from(std::env::var(STATE_TRACE_ENV).ok().as_deref());
+                ENABLED.store(if value { 2 } else { 1 }, Ordering::Relaxed);
+                value
+            }
+        }
+    }
+
+    /// Pure form of [`enabled`]: `1`, `true`, `on` or `yes` arm the trace.
+    pub fn enabled_from(value: Option<&str>) -> bool {
+        matches!(
+            value.map(str::trim),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    }
+
+    /// How a `MTLDepthStencilState` came into existence.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DepthClass {
+        /// Built from an explicit wire/`DepthStencilState` value.
+        Explicit,
+        /// The host's hardcoded `Less` + depth-write default.
+        Invented,
+    }
+
+    /// Which depth state one pass ended up with.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DepthBind {
+        /// No depth state was bound: either the pass has no depth attachment, or
+        /// nothing on the wire asked for one, so Metal's default (compare
+        /// `Always`, no depth writes) stayed in force.
+        None = 0,
+        /// A wire `SetDepthStencilState` bound the state.
+        Wire = 1,
+        /// A pipeline's explicit depth state bound the state.
+        Explicit = 2,
+        /// The host-invented default was refused, so Metal's own default
+        /// (compare `Always`, no depth writes) stays in force.
+        InventedSuppressed = 3,
+    }
+
+    impl DepthBind {
+        const fn as_index(self) -> usize {
+            self as usize
+        }
+    }
+
+    /// The colour attachment a pass samples after its encoder.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct SampleTarget {
+        /// Live `id<MTLTexture>` owned by the device registry for this
+        /// submission.
+        pub texture: objc::Id,
+        /// Attachment width in texels.
+        pub width: u32,
+        /// Attachment height in texels.
+        pub height: u32,
+        /// Bytes per texel of the attachment format.
+        pub bytes_per_texel: u32,
+    }
+
+    /// Attachment state read back from the live `MTLRenderPassDescriptor`.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct PassInfo {
+        /// Colour attachments configured on the descriptor.
+        pub color_attachments: u32,
+        /// Format of colour attachment 0.
+        pub color_format: Option<PixelFormat>,
+        /// `MTLLoadAction` of colour attachment 0 (`0..=2`).
+        pub color_load: usize,
+        /// `MTLStoreAction` of colour attachment 0 (`0..=1`).
+        pub color_store: usize,
+        /// Whether the pass carries a depth attachment.
+        pub depth_attachment: bool,
+        /// `MTLLoadAction` of the depth attachment (`0..=2`).
+        pub depth_load: usize,
+        /// `MTLPixelFormat` of the depth attachment (`0` when absent).
+        pub depth_format: usize,
+        /// Colour attachment 0, when it can be sampled cheaply.
+        pub sample: Option<SampleTarget>,
+    }
+
+    /// Encoder state accumulated for one pass.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct PassState {
+        info: PassInfo,
+        draws: u32,
+        topology: [u32; 5],
+        depth: DepthBind,
+        cull: Option<CullMode>,
+        winding: Option<FrontFaceWinding>,
+    }
+
+    /// A retained pass attachment sample that has not completed yet.
+    ///
+    /// The two handles are stored as `usize` because the process-wide report is
+    /// a `Sync` static and a raw Objective-C pointer is not `Send`.
+    pub(crate) struct PendingSample {
+        /// Retained `MTLCommandBuffer` whose completion gates the read.
+        pub(crate) cb: usize,
+        /// Retained shared `MTLBuffer` holding the two sample blocks.
+        pub(crate) buffer: usize,
+        /// Bytes in `buffer` (`SAMPLE_BLOCKS * SAMPLE_EDGE^2 * bytes_per_texel`).
+        pub(crate) len: usize,
+        /// Bytes of one block.
+        pub(crate) block: usize,
+    }
+
+    impl PendingSample {
+        fn release(&self) {
+            let cb = self.cb as objc::Id;
+            let buffer = self.buffer as objc::Id;
+            if !cb.is_null() {
+                // SAFETY: `cb` was retained by the recorder and is released
+                // exactly once here.
+                unsafe { objc::msg_send_void_0(cb, objc::sel(c"release")) };
+            }
+            if !buffer.is_null() {
+                // SAFETY: `buffer` was retained by the recorder and is released
+                // exactly once here.
+                unsafe { objc::msg_send_void_0(buffer, objc::sel(c"release")) };
+            }
+        }
+    }
+
+    /// Bounded pass summary for telemetry.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PassLine {
+        /// Draws encoded in the pass.
+        pub draws: u32,
+        /// Colour attachments on the descriptor.
+        pub color_attachments: u32,
+        /// Colour attachment 0 format.
+        pub color_format: &'static str,
+        /// Colour attachment 0 load action.
+        pub color_load: &'static str,
+        /// Colour attachment 0 store action.
+        pub color_store: &'static str,
+        /// Whether the pass has a depth attachment.
+        pub depth_attachment: bool,
+        /// Depth load action.
+        pub depth_load: &'static str,
+        /// Depth attachment format.
+        pub depth_format: &'static str,
+        /// Which depth state the pass ran with.
+        pub depth_bind: &'static str,
+        /// Cull mode the encoder carried.
+        pub cull: &'static str,
+        /// Front-face winding the encoder carried.
+        pub winding: &'static str,
+        /// Topology of the pass's draws (`mixed` when they differ).
+        pub topology: &'static str,
+    }
+
+    impl PassLine {
+        /// One bounded log line, counts and class names only.
+        pub fn line(&self) -> String {
+            format!(
+                "state_trace_pass draws={} color={} format={} load={} store={} \
+                 depth={} dformat={} dload={} dstate={} cull={} winding={} topology={}",
+                self.draws,
+                self.color_attachments,
+                self.color_format,
+                self.color_load,
+                self.color_store,
+                u8::from(self.depth_attachment),
+                self.depth_format,
+                self.depth_load,
+                self.depth_bind,
+                self.cull,
+                self.winding,
+                self.topology
+            )
+        }
+    }
+
+    /// Aggregate encoder-state report published as `state_trace` in telemetry.
+    #[derive(Debug, Clone, Default)]
+    pub struct StateTraceReport {
+        /// Whether the trace was armed.
+        pub enabled: bool,
+        /// Render passes described.
+        pub passes: u64,
+        /// Draws encoded inside those passes.
+        pub draws: u64,
+        /// Draws per `MTLPrimitiveType` (point, line, line strip, triangle,
+        /// triangle strip).
+        pub topology: [u64; 5],
+        /// Colour attachments summed over every pass.
+        pub color_attachments: u64,
+        /// Colour attachment 0 load actions (don't care, load, clear).
+        pub color_load: [u64; 3],
+        /// Colour attachment 0 store actions (don't care, store).
+        pub color_store: [u64; 2],
+        /// Passes with a depth attachment.
+        pub depth_attachment_passes: u64,
+        /// Depth load actions (don't care, load, clear).
+        pub depth_load: [u64; 3],
+        /// Depth state per pass (none, wire, explicit, invented suppressed).
+        pub depth_bind: [u64; 4],
+        /// Colour attachments a wire blend state was baked into.
+        pub blend_baked_attachments: u64,
+        /// Baked attachments with `BlendEnable`.
+        pub blend_enabled: u64,
+        /// Baked attachments without `BlendEnable`.
+        pub blend_disabled: u64,
+        /// Baked attachments whose D3D12 write mask was `0`.
+        pub blend_write_mask_zero: u64,
+        /// Baked attachments whose D3D12 write mask was `0xf`.
+        pub blend_write_mask_full: u64,
+        /// Baked attachments with a partial write mask.
+        pub blend_write_mask_partial: u64,
+        /// `SetRasterizerState` applications.
+        pub rasterizer_applied: u64,
+        /// Applied cull modes (none, front, back).
+        pub cull: [u64; 3],
+        /// Applied windings (clockwise, counter-clockwise).
+        pub winding: [u64; 2],
+        /// Pass attachments sampled after their encoder.
+        pub pass_sampled_passes: u64,
+        /// Non-zero bytes in the most recent completed sample.
+        pub pass_nonzero_after_draw: u64,
+        /// Bytes in that sample.
+        pub pass_sample_bytes: u64,
+        /// Distinct byte values in that sample.
+        pub pass_sample_distinct_values: u64,
+        /// Non-zero bytes in the 4x4 corner block.
+        pub pass_corner_nonzero: u64,
+        /// Non-zero bytes in the 4x4 centre block.
+        pub pass_centre_nonzero: u64,
+        /// Samples encoded but not complete at report time.
+        pub pass_samples_pending: u64,
+        /// Samples that could not be encoded or read.
+        pub pass_sample_failures: u64,
+        /// Last bounded pass summary (a pass with at least one draw).
+        pub last_pass: Option<PassLine>,
+        /// Latest bounded failure reason.
+        pub failure: Option<String>,
+    }
+
+    impl StateTraceReport {
+        /// Fixed-key JSON object for `telemetry.json`.
+        pub fn json_value(&self) -> String {
+            let failure = self.failure.as_deref().map_or_else(
+                || "null".to_string(),
+                |message| format!("\"{}\"", json_escape(message)),
+            );
+            let last_pass = self.last_pass.as_ref().map_or_else(
+                || "null".to_string(),
+                |pass| format!("\"{}\"", json_escape(&pass.line())),
+            );
+            format!(
+                concat!(
+                    "{{",
+                    "\"enabled\": {}, ",
+                    "\"passes\": {}, ",
+                    "\"draws\": {}, ",
+                    "\"topology_point\": {}, ",
+                    "\"topology_line\": {}, ",
+                    "\"topology_line_strip\": {}, ",
+                    "\"topology_triangle\": {}, ",
+                    "\"topology_triangle_strip\": {}, ",
+                    "\"color_attachments\": {}, ",
+                    "\"color_load_dont_care\": {}, ",
+                    "\"color_load_load\": {}, ",
+                    "\"color_load_clear\": {}, ",
+                    "\"color_store_dont_care\": {}, ",
+                    "\"color_store_store\": {}, ",
+                    "\"depth_attachment_passes\": {}, ",
+                    "\"depth_load_dont_care\": {}, ",
+                    "\"depth_load_load\": {}, ",
+                    "\"depth_load_clear\": {}, ",
+                    "\"depth_state_none\": {}, ",
+                    "\"depth_state_wire\": {}, ",
+                    "\"depth_state_explicit\": {}, ",
+                    "\"depth_state_invented_suppressed\": {}, ",
+                    "\"blend_baked_attachments\": {}, ",
+                    "\"blend_enabled\": {}, ",
+                    "\"blend_disabled\": {}, ",
+                    "\"blend_write_mask_zero\": {}, ",
+                    "\"blend_write_mask_full\": {}, ",
+                    "\"blend_write_mask_partial\": {}, ",
+                    "\"rasterizer_applied\": {}, ",
+                    "\"cull_none\": {}, ",
+                    "\"cull_front\": {}, ",
+                    "\"cull_back\": {}, ",
+                    "\"winding_clockwise\": {}, ",
+                    "\"winding_counter_clockwise\": {}, ",
+                    "\"pass_sampled_passes\": {}, ",
+                    "\"pass_nonzero_after_draw\": {}, ",
+                    "\"pass_sample_bytes\": {}, ",
+                    "\"pass_sample_distinct_values\": {}, ",
+                    "\"pass_corner_nonzero\": {}, ",
+                    "\"pass_centre_nonzero\": {}, ",
+                    "\"pass_samples_pending\": {}, ",
+                    "\"pass_sample_failures\": {}, ",
+                    "\"last_pass\": {}, ",
+                    "\"failure\": {}",
+                    "}}"
+                ),
+                self.enabled,
+                self.passes,
+                self.draws,
+                self.topology[0],
+                self.topology[1],
+                self.topology[2],
+                self.topology[3],
+                self.topology[4],
+                self.color_attachments,
+                self.color_load[0],
+                self.color_load[1],
+                self.color_load[2],
+                self.color_store[0],
+                self.color_store[1],
+                self.depth_attachment_passes,
+                self.depth_load[0],
+                self.depth_load[1],
+                self.depth_load[2],
+                self.depth_bind[0],
+                self.depth_bind[1],
+                self.depth_bind[2],
+                self.depth_bind[3],
+                self.blend_baked_attachments,
+                self.blend_enabled,
+                self.blend_disabled,
+                self.blend_write_mask_zero,
+                self.blend_write_mask_full,
+                self.blend_write_mask_partial,
+                self.rasterizer_applied,
+                self.cull[0],
+                self.cull[1],
+                self.cull[2],
+                self.winding[0],
+                self.winding[1],
+                self.pass_sampled_passes,
+                self.pass_nonzero_after_draw,
+                self.pass_sample_bytes,
+                self.pass_sample_distinct_values,
+                self.pass_corner_nonzero,
+                self.pass_centre_nonzero,
+                self.pass_samples_pending,
+                self.pass_sample_failures,
+                last_pass,
+                failure
+            )
+        }
+    }
+
+    /// Aggregate counters plus the bounded sample ring.
+    #[derive(Default)]
+    struct Global {
+        passes: u64,
+        draws: u64,
+        topology: [u64; 5],
+        color_attachments: u64,
+        color_load: [u64; 3],
+        color_store: [u64; 2],
+        depth_attachment_passes: u64,
+        depth_load: [u64; 3],
+        depth_bind: [u64; 4],
+        blend_baked_attachments: u64,
+        blend_enabled: u64,
+        blend_disabled: u64,
+        blend_write_mask_zero: u64,
+        blend_write_mask_full: u64,
+        blend_write_mask_partial: u64,
+        rasterizer_applied: u64,
+        cull: [u64; 3],
+        winding: [u64; 2],
+        logged: u64,
+        sample_requests: u64,
+        pass_sampled_passes: u64,
+        pass_nonzero_after_draw: u64,
+        pass_sample_bytes: u64,
+        pass_sample_distinct_values: u64,
+        pass_corner_nonzero: u64,
+        pass_centre_nonzero: u64,
+        pass_sample_failures: u64,
+        failure: Option<String>,
+        last_pass: Option<PassLine>,
+        depth_classes: Vec<(usize, DepthClass)>,
+        pending: Vec<PendingSample>,
+    }
+
+    fn global() -> &'static Mutex<Global> {
+        static GLOBAL: OnceLock<Mutex<Global>> = OnceLock::new();
+        GLOBAL.get_or_init(|| Mutex::new(Global::default()))
+    }
+
+    fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
+        let mut guard = global().lock().unwrap_or_else(|error| error.into_inner());
+        f(&mut guard)
+    }
+
+    fn note_failure(message: &str) {
+        with_global(|global| {
+            if global.failure.is_none() {
+                global.failure = Some(message.to_string());
+            }
+        });
+    }
+
+    /// Records how one `MTLDepthStencilState` was created.
+    ///
+    /// Recorded even when the trace is off: the bind path must be able to
+    /// refuse the host-invented default whether or not telemetry is armed.
+    pub(crate) fn note_depth_class(raw: objc::Id, class: DepthClass) {
+        if raw.is_null() {
+            return;
+        }
+        with_global(|global| {
+            if global.depth_classes.len() >= MAX_DEPTH_CLASSES {
+                global.depth_classes.remove(0);
+            }
+            global.depth_classes.push((raw as usize, class));
+        });
+    }
+
+    /// The classification recorded for `raw`, when it was created while armed.
+    pub(crate) fn depth_class(raw: objc::Id) -> Option<DepthClass> {
+        if raw.is_null() {
+            return None;
+        }
+        with_global(|global| {
+            global
+                .depth_classes
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == raw as usize)
+                .map(|(_, class)| *class)
+        })
+    }
+
+    /// Records one wire blend attachment baked into a pipeline state.
+    ///
+    /// Metal bakes per-attachment blending (and the colour write mask) into
+    /// `MTLRenderPipelineState`, so this is the only place the host can observe
+    /// what a title's blend state will do: `blend_write_mask_zero > 0` is the
+    /// one class that cannot write any colour.
+    pub(crate) fn note_blend(attachment: &BlendAttachment) {
+        if !enabled() {
+            return;
+        }
+        with_global(|global| {
+            global.blend_baked_attachments += 1;
+            if attachment.enable {
+                global.blend_enabled += 1;
+            } else {
+                global.blend_disabled += 1;
+            }
+            match attachment.write_mask & 0x0f {
+                0 => global.blend_write_mask_zero += 1,
+                0x0f => global.blend_write_mask_full += 1,
+                _ => global.blend_write_mask_partial += 1,
+            }
+        });
+    }
+
+    /// Records one `SetRasterizerState` applied to a render encoder.
+    pub(crate) fn note_rasterizer(state: &RasterizerState) {
+        if !enabled() {
+            return;
+        }
+        with_global(|global| {
+            global.rasterizer_applied += 1;
+            global.cull[cull_index(state.cull)] += 1;
+            global.winding[winding_index(state.front_face)] += 1;
+        });
+    }
+
+    const fn cull_index(cull: CullMode) -> usize {
+        match cull {
+            CullMode::None => 0,
+            CullMode::Front => 1,
+            CullMode::Back => 2,
+        }
+    }
+
+    const fn winding_index(winding: FrontFaceWinding) -> usize {
+        match winding {
+            FrontFaceWinding::Clockwise => 0,
+            FrontFaceWinding::CounterClockwise => 1,
+        }
+    }
+
+    const fn cull_name(index: Option<usize>) -> &'static str {
+        match index {
+            Some(0) => "none",
+            Some(1) => "front",
+            Some(2) => "back",
+            _ => "unset",
+        }
+    }
+
+    const fn winding_name(index: Option<usize>) -> &'static str {
+        match index {
+            Some(0) => "clockwise",
+            Some(1) => "counter_clockwise",
+            _ => "unset",
+        }
+    }
+
+    const fn load_name(value: usize) -> &'static str {
+        match value {
+            1 => "load",
+            2 => "clear",
+            _ => "dont_care",
+        }
+    }
+
+    const fn store_name(value: usize) -> &'static str {
+        if value == 1 { "store" } else { "dont_care" }
+    }
+
+    const fn depth_bind_name(bind: DepthBind) -> &'static str {
+        match bind {
+            DepthBind::None => "none",
+            DepthBind::Wire => "wire",
+            DepthBind::Explicit => "explicit",
+            DepthBind::InventedSuppressed => "invented_suppressed",
+        }
+    }
+
+    const fn topology_name(index: usize) -> &'static str {
+        match index {
+            0 => "point",
+            1 => "line",
+            2 => "line_strip",
+            3 => "triangle",
+            4 => "triangle_strip",
+            _ => "unknown",
+        }
+    }
+
+    const fn format_name(format: Option<PixelFormat>) -> &'static str {
+        match format {
+            Some(PixelFormat::Rgba8Unorm) => "rgba8unorm",
+            Some(PixelFormat::Bgra8Unorm) => "bgra8unorm",
+            Some(_) => "non_colour",
+            None => "none",
+        }
+    }
+
+    /// Names the depth attachment's `MTLPixelFormat` value.
+    const fn depth_format_name(value: usize) -> &'static str {
+        match value {
+            252 => "depth32float",
+            260 => "depth32float_stencil8",
+            250 => "depth16unorm",
+            0 => "none",
+            _ => "other",
+        }
+    }
+
+    /// Starts recording one pass, or `None` when the trace is off.
+    pub(crate) fn begin(info: PassInfo) -> Option<PassState> {
+        enabled().then_some(PassState {
+            info,
+            draws: 0,
+            topology: [0; 5],
+            // Metal's own default until an encoder call says otherwise:
+            // compare `Always`, no depth writes.
+            depth: DepthBind::None,
+            cull: None,
+            winding: None,
+        })
+    }
+
+    impl PassState {
+        /// Records one encoded draw and its topology.
+        pub(crate) fn note_draw(&mut self, primitive: PrimitiveType) {
+            self.draws += 1;
+            let index = primitive.mtl_value();
+            if let Some(slot) = self.topology.get_mut(index) {
+                *slot += 1;
+            }
+        }
+
+        /// Draws encoded in this pass so far.
+        pub(crate) fn draws(&self) -> u32 {
+            self.draws
+        }
+
+        /// The colour attachment this pass can sample.
+        pub(crate) fn sample(&self) -> Option<SampleTarget> {
+            self.info.sample
+        }
+
+        /// Records which depth state the encoder carries.
+        pub(crate) fn note_depth(&mut self, bind: DepthBind) {
+            self.depth = bind;
+        }
+
+        /// Records the rasterizer state applied to the encoder.
+        pub(crate) fn note_rasterizer(&mut self, state: &RasterizerState) {
+            self.cull = Some(state.cull);
+            self.winding = Some(state.front_face);
+        }
+    }
+
+    /// Whether this process may encode one more attachment sample.
+    pub(crate) fn should_sample() -> bool {
+        enabled() && with_global(|global| global.sample_requests < MAX_SAMPLED_PASSES)
+    }
+
+    /// Destination row pitch, in bytes, of one sample block for `target`.
+    ///
+    /// `None` when the attachment is smaller than one block or its format has
+    /// no cheap 4-byte/8-byte-per-texel representation.
+    pub(crate) fn sample_row_bytes(target: &SampleTarget) -> Option<usize> {
+        let edge = SAMPLE_EDGE as usize;
+        if target.width < SAMPLE_EDGE || target.height < SAMPLE_EDGE {
+            return None;
+        }
+        let bytes_per_texel = target.bytes_per_texel as usize;
+        if !matches!(bytes_per_texel, 4 | 8) {
+            return None;
+        }
+        Some(edge * bytes_per_texel)
+    }
+
+    /// Registers a retained sample for later, non-blocking readback.
+    pub(crate) fn record_sample(sample: PendingSample) {
+        with_global(|global| {
+            global.sample_requests += 1;
+            if global.pending.len() >= MAX_PENDING_SAMPLES {
+                if let Some(oldest) = global.pending.first() {
+                    oldest.release();
+                }
+                global.pending.remove(0);
+            }
+            global.pending.push(sample);
+        });
+    }
+
+    /// Records a sample that could not even be encoded.
+    pub(crate) fn note_sample_failure(message: &str) {
+        if !enabled() {
+            return;
+        }
+        with_global(|global| global.pass_sample_failures += 1);
+        note_failure(message);
+    }
+
+    /// Reads every completed sample without blocking.
+    fn poll_samples(global: &mut Global) {
+        if global.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut global.pending);
+        for sample in pending {
+            let cb = sample.cb as objc::Id;
+            let buffer = sample.buffer as objc::Id;
+            // SAFETY: `cb` is a retained live `MTLCommandBuffer`.
+            let status = unsafe { objc::msg_send_usize_0(cb, objc::sel(c"status")) };
+            if status < 4 {
+                global.pending.push(sample);
+                continue;
+            }
+            if status == 4 {
+                // SAFETY: the command buffer completed, so the shared buffer
+                // contents are stable for the CPU read below.
+                let ptr = unsafe { objc::msg_send_ptr_0(buffer, objc::sel(c"contents")) };
+                if !ptr.is_null() {
+                    // SAFETY: the buffer holds exactly `len` bytes.
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), sample.len) };
+                    let (nonzero, distinct) = count_bytes(bytes);
+                    let corner = bytes
+                        .get(..sample.block)
+                        .map_or(0, |block| block.iter().filter(|byte| **byte != 0).count() as u64);
+                    let centre = bytes
+                        .get(sample.block..)
+                        .map_or(0, |block| block.iter().filter(|byte| **byte != 0).count() as u64);
+                    global.pass_sampled_passes += 1;
+                    global.pass_nonzero_after_draw = nonzero;
+                    global.pass_sample_bytes = sample.len as u64;
+                    global.pass_sample_distinct_values = distinct;
+                    global.pass_corner_nonzero = corner;
+                    global.pass_centre_nonzero = centre;
+                } else {
+                    global.pass_sample_failures += 1;
+                }
+            } else {
+                global.pass_sample_failures += 1;
+            }
+            sample.release();
+        }
+    }
+
+    fn count_bytes(bytes: &[u8]) -> (u64, u64) {
+        let mut seen = [false; 256];
+        let mut nonzero = 0u64;
+        let mut distinct = 0u64;
+        for byte in bytes {
+            if *byte != 0 {
+                nonzero += 1;
+            }
+            if !seen[*byte as usize] {
+                seen[*byte as usize] = true;
+                distinct += 1;
+            }
+        }
+        (nonzero, distinct)
+    }
+
+    /// Publishes one finished pass into the aggregate counters.
+    pub(crate) fn finish(pass: PassState, sample: Option<PendingSample>) {
+        // A `PassState` only exists when the trace was armed at `begin`, so the
+        // sample it carries is never dropped here.
+        let dominant = {
+            let mut best = 0usize;
+            let mut mixed = false;
+            for (index, count) in pass.topology.iter().enumerate() {
+                if *count > 0 {
+                    if pass.topology[best] == 0 {
+                        best = index;
+                    } else if index != best {
+                        mixed = true;
+                    }
+                }
+            }
+            if mixed {
+                "mixed"
+            } else {
+                topology_name(best)
+            }
+        };
+        let line = PassLine {
+            draws: pass.draws,
+            color_attachments: pass.info.color_attachments,
+            color_format: format_name(pass.info.color_format),
+            color_load: load_name(pass.info.color_load),
+            color_store: store_name(pass.info.color_store),
+            depth_attachment: pass.info.depth_attachment,
+            depth_load: load_name(pass.info.depth_load),
+            depth_format: depth_format_name(pass.info.depth_format),
+            depth_bind: depth_bind_name(pass.depth),
+            cull: cull_name(pass.cull.map(cull_index)),
+            winding: winding_name(pass.winding.map(winding_index)),
+            topology: dominant,
+        };
+        let log_line = with_global(|global| {
+            global.passes += 1;
+            global.draws += u64::from(pass.draws);
+            for (index, count) in pass.topology.iter().enumerate() {
+                global.topology[index] += u64::from(*count);
+            }
+            global.color_attachments += u64::from(pass.info.color_attachments);
+            if pass.info.color_attachments > 0 {
+                if let Some(slot) = global.color_load.get_mut(pass.info.color_load) {
+                    *slot += 1;
+                }
+                if let Some(slot) = global.color_store.get_mut(pass.info.color_store) {
+                    *slot += 1;
+                }
+            }
+            if pass.info.depth_attachment {
+                global.depth_attachment_passes += 1;
+                if let Some(slot) = global.depth_load.get_mut(pass.info.depth_load) {
+                    *slot += 1;
+                }
+            }
+            if let Some(slot) = global.depth_bind.get_mut(pass.depth.as_index()) {
+                *slot += 1;
+            }
+            // Only a pass that actually encoded a draw replaces the summary, so
+            // a clear-only continuation pass cannot hide the drawn pass.
+            if pass.draws > 0 {
+                global.last_pass = Some(line);
+            }
+            if global.logged < MAX_LOGGED_PASSES {
+                global.logged += 1;
+                Some(line)
+            } else {
+                None
+            }
+        });
+        if let Some(line) = log_line {
+            eprintln!("{}", line.line());
+        }
+        if let Some(sample) = sample {
+            record_sample(sample);
+        }
+    }
+
+    /// The current aggregate report, polling completed samples first.
+    pub fn report() -> StateTraceReport {
+        let armed = enabled();
+        with_global(|global| {
+            poll_samples(global);
+            StateTraceReport {
+                enabled: armed,
+                passes: global.passes,
+                draws: global.draws,
+                topology: global.topology,
+                color_attachments: global.color_attachments,
+                color_load: global.color_load,
+                color_store: global.color_store,
+                depth_attachment_passes: global.depth_attachment_passes,
+                depth_load: global.depth_load,
+                depth_bind: global.depth_bind,
+                blend_baked_attachments: global.blend_baked_attachments,
+                blend_enabled: global.blend_enabled,
+                blend_disabled: global.blend_disabled,
+                blend_write_mask_zero: global.blend_write_mask_zero,
+                blend_write_mask_full: global.blend_write_mask_full,
+                blend_write_mask_partial: global.blend_write_mask_partial,
+                rasterizer_applied: global.rasterizer_applied,
+                cull: global.cull,
+                winding: global.winding,
+                pass_sampled_passes: global.pass_sampled_passes,
+                pass_nonzero_after_draw: global.pass_nonzero_after_draw,
+                pass_sample_bytes: global.pass_sample_bytes,
+                pass_sample_distinct_values: global.pass_sample_distinct_values,
+                pass_corner_nonzero: global.pass_corner_nonzero,
+                pass_centre_nonzero: global.pass_centre_nonzero,
+                pass_samples_pending: global.pending.len() as u64,
+                pass_sample_failures: global.pass_sample_failures,
+                last_pass: global.last_pass,
+                failure: global.failure.clone(),
+            }
+        })
+    }
+
+    /// Drops every counter, classification and pending sample.
+    pub fn reset() {
+        ENABLED.store(0, Ordering::Relaxed);
+        with_global(|global| {
+            for sample in &global.pending {
+                sample.release();
+            }
+            *global = Global::default();
+        });
+    }
+
+    /// Minimal JSON string escaping for the bounded failure line.
+    fn json_escape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for character in value.chars() {
+            match character {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                other if other.is_control() => out.push(' '),
+                other => out.push(other),
+            }
+        }
+        out
     }
 }
 

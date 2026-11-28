@@ -1412,6 +1412,7 @@ fn write_telemetry(
     let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
     let draw_trace = draw_trace_json();
+    let state_trace = victory_metal::macos::render::state_trace::report().json_value();
     let descriptor_table_census =
         victory_metal::macos::trace::descriptor_table_refusal_census().json_value();
     let present_trace = victory_metal::macos::present::present_trace_report().json_value();
@@ -1496,6 +1497,7 @@ fn write_telemetry(
             "  \"descriptor_table_refusal_census\": {descriptor_table_census},\n",
             "  \"present_trace\": {present_trace},\n",
             "  \"draw_trace\": {draw_trace},\n",
+            "  \"state_trace\": {state_trace},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0,\n",
@@ -1585,6 +1587,7 @@ fn write_telemetry(
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
         draw_trace = draw_trace,
+        state_trace = state_trace,
     );
 
     if let Some(parent) = path
@@ -2235,6 +2238,7 @@ mod draw_trace_json_tests {
             "descriptor_table_refusal_census",
             "present_trace",
             "draw_trace",
+            "state_trace",
             "d3dmetal_loaded",
             "d3dmetal_images",
             "d3dmetal_fallback_count",
@@ -2255,6 +2259,10 @@ mod draw_trace_json_tests {
         assert!(
             json.contains("  \"draw_trace\": {"),
             "draw_trace is a nested object, not a scalar: {json}"
+        );
+        assert!(
+            json.contains("  \"state_trace\": {"),
+            "state_trace is a nested object, not a scalar: {json}"
         );
     }
 
@@ -2283,5 +2291,222 @@ mod draw_trace_json_tests {
         ] {
             assert!(json.contains(expected), "{expected} missing from {json}");
         }
+    }
+
+    /// Cycle 18B: `state_trace` is a nested object with its own key contract,
+    /// and it is emitted even with the trace off so Boot #33 can tell "not
+    /// armed" from "armed and saw nothing".
+    #[test]
+    fn telemetry_publishes_the_state_trace_object() {
+        let path = std::env::temp_dir().join(format!(
+            "victory-telemetry-state-trace-{}.json",
+            std::process::id()
+        ));
+        write_telemetry(&path, 1, &Stats::default(), &[]).expect("telemetry writes");
+        let json = std::fs::read_to_string(&path).expect("telemetry reads");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            json.contains("  \"state_trace\": {"),
+            "state_trace is a nested object: {json}"
+        );
+        for expected in [
+            "\"pass_nonzero_after_draw\":",
+            "\"depth_state_invented_suppressed\":",
+            "\"blend_write_mask_zero\":",
+            "\"topology_triangle\":",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+}
+
+/// Hermetic proofs for the folded `state_trace` telemetry object (Cycle 18B).
+///
+/// The tests build a report directly, so they never arm the process-wide trace
+/// and never touch a Metal device.
+#[cfg(all(test, target_os = "macos"))]
+mod state_trace_json_tests {
+    use victory_metal::macos::render::state_trace::{
+        enabled_from, StateTraceReport, PassLine, STATE_TRACE_ENV,
+    };
+
+    /// Every key `state_trace` carries, in the emitted order.
+    const STATE_TRACE_KEYS: [&str; 44] = [
+        "enabled",
+        "passes",
+        "draws",
+        "topology_point",
+        "topology_line",
+        "topology_line_strip",
+        "topology_triangle",
+        "topology_triangle_strip",
+        "color_attachments",
+        "color_load_dont_care",
+        "color_load_load",
+        "color_load_clear",
+        "color_store_dont_care",
+        "color_store_store",
+        "depth_attachment_passes",
+        "depth_load_dont_care",
+        "depth_load_load",
+        "depth_load_clear",
+        "depth_state_none",
+        "depth_state_wire",
+        "depth_state_explicit",
+        "depth_state_invented_suppressed",
+        "blend_baked_attachments",
+        "blend_enabled",
+        "blend_disabled",
+        "blend_write_mask_zero",
+        "blend_write_mask_full",
+        "blend_write_mask_partial",
+        "rasterizer_applied",
+        "cull_none",
+        "cull_front",
+        "cull_back",
+        "winding_clockwise",
+        "winding_counter_clockwise",
+        "pass_sampled_passes",
+        "pass_nonzero_after_draw",
+        "pass_sample_bytes",
+        "pass_sample_distinct_values",
+        "pass_corner_nonzero",
+        "pass_centre_nonzero",
+        "pass_samples_pending",
+        "pass_sample_failures",
+        "last_pass",
+        "failure",
+    ];
+
+    fn object_keys(json: &str) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let mut keys = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                let start = index + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    if json[end + 1..].trim_start().starts_with(':') {
+                        keys.push(json[start..end].to_string());
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        keys
+    }
+
+    /// The off object still carries every key, with `enabled: false` and zero
+    /// counters, so Boot #33 can tell "not armed" from "armed, saw nothing".
+    #[test]
+    fn a_disabled_state_trace_carries_the_full_key_set() {
+        let json = StateTraceReport::default().json_value();
+        assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+        assert!(!json.contains('\n'), "one line: {json}");
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+        assert_eq!(object_keys(&json), STATE_TRACE_KEYS.to_vec(), "{json}");
+        for expected in [
+            "\"enabled\": false",
+            "\"passes\": 0",
+            "\"draws\": 0",
+            "\"depth_state_none\": 0",
+            "\"blend_write_mask_zero\": 0",
+            "\"pass_nonzero_after_draw\": 0",
+            "\"last_pass\": null",
+            "\"failure\": null",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+
+    /// Marker values prove each field is wired to the right report member.
+    #[test]
+    fn a_populated_state_trace_folds_every_field() {
+        let report = StateTraceReport {
+            enabled: true,
+            passes: 87,
+            draws: 85,
+            topology: [0, 0, 0, 85, 0],
+            color_attachments: 87,
+            color_load: [0, 87, 0],
+            color_store: [0, 87],
+            depth_attachment_passes: 85,
+            depth_load: [5, 80, 0],
+            depth_bind: [0, 0, 0, 85],
+            blend_baked_attachments: 2,
+            blend_enabled: 0,
+            blend_disabled: 2,
+            blend_write_mask_zero: 0,
+            blend_write_mask_full: 2,
+            blend_write_mask_partial: 0,
+            rasterizer_applied: 3,
+            cull: [3, 0, 0],
+            winding: [2, 1],
+            pass_sampled_passes: 1,
+            pass_nonzero_after_draw: 128,
+            pass_sample_bytes: 128,
+            pass_sample_distinct_values: 2,
+            pass_corner_nonzero: 64,
+            pass_centre_nonzero: 64,
+            pass_samples_pending: 0,
+            pass_sample_failures: 0,
+            last_pass: Some(PassLine {
+                draws: 85,
+                color_attachments: 1,
+                color_format: "rgba8unorm",
+                color_load: "clear",
+                color_store: "store",
+                depth_attachment: true,
+                depth_format: "depth32float",
+                depth_load: "load",
+                depth_bind: "invented_suppressed",
+                cull: "none",
+                winding: "clockwise",
+                topology: "triangle",
+            }),
+            failure: Some("blit encoder unavailable".to_string()),
+        };
+        let json = report.json_value();
+        assert_eq!(object_keys(&json), STATE_TRACE_KEYS.to_vec(), "{json}");
+        for expected in [
+            "\"enabled\": true",
+            "\"passes\": 87",
+            "\"draws\": 85",
+            "\"topology_triangle\": 85",
+            "\"color_load_load\": 87",
+            "\"depth_attachment_passes\": 85",
+            "\"depth_state_invented_suppressed\": 85",
+            "\"blend_write_mask_zero\": 0",
+            "\"blend_write_mask_full\": 2",
+            "\"pass_nonzero_after_draw\": 128",
+            "\"pass_sample_distinct_values\": 2",
+            "\"last_pass\": \"state_trace_pass draws=85",
+            "\"failure\": \"blit encoder unavailable\"",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+
+    /// `1`, `true`, `on` and `yes` arm the trace; everything else leaves it off.
+    #[test]
+    fn the_environment_flag_only_arms_on_an_explicit_spelling() {
+        for armed in ["1", "true", "TRUE", "on", "ON", "yes", "YES", " 1 "] {
+            assert!(enabled_from(Some(armed)), "{armed} arms the trace");
+        }
+        for off in ["", "0", "false", "no", "off", "2"] {
+            assert!(!enabled_from(Some(off)), "{off} leaves the trace off");
+        }
+        assert!(!enabled_from(None));
+        assert_eq!(STATE_TRACE_ENV, "VICTORY_METAL_STATE_TRACE");
     }
 }

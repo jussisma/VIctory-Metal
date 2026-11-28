@@ -29,8 +29,9 @@ use victory_metal::macos::render::{GraphicsPipeline, PixelFormat, RenderTarget};
 use victory_metal::macos::trace;
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, DrawState, LoadOp, PipelineRef, PrimitiveTopology,
-    ScissorRect, StoreOp, SubmissionV3, Viewport,
+    BeginRenderPass, ColorAttachment, CommandV3, CullMode, DrawState, FillMode, FrontFaceWinding,
+    LoadOp, PipelineRef, PrimitiveTopology, RasterizerState, ScissorRect, StoreOp, SubmissionV3,
+    Viewport,
 };
 
 const EDGE: u32 = 64;
@@ -288,4 +289,157 @@ fn a_clear_only_pass_is_not_sampled_as_drawn_output() {
         "draw_trace_gpu: clear_only_submit_us={} report={report:?}",
         submit_cost.as_micros()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 18B: the encoder-state trace (`VICTORY_METAL_STATE_TRACE=1`).
+//
+// Boot #32 encoded 85 three-vertex 4K draws and the attachment still had one
+// distinct value. `draw_trace` describes the work but not the encoder state, so
+// the new trace reports topology, attachment load/store, depth state, blend
+// census, cull/winding and one bounded after-draw pixel sample of the pass's
+// colour attachment. This case proves the accounting on the real GPU at 3840x2160.
+// ---------------------------------------------------------------------------
+
+const FOUR_K_WIDTH: u32 = 3840;
+const FOUR_K_HEIGHT: u32 = 2160;
+const ALLOC_4K: u64 = 0x4A10;
+
+fn state_trace_4k_target(
+    transport: &DirectMetalTransport,
+) -> (RenderTarget, HashMap<(u64, u32), VmBufferId>) {
+    let target = transport
+        .create_render_target_2d(FOUR_K_WIDTH, FOUR_K_HEIGHT, PixelFormat::Rgba8Unorm)
+        .expect("4K offscreen target");
+    let handle = transport
+        .register_render_target(&target)
+        .expect("4K target registers");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_4K, 1), VmBufferId(handle.0));
+    (target, allocations)
+}
+
+/// The encoder-state trace names topology, load/store, depth, blend and
+/// cull/winding for a 4K draw, and its after-draw sample is non-zero.
+#[test]
+fn state_trace_names_the_encoder_state_of_a_4k_draw() {
+    // SAFETY: this test binary runs with `--test-threads=1`, so the process-wide
+    // flag and report are written before any device call by this test.
+    unsafe {
+        std::env::set_var(
+            victory_metal::macos::render::state_trace::STATE_TRACE_ENV,
+            "1",
+        )
+    };
+    victory_metal::macos::render::state_trace::reset();
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let (target, allocations) = state_trace_4k_target(&transport);
+    let pipeline_id = pipeline(&transport);
+
+    let commands = vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![ColorAttachment {
+                allocation_id: ALLOC_4K,
+                generation: 1,
+                mip_level: 0,
+                slice: 0,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                // Transparent black, so any non-zero sample byte is the draw's.
+                clear_color: [0.0, 0.0, 0.0, 0.0],
+            }],
+            depth_stencil: None,
+        }),
+        CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id }),
+        CommandV3::SetViewport(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(FOUR_K_WIDTH),
+            height: f64::from(FOUR_K_HEIGHT),
+            near: 0.0,
+            far: 1.0,
+        }),
+        CommandV3::SetScissor(ScissorRect {
+            x: 0,
+            y: 0,
+            width: FOUR_K_WIDTH,
+            height: FOUR_K_HEIGHT,
+        }),
+        CommandV3::SetRasterizerState(RasterizerState {
+            fill: FillMode::Solid,
+            cull: CullMode::None,
+            front_face: FrontFaceWinding::Clockwise,
+            depth_bias: 0,
+            slope_scaled_depth_bias: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_clip: true,
+        }),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+    ];
+    submit(&transport, &allocations, commands);
+
+    let report = victory_metal::macos::render::state_trace::report();
+    assert!(report.enabled, "the state trace is armed: {report:?}");
+    assert_eq!(report.passes, 1, "{report:?}");
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert_eq!(report.topology[3], 1, "one triangle: {report:?}");
+    assert_eq!(report.color_attachments, 1, "{report:?}");
+    assert_eq!(report.color_load[2], 1, "the pass loads with a clear");
+    assert_eq!(report.color_store[1], 1, "the pass stores the attachment");
+    assert_eq!(report.depth_attachment_passes, 0, "no depth attachment");
+    assert_eq!(report.depth_bind[0], 1, "the pass ran with no depth state");
+    assert_eq!(
+        report.blend_baked_attachments, 0,
+        "a pipeline compiled without a blend state bakes no mask: {report:?}"
+    );
+    assert_eq!(report.blend_write_mask_zero, 0, "{report:?}");
+    assert_eq!(report.rasterizer_applied, 1, "{report:?}");
+    assert_eq!(report.cull[0], 1, "cull none: {report:?}");
+    assert_eq!(report.winding[0], 1, "clockwise: {report:?}");
+
+    let pass = report.last_pass.expect("the pass summary is published");
+    assert_eq!(pass.draws, 1, "{pass:?}");
+    assert_eq!(pass.topology, "triangle", "{pass:?}");
+    assert_eq!(pass.color_load, "clear", "{pass:?}");
+    assert_eq!(pass.depth_bind, "none", "{pass:?}");
+    assert!(
+        pass.line().contains("state_trace_pass") && pass.line().contains("topology=triangle"),
+        "{}",
+        pass.line()
+    );
+
+    assert_eq!(report.pass_sampled_passes, 1, "{report:?}");
+    assert_eq!(report.pass_samples_pending, 0, "{report:?}");
+    assert_eq!(report.pass_sample_failures, 0, "{report:?}");
+    assert_eq!(report.pass_sample_bytes, 128, "two 4x4 RGBA8 blocks");
+    assert!(
+        report.pass_nonzero_after_draw > 0,
+        "the draw wrote colour into the 4K attachment: {report:?}"
+    );
+    assert!(
+        report.pass_sample_distinct_values >= 2,
+        "red on transparent black has two byte values: {report:?}"
+    );
+    assert!(report.pass_corner_nonzero > 0, "{report:?}");
+    assert!(report.pass_centre_nonzero > 0, "{report:?}");
+
+    eprintln!(
+        "state_trace_gpu: draws={} topology={:?} depth={:?} blend_zero_mask={} \
+         sample_nonzero={}/{} distinct={}",
+        report.draws,
+        report.topology,
+        report.depth_bind,
+        report.blend_write_mask_zero,
+        report.pass_nonzero_after_draw,
+        report.pass_sample_bytes,
+        report.pass_sample_distinct_values
+    );
+    let _ = target;
 }
