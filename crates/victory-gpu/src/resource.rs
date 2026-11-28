@@ -2773,6 +2773,28 @@ fn wire_format_code(dxgi: u32) -> Option<u8> {
         .map(|(_, code)| *code)
 }
 
+/// The named reason a console format this build cannot express is refused.
+///
+/// A format with no host code is the generic "format has no host code"
+/// refusal; a format named here is refused with the console format and why no
+/// host format stands in for it, so a title target is never refused
+/// anonymously. Nothing is ever mapped to an approximate format: a layout this
+/// build cannot prove is a refusal, not a guess.
+#[cfg(any(windows, test))]
+fn console_format_refusal(format: u32) -> Option<&'static str> {
+    Some(match format {
+        // The console's 16-bit 4-4-4-4 colour format (`DXGI_FORMAT_B4G4R4A4_UNORM`,
+        // 2 bytes per texel per [`element`]): a standard DXGI value the host
+        // table has no row for, and no console->PC mapping names an equivalent.
+        // Boot #27's 2560x1440 colour target is this shape.
+        115 => "texture registration: console format 115 (DXGI_FORMAT_B4G4R4A4_UNORM, \
+                16-bit 4-4-4-4 colour) has no PC host format: there is no console->PC \
+                mapping for it and no host TextureFormat row, and its channel order is \
+                not guessed",
+        _ => return None,
+    })
+}
+
 /// Maps a texture description to the kind 8 `(dimension, format, usage)` codes.
 #[cfg(any(windows, test))]
 fn texture_registration_codes(
@@ -2786,13 +2808,25 @@ fn texture_registration_codes(
         4 => 5,                                  // D3
         _ => return Err("texture registration: unknown dimension"),
     };
-    let format = wire_format_code(desc.format)
+    if let Some(reason) = console_format_refusal(desc.format) {
+        return Err(reason);
+    }
+    // A console format reaches the host in the PC format the creation path
+    // already makes for it: 118 (16-bit depth with an 8-bit stencil plane) and
+    // its typeless views 119/120 are the 32-bit float depth-stencil
+    // [`pc_format`] names. Looking the console number up directly is what
+    // refused Boot #27's 1024x1024 and 2560x1440 depth targets with "format
+    // has no host code" while their host copies were DXGI 20 all along.
+    let host_format = pc_format(desc.format);
+    let format = wire_format_code(host_format)
         .ok_or("texture registration: format has no host code")?;
     // A typeless colour-family resource the title declares as depth (the
     // `ALLOW_DEPTH_STENCIL` bit) must be registered with its concrete depth
     // format: the host correctly refuses a colour format as a depth attachment.
     let format = if usage == 2 {
-        depth_wire_code(desc.format).unwrap_or(format)
+        depth_wire_code(desc.format)
+            .or_else(|| depth_wire_code(host_format))
+            .unwrap_or(format)
     } else {
         format
     };
@@ -4111,6 +4145,94 @@ mod tests {
             native_texture_registration(&xr_bias),
             Some(Err("texture registration: format has no host code"))
         );
+    }
+
+    /// Boot #27's two depth shapes. The console's 16-bit depth with an 8-bit
+    /// stencil plane is format 118 (119/120 its typeless views); the creation
+    /// path already makes it as `pc_format`'s DXGI 20
+    /// (`D32_FLOAT_S8X24_UINT`), whose kind 8 code is 8. Both shapes refused
+    /// with "format has no host code" only because this decode looked up the
+    /// console number instead of the format the host copy is made in.
+    #[test]
+    fn console_depth_stencil_targets_register_with_the_mapped_pc_format() {
+        assert_eq!(wire_format_code(20), Some(8), "DXGI 20 is the mapped PC format");
+        // The 1024x1024 shadow map: ALLOW_DEPTH_STENCIL only.
+        let shadow = ResourceDesc {
+            flags: 0x2,
+            ..texture(1024, 1024, 118, 1)
+        };
+        assert_eq!(native_texture_registration(&shadow), Some(Ok((1, 8, 2))));
+        // The 2560x1440 target that is depth and unordered at once: the depth
+        // attachment code wins, as for any depth target.
+        let depth_uav = ResourceDesc {
+            flags: 0x2 | 0x4,
+            ..texture(2560, 1440, 118, 1)
+        };
+        assert_eq!(native_texture_registration(&depth_uav), Some(Ok((1, 8, 2))));
+        // Every target usage decodes to the mapped format's code.
+        for usage in [1u8, 2, 3] {
+            assert_eq!(texture_registration_codes(&shadow, usage), Ok((1, 8, usage)));
+        }
+        // The typeless views keep their own mapped PC format's code: 119 is
+        // R32_FLOAT_X8X24_TYPELESS (code 25), 120 X32_TYPELESS_G8X24_UINT
+        // (code 26) — and 8 as a depth attachment, its concrete depth family.
+        let depth_plane = ResourceDesc { format: 119, ..shadow };
+        assert_eq!(native_texture_registration(&depth_plane), Some(Ok((1, 25, 2))));
+        let stencil_plane = ResourceDesc { format: 120, ..shadow };
+        assert_eq!(native_texture_registration(&stencil_plane), Some(Ok((1, 8, 2))));
+    }
+
+    /// Boot #27's 2560x1440 colour target is console format 115
+    /// (`DXGI_FORMAT_B4G4R4A4_UNORM`, 2 bytes per texel). No console->PC
+    /// mapping names an equivalent and the host table has no row for it, so
+    /// every target usage is refused by name — never sent with a guessed
+    /// 4-bit channel order.
+    #[test]
+    fn console_format_115_refuses_by_name_in_every_usage() {
+        let desc = ResourceDesc {
+            flags: 0x1,
+            ..texture(2560, 1440, 115, 1)
+        };
+        for usage in [1u8, 2, 3] {
+            let reason = texture_registration_codes(&desc, usage)
+                .expect_err("console format 115 has no PC host format");
+            assert!(reason.contains("115"), "the reason names the format: {reason}");
+            assert!(reason.contains("B4G4R4A4"), "{reason}");
+            assert!(reason.contains("not guessed"), "{reason}");
+        }
+        assert_eq!(
+            native_texture_registration(&desc),
+            Some(Err(
+                console_format_refusal(115).expect("115 has a named refusal")
+            ))
+        );
+        // Creation still answers S_OK and counts the named refusal: the
+        // resource exists for its non-attachment uses.
+        let before = texture_registration_refusals();
+        let hr = settle_native_texture_registration(
+            target_texture_shape(0xeeb5_70000, &desc),
+            native_texture_request(0xeeb5_70000, &desc),
+            |_| panic!("a format with no PC host format must not reach register_texture"),
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(texture_registration_refusals(), before + 1);
+    }
+
+    /// A console format this build has no mapping for keeps the generic named
+    /// refusal: no default host code and no approximate format.
+    #[test]
+    fn an_unknown_console_format_still_refuses_explicitly() {
+        for console in [116u32, 117, 189, 190, 191] {
+            let desc = ResourceDesc {
+                flags: 0x1,
+                ..texture(256, 256, console, 1)
+            };
+            assert_eq!(
+                native_texture_registration(&desc),
+                Some(Err("texture registration: format has no host code")),
+                "console format {console}"
+            );
+        }
     }
 
     /// ADR-033: the Boot #2 target and the format families it needed resolve
