@@ -35,6 +35,7 @@ use crate::macos::retire::{BackpressureBudget, RetireQueue};
 use crate::macos::state::{self, DepthStencilCache};
 use crate::macos::texture::VmTextureId;
 use crate::macos::{blit, indirect};
+use crate::root_arguments::{PlanArgumentKind, RootParameterPlan, RootPlanEntry};
 use crate::transport::{MetalError, MetalTransport};
 use crate::wire::{self, Command, Reply, ReplyStatus, Submission};
 use crate::wire_v3::{
@@ -1178,6 +1179,13 @@ pub struct DirectMetalTransport {
     /// Root-signature arguments refused because the translated layout does not
     /// declare them or declares a different `(space, register, kind)`.
     abi_refusals: std::sync::atomic::AtomicU64,
+    /// Root arguments bound through the legacy wire-slot lookup, because the
+    /// submission carried no root-argument plan entry for its slot.
+    ///
+    /// Counted separately so a boot can tell "every binding resolved by its
+    /// translated identity" from "the guest sent no plan and the old lookup
+    /// still happened to agree".
+    legacy_root_bindings: std::sync::atomic::AtomicU64,
     /// MEMORY_SPACE parameters bound to a default zero-filled buffer.
     memory_space_bound: std::sync::atomic::AtomicU64,
     /// Bytes allocated for those default MEMORY_SPACE buffers.
@@ -1247,6 +1255,7 @@ impl DirectMetalTransport {
             async_submit,
             encode_counters: crate::macos::trace::EncodeCounters::default(),
             abi_refusals: std::sync::atomic::AtomicU64::new(0),
+            legacy_root_bindings: std::sync::atomic::AtomicU64::new(0),
             memory_space_bound: std::sync::atomic::AtomicU64::new(0),
             memory_space_bytes: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1275,6 +1284,18 @@ impl DirectMetalTransport {
 
     fn count_abi_refusal(&self) {
         self.abi_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Root arguments bound through the legacy wire-slot lookup, i.e. without a
+    /// plan entry for their slot.
+    pub fn legacy_root_binding_count(&self) -> u64 {
+        self.legacy_root_bindings
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_legacy_root_binding(&self) {
+        self.legacy_root_bindings
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3162,6 +3183,51 @@ impl PipelineAbi {
             .chain(self.compute.iter())
     }
 
+    /// The declaration the translated root signature binds at `(space,
+    /// register)` for a root argument of `kind`.
+    ///
+    /// This is the bridge from the guest's versioned root-argument plan, which
+    /// names the translated register identity, to the flattened parameter the
+    /// argument buffer is written at. Title root-parameter indices are *not*
+    /// translated slots, so a wire `SetRootBufferView` at title index 0 must be
+    /// looked up here rather than at flattened index 0.
+    ///
+    /// `kind` is the plan's argument kind and is coarser than
+    /// [`RootParameterKind`]: [`PlanArgumentKind::RootView`] names any of a
+    /// root CBV, SRV or UAV, because the wire's `SetRootBufferView` carries no
+    /// view kind. The translated signature's root view registers are the
+    /// title's root-parameter indices, so `(space, register)` is unique among
+    /// them: one index is exactly one view kind. A descriptor table's reflected
+    /// field may be `u32::MAX` (converter reflection reports every table that
+    /// way); such a field matches any requested value. The first declaration in
+    /// slot order wins deterministically, mirroring
+    /// [`RootSignatureLayout::parameter_by`].
+    pub fn root_parameter_for_argument(
+        &self,
+        space: u16,
+        register: u16,
+        kind: PlanArgumentKind,
+    ) -> Option<RootParameterSlot> {
+        if let Some(map) = self.root_parameters.as_ref() {
+            return map
+                .slots()
+                .iter()
+                .copied()
+                .find(|slot| root_slot_declares_argument(slot, space, register, kind));
+        }
+        self.layouts().find_map(|layout| {
+            layout.parameters().iter().find_map(|parameter| {
+                let slot = RootParameterSlot::new(
+                    parameter.space(),
+                    parameter.register(),
+                    parameter.kind(),
+                    parameter.size(),
+                );
+                root_slot_declares_argument(&slot, space, register, kind).then_some(slot)
+            })
+        })
+    }
+
     /// Whether no stage declares a root signature.
     pub fn is_empty(&self) -> bool {
         self.vertex.is_none()
@@ -4181,6 +4247,124 @@ fn abi_kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -
     }
 }
 
+/// Whether one translated declaration binds the `(space, register)` a root
+/// argument of `kind` names.
+///
+/// The plan's root view kind covers all three view kinds, because the wire
+/// `SetRootBufferView` carries no view kind; the translated signature's root
+/// view registers are title root-parameter indices, so one index is exactly one
+/// view kind. A table's reflected `(space, register)` may be `u32::MAX`
+/// (converter reflection reports every table that way) and then matches any
+/// requested value. A sampler table never names a root parameter: the
+/// translated signature's samplers are static samplers.
+fn root_slot_declares_argument(
+    slot: &RootParameterSlot,
+    space: u16,
+    register: u16,
+    kind: PlanArgumentKind,
+) -> bool {
+    let table = matches!(slot.kind(), RootParameterKind::DescriptorTable(_));
+    let space_matches = slot.space() == u32::from(space) || (table && slot.space() == u32::MAX);
+    let register_matches =
+        slot.register() == u32::from(register) || (table && slot.register() == u32::MAX);
+    if !space_matches || !register_matches {
+        return false;
+    }
+    match kind {
+        PlanArgumentKind::Constants => slot.kind() == RootParameterKind::Constants,
+        PlanArgumentKind::RootView => matches!(
+            slot.kind(),
+            RootParameterKind::ConstantBufferView
+                | RootParameterKind::ShaderResourceView
+                | RootParameterKind::UnorderedAccessView
+        ),
+        PlanArgumentKind::DescriptorTable => {
+            matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
+        }
+        PlanArgumentKind::SamplerTable => false,
+    }
+}
+
+/// Resolves one planned wire root argument to the translated parameter it
+/// names, or refuses it by name.
+///
+/// The plan entry is authoritative: a guest that recorded it named a translated
+/// register identity, so a layout that does not declare that identity is a
+/// counted ABI refusal instead of a binding at the wrong parameter. The entry's
+/// kind must also match the command (a `SetRootBufferView` cannot consume a
+/// root-constants record).
+fn planned_root_parameter(
+    transport: &DirectMetalTransport,
+    abi: &PipelineAbi,
+    entry: &RootPlanEntry,
+    kind: PlanArgumentKind,
+    mismatched: &'static str,
+) -> Result<RootParameterSlot, PrepareAbort> {
+    if entry.kind != kind {
+        transport.count_abi_refusal();
+        return Err(MetalError::InvalidArg(mismatched).into());
+    }
+    if let Some(slot) = abi.root_parameter_for_argument(entry.space, entry.register, kind) {
+        return Ok(slot);
+    }
+    transport.count_abi_refusal();
+    Err(MetalError::InvalidArg(
+        "a wire root argument names a translated parameter the root signature does not declare",
+    )
+    .into())
+}
+
+/// Which root argument a `SetRoot...` command names, and the refusals that
+/// command's resolution reports.
+#[derive(Clone, Copy)]
+struct RootArgumentSite {
+    /// The translated argument kind the command consumes.
+    kind: PlanArgumentKind,
+    /// Name of the refusal when no parameter is declared for the wire slot.
+    undeclared: &'static str,
+    /// Name of the refusal when the plan entry is another argument kind.
+    mismatched: &'static str,
+}
+
+impl RootArgumentSite {
+    const CONSTANTS: Self = Self {
+        kind: PlanArgumentKind::Constants,
+        undeclared: "root constants name no declared root parameter",
+        mismatched: "root constants plan names a non-constant root argument",
+    };
+    const ROOT_VIEW: Self = Self {
+        kind: PlanArgumentKind::RootView,
+        undeclared: "root buffer view names no declared root parameter",
+        mismatched: "root buffer view plan names a non-view root argument",
+    };
+}
+
+/// Resolves the wire root-parameter slot `wire_slot` of `site` against the
+/// selected pipeline.
+///
+/// A plan entry for the slot is resolved by its translated `(space, register,
+/// kind)`; a plan entry that names no declared parameter is a counted ABI
+/// refusal. Without a plan entry the legacy wire-slot lookup is kept, exactly as
+/// a guest that predates the plan expects, and counted separately through
+/// [`DirectMetalTransport::count_legacy_root_binding`].
+fn resolve_wire_root_argument(
+    transport: &DirectMetalTransport,
+    abi: &PipelineAbi,
+    plan: Option<&RootParameterPlan>,
+    wire_slot: u16,
+    site: RootArgumentSite,
+) -> Result<RootParameterSlot, PrepareAbort> {
+    if let Some(entry) = plan.and_then(|plan| plan.entry(wire_slot)) {
+        return planned_root_parameter(transport, abi, entry, site.kind, site.mismatched);
+    }
+    transport.count_legacy_root_binding();
+    abi.root_parameter(usize::from(wire_slot)).ok_or_else(|| {
+        transport.count_abi_refusal();
+        MetalError::InvalidArg(site.undeclared).into()
+    })
+}
+
+
 fn flush_abi(
     transport: &DirectMetalTransport,
     state: &mut DeviceState,
@@ -4781,6 +4965,7 @@ fn prepare_compute_segment(
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     range: Range<usize>,
+    root_plan: Option<&RootParameterPlan>,
 ) -> Result<Vec<PreparedComputeOp>, PrepareAbort> {
     let device = transport.device_raw();
     if state.trace.is_none() && crate::macos::trace::enabled() {
@@ -4963,13 +5148,13 @@ fn prepare_compute_segment(
                     );
                 }
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter(usize::from(constants.slot)) else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "root constants name no declared root parameter",
-                        )
-                        .into());
-                    };
+                    let slot = resolve_wire_root_argument(
+                        transport,
+                        active,
+                        root_plan,
+                        constants.slot,
+                        RootArgumentSite::CONSTANTS,
+                    )?;
                     if slot.kind() != RootParameterKind::Constants {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -4999,21 +5184,38 @@ fn prepare_compute_segment(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    // The wire set index is the flattened parameter index on
-                    // this path; a signature that also declares non-table
-                    // parameters first may instead send the table's ordinal.
-                    // Try the index, then the ordinal, and only then refuse.
+                    // A plan entry names the translated table by its
+                    // `(space, base register)`; without one the wire set index
+                    // is the flattened parameter index on this path, and a
+                    // signature that also declares non-table parameters first
+                    // may instead send the table's ordinal. Try the index, then
+                    // the ordinal, and only then refuse.
                     let set = usize::from(table.set);
-                    let Some(slot) = active
-                        .root_parameter(set)
-                        .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
-                        .or_else(|| active.root_parameter_for_table(set))
-                    else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "descriptor table names no declared root parameter",
-                        )
-                        .into());
+                    let slot = match root_plan.and_then(|plan| plan.entry(table.set)) {
+                        Some(entry) => planned_root_parameter(
+                            transport,
+                            active,
+                            entry,
+                            PlanArgumentKind::DescriptorTable,
+                            "descriptor table plan names a non-table root argument",
+                        )?,
+                        None => {
+                            transport.count_legacy_root_binding();
+                            let Some(slot) = active
+                                .root_parameter(set)
+                                .filter(|slot| {
+                                    matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
+                                })
+                                .or_else(|| active.root_parameter_for_table(set))
+                            else {
+                                transport.count_abi_refusal();
+                                return Err(MetalError::InvalidArg(
+                                    "descriptor table names no declared root parameter",
+                                )
+                                .into());
+                            };
+                            slot
+                        }
                     };
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
@@ -5055,13 +5257,13 @@ fn prepare_compute_segment(
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter(usize::from(view.slot)) else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "root buffer view names no declared root parameter",
-                        )
-                        .into());
-                    };
+                    let slot = resolve_wire_root_argument(
+                        transport,
+                        active,
+                        root_plan,
+                        view.slot,
+                        RootArgumentSite::ROOT_VIEW,
+                    )?;
                     if !matches!(
                         slot.kind(),
                         RootParameterKind::ConstantBufferView
@@ -5155,6 +5357,7 @@ fn prepare_render_segment(
     commands: &[CommandV3],
     range: Range<usize>,
     pass: &BeginRenderPass,
+    root_plan: Option<&RootParameterPlan>,
 ) -> Result<(Vec<PreparedRenderPass>, u32, u32), PrepareAbort> {
     let device = transport.device_raw();
     let mut colors = Vec::with_capacity(pass.colors.len());
@@ -5352,6 +5555,7 @@ fn prepare_render_segment(
             width,
             height,
             trace_target,
+            root_plan,
         )?;
         let (descriptor_colors, descriptor_depth) = if first {
             (colors.clone(), depth)
@@ -5388,6 +5592,7 @@ fn prepare_render_segment(
         width,
         height,
         trace_target,
+        root_plan,
     )?;
     let (final_colors, final_depth) = if first {
         (colors, depth)
@@ -5573,6 +5778,7 @@ fn build_render_ops(
     width: u32,
     height: u32,
     trace_target: Option<crate::macos::trace::TraceTarget>,
+    root_plan: Option<&RootParameterPlan>,
 ) -> Result<Vec<PreparedRenderOp>, PrepareAbort> {
     let mut ops = Vec::new();
     let mut mesh_pipeline: Option<u64> = None;
@@ -5874,16 +6080,17 @@ fn build_render_ops(
                 }
                 if let Some(active) = abi.as_ref() {
                     // Converted ABI: resolve the wire slot through the
-                    // translated root signature, then write the bytes at the
-                    // reflected constant slot (inline in the top-level argument
-                    // buffer, or a dedicated setBytes index).
-                    let Some(slot) = active.root_parameter(usize::from(constants.slot)) else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "root constants name no declared root parameter",
-                        )
-                        .into());
-                    };
+                    // translated root signature (by the plan's register
+                    // identity when the guest sent one), then write the bytes
+                    // at the reflected constant slot (inline in the top-level
+                    // argument buffer, or a dedicated setBytes index).
+                    let slot = resolve_wire_root_argument(
+                        transport,
+                        active,
+                        root_plan,
+                        constants.slot,
+                        RootArgumentSite::CONSTANTS,
+                    )?;
                     if slot.kind() != RootParameterKind::Constants {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
@@ -5913,21 +6120,38 @@ fn build_render_ops(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    // The wire set index is the flattened parameter index on
-                    // this path; a signature that also declares non-table
-                    // parameters first may instead send the table's ordinal.
-                    // Try the index, then the ordinal, and only then refuse.
+                    // A plan entry names the translated table by its
+                    // `(space, base register)`; without one the wire set index
+                    // is the flattened parameter index on this path, and a
+                    // signature that also declares non-table parameters first
+                    // may instead send the table's ordinal. Try the index, then
+                    // the ordinal, and only then refuse.
                     let set = usize::from(table.set);
-                    let Some(slot) = active
-                        .root_parameter(set)
-                        .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
-                        .or_else(|| active.root_parameter_for_table(set))
-                    else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "descriptor table names no declared root parameter",
-                        )
-                        .into());
+                    let slot = match root_plan.and_then(|plan| plan.entry(table.set)) {
+                        Some(entry) => planned_root_parameter(
+                            transport,
+                            active,
+                            entry,
+                            PlanArgumentKind::DescriptorTable,
+                            "descriptor table plan names a non-table root argument",
+                        )?,
+                        None => {
+                            transport.count_legacy_root_binding();
+                            let Some(slot) = active
+                                .root_parameter(set)
+                                .filter(|slot| {
+                                    matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
+                                })
+                                .or_else(|| active.root_parameter_for_table(set))
+                            else {
+                                transport.count_abi_refusal();
+                                return Err(MetalError::InvalidArg(
+                                    "descriptor table names no declared root parameter",
+                                )
+                                .into());
+                            };
+                            slot
+                        }
                     };
                     if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
                         transport.count_abi_refusal();
@@ -5969,13 +6193,13 @@ fn build_render_ops(
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter(usize::from(view.slot)) else {
-                        transport.count_abi_refusal();
-                        return Err(MetalError::InvalidArg(
-                            "root buffer view names no declared root parameter",
-                        )
-                        .into());
-                    };
+                    let slot = resolve_wire_root_argument(
+                        transport,
+                        active,
+                        root_plan,
+                        view.slot,
+                        RootArgumentSite::ROOT_VIEW,
+                    )?;
                     if !matches!(
                         slot.kind(),
                         RootParameterKind::ConstantBufferView
@@ -6915,6 +7139,7 @@ fn prepare_v3(
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     plan: &[crate::macos::render::Segment],
+    root_plan: Option<&RootParameterPlan>,
 ) -> Result<Vec<PreparedSegment>, PrepareAbort> {
     let passes: Vec<&BeginRenderPass> = commands
         .iter()
@@ -6927,7 +7152,14 @@ fn prepare_v3(
     for segment in plan {
         match &segment.kind {
             SegmentKind::Compute(range) => prepared.push(PreparedSegment::Compute(
-                prepare_compute_segment(state, transport, allocations, commands, range.clone())?,
+                prepare_compute_segment(
+                    state,
+                    transport,
+                    allocations,
+                    commands,
+                    range.clone(),
+                    root_plan,
+                )?,
             )),
             SegmentKind::Render { pass_index, range } => {
                 let pass = passes.get(*pass_index).ok_or(MetalError::InternalError(
@@ -6940,6 +7172,7 @@ fn prepare_v3(
                     commands,
                     range.clone(),
                     pass,
+                    root_plan,
                 )?;
                 prepared.push(PreparedSegment::Render {
                     passes,
@@ -7508,6 +7741,23 @@ impl DirectMetalTransport {
             .map(|(reply, _stats)| reply)
     }
 
+    /// Executes one version 3 submission with the guest's root-argument plan.
+    ///
+    /// The plan names the translated `(space, register, kind)` each title
+    /// root-parameter index feeds; `None` keeps the legacy wire-slot lookup, so
+    /// a submission that carried no plan executes exactly as before. See
+    /// [`Self::submit_v3_with_stats`] for the execution contract. This wrapper
+    /// discards the diagnostic encoder inventory.
+    pub fn submit_v3_with_root_plan(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+        plan: Option<&RootParameterPlan>,
+    ) -> Result<Reply, MetalError> {
+        self.submit_v3_with_stats_and_plan(submission, allocations, plan)
+            .map(|(reply, _stats)| reply)
+    }
+
     /// Executes one version 3 submission and reports its encoder inventory.
     ///
     /// # Contract
@@ -7566,6 +7816,23 @@ impl DirectMetalTransport {
         submission: &SubmissionV3,
         allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Result<(Reply, EncoderStats), MetalError> {
+        self.submit_v3_with_stats_and_plan(submission, allocations, None)
+    }
+
+    /// [`Self::submit_v3_with_stats`] with the guest's root-argument plan.
+    ///
+    /// Every `SetRootConstants`/`SetRootBufferView`/`SetDescriptorTable` is
+    /// resolved through the plan entry for its title slot, so a title
+    /// root-parameter index binds the parameter the *translated* root signature
+    /// declares at that register rather than the flattened parameter at the same
+    /// index. A submission without a plan (or without an entry for a slot) keeps
+    /// the legacy wire-slot lookup.
+    pub fn submit_v3_with_stats_and_plan(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+        root_plan: Option<&RootParameterPlan>,
+    ) -> Result<(Reply, EncoderStats), MetalError> {
         if submission.sequence == 0 {
             return Err(MetalError::InvalidArg(
                 "submission sequence must be nonzero",
@@ -7618,7 +7885,14 @@ impl DirectMetalTransport {
         }
 
         UNKNOWN_HANDLE_ID.store(0, std::sync::atomic::Ordering::Relaxed);
-        let prepared = match prepare_v3(&mut state, self, allocations, &submission.commands, &plan) {
+        let prepared = match prepare_v3(
+            &mut state,
+            self,
+            allocations,
+            &submission.commands,
+            &plan,
+            root_plan,
+        ) {
             Ok(prepared) => prepared,
             Err(PrepareAbort::UnknownHandle) => {
                 self.note_refusal();

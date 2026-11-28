@@ -133,6 +133,8 @@
 //! | 10 | 2 | reserved, must be zero |
 //! | 12 | 4 | encoded submission length, at most [`MAX_SUBMISSION_V3_LEN`] |
 //! | 16 | N | encoded version 3 submission |
+//! | 16+N | 4 | optional root-argument plan length, `0` never appears |
+//! | 20+N | M | optional encoded root-argument plan ([`crate::root_arguments`]) |
 //!
 //! The envelope sequence must equal the encoded submission's sequence. A bad
 //! version, reserved word, declared length, inner frame or trailing byte is
@@ -140,6 +142,15 @@
 //! session open, so the guest can retry the same sequence. Only a frame with no
 //! recoverable sequence (short envelope or wrong magic) is answered and then
 //! closes the connection.
+//!
+//! The root-argument plan section is optional and framed *after* the declared
+//! submission, so a frame with no section is byte-for-byte the envelope this
+//! host decoded before the section existed: `declared` still names exactly the
+//! submission and the plan never hides inside it. A section that is present
+//! must carry a complete [`crate::root_arguments::RootParameterPlan`]: a
+//! truncated, oversized, mistyped or trailing-byte section is refused by name
+//! with [`crate::wire::ReplyStatus::ExecutionFailed`], never decoded as a
+//! shifted plan.
 //!
 //! Kind 128 acknowledges authentication and registration only. A rejected
 //! authentication or registration frame is followed by connection close. GPU
@@ -236,6 +247,7 @@ use crate::macos::registry::{
     TextureDimension, TextureFormat, TextureUsage,
 };
 use crate::macos::vertex_layout::VertexLayout;
+use crate::root_arguments::{RootParameterPlan, decode_root_plan};
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
@@ -258,8 +270,14 @@ pub const V3_REQUEST_HEADER_LEN: usize = 16;
 /// is slightly over 1 MiB, so 4 MiB leaves bounded headroom while still
 /// refusing a hostile declared length before any allocation.
 pub const MAX_SUBMISSION_V3_LEN: usize = 4 * 1024 * 1024;
+/// Largest root-argument plan section a version 3 request may carry: the
+/// `plan_len: u32 LE` prefix followed by [`crate::root_arguments::MAX_ROOT_PLAN_LEN`].
+pub const MAX_ROOT_PLAN_SECTION_LEN: usize =
+    4 + crate::root_arguments::MAX_ROOT_PLAN_LEN;
 /// Maximum transport payload length accepted for a version 3 frame.
-pub const MAX_PAYLOAD_LEN_V3: u32 = V3_REQUEST_HEADER_LEN as u32 + MAX_SUBMISSION_V3_LEN as u32;
+pub const MAX_PAYLOAD_LEN_V3: u32 = V3_REQUEST_HEADER_LEN as u32
+    + MAX_SUBMISSION_V3_LEN as u32
+    + MAX_ROOT_PLAN_SECTION_LEN as u32;
 /// Frame kind of the first, authentication frame.
 pub const KIND_AUTH: u8 = 1;
 /// Frame kind for allocation registration.
@@ -528,6 +546,22 @@ pub trait BatchExecutor {
             "version 3 submission is not enabled by this executor",
         ))
     }
+    /// Executes one decoded version 3 submission with the guest's
+    /// root-argument plan, when the submission carried one.
+    ///
+    /// The plan names the translated `(space, register, kind)` each title
+    /// root-parameter index feeds, which the wire's root commands cannot
+    /// express. The default forwards to [`Self::submit_v3`], so an executor
+    /// that predates the plan keeps its legacy slot lookup and an old-style
+    /// submission (no plan) executes exactly as before.
+    fn submit_v3_with_root_plan(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+        _plan: Option<&RootParameterPlan>,
+    ) -> Result<Reply, MetalError> {
+        self.submit_v3(submission, allocations)
+    }
     /// Installs the guest's VA → share-allocation map (ADR-055).
     ///
     /// `ranges` name live [`VmBufferId`]s the host already registered; the
@@ -733,6 +767,15 @@ impl BatchExecutor for DirectMetalTransport {
         allocations: &HashMap<(u64, u32), VmBufferId>,
     ) -> Result<Reply, MetalError> {
         DirectMetalTransport::submit_v3(self, submission, allocations)
+    }
+
+    fn submit_v3_with_root_plan(
+        &self,
+        submission: &SubmissionV3,
+        allocations: &HashMap<(u64, u32), VmBufferId>,
+        plan: Option<&RootParameterPlan>,
+    ) -> Result<Reply, MetalError> {
+        DirectMetalTransport::submit_v3_with_root_plan(self, submission, allocations, plan)
     }
 
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
@@ -1949,8 +1992,8 @@ impl<E: BatchExecutor> IpcHost<E> {
         stream: &mut TcpStream,
         payload: &[u8],
     ) -> Result<(), HostError> {
-        let submission = match decode_v3_request(payload) {
-            Ok(submission) => submission,
+        let request = match decode_v3_request(payload) {
+            Ok(request) => request,
             Err(V3RequestError::Rejected { sequence, reason }) => {
                 self.note_refusal(ReplyStatus::ExecutionFailed, &reason);
                 write_v3_reply(
@@ -1980,6 +2023,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             }
         };
 
+        let submission = &request.submission;
         if submission.sequence != self.next_sequence {
             let reason = format!(
                 "submission sequence mismatch: expected {}, got {}",
@@ -2000,7 +2044,7 @@ impl<E: BatchExecutor> IpcHost<E> {
             ));
         }
 
-        let reply = self.execute_or_refuse_v3(&submission);
+        let reply = self.execute_or_refuse_v3(submission, request.plan.as_ref());
         let reason = (reply.status != ReplyStatus::Ok).then(|| {
             self.last_error.clone().unwrap_or_else(|| {
                 format!(
@@ -2028,13 +2072,14 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// [`Self::execute_v3_with_fence`]); a refusal or executor failure leaves it
     /// behind `submitted_fence`, which the guest observes as pending.
     fn serve_async_submission(&mut self, payload: &[u8]) -> Result<(), HostError> {
-        let submission = decode_v3_request(payload).map_err(|_| {
+        let request = decode_v3_request(payload).map_err(|_| {
             self.note_refusal(
                 ReplyStatus::ExecutionFailed,
                 "asynchronous version 3 request has no decodable envelope",
             );
             HostError::Protocol("asynchronous version 3 request has no decodable envelope")
         })?;
+        let submission = &request.submission;
         if submission.sequence != self.next_sequence {
             self.note_refusal(
                 ReplyStatus::ExecutionFailed,
@@ -2049,7 +2094,7 @@ impl<E: BatchExecutor> IpcHost<E> {
         }
 
         // The reply carries only a status; there is no frame to send it in.
-        let _reply = self.execute_or_refuse_v3(&submission);
+        let _reply = self.execute_or_refuse_v3(submission, request.plan.as_ref());
         self.next_sequence = submission
             .sequence
             .checked_add(1)
@@ -2075,7 +2120,11 @@ impl<E: BatchExecutor> IpcHost<E> {
     /// actually finished advances `completed_fence` (from the GPU completion
     /// handler for an asynchronous transport, from this call for a synchronous
     /// executor). Refused and replayed submissions publish nothing.
-    fn execute_or_refuse_v3(&mut self, submission: &SubmissionV3) -> Reply {
+    fn execute_or_refuse_v3(
+        &mut self,
+        submission: &SubmissionV3,
+        plan: Option<&RootParameterPlan>,
+    ) -> Reply {
         let response = |status| Reply {
             sequence: submission.sequence,
             status,
@@ -2110,12 +2159,12 @@ impl<E: BatchExecutor> IpcHost<E> {
         let allocations = self.allocation_snapshot();
 
         let Some(identity) = submission.list else {
-            return self.execute_v3_with_fence(submission, &allocations);
+            return self.execute_v3_with_fence(submission, &allocations, plan);
         };
 
         match self.ledger.begin(identity, submission.sequence) {
             Ok(()) => {
-                let reply = self.execute_v3_with_fence(submission, &allocations);
+                let reply = self.execute_v3_with_fence(submission, &allocations, plan);
                 if reply.status == ReplyStatus::Ok {
                     self.ledger.complete(identity, submission.sequence);
                 }
@@ -2153,9 +2202,10 @@ impl<E: BatchExecutor> IpcHost<E> {
         &mut self,
         submission: &SubmissionV3,
         allocations: &HashMap<(u64, u32), VmBufferId>,
+        plan: Option<&RootParameterPlan>,
     ) -> Reply {
         self.publish_submitted(submission.sequence);
-        let reply = self.execute_v3(submission, allocations);
+        let reply = self.execute_v3(submission, allocations, plan);
         if reply.status == ReplyStatus::Ok && !self.fence_page_attached {
             self.publish_completed(submission.sequence);
         }
@@ -2180,8 +2230,9 @@ impl<E: BatchExecutor> IpcHost<E> {
         &mut self,
         submission: &SubmissionV3,
         allocations: &HashMap<(u64, u32), VmBufferId>,
+        plan: Option<&RootParameterPlan>,
     ) -> Reply {
-        match self.executor.submit_v3(submission, allocations) {
+        match self.executor.submit_v3_with_root_plan(submission, allocations, plan) {
             Ok(reply) => {
                 if reply.status != ReplyStatus::Ok {
                     self.note_refusal(
@@ -3122,15 +3173,25 @@ enum V3RequestError {
     },
 }
 
+/// One decoded version 3 request envelope.
+#[derive(Debug, Clone, PartialEq)]
+struct V3Request {
+    /// The encoded [`SubmissionV3`] the envelope declared.
+    submission: SubmissionV3,
+    /// The guest's root-argument plan, when the request carried one.
+    plan: Option<RootParameterPlan>,
+}
+
 /// Decodes one version 3 request envelope.
 ///
 /// Layout: `magic[4]`, `version u16`, `sequence u32`, reserved `u16`,
 /// `submission_len u32`, then exactly `submission_len` bytes decoded by
-/// [`decode_submission_v3`]. The envelope sequence must match the encoded
-/// submission. Every length and version check happens before the codec sees the
-/// frame, and the codec itself rejects truncation, trailing bytes and oversized
-/// payloads, so hostile input never panics.
-fn decode_v3_request(payload: &[u8]) -> Result<SubmissionV3, V3RequestError> {
+/// [`decode_submission_v3`] and an optional trailing root-argument section
+/// (`plan_len u32`, exactly `plan_len` plan bytes). The envelope sequence must
+/// match the encoded submission. Every length and version check happens before
+/// the codec sees the frame, and the codec itself rejects truncation, trailing
+/// bytes and oversized payloads, so hostile input never panics.
+fn decode_v3_request(payload: &[u8]) -> Result<V3Request, V3RequestError> {
     if payload.len() < V3_REQUEST_HEADER_LEN {
         return Err(V3RequestError::Unsequenced);
     }
@@ -3172,7 +3233,7 @@ fn decode_v3_request(payload: &[u8]) -> Result<SubmissionV3, V3RequestError> {
         });
     }
     let frame = &payload[V3_REQUEST_HEADER_LEN..];
-    if frame.len() != declared {
+    if frame.len() < declared {
         return Err(V3RequestError::Rejected {
             sequence,
             reason: format!(
@@ -3181,8 +3242,15 @@ fn decode_v3_request(payload: &[u8]) -> Result<SubmissionV3, V3RequestError> {
             ),
         });
     }
+    let (submission_frame, section) = frame.split_at(declared);
+    let plan = decode_root_plan_section(section, declared).map_err(|reason| {
+        V3RequestError::Rejected {
+            sequence,
+            reason,
+        }
+    })?;
 
-    let submission = decode_submission_v3(frame).map_err(|error| V3RequestError::Rejected {
+    let submission = decode_submission_v3(submission_frame).map_err(|error| V3RequestError::Rejected {
         sequence,
         reason: format!("version 3 submission frame was refused: {error}"),
     })?;
@@ -3195,7 +3263,55 @@ fn decode_v3_request(payload: &[u8]) -> Result<SubmissionV3, V3RequestError> {
             ),
         });
     }
-    Ok(submission)
+    Ok(V3Request { submission, plan })
+}
+
+/// Decodes the optional root-argument section that follows a version 3 frame.
+///
+/// An empty section is a request without a plan, which decodes exactly as this
+/// host decoded before the section existed. A present section must be
+/// `plan_len: u32 LE` followed by exactly `plan_len` plan bytes; anything else
+/// is refused by name so a malformed plan never becomes a shifted read.
+fn decode_root_plan_section(
+    section: &[u8],
+    submission_len: usize,
+) -> Result<Option<RootParameterPlan>, String> {
+    if section.is_empty() {
+        return Ok(None);
+    }
+    if section.len() < 4 {
+        return Err(format!(
+            "version 3 request carries {} trailing byte(s) after the {submission_len}-byte submission, fewer than a root-argument plan length",
+            section.len()
+        ));
+    }
+    let plan_len = usize::try_from(read_u32(section, 0)).unwrap_or(usize::MAX);
+    if plan_len == 0 {
+        return Err(
+            "version 3 request carries an empty root-argument plan section".to_string(),
+        );
+    }
+    if plan_len > crate::root_arguments::MAX_ROOT_PLAN_LEN {
+        return Err(format!(
+            "version 3 root-argument plan declares {plan_len} bytes, over the {}-byte limit",
+            crate::root_arguments::MAX_ROOT_PLAN_LEN
+        ));
+    }
+    let plan_bytes = section.get(4..4 + plan_len).ok_or_else(|| {
+        format!(
+            "version 3 request carries {} trailing byte(s) after its {submission_len}-byte submission, fewer than the {plan_len}-byte root-argument plan it declares",
+            section.len()
+        )
+    })?;
+    if section.len() != 4 + plan_len {
+        return Err(format!(
+            "version 3 request carries {} byte(s) after the {plan_len}-byte root-argument plan it declares",
+            section.len() - 4 - plan_len
+        ));
+    }
+    decode_root_plan(plan_bytes)
+        .map(Some)
+        .map_err(|error| format!("version 3 root-argument plan was refused: {error}"))
 }
 
 fn write_v3_reply(
@@ -4263,6 +4379,10 @@ mod tests {
         executions: u64,
         v3_submissions: Vec<SubmissionV3>,
         v3_executions: u64,
+        /// Root-argument plans the host handed the executor, in arrival order.
+        /// `Entry(..)` is a plan that arrived; the vector stays empty for a
+        /// submission that carried no plan section.
+        v3_plans: Vec<Vec<crate::root_arguments::RootPlanEntry>>,
         v3_not_supported: bool,
         /// When set, the next `submit_v3` fails with a synthetic Metal error
         /// and clears the flag, so a later submission in the same session can
@@ -4452,6 +4572,22 @@ mod tests {
                 sequence: submission.sequence,
                 status: ReplyStatus::Ok,
             })
+        }
+
+        /// Records the plan beside the submission, so a session test proves the
+        /// section reached the executor and not only the decoder.
+        fn submit_v3_with_root_plan(
+            &self,
+            submission: &SubmissionV3,
+            allocations: &HashMap<(u64, u32), VmBufferId>,
+            plan: Option<&RootParameterPlan>,
+        ) -> Result<Reply, MetalError> {
+            let reply = self.submit_v3(submission, allocations)?;
+            self.state().v3_plans.push(
+                plan.map(|plan| plan.entries().to_vec())
+                    .unwrap_or_default(),
+            );
+            Ok(reply)
         }
 
         /// Accepts kind 8 registrations so a session test can submit a
@@ -4743,13 +4879,23 @@ mod tests {
 
     /// Wraps one already-encoded v3 frame in the `V3RQ` request envelope.
     fn v3_envelope_from_frame(sequence: u32, frame: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len());
+        v3_envelope_with_plan(sequence, frame, None)
+    }
+
+    /// Wraps one v3 frame and an optional encoded root-argument plan.
+    fn v3_envelope_with_plan(sequence: u32, frame: &[u8], plan: Option<&[u8]>) -> Vec<u8> {
+        let section = plan.map_or(0, |plan| 4 + plan.len());
+        let mut payload = Vec::with_capacity(V3_REQUEST_HEADER_LEN + frame.len() + section);
         payload.extend_from_slice(&V3_REQUEST_MAGIC);
         payload.extend_from_slice(&PROTOCOL_VERSION_V3.to_le_bytes());
         payload.extend_from_slice(&sequence.to_le_bytes());
         payload.extend_from_slice(&0u16.to_le_bytes());
         payload.extend_from_slice(&(frame.len() as u32).to_le_bytes());
         payload.extend_from_slice(frame);
+        if let Some(plan) = plan {
+            payload.extend_from_slice(&(plan.len() as u32).to_le_bytes());
+            payload.extend_from_slice(plan);
+        }
         payload
     }
 
@@ -4783,8 +4929,12 @@ mod tests {
         client: &mut TcpStream,
         submission: &SubmissionV3,
     ) -> wire::ReplyWithReason {
-        write_frame(client, KIND_SUBMISSION_V3, &v3_envelope(submission))
-            .expect("send v3 submission");
+        roundtrip_v3_payload(client, &v3_envelope(submission))
+    }
+
+    /// Sends one already-framed v3 request payload and decodes its reply.
+    fn roundtrip_v3_payload(client: &mut TcpStream, payload: &[u8]) -> wire::ReplyWithReason {
+        write_frame(client, KIND_SUBMISSION_V3, payload).expect("send v3 submission");
         let (kind, payload) = read_frame(client)
             .expect("read v3 reply")
             .expect("v3 reply frame");
@@ -4795,7 +4945,7 @@ mod tests {
     /// Asserts one v3 envelope was refused for `sequence` with a non-empty
     /// reason containing `needle`.
     fn assert_rejected_with_reason(
-        result: &Result<SubmissionV3, V3RequestError>,
+        result: &Result<V3Request, V3RequestError>,
         sequence: u32,
         needle: &str,
     ) {
@@ -5992,6 +6142,156 @@ mod tests {
         assert_eq!(
             decode_v3_request(&zero_sequence),
             Err(V3RequestError::Unsequenced)
+        );
+    }
+
+    /// One plan entry a guest records for a title root CBV at slot 0.
+    fn root_view_plan() -> Vec<crate::root_arguments::RootPlanEntry> {
+        vec![crate::root_arguments::RootPlanEntry {
+            root_parameter: 0,
+            space: victory_shader::emit::ROOT_CBV_SPACE as u16,
+            kind: crate::root_arguments::PlanArgumentKind::RootView,
+            register: 0,
+            offset: 0,
+            size: 16,
+        }]
+    }
+
+    /// A request with a plan section decodes the same submission and keeps the
+    /// plan; the plan never enters the declared submission length.
+    #[test]
+    fn a_version_three_request_decodes_its_root_argument_plan() {
+        let submission = v3_submission(7, None, full_binding(BYTES as u64));
+        let frame =
+            crate::wire_v3::encode_submission_v3(&submission).expect("encode v3 submission");
+        let plan = crate::root_arguments::encode_root_plan(&root_view_plan())
+            .expect("the plan encodes");
+        let payload = v3_envelope_with_plan(7, &frame, Some(&plan));
+
+        // The declared length still names exactly the submission.
+        assert_eq!(
+            read_u32(&payload, 12) as usize,
+            frame.len(),
+            "the plan section must not be counted inside the submission"
+        );
+        let decoded = decode_v3_request(&payload).expect("the request decodes");
+        assert_eq!(decoded.submission, submission);
+        let plan = decoded.plan.expect("the plan survived the envelope");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.entry(0).expect("title slot 0").register, 0);
+    }
+
+    /// The envelope this host decoded before the plan section existed decodes
+    /// exactly as it did: same submission, no plan.
+    #[test]
+    fn a_request_without_a_plan_section_decodes_exactly_as_before() {
+        let submission = v3_submission(8, None, full_binding(BYTES as u64));
+        let payload = v3_envelope(&submission);
+        let decoded = decode_v3_request(&payload).expect("the request decodes");
+        assert_eq!(decoded.submission, submission);
+        assert!(decoded.plan.is_none());
+    }
+
+    /// A malformed plan section is refused by name, never read as a shorter
+    /// plan or folded into the submission.
+    #[test]
+    fn malformed_root_argument_sections_are_refused_by_name() {
+        let submission = v3_submission(9, None, full_binding(BYTES as u64));
+        let frame =
+            crate::wire_v3::encode_submission_v3(&submission).expect("encode v3 submission");
+        let plan = crate::root_arguments::encode_root_plan(&root_view_plan())
+            .expect("the plan encodes");
+
+        // A plan length prefix split across fewer than four bytes.
+        let mut short_prefix = v3_envelope_with_plan(9, &frame, Some(&plan));
+        short_prefix.truncate(V3_REQUEST_HEADER_LEN + frame.len() + 3);
+        assert_rejected_with_reason(&decode_v3_request(&short_prefix), 9, "carries");
+
+        // A present section that declares no plan at all.
+        let mut empty_section = v3_envelope_with_plan(9, &frame, Some(&plan));
+        let prefix_at = V3_REQUEST_HEADER_LEN + frame.len();
+        empty_section[prefix_at..prefix_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        empty_section.truncate(prefix_at + 4);
+        assert_rejected_with_reason(&decode_v3_request(&empty_section), 9, "empty");
+
+        // A declared plan length longer than the bytes carried.
+        let mut truncated_plan = v3_envelope_with_plan(9, &frame, Some(&plan));
+        truncated_plan[prefix_at..prefix_at + 4]
+            .copy_from_slice(&((plan.len() as u32) + 4).to_le_bytes());
+        assert_rejected_with_reason(&decode_v3_request(&truncated_plan), 9, "fewer");
+
+        // Bytes after the declared plan.
+        let mut trailing = v3_envelope_with_plan(9, &frame, Some(&plan));
+        trailing.push(0);
+        assert_rejected_with_reason(&decode_v3_request(&trailing), 9, "after the");
+
+        // A plan over the host's bound.
+        let mut oversized_plan = v3_envelope_with_plan(9, &frame, Some(&plan));
+        oversized_plan[prefix_at..prefix_at + 4].copy_from_slice(
+            &((crate::root_arguments::MAX_ROOT_PLAN_LEN as u32) + 1).to_le_bytes(),
+        );
+        assert_rejected_with_reason(&decode_v3_request(&oversized_plan), 9, "limit");
+
+        // A plan whose own magic is wrong.
+        let mut bad_magic_plan = plan.clone();
+        bad_magic_plan[0] = b'X';
+        let payload = v3_envelope_with_plan(9, &frame, Some(&bad_magic_plan));
+        assert_rejected_with_reason(&decode_v3_request(&payload), 9, "VRAB");
+
+        // A plan version this host does not know.
+        let mut bad_version_plan = plan;
+        bad_version_plan[4] = 9;
+        let payload = v3_envelope_with_plan(9, &frame, Some(&bad_version_plan));
+        assert_rejected_with_reason(&decode_v3_request(&payload), 9, "version 9");
+    }
+
+    /// The plan reaches the executor beside the submission it belongs to, and a
+    /// submission without a section reaches it with no plan.
+    #[test]
+    fn a_root_argument_plan_reaches_the_executor() {
+        let dir = TestDir::new();
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        let server = start(host(&dir, StubExecutor::new(4096)));
+        let mut client = connect(&server);
+        authenticate(&mut client);
+        write_frame(&mut client, KIND_REGISTER, &registration(ALLOCATION_ID, BYTES as u64))
+            .expect("send register");
+        expect_ack(&mut client, true);
+
+        let planned = v3_submission(1, None, full_binding(BYTES as u64));
+        let frame = crate::wire_v3::encode_submission_v3(&planned).expect("encode");
+        let plan =
+            crate::root_arguments::encode_root_plan(&root_view_plan()).expect("plan encodes");
+        let reply = roundtrip_v3_payload(&mut client, &v3_envelope_with_plan(1, &frame, Some(&plan)))
+            .without_reason();
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 1,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        let unplanned = v3_submission(2, None, full_binding(BYTES as u64));
+        let reply = roundtrip_v3(&mut client, &unplanned);
+        assert_eq!(
+            reply,
+            Reply {
+                sequence: 2,
+                status: ReplyStatus::Ok,
+            }
+        );
+
+        drop(client);
+        let (result, host) = server.handle.join().expect("server thread");
+        result.expect("session succeeds");
+        let state = host.executor.state();
+        assert_eq!(state.v3_executions, 2);
+        assert_eq!(state.v3_plans.len(), 2);
+        assert_eq!(state.v3_plans[0], root_view_plan());
+        assert!(
+            state.v3_plans[1].is_empty(),
+            "a submission without a section hands the executor no plan"
         );
     }
 

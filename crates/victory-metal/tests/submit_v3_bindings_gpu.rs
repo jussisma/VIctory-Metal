@@ -1246,3 +1246,257 @@ fn unknown_handles_are_refused_without_encoders() {
         after.len()
     );
 }
+/// Reflected graphics ABI whose *flattened* parameter order is not the title's
+/// root-parameter order: the translated user-data block is parameter 0 and the
+/// root CBV is parameter 1, at `(space 1, register 0)` — the translated
+/// root-CBV space.
+///
+/// This is the Boot #27 shape: a title's root parameter 0 is its root CBV, but
+/// flattened slot 0 is a 32-bit-constants parameter, so a wire-slot lookup binds
+/// the wrong parameter and refuses the view.
+fn translated_order_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            RootParameterSpec {
+                kind: RootParameterKind::Constants,
+                size: 16,
+                register: 0,
+                space: 0,
+            },
+            RootParameterSpec {
+                kind: RootParameterKind::ConstantBufferView,
+                size: 8,
+                register: 0,
+                space: 1,
+            },
+        ],
+    )
+    .expect("fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
+}
+
+/// One plan record built with the documented `VRAB` version 2 layout, which the
+/// host and guest share without a crate dependency.
+fn root_plan_record(root_parameter: u16, space: u16, kind: u8, register: u16) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&root_parameter.to_le_bytes());
+    bytes.extend_from_slice(&space.to_le_bytes());
+    bytes.push(kind);
+    bytes.extend_from_slice(&register.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes
+}
+
+fn encoded_root_plan(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"VRAB");
+    bytes.push(2);
+    bytes.extend_from_slice(&(records.len() as u16).to_le_bytes());
+    for record in records {
+        bytes.extend_from_slice(record);
+    }
+    bytes
+}
+
+/// A title root-parameter index is not a translated slot: title slot 0 (the
+/// root CBV) binds the translated `(space 1, register 0)` parameter through the
+/// guest's root-argument plan, and the pass plus draw encode with no ABI
+/// refusal.
+///
+/// The same submission without a plan reproduces Boot #27: the legacy wire-slot
+/// lookup resolves slot 0 to the flattened constants parameter and refuses the
+/// view with `root buffer view names a non-buffer root parameter`.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn a_planned_root_view_binds_the_translated_parameter_and_draws() {
+    let dir = TempDir::new("submit-v3-root-plan");
+    let Some(metallib) = compile_metallib(dir.path(), "graphics", GRAPHICS_MSL) else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; plan proof skipped");
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+    let allocations = register_mrt_targets(&transport);
+
+    let mut cbv = HostPage::new(16 * 1024);
+    cbv.write(0, &float4_bytes([0.0, 128.0 / 255.0, 1.0, 1.0]));
+    // SAFETY: `cbv` is a live 16 KiB page that outlives the submission.
+    let cbv_id = unsafe { transport.register_zerocopy(cbv.raw(), 16 * 1024) }
+        .expect("root CBV page must register");
+
+    let pipeline_state = victory_metal::macos::registry::PipelineState {
+        color_formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Rgba8Unorm],
+        depth_format: Some(TextureFormat::Depth32Float),
+        fragment_entry: Some("bind_fragment".to_string()),
+        ..Default::default()
+    }
+    .encode(PipelineStage::Graphics);
+
+    const HANDLE: u64 = 0x5000;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "bind_vertex",
+            &pipeline_state,
+            translated_order_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let mut snapshot = allocations.clone();
+    snapshot.insert((4u64, 1u32), cbv_id);
+
+    // The title's root parameters: 5 is the constants block, 0 the root CBV.
+    // (One title index never names two different arguments, so the constants
+    // stay at 5.)
+    let title_commands = || {
+        vec![
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![
+                    color_attachment(1, [0.0, 0.0, 0.0, 1.0]),
+                    color_attachment(2, [0.0, 0.0, 0.0, 1.0]),
+                ],
+                depth_stencil: Some(DepthStencilAttachment {
+                    allocation_id: 3,
+                    generation: 1,
+                    mip_level: 0,
+                    slice: 0,
+                    depth_load: LoadOp::Clear,
+                    depth_store: StoreOp::Store,
+                    clear_depth: 1.0,
+                    stencil_load: LoadOp::DontCare,
+                    stencil_store: StoreOp::DontCare,
+                    clear_stencil: 0,
+                }),
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            // Title root parameter 5 is the constants block; the translated
+            // signature puts it at flattened parameter 0.
+            CommandV3::SetRootConstants(RootConstantsV3 {
+                slot: 5,
+                bytes: float4_bytes([1.0, 128.0 / 255.0, 0.0, 1.0]),
+            }),
+            // Title root parameter 0 is the root CBV; the translated signature
+            // declares it at flattened parameter 1, (space 1, register 0).
+            CommandV3::SetRootBufferView(RootBufferView {
+                slot: 0,
+                allocation_id: 4,
+                generation: 1,
+                offset: 0,
+                length: 16,
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ]
+    };
+
+    // Control: no plan, so the legacy wire-slot lookup resolves the view's
+    // slot 0 to the flattened constants parameter and refuses it. The control's
+    // own constants are bound at slot 0 for the same reason a title's root
+    // parameter 0 was: this is the Boot #27 refusal, reproduced without a
+    // title.
+    let mut legacy_commands = title_commands();
+    legacy_commands[5] = CommandV3::SetRootConstants(RootConstantsV3 {
+        slot: 0,
+        bytes: float4_bytes([1.0, 128.0 / 255.0, 0.0, 1.0]),
+    });
+    let unplanned = SubmissionV3 {
+        sequence: 111,
+        list: Some(ListIdentity {
+            list_id: 21,
+            list_generation: 1,
+        }),
+        commands: legacy_commands,
+    };
+    let refusals_before = transport.abi_refusal_count();
+    let error = transport
+        .submit_v3_with_stats(&unplanned, &snapshot)
+        .expect_err("a slot-only root view must not bind a constants parameter");
+    assert!(
+        error.to_string().contains("non-buffer root parameter"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(
+        transport.abi_refusal_count(),
+        refusals_before + 1,
+        "the legacy mismatch is one counted ABI refusal"
+    );
+
+    // The plan names the translated identity of both title root parameters.
+    let plan = victory_metal::root_arguments::decode_root_plan(&encoded_root_plan(&[
+        root_plan_record(5, 0, 0, 0),
+        root_plan_record(0, 1, 1, 0),
+    ]))
+    .expect("the plan decodes");
+
+    let submission = SubmissionV3 {
+        sequence: 112,
+        list: Some(ListIdentity {
+            list_id: 22,
+            list_generation: 1,
+        }),
+        commands: title_commands(),
+    };
+    let refusals_before = transport.abi_refusal_count();
+    let legacy_before = transport.legacy_root_binding_count();
+    let draws_before = transport.encode_counters().draws;
+    let (reply, stats) = transport
+        .submit_v3_with_stats_and_plan(&submission, &snapshot, Some(&plan))
+        .expect("the planned submission must execute");
+    assert_eq!(
+        reply.status,
+        victory_metal::wire::ReplyStatus::Ok,
+        "the planned submission status"
+    );
+    assert_eq!(
+        transport.abi_refusal_count(),
+        refusals_before,
+        "a planned binding is not an ABI refusal"
+    );
+    assert_eq!(
+        transport.legacy_root_binding_count(),
+        legacy_before,
+        "every planned root argument resolved by its translated identity"
+    );
+    assert_eq!(stats.render_encoders, 1, "the pass encoded");
+    assert_eq!(
+        transport.encode_counters().draws,
+        draws_before + 1,
+        "the draw encoded through the harness"
+    );
+    transport.wait_for_gpu().expect("the pass should complete");
+
+    let target0 = transport
+        .read_registered_texture_rgba8(0x1000)
+        .expect("target 0 readback");
+    let target1 = transport
+        .read_registered_texture_rgba8(0x1001)
+        .expect("target 1 readback");
+    assert_uniform(&target0, TARGET0_RGBA, "target 0");
+    assert_uniform(&target1, TARGET1_RGBA, "target 1");
+
+    transport
+        .unregister_buffer(cbv_id)
+        .expect("unregister the CBV page");
+
+    eprintln!(
+        "root-plan proof on {}: title slot 0 -> translated (space 1, register 0); \
+         target0={:?}, target1={:?}, draws_encoded=+1, abi_refusals=0, \
+         legacy_bindings=0",
+        info.name_str(),
+        target0[0],
+        target1[0]
+    );
+}

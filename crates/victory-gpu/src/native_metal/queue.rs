@@ -78,6 +78,9 @@ pub enum NativeQueueError {
     NoSwapchain,
     /// The canonical v3 codec refused a submission before it was carried.
     Encode(WireError),
+    /// The versioned root-argument plan could not be encoded or framed before
+    /// anything was sent. Nothing reached the host, so the frame stays queued.
+    Plan(String),
     /// The producer refused a call; the queue surfaces its failure HRESULT.
     Producer(ProducerError),
     /// The native swapchain or its host presenter refused a frame.
@@ -93,6 +96,7 @@ impl std::fmt::Display for NativeQueueError {
             Self::NoSurface(id) => write!(f, "native swapchain does not own surface {id}"),
             Self::NoSwapchain => write!(f, "no native swapchain is installed for present"),
             Self::Encode(why) => write!(f, "native queue encode: {why}"),
+            Self::Plan(why) => write!(f, "native queue root-argument plan: {why}"),
             Self::Producer(why) => write!(f, "native producer refused: {why}"),
             Self::Present(why) => write!(f, "native present refused: {why}"),
         }
@@ -124,9 +128,8 @@ impl NativeQueueError {
         match self {
             Self::Empty(_) => crate::object::E_INVALIDARG,
             Self::Producer(error) => error.hresult(),
-            Self::Encode(WireError::ZeroSequence | WireError::UnsupportedVersion(_)) => {
-                crate::object::E_INVALIDARG
-            }
+            Self::Encode(WireError::ZeroSequence | WireError::UnsupportedVersion(_))
+            | Self::Plan(_) => crate::object::E_INVALIDARG,
             _ => E_FAIL,
         }
     }
@@ -141,6 +144,9 @@ pub struct OutboundFrame {
     pub list: Option<ListIdentity>,
     /// Canonical v3 encoded bytes, handed to the sink unchanged.
     pub bytes: Vec<u8>,
+    /// Encoded `VRAB` root-argument plan of the recorded arguments, or `None`
+    /// when the list recorded no root argument.
+    pub plan: Option<Vec<u8>>,
     /// The first work/handle-bearing command, for a refusal diagnostic.
     pub(crate) probe: Option<RefusalProbe>,
     /// The registration epoch this frame must not overtake, when it selects a
@@ -232,6 +238,22 @@ fn selects_a_pipeline(commands: &[CommandV3]) -> bool {
 pub trait V3Sink {
     /// Carries one encoded version 3 submission.
     fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError>;
+
+    /// Carries one encoded version 3 submission and its optional encoded
+    /// root-argument plan (`VRAB` bytes).
+    ///
+    /// The plan is a versioned trailing section of the same request; the
+    /// submission frame itself is carried unchanged. The default forwards to
+    /// [`Self::send`], which is exactly what a transport that predates the plan
+    /// does: the frame goes out as before and the host keeps its legacy wire-slot
+    /// lookup. The live [`NativeSink`] and [`WireV3Client`] carry the section.
+    fn send_with_plan(
+        &mut self,
+        bytes: &[u8],
+        _plan: Option<&[u8]>,
+    ) -> Result<ReplyStatus, NativeQueueError> {
+        self.send(bytes)
+    }
 }
 
 /// The sink in place until the IPC bridge lands: every send is an explicit
@@ -302,6 +324,17 @@ impl V3Sink for NativeSink {
         match self {
             Self::Disconnected(sink) => sink.send(bytes),
             Self::Live(client) => client.send(bytes),
+        }
+    }
+
+    fn send_with_plan(
+        &mut self,
+        bytes: &[u8],
+        plan: Option<&[u8]>,
+    ) -> Result<ReplyStatus, NativeQueueError> {
+        match self {
+            Self::Disconnected(sink) => sink.send_with_plan(bytes, plan),
+            Self::Live(client) => client.send_with_plan(bytes, plan),
         }
     }
 }
@@ -381,19 +414,44 @@ impl<S: V3Sink> NativeQueue<S> {
     /// queued if any frame fails to encode, so a refused batch never leaves a
     /// partial prefix behind.
     pub fn enqueue(&mut self, submissions: &[SubmissionV3]) -> Result<usize, NativeQueueError> {
+        self.enqueue_with_root_arguments(submissions, &[])
+    }
+
+    /// [`Self::enqueue`] with the root-argument plan each submission recorded.
+    ///
+    /// `plans` is index-aligned with `submissions`: the plan at index `i`
+    /// belongs to the submission at index `i`. A missing plan, or an empty one,
+    /// is not an error and not a section: the frame goes out exactly as it did
+    /// before the plan existed. A plan the encoder refuses fails the whole batch
+    /// with [`NativeQueueError::Plan`] before anything is queued, so a refused
+    /// batch never leaves a partial prefix behind.
+    pub fn enqueue_with_root_arguments(
+        &mut self,
+        submissions: &[SubmissionV3],
+        plans: &[&[bindings::RootArgument]],
+    ) -> Result<usize, NativeQueueError> {
         if submissions.is_empty() {
             return Err(NativeQueueError::Empty(
                 "ExecuteCommandLists carried no submission",
             ));
         }
         let mut encoded = Vec::with_capacity(submissions.len());
-        for submission in submissions {
+        for (index, submission) in submissions.iter().enumerate() {
             if submission.commands.is_empty() {
                 // An empty stream is not a frame: it is never handed to the
                 // host and must not consume a sequence the host will never
                 // see, or every later frame is a protocol violation.
                 continue;
             }
+            let plan = match plans.get(index) {
+                Some(plan) if !plan.is_empty() => {
+                    Some(
+                        bindings::encode_root_arguments(plan)
+                            .map_err(|error| NativeQueueError::Plan(error.to_string()))?,
+                    )
+                }
+                _ => None,
+            };
             // A submitted stream leaves the producer unassigned; assign it
             // here, exactly once, in recorded order. A frame that already
             // carries a sequence keeps it.
@@ -420,6 +478,7 @@ impl<S: V3Sink> NativeQueue<S> {
                 sequence: submission.sequence,
                 list: submission.list,
                 bytes,
+                plan,
                 probe: first_refusal_probe(&submission.commands),
                 required_epoch,
             });
@@ -456,7 +515,7 @@ impl<S: V3Sink> NativeQueue<S> {
                 flush_reached_pipeline_wait();
                 crate::native_metal::pso::wait_for_registration_epoch(required);
             }
-            match self.sink.send(&frame.bytes) {
+            match self.sink.send_with_plan(&frame.bytes, frame.plan.as_deref()) {
                 Ok(ReplyStatus::UnknownHandle) => {
                     self.sent += 1;
                     note_refused_site(&frame, None);
@@ -510,6 +569,19 @@ impl<S: V3Sink> NativeQueue<S> {
             .map(|(status, _timing)| status)
     }
 
+    /// [`Self::submit`] with each submission's root-argument plan.
+    ///
+    /// The reply rule is identical; the plan is encoded at enqueue and carried
+    /// beside the unchanged frame.
+    pub fn submit_with_root_arguments(
+        &mut self,
+        submissions: &[SubmissionV3],
+        plans: &[&[bindings::RootArgument]],
+    ) -> Result<ReplyStatus, NativeQueueError> {
+        self.submit_measured_with_root_arguments(submissions, plans)
+            .map(|(status, _timing)| status)
+    }
+
     /// [`Self::submit`], also reporting where the batch spent its time.
     ///
     /// The reply rule is identical (the first status that is not `Ok`, else
@@ -520,8 +592,17 @@ impl<S: V3Sink> NativeQueue<S> {
         &mut self,
         submissions: &[SubmissionV3],
     ) -> Result<(ReplyStatus, SubmitTiming), NativeQueueError> {
+        self.submit_measured_with_root_arguments(submissions, &[])
+    }
+
+    /// [`Self::submit_measured`] with each submission's root-argument plan.
+    pub fn submit_measured_with_root_arguments(
+        &mut self,
+        submissions: &[SubmissionV3],
+        plans: &[&[bindings::RootArgument]],
+    ) -> Result<(ReplyStatus, SubmitTiming), NativeQueueError> {
         let started = Instant::now();
-        self.enqueue(submissions)?;
+        self.enqueue_with_root_arguments(submissions, plans)?;
         let encode_us = micros(started.elapsed());
 
         let started = Instant::now();
@@ -685,6 +766,17 @@ pub fn dispatch<S: V3Sink>(
     dispatch_measured(backend, queue, submissions).map(|(dispatch, _timing)| dispatch)
 }
 
+/// [`dispatch`] with each submission's root-argument plan.
+pub fn dispatch_with_root_arguments<S: V3Sink>(
+    backend: GpuBackend,
+    queue: &mut NativeQueue<S>,
+    submissions: &[SubmissionV3],
+    plans: &[&[bindings::RootArgument]],
+) -> Result<NativeDispatch, NativeQueueError> {
+    dispatch_measured_with_root_arguments(backend, queue, submissions, plans)
+        .map(|(dispatch, _timing)| dispatch)
+}
+
 /// [`dispatch`], also reporting the batch's timing when it went native.
 ///
 /// The D3D12 branch returns `None` and touches neither the queue nor the
@@ -695,10 +787,20 @@ pub fn dispatch_measured<S: V3Sink>(
     queue: &mut NativeQueue<S>,
     submissions: &[SubmissionV3],
 ) -> Result<(NativeDispatch, Option<SubmitTiming>), NativeQueueError> {
+    dispatch_measured_with_root_arguments(backend, queue, submissions, &[])
+}
+
+/// [`dispatch_measured`] with each submission's root-argument plan.
+pub fn dispatch_measured_with_root_arguments<S: V3Sink>(
+    backend: GpuBackend,
+    queue: &mut NativeQueue<S>,
+    submissions: &[SubmissionV3],
+    plans: &[&[bindings::RootArgument]],
+) -> Result<(NativeDispatch, Option<SubmitTiming>), NativeQueueError> {
     match backend {
         GpuBackend::D3d12 => Ok((NativeDispatch::Host, None)),
         GpuBackend::Metal => {
-            let (status, timing) = queue.submit_measured(submissions)?;
+            let (status, timing) = queue.submit_measured_with_root_arguments(submissions, plans)?;
             Ok((
                 NativeDispatch::Native {
                     status,
@@ -1880,6 +1982,22 @@ pub fn submit_recorded_batch(
     submissions: &[SubmissionV3],
     record_us: u64,
 ) -> Result<NativeDispatch, NativeQueueError> {
+    submit_recorded_batch_with_root_arguments(submissions, &[], record_us)
+}
+
+/// [`submit_recorded_batch`] with the root-argument plan each submission
+/// recorded.
+///
+/// The plan is encoded at enqueue and carried beside the unchanged frame, so a
+/// title root-parameter index reaches the host together with the register space,
+/// kind and register the translated root signature actually declares. Every
+/// counter, refusal name and empty-batch rule is the same.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn submit_recorded_batch_with_root_arguments(
+    submissions: &[SubmissionV3],
+    plans: &[&[bindings::RootArgument]],
+    record_us: u64,
+) -> Result<NativeDispatch, NativeQueueError> {
     // An empty stream is not a frame: nothing reaches the host, nothing is
     // counted and nothing consumes a sequence. Counting it as a refused
     // submission is exactly the unnamed per-boot refusal this guards against.
@@ -1909,7 +2027,12 @@ pub fn submit_recorded_batch(
     let _ = sync_title_memory_map();
 
     let mut queue = native_queue();
-    let outcome = dispatch_measured(GpuBackend::Metal, &mut queue, submissions);
+    let outcome = dispatch_measured_with_root_arguments(
+        GpuBackend::Metal,
+        &mut queue,
+        submissions,
+        plans,
+    );
     // The sequences were assigned at enqueue, so the callers' submissions may
     // still be unassigned here; the queue knows the last one it handed out.
     let highest_sequence = queue.highest_sequence();
@@ -1997,7 +2120,7 @@ fn submit_refusal_reason(error: &NativeQueueError, attached: bool) -> &'static s
     use crate::native_metal::telemetry::submit_refusals as names;
     match error {
         NativeQueueError::Empty(_) => names::NO_COMMAND_BUFFER,
-        NativeQueueError::Encode(_) => names::ENCODE,
+        NativeQueueError::Encode(_) | NativeQueueError::Plan(_) => names::ENCODE,
         NativeQueueError::Refused(_) => names::HOST_REFUSED,
         NativeQueueError::Transport(_) if !attached => names::NO_CLIENT,
         NativeQueueError::Transport(_) => names::TRANSPORT,
@@ -2064,6 +2187,17 @@ pub(crate) fn submit_list_batch(
     submissions: &[SubmissionV3],
     record_us: u64,
 ) -> Result<Option<NativeDispatch>, NativeQueueError> {
+    submit_list_batch_with_root_arguments(submissions, &[], record_us)
+}
+
+/// [`submit_list_batch`] with each submission's root-argument plan.
+#[cfg(any(windows, test, target_os = "macos"))]
+#[allow(dead_code)] // the live entry point is Windows-only; the tests use it everywhere
+pub(crate) fn submit_list_batch_with_root_arguments(
+    submissions: &[SubmissionV3],
+    plans: &[&[bindings::RootArgument]],
+    record_us: u64,
+) -> Result<Option<NativeDispatch>, NativeQueueError> {
     if !carries_a_frame(submissions) {
         tracing::debug!(
             submissions = submissions.len(),
@@ -2071,7 +2205,7 @@ pub(crate) fn submit_list_batch(
         );
         return Ok(None);
     }
-    submit_recorded_batch(submissions, record_us).map(Some)
+    submit_recorded_batch_with_root_arguments(submissions, plans, record_us).map(Some)
 }
 
 /// `ExecuteCommandLists` under `VICTORY_BACKEND=metal`.
@@ -2093,11 +2227,11 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
     let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
     for &list in lists {
         let started = Instant::now();
-        let submissions = crate::list::take_submissions(list);
+        let batch = crate::list::take_submissions(list);
         // Guest time spent draining the finished list, reported as the frame's
         // record phase: the title's own recording happens in the list calls.
         let record_us = micros(started.elapsed());
-        if submissions.is_empty() {
+        if batch.is_empty() {
             let failures = crate::list::metal_failures(list);
             if failures > 0 {
                 tracing::debug!(
@@ -2107,7 +2241,16 @@ pub fn execute_native(count: u32, lists: *const crate::object::This) {
                 );
             }
         }
-        match submit_list_batch(&submissions, record_us) {
+        // The root-argument plan travels with its submission: a title
+        // root-parameter index is not a translated slot, so the host needs the
+        // register identity the plan recorded.
+        let (submissions, plans): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .map(|recorded| (recorded.submission, recorded.root_arguments))
+            .unzip();
+        let plans: Vec<&[crate::native_metal::bindings::RootArgument]> =
+            plans.iter().map(Vec::as_slice).collect();
+        match submit_list_batch_with_root_arguments(&submissions, &plans, record_us) {
             Ok(None) => {}
             Ok(Some(NativeDispatch::Native {
                 status,
@@ -4648,5 +4791,188 @@ mod tests {
 
         let _ = bindings::clear_resolver();
         native_queue_reset();
+    }
+
+    /// A sink that keeps the frame *and* the plan section that rode with it.
+    #[derive(Debug, Default)]
+    struct PlanRecordingSink {
+        frames: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    }
+
+    impl V3Sink for PlanRecordingSink {
+        fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+            self.frames.push((bytes.to_vec(), None));
+            Ok(ReplyStatus::Ok)
+        }
+
+        fn send_with_plan(
+            &mut self,
+            bytes: &[u8],
+            plan: Option<&[u8]>,
+        ) -> Result<ReplyStatus, NativeQueueError> {
+            self.frames.push((bytes.to_vec(), plan.map(<[u8]>::to_vec)));
+            Ok(ReplyStatus::Ok)
+        }
+    }
+
+    /// A producer with one compute dispatch and the root arguments it recorded.
+    fn compute_producer(
+        list_id: u64,
+        record: impl FnOnce(&mut producer::MetalProducer),
+    ) -> (SubmissionV3, Vec<bindings::RootArgument>) {
+        let mut producer = producer::MetalProducer::new(list_id, 1).expect("a list generation");
+        record(&mut producer);
+        producer.set_compute_pipeline(0x700).expect("compute pipeline");
+        producer
+            .set_compute_threadgroup_size([64, 1, 1])
+            .expect("threadgroup size");
+        producer.dispatch(1, 1, 1).expect("dispatch");
+        let submission = producer.flush().expect("flush");
+        let plan = producer.root_arguments().to_vec();
+        (submission, plan)
+    }
+
+    /// The list's recorded plan reaches the sink beside the unchanged frame, and
+    /// the frame still decodes as the canonical v3 submission it always was.
+    #[test]
+    fn a_submission_carries_its_root_argument_plan_to_the_sink() {
+        let (submission, plan) = compute_producer(401, |producer| {
+            producer
+                .set_compute_root_constants_at(0, 0, &[7], 0)
+                .expect("root constants");
+            producer
+                .set_compute_root_buffer_view_at(
+                    victory_metal::wire_v3::RootBufferView {
+                        slot: 0,
+                        allocation_id: 0x9000,
+                        generation: 1,
+                        offset: 0,
+                        length: 16,
+                    },
+                    victory_shader::emit::ROOT_CBV_SPACE as u16,
+                )
+                .expect("root view");
+        });
+        assert_eq!(plan.len(), 2);
+
+        let mut queue = NativeQueue::new(PlanRecordingSink::default());
+        let mut frame = submission;
+        producer::ensure_sequence(&mut frame).expect("sequence");
+        queue
+            .submit_with_root_arguments(std::slice::from_ref(&frame), &[plan.as_slice()])
+            .expect("the batch carries");
+
+        let sink = queue.sink();
+        assert_eq!(sink.frames.len(), 1);
+        let (bytes, carried) = &sink.frames[0];
+        assert_eq!(
+            decode_submission_v3(bytes).expect("the frame is still a v3 submission"),
+            frame,
+            "the plan never enters the frame"
+        );
+        let carried = carried.as_ref().expect("the plan rode with the frame");
+        assert_eq!(
+            bindings::decode_root_arguments(carried).expect("the plan decodes"),
+            plan,
+            "the sink sees the plan the list recorded"
+        );
+    }
+
+    /// A plan at the entry cap and an empty plan are both carried unchanged; an
+    /// empty plan is not a section at all.
+    #[test]
+    fn a_capped_plan_and_an_empty_plan_are_both_carried() {
+        let (recorded, plan) = compute_producer(402, |producer| {
+            for slot in 0..bindings::MAX_ROOT_ARGUMENTS as u16 {
+                producer
+                    .set_compute_root_constants_at(u32::from(slot), 0, &[1], 0)
+                    .expect("root constants at the cap");
+            }
+        });
+        assert_eq!(plan.len(), bindings::MAX_ROOT_ARGUMENTS);
+
+        let mut queue = NativeQueue::new(PlanRecordingSink::default());
+        let mut frame = recorded;
+        producer::ensure_sequence(&mut frame).expect("sequence");
+        queue
+            .submit_with_root_arguments(std::slice::from_ref(&frame), &[plan.as_slice()])
+            .expect("a plan at the cap carries");
+        let carried = queue.sink().frames[0]
+            .1
+            .as_ref()
+            .expect("the capped plan rode with the frame");
+        // The documented version 2 shape: a 7-byte header and 15-byte records.
+        assert_eq!(
+            carried.len(),
+            7 + 15 * bindings::MAX_ROOT_ARGUMENTS,
+            "the capped plan is the documented record layout"
+        );
+        assert_eq!(
+            bindings::decode_root_arguments(carried)
+                .expect("the capped plan decodes")
+                .len(),
+            bindings::MAX_ROOT_ARGUMENTS
+        );
+
+        // An empty plan is not sent at all: the frame is exactly the one this
+        // queue carried before the plan existed.
+        let unplanned = submission(7, 402, 1);
+        queue
+            .submit_with_root_arguments(std::slice::from_ref(&unplanned), &[&[]])
+            .expect("an empty plan is not a section");
+        let (bytes, carried) = &queue.sink().frames[1];
+        assert!(carried.is_none(), "an empty plan is never a section");
+        assert_eq!(
+            decode_submission_v3(bytes).expect("the frame decodes"),
+            unplanned
+        );
+    }
+
+    /// A sink that predates the plan (the trait's default) still receives the
+    /// frame: the plan is dropped, never the submission, and the host's legacy
+    /// lookup stays in charge.
+    #[test]
+    fn a_sink_without_plan_support_still_carries_the_frame() {
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        let submission = submission(8, 403, 1);
+        let plan = vec![bindings::RootArgument::root_view(
+            0,
+            victory_shader::emit::ROOT_CBV_SPACE as u16,
+            16,
+        )];
+        queue
+            .submit_with_root_arguments(std::slice::from_ref(&submission), &[plan.as_slice()])
+            .expect("the frame carries");
+        assert_eq!(queue.sink().frames.len(), 1);
+        assert_eq!(
+            decode_submission_v3(&queue.sink().frames[0]).expect("canonical v3"),
+            submission
+        );
+    }
+
+    /// A plan the encoder refuses fails the whole batch before anything is
+    /// queued: no partial prefix, no consumed sequence.
+    #[test]
+    fn a_refused_plan_queues_nothing() {
+        let mut queue = NativeQueue::new(RecordingSink::default());
+        let submission = submission(9, 404, 1);
+        // A sampler table outside the sampler space is not a plan this backend
+        // can have translated.
+        let plan = vec![bindings::RootArgument::descriptor_table(
+            0,
+            1,
+            0,
+            bindings::RootArgumentKind::SamplerTable,
+            4,
+        )];
+        let error = queue
+            .submit_with_root_arguments(std::slice::from_ref(&submission), &[plan.as_slice()])
+            .expect_err("the plan is refused");
+        assert!(
+            matches!(&error, NativeQueueError::Plan(why) if why.contains("sampler")),
+            "unexpected error {error:?}"
+        );
+        assert_eq!(queue.pending(), 0, "a refused plan leaves no frame queued");
+        assert!(queue.sink().frames.is_empty(), "nothing reached the sink");
     }
 }

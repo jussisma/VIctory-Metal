@@ -461,8 +461,17 @@ pub const ENVELOPE_LEN: usize = 5;
 pub const MAX_PAYLOAD_LEN: u32 = 65_536;
 /// Largest encoded v3 submission the host accepts (its `MAX_SUBMISSION_V3_LEN`).
 pub const MAX_SUBMISSION_V3_LEN: usize = 4 * 1024 * 1024;
+/// Largest optional root-argument plan section: `plan_len: u32 LE` plus the
+/// encoded `VRAB` plan.
+///
+/// The plan rides *after* the declared submission, so this section never
+/// affects [`MAX_SUBMISSION_V3_LEN`] or the codec: a frame without it is the
+/// envelope the host decoded before the section existed.
+pub const MAX_ROOT_PLAN_SECTION_LEN: usize =
+    4 + victory_metal::root_arguments::MAX_ROOT_PLAN_LEN;
 /// Largest v3 frame payload the host accepts.
-pub const MAX_PAYLOAD_LEN_V3: usize = V3_REQUEST_HEADER_LEN + MAX_SUBMISSION_V3_LEN;
+pub const MAX_PAYLOAD_LEN_V3: usize =
+    V3_REQUEST_HEADER_LEN + MAX_SUBMISSION_V3_LEN + MAX_ROOT_PLAN_SECTION_LEN;
 /// Default port the native host listens on.
 pub const DEFAULT_PORT: u16 = 47_654;
 /// Default endpoint when only a port is given.
@@ -1831,6 +1840,22 @@ impl WireV3Client {
     /// per-frame path. A frame that is not a well-formed submission is refused
     /// before the socket is touched.
     fn request(&self, bytes: &[u8]) -> Result<Request, NativeQueueError> {
+        self.request_with_plan(bytes, None)
+    }
+
+    /// Frames one encoded submission and its optional encoded root-argument
+    /// plan.
+    ///
+    /// The envelope's declared length stays exactly `bytes.len()`, so the host
+    /// decodes the submission it always decoded; the plan is appended after it
+    /// as `plan_len: u32 LE` followed by the plan bytes. A plan over the
+    /// section's bound or a payload over the transport's bound is refused before
+    /// anything is written.
+    fn request_with_plan(
+        &self,
+        bytes: &[u8],
+        plan: Option<&[u8]>,
+    ) -> Result<Request, NativeQueueError> {
         let malformed = |why: &str| {
             NativeQueueError::Transport(
                 TransportError::MalformedSubmission(why.to_string()).to_string(),
@@ -1880,13 +1905,37 @@ impl WireV3Client {
                 .expect("eight bytes"),
         );
 
-        let mut envelope = Vec::with_capacity(V3_REQUEST_HEADER_LEN + bytes.len());
+        if let Some(plan) = plan
+            && (plan.is_empty() || plan.len() > victory_metal::root_arguments::MAX_ROOT_PLAN_LEN)
+        {
+            return Err(NativeQueueError::Plan(format!(
+                "the root-argument plan carries {} bytes, over the {}-byte bound",
+                plan.len(),
+                victory_metal::root_arguments::MAX_ROOT_PLAN_LEN
+            )));
+        }
+        let mut envelope = Vec::with_capacity(
+            V3_REQUEST_HEADER_LEN + bytes.len() + plan.map_or(0, |plan| 4 + plan.len()),
+        );
         envelope.extend_from_slice(&V3_REQUEST_MAGIC);
         envelope.extend_from_slice(&PROTOCOL_VERSION_V3.to_le_bytes());
         envelope.extend_from_slice(&sequence.to_le_bytes());
         envelope.extend_from_slice(&0u16.to_le_bytes());
         envelope.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
         envelope.extend_from_slice(bytes);
+        if let Some(plan) = plan {
+            envelope.extend_from_slice(&u32::try_from(plan.len()).unwrap_or(u32::MAX).to_le_bytes());
+            envelope.extend_from_slice(plan);
+        }
+        if envelope.len() > MAX_PAYLOAD_LEN_V3 {
+            return Err(NativeQueueError::Transport(
+                TransportError::FrameTooLarge {
+                    length: envelope.len(),
+                    limit: MAX_PAYLOAD_LEN_V3,
+                }
+                .to_string(),
+            ));
+        }
         Ok(Request {
             envelope,
             sequence,
@@ -2247,7 +2296,19 @@ impl V3Sink for WireV3Client {
     /// only a list-bound submission is retried (see the module docs). A host
     /// refusal is surfaced as [`NativeQueueError::Refused`] and never retried.
     fn send(&mut self, bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
-        let request = self.request(bytes)?;
+        self.send_with_plan(bytes, None)
+    }
+
+    /// Carries one encoded submission with its encoded root-argument plan.
+    ///
+    /// The plan is the optional trailing section of the same kind 5 request; the
+    /// retry, refusal and reply rules are exactly those of [`Self::send`].
+    fn send_with_plan(
+        &mut self,
+        bytes: &[u8],
+        plan: Option<&[u8]>,
+    ) -> Result<ReplyStatus, NativeQueueError> {
+        let request = self.request_with_plan(bytes, plan)?;
         match self.exchange(&request) {
             Ok(status) => Ok(status),
             Err(NativeQueueError::Transport(first)) => {

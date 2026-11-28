@@ -250,18 +250,24 @@ fn register_attachment_host(
     registration.send().map_err(|error| error.to_string())
 }
 
-/// The native submissions of a list finished by `Close`, for the queue/bridge
-/// task to carry over the wire.
+/// The native submissions of a list finished by `Close`, each with the
+/// root-argument plan its producer recorded, for the queue/bridge task to carry
+/// over the wire.
 #[cfg(windows)]
 #[allow(dead_code)]
-pub(crate) fn take_submissions(this: This) -> Vec<crate::native_metal::producer::SubmissionV3> {
+pub(crate) fn take_submissions(
+    this: This,
+) -> Vec<crate::native_metal::producer::RecordedSubmission> {
     if this.is_null() {
         return Vec::new();
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
     let mut metal = list.metal.lock().unwrap_or_else(|e| e.into_inner());
-    metal.as_mut().map(|metal| metal.take()).unwrap_or_default()
+    metal
+        .as_mut()
+        .map(|metal| metal.take_with_root_arguments())
+        .unwrap_or_default()
 }
 
 /// Calls the native producer refused on this list so far.
