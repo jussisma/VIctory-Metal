@@ -189,7 +189,7 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    // A whole committed region the title can hand to a buffer must have a
+    // A committed region the title can hand to a buffer must have a
     // host-visible range: a title allocator's `XMemVirtualAlloc` commit is
     // host memory, but it never went through a physical-page section, so the
     // share table has no range for it and its buffers are refused as
@@ -199,18 +199,23 @@ pub extern "system" fn XMemVirtualAlloc(
     // exactly the committed size. Reservations stay reserved and create no
     // file.
     //
+    // The size need not be a whole page: a title allocator may commit exactly
+    // the block it hands out (19680 bytes in Boot #23), and the share layer
+    // rounds the file and the view up while the section keeps the real size.
     // Which backing applies is the session's choice, unchanged for the
     // reference path: with a share directory configured (the Metal launcher
     // sets one) the native host reads the file, so the region is shared; with
     // none, the Rosetta/D3DMetal alias keeps owning it as before.
-    let committed = !at.is_null()
+    let committable = !at.is_null()
         && kind & MEM_COMMIT != 0
         && kind & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER) == 0
         && protect == PAGE_READWRITE
         && (at as usize).is_multiple_of(PAGE)
-        && size >= PAGE
-        && size.is_multiple_of(PAGE);
-    if committed && share::configured() {
+        && size > 0;
+    // `alias_region` works in whole pages, so the alias path keeps the
+    // page-multiple rule.
+    let page_aligned_commit = committable && size >= PAGE && size.is_multiple_of(PAGE);
+    if committable && share::configured() {
         let backing = share::back_committed_region(at as usize, size);
         let registered = backing == share::CommittedBacking::Shared;
         tracing::debug!(
@@ -228,7 +233,7 @@ pub extern "system" fn XMemVirtualAlloc(
             );
             return std::ptr::null_mut();
         }
-    } else if committed && victory_gpu::alias_buffers() {
+    } else if page_aligned_commit && victory_gpu::alias_buffers() {
         victory_gpu::alias_region(at as usize, size, false);
     }
     if base.is_null() {

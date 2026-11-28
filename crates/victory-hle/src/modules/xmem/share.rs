@@ -64,8 +64,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::sync::OnceLock;
 
 use windows_sys::Win32::System::Memory::{
-    MapViewOfFile3, MEM_COMMIT, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-    MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree,
+    MapViewOfFile3, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2,
+    VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -715,6 +716,9 @@ pub(crate) enum ResolveError {
     OutOfBounds,
     /// Not every page of the range is shown by a tracked view.
     NotMapped,
+    /// Every page of the range is committed readable guest memory, but no
+    /// share backing covers it: it lives in the title's own allocation.
+    TitleCommitted,
     /// The views do not show one contiguous run of one section.
     NotContiguous,
     /// The backing is not this session's: a foreign id or generation.
@@ -729,6 +733,9 @@ impl std::fmt::Display for ResolveError {
             ResolveError::Empty => "the range is empty",
             ResolveError::OutOfBounds => "the range leaves its section",
             ResolveError::NotMapped => "the range is not mapped by tracked views",
+            ResolveError::TitleCommitted => {
+                "the range is committed title memory with no host-visible share backing"
+            }
             ResolveError::NotContiguous => "the range is not one contiguous section run",
             ResolveError::Stale => "the range's backing is stale or not this session's",
             ResolveError::Pagefile => "the range's section has no host-visible backing",
@@ -885,9 +892,14 @@ pub(crate) enum CommittedBacking {
 /// The caller has just obtained `[at, at + size)` from the host as committed
 /// readable/writable memory and has not returned it to the guest yet: that is
 /// the one moment the region can be swapped for a view of a share file without
-/// moving the address or losing bytes. A reservation is not a commit and never
-/// reaches this function, so a large reservation creates no file; only the
-/// bytes actually committed get one.
+/// moving the address or losing bytes. Only a whole allocation (its own base,
+/// exactly `size` rounded up to pages) is backed: a commit inside a larger
+/// reservation would have to release the reservation to become a placeholder,
+/// so it is left untouched. A reservation is not a commit and never reaches
+/// this function, so a large reservation creates no file; only the bytes
+/// actually committed get one. The file and view are page-rounded; a size
+/// that is not a page multiple (the title's 19680-byte blocks) keeps its real
+/// size in the section, so its padding tail never resolves.
 ///
 /// On the share path the region is released, a placeholder is reserved at the
 /// same address, a view of a new section file is mapped over it and the view
@@ -901,17 +913,23 @@ pub(crate) enum CommittedBacking {
 /// has already succeeded.
 pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking {
     install_if_metal();
-    if at == 0
-        || size < PAGE
-        || !at.is_multiple_of(PAGE)
-        || !size.is_multiple_of(PAGE)
-        || directory().is_none()
-    {
+    if at == 0 || size == 0 || !at.is_multiple_of(PAGE) || directory().is_none() {
         return CommittedBacking::Unchanged;
     }
-    let Some(end) = at.checked_add(size) else {
+    // The file and the placeholder are whole pages: a title allocation whose
+    // size is not a page multiple is rounded up for the backing only, exactly
+    // as `share::section` rounds a section. The guest keeps its real size.
+    let Some(map_size) = size.checked_next_multiple_of(PAGE) else {
         return CommittedBacking::Unchanged;
     };
+    let Some(end) = at.checked_add(map_size) else {
+        return CommittedBacking::Unchanged;
+    };
+    // Releasing a sub-range of a larger reservation would destroy the rest of
+    // it; only a whole host allocation is safe to swap for a share view.
+    if !own_commit(at, size, map_size) {
+        return CommittedBacking::Unchanged;
+    }
     // A title may reuse an address it already maps: never disturb a tracked
     // view there.
     if overlaps(&super::physical(), at, end) {
@@ -928,12 +946,13 @@ pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking 
         discard(section);
         return CommittedBacking::Unchanged;
     }
-    // SAFETY: `[at, at + size)` is free address space just released.
+    // SAFETY: `[at, at + map_size)` is free address space just released: the
+    // original allocation was this page-rounded size (`own_commit` proved it).
     let placeholder = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             at as *const c_void,
-            size,
+            map_size,
             MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
             PAGE_NOACCESS,
             std::ptr::null_mut(),
@@ -942,7 +961,7 @@ pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking 
     };
     if placeholder as usize != at {
         discard(section);
-        return restore_or_lost(at, size);
+        return restore_or_lost(at, map_size);
     }
     // SAFETY: the placeholder above, replaced by a view of our own section.
     let view = unsafe {
@@ -951,7 +970,7 @@ pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking 
             GetCurrentProcess(),
             at as *const c_void,
             0,
-            size,
+            map_size,
             MEM_REPLACE_PLACEHOLDER,
             PAGE_READWRITE,
             std::ptr::null_mut(),
@@ -962,15 +981,78 @@ pub(crate) fn back_committed_region(at: usize, size: usize) -> CommittedBacking 
         // SAFETY: the placeholder above; release it before restoring.
         unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
         discard(section);
-        return restore_or_lost(at, size);
+        return restore_or_lost(at, map_size);
     }
     // The bytes at these addresses are new (a zeroed commit): pages the GPU
     // side guarded for the old contents are stale.
-    victory_gpu::title_memory_remapped(at, size);
+    victory_gpu::title_memory_remapped(at, map_size);
     super::physical()
         .views
-        .insert(at, (size, super::Slice { section, index: 0 }));
+        .insert(at, (map_size, super::Slice { section, index: 0 }));
     CommittedBacking::Shared
+}
+
+/// The protections that let the host read committed bytes. `PAGE_NOACCESS`
+/// and `PAGE_GUARD` are committed but not readable (a guard page faults on
+/// read), so they never count as host-visible.
+fn readable(protect: u32) -> bool {
+    protect & 0xff != PAGE_NOACCESS && protect & PAGE_GUARD == 0
+}
+
+/// One virtual-memory region as the host's query reports it.
+fn query(at: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a live process handle and a writable structure of the right size.
+    let written = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            at as *const c_void,
+            &mut info,
+            std::mem::size_of_val(&info),
+        )
+    };
+    (written == std::mem::size_of_val(&info)).then_some(info)
+}
+
+/// Whether `[at, stop)` is committed, readable guest memory as one or more
+/// host regions. Used only to name an unbacked range precisely: it never
+/// grants bytes and never creates a backing.
+fn committed_readable(at: usize, stop: usize) -> bool {
+    let mut cursor = at;
+    while cursor < stop {
+        let Some(info) = query(cursor) else {
+            return false;
+        };
+        if info.State != MEM_COMMIT || !readable(info.Protect) {
+            return false;
+        }
+        // Virtual memory is page-granular: advance at least a page even if a
+        // host reports a region whose length is not rounded up.
+        let page_end = cursor.saturating_add(PAGE);
+        let end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .max(page_end);
+        if end <= cursor {
+            return false;
+        }
+        cursor = end.min(stop);
+    }
+    true
+}
+
+/// Whether `at` is the base of one committed, readable host allocation of
+/// exactly `map_size` page-rounded bytes. Only such a region can be released
+/// with `MEM_RELEASE` and replaced without touching a larger reservation, so
+/// only it is backed; a commit inside a reservation is left untouched.
+fn own_commit(at: usize, size: usize, map_size: usize) -> bool {
+    query(at).is_some_and(|info| {
+        info.BaseAddress as usize == at
+            && info.AllocationBase as usize == at
+            && info.State == MEM_COMMIT
+            && info.RegionSize >= size
+            && info.RegionSize <= map_size
+            && readable(info.Protect)
+    })
 }
 
 /// Whether a tracked view overlaps `[at, at + size)`.
@@ -1046,7 +1128,14 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
     let mut cursor = start;
     while cursor < stop {
         let Some((base, size, slice)) = view_at(&physical, cursor) else {
-            return Err(ResolveError::NotMapped);
+            // A page no view shows may still be committed guest memory (the
+            // title's own allocator): name that precisely instead of reading
+            // like an `xmem` miss. Still a refusal, never a fabricated range.
+            return Err(if committed_readable(cursor, stop) {
+                ResolveError::TitleCommitted
+            } else {
+                ResolveError::NotMapped
+            });
         };
         let index = slice
             .index
@@ -1075,12 +1164,21 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
         .checked_mul(PAGE)
         .ok_or(ResolveError::OutOfBounds)?;
     let length = stop.checked_sub(start).ok_or(ResolveError::OutOfBounds)?;
-    // Even though every page is shown by a view, check the whole rounded
-    // span lies in the section: no view may grant a page outside it.
-    let end_offset = offset
+    // The guest asked for bytes up to `end`: those must lie in the section's
+    // real (possibly round-up-trimmed) size. The page-rounded window may
+    // include the padding tail of the last page, but never a page outside the
+    // file: the host maps whole pages, and the binding still names exactly
+    // the requested bytes.
+    let requested_end = offset
+        .checked_add(end.checked_sub(start).ok_or(ResolveError::OutOfBounds)?)
+        .ok_or(ResolveError::OutOfBounds)?;
+    if requested_end > section.size {
+        return Err(ResolveError::OutOfBounds);
+    }
+    let window_end = offset
         .checked_add(length)
         .ok_or(ResolveError::OutOfBounds)?;
-    if end_offset > section.size {
+    if window_end > section.map_size {
         return Err(ResolveError::OutOfBounds);
     }
     let backing = section.share.as_ref().ok_or(ResolveError::Pagefile)?;
@@ -1222,6 +1320,9 @@ fn seam_resolve_error(error: ResolveError, address: u64, len: u64) -> SeamError 
     match error {
         ResolveError::Empty => SeamError::Invalid("the guest range is empty"),
         ResolveError::OutOfBounds | ResolveError::NotMapped => SeamError::Unmapped { address, len },
+        ResolveError::TitleCommitted => SeamError::Unsupported(
+            "the range is committed title memory with no host-visible share backing",
+        ),
         ResolveError::NotContiguous => {
             SeamError::Invalid("the range is not one contiguous shared allocation")
         }
@@ -1332,7 +1433,9 @@ impl Drop for TestDirectory {
 mod tests {
     use super::*;
 
-    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
 
     use crate::modules::xmem::{
         PAGES_64K, XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages,
@@ -1467,6 +1570,171 @@ mod tests {
             "the padded page must not be guest-visible"
         );
         drop((lease, view));
+    }
+
+    /// A committed region whose size is not a whole page (the Boot #23
+    /// 19680-byte buffers) takes the share path: the file and view are
+    /// page-rounded, the section keeps the real size, and the region's own
+    /// bytes resolve while the padding tail does not.
+    #[test]
+    fn a_sub_page_commit_resolves_its_own_bytes_and_refuses_the_padding_tail() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let before = live();
+        let size = 19_680usize;
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null(), "the committed region failed");
+        let at = at as usize;
+        assert_eq!(live(), before + 1, "the sub-page commit gets one section");
+
+        let payload: Vec<u8> = (0..size).map(|index| (index * 31 + 5) as u8).collect();
+        // SAFETY: `[at, at + size)` is the committed region this call returned.
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), at as *mut u8, payload.len()) };
+
+        let lease = resolve_guest_range(at, size).expect("the commit's own bytes resolve");
+        assert_eq!(
+            (lease.range.offset, lease.range.length),
+            (0, PAGE as u64),
+            "the window is the one page holding the real bytes"
+        );
+        assert_eq!(lease.file_size(), PAGE as u64);
+        let tail = resolve_guest_range(at + size - 0x10, 0x10)
+            .expect("the last real bytes resolve");
+        assert_eq!((tail.range.offset, tail.range.length), (0, PAGE as u64));
+        drop(tail);
+
+        let path = lease.path().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&path).expect("the share file").len(),
+            PAGE as u64,
+            "the file is one whole page"
+        );
+        let bytes = std::fs::read(&path).expect("the share file's bytes");
+        assert_eq!(
+            &bytes[..payload.len()],
+            &payload[..],
+            "guest writes reach the share file"
+        );
+
+        // The padding tail past `size` is not guest-visible, even though the
+        // host maps the whole page.
+        assert_eq!(
+            resolve_guest_range(at + size - 0x10, 0x20).unwrap_err(),
+            ResolveError::OutOfBounds,
+            "a request past the real size must not resolve"
+        );
+
+        // Retain/release stay balanced over the sub-page backing.
+        let submission = fresh_submission();
+        let key = lease.retain(submission).expect("the range retains");
+        assert!(is_retained(key));
+        assert_eq!(retire(submission).expect("the submission retires"), 1);
+        assert!(!is_retained(key), "retirement drops the retained range");
+        drop(lease);
+    }
+
+    /// Memory the title maps with its own `VirtualAlloc`, outside every
+    /// `XMem*` entry point, has no share file. The resolver names that
+    /// precisely, creates nothing, and never fabricates a window.
+    #[test]
+    fn title_virtual_alloc_memory_is_refused_by_name_and_never_mapped() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let size = 19_680usize;
+        // SAFETY: a plain committed allocation owned by this test.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!at.is_null(), "the title allocation failed");
+        let at = at as usize;
+        let files = std::fs::read_dir(directory.path())
+            .expect("the share directory")
+            .count();
+
+        for _ in 0..8 {
+            let error = resolve_guest_range(at, size).unwrap_err();
+            assert_eq!(error, ResolveError::TitleCommitted);
+            assert!(
+                error.to_string().contains("committed title memory"),
+                "the refusal names its owner: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("the share directory")
+                .count(),
+            files,
+            "a refusal must not create a share file"
+        );
+
+        // SAFETY: the committed allocation above.
+        unsafe { super::VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    /// Adjacent chunks of one shared mapping resolve as one guest range: two
+    /// views of consecutive slices, mapped by separate calls, give one exact
+    /// window. A gap between chunks still refuses, never a partial mapping.
+    #[test]
+    fn adjacent_chunks_of_one_mapping_resolve_and_a_gap_refuses() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let _share = ShareDirectory::configured(directory.path());
+        let pages = allocate(4);
+        let at = reserve(4 * PAGE);
+
+        // Chunk 1 (page 0) and chunk 2 (page 1), mapped separately.
+        assert_eq!(XMemMapPhysicalPages(at, 1, pages.as_ptr()), at);
+        let second = at
+            .cast::<u8>()
+            .wrapping_add(PAGE)
+            .cast::<std::ffi::c_void>();
+        assert_eq!(
+            XMemMapPhysicalPages(second, 1, pages[1..].as_ptr()),
+            second
+        );
+
+        let both = resolve_guest_range(at as usize, 2 * PAGE).expect("two chunks resolve");
+        assert_eq!(
+            (both.range.offset, both.range.length),
+            (0, (2 * PAGE) as u64),
+            "the chunks are one contiguous window"
+        );
+        assert_eq!(both.file_size(), (4 * PAGE) as u64);
+        let inner = resolve_guest_range(at as usize + PAGE + 0x20, 0x40)
+            .expect("a subrange of the second chunk resolves");
+        assert_eq!(
+            (inner.range.offset, inner.range.length),
+            (PAGE as u64, PAGE as u64)
+        );
+        drop((both, inner));
+
+        // Page 2 is at at + 3 pages: the page between the chunks is a gap.
+        let third = at
+            .cast::<u8>()
+            .wrapping_add(3 * PAGE)
+            .cast::<std::ffi::c_void>();
+        assert_eq!(
+            XMemMapPhysicalPages(third, 1, pages[2..].as_ptr()),
+            third
+        );
+        assert_eq!(
+            resolve_guest_range(at as usize, 4 * PAGE).unwrap_err(),
+            ResolveError::NotMapped,
+            "a range over the unmapped page must not resolve"
+        );
+
+        assert_eq!(XMemMapPhysicalPages(at, 4, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// With no directory, sections stay pagefile-backed and the resolver says
