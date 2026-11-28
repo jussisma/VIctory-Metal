@@ -546,6 +546,11 @@ struct Stats {
     clear_ops_encoded: u64,
     /// ADR-052: handle class of the last `UnknownHandle` refusal.
     unknown_handle_site: Option<String>,
+    /// ADR-051: MEMORY_SPACE parameters bound and bytes allocated.
+    memory_space_bound: u64,
+    memory_space_bytes: u64,
+    /// ADR-051: root arguments refused by the (space, register, kind) resolver.
+    abi_refusals: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -584,6 +589,9 @@ impl Default for Stats {
             render_passes_encoded: 0,
             clear_ops_encoded: 0,
             unknown_handle_site: None,
+            memory_space_bound: 0,
+            memory_space_bytes: 0,
+            abi_refusals: 0,
         }
     }
 }
@@ -857,6 +865,10 @@ impl BatchExecutor for DaemonExecutor {
             stats.indirect_encoded = counters.indirect;
             stats.render_passes_encoded = counters.render_passes;
             stats.clear_ops_encoded = counters.clear_ops;
+            let (memory_bound, memory_bytes) = self.transport.memory_space_counters();
+            stats.memory_space_bound = memory_bound;
+            stats.memory_space_bytes = memory_bytes;
+            stats.abi_refusals = self.transport.abi_refusal_count();
             if matches!(&result, Ok(reply) if reply.status == ReplyStatus::UnknownHandle) {
                 let site = victory_metal::macos::device::last_unknown_site().to_string();
                 stats.last_error = Some(format!(
@@ -1381,6 +1393,9 @@ fn write_telemetry(
             "  \"render_passes_encoded\": {render_passes_encoded},\n",
             "  \"clear_ops_encoded\": {clear_ops_encoded},\n",
             "  \"unknown_handle_site\": {unknown_handle_site},\n",
+            "  \"memory_space_bound\": {memory_space_bound},\n",
+            "  \"memory_space_bytes\": {memory_space_bytes},\n",
+            "  \"abi_refusals\": {abi_refusals},\n",
             "  \"draw_trace\": {draw_trace},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
@@ -1439,6 +1454,9 @@ fn write_telemetry(
             .unknown_handle_site
             .as_deref()
             .map_or_else(|| "null".to_string(), |site| format!("\"{site}\"")),
+        memory_space_bound = stats.memory_space_bound,
+        memory_space_bytes = stats.memory_space_bytes,
+        abi_refusals = stats.abi_refusals,
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
@@ -1735,6 +1753,9 @@ impl Clone for Stats {
             render_passes_encoded: self.render_passes_encoded,
             clear_ops_encoded: self.clear_ops_encoded,
             unknown_handle_site: self.unknown_handle_site.clone(),
+            memory_space_bound: self.memory_space_bound,
+            memory_space_bytes: self.memory_space_bytes,
+            abi_refusals: self.abi_refusals,
         }
     }
 }
@@ -2001,7 +2022,7 @@ mod draw_trace_json_tests {
         let json = std::fs::read_to_string(&path).expect("telemetry reads");
         let _ = std::fs::remove_file(&path);
 
-        const KEYS: [&str; 52] = [
+        const KEYS: [&str; 55] = [
             "host",
             "pid",
             "port",
@@ -2049,6 +2070,9 @@ mod draw_trace_json_tests {
             "render_passes_encoded",
             "clear_ops_encoded",
             "unknown_handle_site",
+            "memory_space_bound",
+            "memory_space_bytes",
+            "abi_refusals",
             "draw_trace",
             "d3dmetal_loaded",
             "d3dmetal_images",

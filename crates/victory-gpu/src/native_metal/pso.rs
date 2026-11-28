@@ -327,12 +327,22 @@ impl RegistrationBarrier {
     }
 
     fn wait_for_epoch(&self, required: u64) {
+        // Bounded: a registration that wedges (a dead converter, a vanished
+        // host) must not freeze presentation forever. The host's own refusal
+        // then names the missing handle, and the queue keeps its sequence
+        // ledger dense because this frame was already assigned one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         let mut state = self.lock();
         while state.epoch < required {
-            state = self
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let (next, _timeout) = self
                 .settled
-                .wait(state)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|error| error.into_inner());
+            state = next;
         }
     }
 

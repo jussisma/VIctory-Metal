@@ -2431,9 +2431,15 @@ impl<E: BatchExecutor> IpcHost<E> {
             Some(bytes) => match RootParameterMap::from_versioned_blob(&bytes) {
                 Ok(map) => abi.with_root_parameters(map),
                 Err(_) => {
-                    return self.reject_host_translation(
-                        "the translated root signature is not a usable versioned signature",
+                    // A root signature this host cannot parse is not a reason to
+                    // lose an otherwise valid PSO: keep the title-index binding
+                    // path, which is what Cycle 14 shipped, and record the gap.
+                    eprintln!(
+                        "victory-metal-host: root_signature_map_fallback reason=unparsable"
                     );
+                    self.host_translation_reason =
+                        Some("root-signature map fallback: unparsable".to_string());
+                    abi
                 }
             },
             None => abi,

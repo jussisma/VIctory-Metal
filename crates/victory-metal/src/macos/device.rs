@@ -1770,10 +1770,12 @@ impl DirectMetalTransport {
     fn trace_sample_target(&self, target: &crate::macos::trace::TraceTarget) {
         let Some(texture) = retain_object(target.texture as objc::Id) else {
             eprintln!("draw_trace_rt failure=texture-gone");
+            crate::macos::trace::note_failure("texture gone before sample");
             return;
         };
         let Ok(render_target) = RenderTarget::from_objc(texture) else {
             eprintln!("draw_trace_rt failure=texture-unsupported");
+            crate::macos::trace::note_failure("attachment format unsupported");
             return;
         };
         match read_back_render_target(self, &render_target) {
@@ -1782,7 +1784,10 @@ impl DirectMetalTransport {
                     crate::macos::trace::sample_grid(&bytes, target.width, target.height);
                 eprintln!("{}", stats.line());
             }
-            Err(error) => eprintln!("draw_trace_rt failure=readback {error}"),
+            Err(error) => {
+                eprintln!("draw_trace_rt failure=readback {error}");
+                crate::macos::trace::note_failure("target readback failed");
+            }
         }
     }
 
@@ -3422,6 +3427,25 @@ struct PreparedRenderPass {
     ops: Vec<PreparedRenderOp>,
     /// ADR-053: first colour attachment, for the opt-in offscreen-RT sample.
     trace_target: Option<crate::macos::trace::TraceTarget>,
+    /// ADR-053: draw-family ops this sub-pass encodes.
+    draws: u32,
+}
+
+/// Counts the draw-family ops one prepared sub-pass encodes.
+fn draw_op_count(ops: &[PreparedRenderOp]) -> u32 {
+    ops.iter()
+        .filter(|op| {
+            matches!(
+                op,
+                PreparedRenderOp::Draw { .. }
+                    | PreparedRenderOp::DrawIndexed { .. }
+                    | PreparedRenderOp::DispatchMesh { .. }
+                    | PreparedRenderOp::DrawIndirect { .. }
+                    | PreparedRenderOp::DrawIndexedIndirect { .. }
+                    | PreparedRenderOp::DispatchMeshIndirect { .. }
+            )
+        })
+        .count() as u32
 }
 
 fn to_usize(value: u64) -> Result<usize, MetalError> {
@@ -4524,13 +4548,16 @@ fn resolve_mesh_pipeline(
 
 /// Validates and prepares a compute segment.
 fn prepare_compute_segment(
-    state: &DeviceState,
+    state: &mut DeviceState,
     transport: &DirectMetalTransport,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: &[CommandV3],
     range: Range<usize>,
 ) -> Result<Vec<PreparedComputeOp>, PrepareAbort> {
     let device = transport.device_raw();
+    if state.trace.is_none() && crate::macos::trace::enabled() {
+        state.trace = Some(crate::macos::trace::TraceState::default());
+    }
     let mut ops = Vec::new();
     let mut abi: Option<PipelineAbi> = None;
     let mut pending = AbiPending::default();
@@ -4564,6 +4591,18 @@ fn prepare_compute_segment(
                 }
                 flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
+                trace_encoded_work(
+                    state,
+                    "dispatch",
+                    dispatch.pipeline_id,
+                    dispatch.threads,
+                    1,
+                    None,
+                    None,
+                    abi.as_ref(),
+                    false,
+                    None,
+                );
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
                     grid: PreparedGrid::OneD {
@@ -4594,6 +4633,18 @@ fn prepare_compute_segment(
                 }
                 flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
+                trace_encoded_work(
+                    state,
+                    "dispatch",
+                    dispatch.pipeline_id,
+                    u32::try_from(local_threads).unwrap_or(u32::MAX),
+                    1,
+                    None,
+                    None,
+                    abi.as_ref(),
+                    false,
+                    None,
+                );
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
                     grid: PreparedGrid::ThreeD {
@@ -4653,6 +4704,18 @@ fn prepare_compute_segment(
                 indirect::validate(&arguments)?;
                 flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_indirect();
+                trace_encoded_work(
+                    state,
+                    "dispatch_indirect",
+                    dispatch.pipeline_id,
+                    0,
+                    1,
+                    None,
+                    None,
+                    abi.as_ref(),
+                    false,
+                    None,
+                );
                 ops.push(PreparedComputeOp::DispatchIndirect {
                     pipeline: pso.raw,
                     threads_per_group: MTLSize {
@@ -5039,6 +5102,7 @@ fn prepare_render_segment(
         )?;
         passes.push(PreparedRenderPass {
             descriptor,
+            draws: draw_op_count(&ops),
             ops,
             trace_target,
         });
@@ -5072,6 +5136,7 @@ fn prepare_render_segment(
         build_mrt_render_pass_descriptor(&final_colors, final_depth.as_ref())?;
     passes.push(PreparedRenderPass {
         descriptor: final_descriptor,
+        draws: draw_op_count(&final_ops),
         ops: final_ops,
         trace_target,
     });
@@ -5080,7 +5145,6 @@ fn prepare_render_segment(
     }
     Ok((passes, width, height))
 }
-
 /// Records one clear at its command index, merging adjacent clears.
 fn push_clear_group(groups: &mut Vec<(usize, Vec<ClearSpec>)>, index: usize, spec: ClearSpec) {
     match groups.last_mut() {
@@ -7268,9 +7332,10 @@ impl DirectMetalTransport {
         // command buffer completes; at most MAX_TRACED_PASSES per process.
         let trace_sample = if crate::macos::trace::enabled() {
             let first = prepared.iter().find_map(|segment| match segment {
-                PreparedSegment::Render { passes, .. } => {
-                    passes.first().and_then(|pass| pass.trace_target)
-                }
+                PreparedSegment::Render { passes, .. } => passes
+                    .iter()
+                    .find(|pass| pass.draws > 0)
+                    .and_then(|pass| pass.trace_target),
                 _ => None,
             });
             match (first, state.trace.as_mut()) {
