@@ -2982,6 +2982,7 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             | CommandV3::SetIndexBuffer(_)
             | CommandV3::SetRootConstants(_)
             | CommandV3::SetDescriptorTable(_)
+            | CommandV3::SetDescriptorHeaps(_)
             | CommandV3::SetRootBufferView(_)
             | CommandV3::SetBlendState(_)
             | CommandV3::SetDepthStencilState(_)

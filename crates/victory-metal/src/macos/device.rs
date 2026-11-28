@@ -4021,6 +4021,12 @@ fn map_topology(topology: PrimitiveTopology) -> PrimitiveType {
         PrimitiveTopology::LineStrip => PrimitiveType::LineStrip,
         PrimitiveTopology::TriangleList => PrimitiveType::Triangle,
         PrimitiveTopology::TriangleStrip => PrimitiveType::TriangleStrip,
+        // Seam for the ADR-065 host worker: rect lists arrive as a distinct
+        // wire topology, and the host's two-triangle expansion lives in this
+        // file's owner's change. Until that lands, the three explicit rect
+        // vertices rasterise as the single triangle console retail
+        // full-screen passes fall back to.
+        PrimitiveTopology::RectList => PrimitiveType::Triangle,
     }
 }
 

@@ -126,6 +126,45 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    /// Bytes between consecutive descriptors, when this heap's kind has a
+    /// descriptor increment (ADR-064).
+    pub(crate) fn descriptor_stride(&self) -> Option<u32> {
+        increment(self.desc.kind)
+    }
+
+    /// Descriptors this heap was created with.
+    pub(crate) fn descriptor_count(&self) -> u32 {
+        self.desc.count
+    }
+
+    /// The raw descriptor bytes at `handle`, zero-padded to eight words.
+    ///
+    /// The guest leaves either its own live-slot record or an RDNA 2
+    /// descriptor here; the table enumerator classifies whichever it finds.
+    /// `None` when `handle` is not a stride-aligned descriptor of this heap,
+    /// so a caller never reads past the heap's memory.
+    pub(crate) fn read_descriptor(&self, handle: u64) -> Option<[u32; 8]> {
+        let step = self.descriptor_stride()?;
+        let index = self.index(handle)?;
+        let offset = u64::from(index).checked_mul(u64::from(step))?;
+        if handle.checked_sub(self.start)? != offset {
+            return None;
+        }
+        let offset = usize::try_from(offset).ok()?;
+        let mut words = [0u32; 8];
+        // SAFETY: `index` proved the descriptor is inside this heap's
+        // `count * stride` bytes, which live until the heap is released; the
+        // caller holds the heap for the duration of the read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (self.start as *const u8).add(offset),
+                words.as_mut_ptr().cast::<u8>(),
+                (step as usize).min(size_of::<[u32; 8]>()),
+            );
+        }
+        Some(words)
+    }
 }
 
 const VIEWS_KIND: u32 = 0;
@@ -1592,6 +1631,44 @@ pub(crate) mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// ADR-064: a heap reads back the raw descriptor words the title (or this
+    /// backend) wrote at a stride-aligned handle, and refuses an unaligned or
+    /// out-of-range handle instead of reading past the heap.
+    #[test]
+    fn a_heap_reads_raw_descriptor_words_at_aligned_handles_only() {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 3,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let start = heap(h).start;
+        assert_eq!(heap(h).descriptor_stride(), Some(32));
+        assert_eq!(heap(h).descriptor_count(), 3);
+        // A 2D image descriptor's TYPE bits, written where the title would.
+        let words = [0x1234u32, 9 << 28, 0, 9 << 28, 0, 0, 0, 0];
+        // SAFETY: slot 1 is inside the three-slot heap's memory.
+        unsafe { ((start + 32) as *mut [u32; 8]).write_unaligned(words) };
+        assert_eq!(heap(h).read_descriptor(start + 32), Some(words));
+        assert_eq!(
+            heap(h).read_descriptor(start + 8),
+            None,
+            "an unaligned handle is refused"
+        );
+        assert_eq!(
+            heap(h).read_descriptor(start + 3 * 32),
+            None,
+            "a handle past the heap is refused"
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
     }
 
     /// The host reference refuses a heap of zero descriptors with
