@@ -1870,3 +1870,95 @@ used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
 - Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.837 / p95 0.922 / p99 0.958 ms, 1,191 FPS,
   checksum unchanged.
 - Worker `target/` directories pruned after every wave; **118 GB free**; zero orphaned processes.
+
+## 16. Cycle 16 — attachment registration, the depth-format constant, and the first executed draws
+
+### 16.1 What changed
+
+- **ADR-054, complete attachment registration.** Every guest render-target, depth-stencil and
+  swapchain attachment is registered with the host before a pass needs it: eagerly at texture
+  creation for flag-declared targets and at RTV/DSV creation, and lazily before
+  `OMSetRenderTargets`, `ClearRenderTargetView` and `ClearDepthStencilView` for any handle the
+  session has not registered. Registration is idempotent; re-registering one handle with equal
+  geometry but a wider usage unions the usage (an SRV-first texture can later become an
+  attachment) instead of refusing; a differing descriptor stays a named conflict.
+- **ADR-056, Metal pixel formats are the values Apple declares.** `MTLPixelFormatDepth32Float_Stencil8`
+  is **260** (`253` is `Depth24Unorm_Stencil8`). The wrong constant made `texture_info` reject every
+  `D32_FLOAT_S8X24_UINT` attachment, which is why Boot #26/#27 refused all 52/53 `BeginRenderPass`
+  batches on one depth target even once registration made the handle resolvable. A regression test
+  pins the value.
+- **Root-argument plan end to end.** The guest's versioned `VRAB` plan travels as an optional
+  trailing section of the version-3 submission frame (a frame without the section decodes exactly
+  as before), the host decodes it, and `SetRootConstants`/`SetRootBufferView`/`SetDescriptorTable`
+  resolve the translated parameter by `(space, register, kind)` with the plan authoritative.
+  Without a plan the host resolves from the converter's own reflection: a root view/constants by
+  the reflected kind and register, a descriptor table by the unique reflected table when the
+  signature declares exactly one, and only then the legacy slot lookup (counted separately).
+  Boot #28 showed the reflected root CBV at `(space 0, register 0)` while the emitter's convention
+  named `ROOT_CBV_SPACE`, so the plan alone was not sufficient.
+- **Console formats.** Console virtual format 118 maps through the existing `pc_format` table to
+  `D32_FLOAT_S8X24_UINT` before the host-code lookup, so both Boot #27 depth targets register;
+  format 115 (`B4G4R4A4_UNORM`) has no exact PC host format and is refused by name rather than
+  guessed.
+- **ADR-055, title memory (partial).** The guest's VA → share-allocation map is transmitted in a
+  versioned, chunked frame; the host keeps it and builds the documented two-level `MEMORY_SPACE`
+  page table from already-mapped share buffers, binds `t0`/`u0` for translated pipelines that
+  declare title memory, and counts `memory_space_bound`/`memory_space_bytes`. No GPU proof of a
+  translated shader dereferencing a guest VA landed this cycle (counters read 0 in Boot #28).
+- **xmem ranges.** Multi-view/multi-slice ranges of one share backing resolve exactly; a span over
+  two share files is refused by a dedicated, bounded, counted `CrossBacking` reason instead of a
+  generic one.
+
+### 16.2 Windowed boots (probe on, draw trace on)
+
+| | #26 | #27 | **#28** |
+|---|---|---|---|
+| host submissions / refused | 4287 / 52 | 4249 / 52 | **4312 / 51** |
+| frames | 4235 | 4197 | **4261** |
+| Metal PSOs / translation refusals | 6 / 0 | 6 / 0 | **6 / 0** |
+| **draws / indexed / dispatches** | 0 / 0 / 0 | 0 / 0 / 0 | **52 / 0 / 0** |
+| render passes encoded | 53 | 53 | **54** |
+| `abi_refusals` | 0 | 0 | **51** |
+| texture-registration refusals | 0 | 0 | **0** |
+| refusal class | texture, id one depth target | texture, same id | **descriptor-table root-argument mapping** |
+| `draw_trace` work / passes | 0 / 0 | 0 / 0 | **10 / 1** |
+| offscreen RT non-zero bytes | 0 | 0 | **0** (16,384 sampled, 1 distinct value) |
+| swapchain `non_black_pixels` / buckets | 0 / 1 | 0 / 1 | **0 / 1** |
+| `uniform_color` | transparent_black | same | same |
+| host p50 / p95 ms | .012 / .026 | .013 / .030 | **.012 / .030** |
+| D3DMetal fallback / host D3D12 | 0 / 0 | 0 / 0 | **0 / 0** |
+
+### 16.3 What the boots proved
+
+- Attachment registration plus the corrected Metal depth format removed the whole attachment class:
+  `UnknownHandle` at `BeginRenderPass` is gone (`unknown_handle_site` null), texture-registration
+  refusals stay 0, and the refused batches no longer name a texture at all.
+- **Draws execute.** Boot #28 encodes 52 draws and captures ten `draw_trace` records: a 3-vertex
+  draw through pipeline 1, viewport and scissor `0,0,3840,2160`, ABI 1 parameter / 32 bytes, into a
+  3840×2160 offscreen `rgba8unorm` attachment. The traced pass reports one draw.
+- The remaining 51 refusals are one named class: a descriptor table whose set does not resolve to a
+  declared table parameter (`descriptor table names no declared root parameter`), i.e. submissions
+  that carry no root-argument plan. That is the next concrete gate, not an attachment or format
+  problem.
+
+### 16.4 What is still not true
+
+- **No non-black pixel and no title FPS are claimed.** Every probe sample is still
+  `transparent_black` (0 non-black pixels, 1 luma bucket), and the traced offscreen attachment holds
+  one distinct value (0). Executed draws currently write nothing that reaches the swapchain.
+- **`MEMORY_SPACE` is still zeros on a title.** The map/page-table path is implemented but
+  `memory_space_bound`/`memory_space_bytes` read 0 and no translated shader was proven to read
+  guest bytes at a computed address.
+- Console format 115's colour target stays unregistered; a guest range spanning two share files is
+  still refused (now by name and counter).
+
+### 16.5 Counts at the integration head
+
+- `victory-metal` **420 passed / 0 failed / 10 ignored** (lib, no outer GPU lock); `victory-gpu`
+  **427 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus **3 / 0 / 1**; Wine `victory-hle`
+  **198 / 0 / 1**; `victory` bin **16 / 0 / 0**, **2 / 0 / 0**, **1 / 0 / 0**.
+- Win64 `diag` build, three Windows all-targets checks, x86_64 `victory-irconverter` build and the
+  ARM64 host build all exit 0; `git diff --check` clean.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.832 / p95 0.912 / p99 0.955 ms, 1,200 FPS,
+  checksum unchanged (`11527919792119713699`).
+- Worker `target/` directories pruned after each wave; zero orphaned processes.
