@@ -230,6 +230,26 @@ pub(crate) fn with_metal(
     }
 }
 
+/// Whether `this` is a list the native backend records.
+///
+/// The same guard [`with_metal`] makes, for the decision points that resolve
+/// and register before handing work to the producer.
+#[cfg(windows)]
+fn metal_list(this: This) -> bool {
+    crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal && !this.is_null()
+}
+
+/// Sends one kind 8 attachment registration over the live queue.
+///
+/// The transport error is flattened to its text for the caller's named refusal
+/// (the precise reason is logged there, never carried as a silent success).
+#[cfg(windows)]
+fn register_attachment_host(
+    registration: &crate::resource::TextureTableRegistration,
+) -> Result<(bool, Option<String>), String> {
+    registration.send().map_err(|error| error.to_string())
+}
+
 /// The native submissions of a list finished by `Close`, for the queue/bridge
 /// task to carry over the wire.
 #[cfg(windows)]
@@ -1291,7 +1311,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
 /// The IPC bridge owns the allocation registry (`WIRE-V3-HOST-BRIDGE`); until
 /// it registers a range, the guest address is the key both sides can agree
 /// on, and nonzero.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn metal_resource(this: This) -> Option<crate::native_metal::producer::ResourceId> {
     use crate::native_metal::producer::ResourceId;
     let address = match crate::resource::texture_memory(this) {
@@ -1299,6 +1319,83 @@ fn metal_resource(this: This) -> Option<crate::native_metal::producer::ResourceI
         None => crate::resource::buffer_bytes(this)?.0 as u64,
     };
     ResourceId::from_guest_address(address).ok()
+}
+
+/// The identity of a texture used as a render or depth attachment, with the
+/// kind 8 registration that makes the host resolve it (ADR-054).
+///
+/// `usage` is the attachment code ([`crate::resource::ATTACHMENT_USAGE_COLOR`]
+/// or [`crate::resource::ATTACHMENT_USAGE_DEPTH`]); `operation` names the
+/// D3D12 call in a refusal. `registered` short-circuits a handle this session
+/// already holds, so re-binding the same target sends no second request;
+/// `register` is the live wire send in production and is injected by tests.
+///
+/// Every outcome other than a registered texture is a named refusal of
+/// `operation`: a resource that is not a texture, a shape the kind 8 codes
+/// cannot express, and a host refusal. No format is guessed, and a pass never
+/// names an unregistered handle.
+#[cfg(any(windows, test))]
+fn attachment_resource(
+    resource: This,
+    usage: u8,
+    operation: &'static str,
+    registered: impl Fn(u64) -> bool,
+    register: impl FnOnce(
+        &crate::resource::TextureTableRegistration,
+    ) -> Result<(bool, Option<String>), String>,
+) -> Result<crate::native_metal::producer::ResourceId, crate::native_metal::producer::ProducerError>
+{
+    use crate::native_metal::producer::{ProducerError, ResourceId};
+    let Some(registration) = crate::resource::texture_attachment_registration(resource, usage)
+    else {
+        tracing::warn!(usage, "{operation}: the render target is not a texture");
+        return Err(ProducerError::unsupported(operation));
+    };
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(reason) => {
+            tracing::warn!(
+                usage,
+                reason,
+                "{operation}: the texture has no host registration code"
+            );
+            return Err(ProducerError::unregistered(operation));
+        }
+    };
+    let handle = registration.handle;
+    if registered(handle) {
+        return ResourceId::from_guest_address(handle);
+    }
+    match register(&registration) {
+        Ok((true, _)) => {
+            tracing::debug!(
+                handle = format_args!("{handle:#x}"),
+                usage,
+                "native attachment texture registered"
+            );
+        }
+        Ok((false, reason)) => {
+            tracing::warn!(
+                handle = format_args!("{handle:#x}"),
+                usage,
+                reason = reason
+                    .as_deref()
+                    .unwrap_or("the host refused the registration"),
+                "{operation}: the host refused the attachment registration"
+            );
+            return Err(ProducerError::unregistered(operation));
+        }
+        Err(error) => {
+            tracing::warn!(
+                handle = format_args!("{handle:#x}"),
+                usage,
+                error,
+                "{operation}: the attachment registration did not reach the host"
+            );
+            return Err(ProducerError::unregistered(operation));
+        }
+    }
+    ResourceId::from_guest_address(handle)
 }
 
 /// One texture subresource as the wire names it, from a D3D12 subresource
@@ -2664,34 +2761,45 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
-    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
+    if metal_list(this) {
+        use crate::native_metal::producer::ProducerError;
         // SAFETY: the title passes four floats (null is tolerated).
         let color = unsafe { color.as_ref() }.copied();
-        with_metal(this, |producer| {
-            let Some(color) = color else {
-                return producer.refuse(
-                "ClearRenderTargetView: no clear colour",
-                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
-            );
-            };
-            if count > 0 || !rects.is_null() {
-                return producer.refuse(
-                "ClearRenderTargetView: partial rectangles",
-                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
-            );
-            }
-            let record = crate::descriptor::rtv_record(handle).ok_or(
-                crate::native_metal::producer::ProducerError::unsupported(
-                    "ClearRenderTargetView: no recorded view",
-                ),
-            )?;
-            let resource = metal_resource(record.resource).ok_or(
-                crate::native_metal::producer::ProducerError::unsupported(
-                    "ClearRenderTargetView: no guest allocation",
-                ),
-            )?;
-            producer.clear_render_target(resource, color)
-        });
+        let Some(color) = color else {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "ClearRenderTargetView: no clear colour",
+                    Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+                )
+            });
+            return;
+        };
+        if count > 0 || !rects.is_null() {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "ClearRenderTargetView: partial rectangles",
+                    Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+                )
+            });
+            return;
+        }
+        let resolved: Result<_, ProducerError> = (|| {
+            let record = crate::descriptor::rtv_record(handle)
+                .ok_or(ProducerError::unsupported("ClearRenderTargetView: no recorded view"))?;
+            attachment_resource(
+                record.resource,
+                crate::resource::ATTACHMENT_USAGE_COLOR,
+                "ClearRenderTargetView: render target is not registered with the host",
+                crate::native_metal::queue::texture_registered,
+                register_attachment_host,
+            )
+        })();
+        match resolved {
+            Ok(resource) => with_metal(this, |producer| {
+                producer.clear_render_target(resource, color)
+            }),
+            Err(error) => with_metal(this, |_| Err(error)),
+        }
         return;
     }
     #[cfg(windows)]
@@ -2745,26 +2853,40 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
-    if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
-        with_metal(this, |producer| {
-            if count > 0 || !rects.is_null() {
-                return producer.refuse(
-                "ClearDepthStencilView: partial rectangles",
-                Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
-            );
-            }
-            let record = crate::descriptor::dsv_record(handle).ok_or(
-                crate::native_metal::producer::ProducerError::unsupported(
-                    "ClearDepthStencilView: no recorded view",
-                ),
-            )?;
-            let resource = metal_resource(record.resource).ok_or(
-                crate::native_metal::producer::ProducerError::unsupported(
-                    "ClearDepthStencilView: no guest allocation",
-                ),
-            )?;
-            producer.clear_depth_stencil(resource, flags & 1 != 0, depth, flags & 2 != 0, stencil)
-        });
+    if metal_list(this) {
+        use crate::native_metal::producer::ProducerError;
+        if count > 0 || !rects.is_null() {
+            with_metal(this, |producer| {
+                producer.refuse(
+                    "ClearDepthStencilView: partial rectangles",
+                    Some(victory_metal::wire_v3::OP_BEGIN_RENDER_PASS),
+                )
+            });
+            return;
+        }
+        let resolved: Result<_, ProducerError> = (|| {
+            let record = crate::descriptor::dsv_record(handle)
+                .ok_or(ProducerError::unsupported("ClearDepthStencilView: no recorded view"))?;
+            attachment_resource(
+                record.resource,
+                crate::resource::ATTACHMENT_USAGE_DEPTH,
+                "ClearDepthStencilView: depth target is not registered with the host",
+                crate::native_metal::queue::texture_registered,
+                register_attachment_host,
+            )
+        })();
+        match resolved {
+            Ok(resource) => with_metal(this, |producer| {
+                producer.clear_depth_stencil(
+                    resource,
+                    flags & 1 != 0,
+                    depth,
+                    flags & 2 != 0,
+                    stencil,
+                )
+            }),
+            Err(error) => with_metal(this, |_| Err(error)),
+        }
         return;
     }
     #[cfg(windows)]
@@ -3688,35 +3810,61 @@ mod state {
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        if metal() {
-            with_metal(this, |p| {
-                let mut colors = Vec::with_capacity(handles.len());
-                for &handle in &handles {
-                    let record =
-                        crate::descriptor::rtv_record(handle).ok_or(ProducerError::unsupported(
+        if super::metal_list(this) {
+            // Resolve and register every attachment before the producer is
+            // locked: registration is blocking I/O (a kind 8 frame), and a
+            // target this session has not registered would make the host refuse
+            // the pass with `UnknownHandle` (ADR-054).
+            let mut colors = Vec::with_capacity(handles.len());
+            for &handle in &handles {
+                let resolved: Result<_, ProducerError> = (|| {
+                    let record = crate::descriptor::rtv_record(handle).ok_or(
+                        ProducerError::unsupported(
                             "OMSetRenderTargets: render target with no recorded view",
-                        ))?;
-                    let resource =
-                        metal_resource(record.resource).ok_or(ProducerError::unsupported(
-                            "OMSetRenderTargets: render target without a guest allocation",
-                        ))?;
-                    colors.push(RenderTarget::new(resource));
+                        ),
+                    )?;
+                    super::attachment_resource(
+                        record.resource,
+                        crate::resource::ATTACHMENT_USAGE_COLOR,
+                        "OMSetRenderTargets: render target is not registered with the host",
+                        crate::native_metal::queue::texture_registered,
+                        super::register_attachment_host,
+                    )
+                })();
+                match resolved {
+                    Ok(resource) => colors.push(RenderTarget::new(resource)),
+                    Err(error) => {
+                        with_metal(this, |_| Err(error));
+                        return;
+                    }
                 }
-                let depth = if depth == 0 {
-                    None
-                } else {
-                    let record =
-                        crate::descriptor::dsv_record(depth).ok_or(ProducerError::unsupported(
+            }
+            let depth = if depth == 0 {
+                None
+            } else {
+                let resolved: Result<_, ProducerError> = (|| {
+                    let record = crate::descriptor::dsv_record(depth).ok_or(
+                        ProducerError::unsupported(
                             "OMSetRenderTargets: depth target with no recorded view",
-                        ))?;
-                    let resource =
-                        metal_resource(record.resource).ok_or(ProducerError::unsupported(
-                            "OMSetRenderTargets: depth target without a guest allocation",
-                        ))?;
-                    Some(DepthTarget::new(resource))
-                };
-                p.set_render_targets(&colors, depth)
-            });
+                        ),
+                    )?;
+                    super::attachment_resource(
+                        record.resource,
+                        crate::resource::ATTACHMENT_USAGE_DEPTH,
+                        "OMSetRenderTargets: depth target is not registered with the host",
+                        crate::native_metal::queue::texture_registered,
+                        super::register_attachment_host,
+                    )
+                })();
+                match resolved {
+                    Ok(resource) => Some(DepthTarget::new(resource)),
+                    Err(error) => {
+                        with_metal(this, |_| Err(error));
+                        return;
+                    }
+                }
+            };
+            with_metal(this, |p| p.set_render_targets(&colors, depth));
             return;
         }
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -5228,5 +5376,201 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(after, before + 1, "the refusal is in the named census");
         assert_eq!(placed_census::counts(), [1, 1], "a refusal is not a resolution");
+    }
+
+    /// ADR-054: a texture created with `flags == 0` — here an at-address
+    /// texture, the class Boot #26 refused at `BeginRenderPass` — has no
+    /// creation-time registration. The first `OMSetRenderTargets` bind
+    /// registers it once with usage 1 (colour); a second bind of the same
+    /// handle sends nothing.
+    #[test]
+    fn binding_an_unregistered_colour_target_registers_it_once() {
+        use crate::resource::{
+            ATTACHMENT_USAGE_COLOR, test_texture_at_address, test_texture_desc,
+        };
+        use std::cell::RefCell;
+
+        const OPERATION: &str =
+            "OMSetRenderTargets: render target is not registered with the host";
+        let address = 0x2_E2A6_A000u64;
+        // DXGI 28 = R8G8B8A8_UNORM, flags 0: only an RTV ever names it.
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 28, 0), address);
+        let session: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+        let sent: RefCell<Vec<(u8, u8)>> = RefCell::new(Vec::new());
+
+        let first = attachment_resource(
+            resource,
+            ATTACHMENT_USAGE_COLOR,
+            OPERATION,
+            |handle| session.borrow().contains(&handle),
+            |request| {
+                sent.borrow_mut().push((request.usage, request.format));
+                session.borrow_mut().push(request.handle);
+                Ok((true, None))
+            },
+        )
+        .expect("the first bind registers the colour target");
+        assert_eq!(first.allocation_id, address, "the kind 8 handle is the memory");
+        assert_eq!(first.generation, 1);
+        assert_eq!(
+            sent.borrow().as_slice(),
+            [(ATTACHMENT_USAGE_COLOR, 0)],
+            "one colour registration with the RGBA8 wire code"
+        );
+
+        // The same target again: the session holds it, so no second request.
+        attachment_resource(
+            resource,
+            ATTACHMENT_USAGE_COLOR,
+            OPERATION,
+            |handle| session.borrow().contains(&handle),
+            |_| panic!("a registered attachment must not be sent again"),
+        )
+        .expect("a second bind reuses the registration");
+        assert_eq!(sent.borrow().len(), 1, "a second bind sends nothing");
+    }
+
+    /// A depth bind registers with usage 2, and a typeless-free depth format
+    /// keeps its concrete host code: the depth plane is never sent as colour.
+    #[test]
+    fn binding_an_unregistered_depth_target_registers_usage_2() {
+        use crate::resource::{
+            ATTACHMENT_USAGE_DEPTH, test_texture_at_address, test_texture_desc,
+        };
+        use std::cell::RefCell;
+
+        // DXGI 55 = D16_UNORM -> kind 8 wire code 54.
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 55, 0), 0x2_E2A6_B000);
+        let sent: RefCell<Vec<(u8, u8)>> = RefCell::new(Vec::new());
+        attachment_resource(
+            resource,
+            ATTACHMENT_USAGE_DEPTH,
+            "OMSetRenderTargets: depth target is not registered with the host",
+            |_| false,
+            |request| {
+                sent.borrow_mut().push((request.usage, request.format));
+                Ok((true, None))
+            },
+        )
+        .expect("the depth target registers");
+        assert_eq!(
+            sent.borrow().as_slice(),
+            [(ATTACHMENT_USAGE_DEPTH, 54)],
+            "depth usage 2 with the D16_UNORM host code"
+        );
+    }
+
+    /// A host refusal keeps the pass from being encoded and is a named refusal
+    /// of the operation; the handle is in the log line. Nothing is guessed and
+    /// the pass is not recorded.
+    #[test]
+    fn a_refused_attachment_registration_refuses_the_pass() {
+        use crate::native_metal::producer::ProducerError;
+        use crate::resource::{test_texture_at_address, test_texture_desc};
+
+        const OPERATION: &str =
+            "OMSetRenderTargets: render target is not registered with the host";
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 28, 0), 0x2_E2A6_C000);
+        let mut sent = 0;
+        let result = attachment_resource(
+            resource,
+            crate::resource::ATTACHMENT_USAGE_COLOR,
+            OPERATION,
+            |_| false,
+            |_| {
+                sent += 1;
+                Ok((
+                    false,
+                    Some("texture was not registered with render_target usage".to_string()),
+                ))
+            },
+        );
+        assert_eq!(sent, 1);
+        assert_eq!(
+            result,
+            Err(ProducerError::unregistered(OPERATION)),
+            "the pass is refused by name, not encoded with a guessed format"
+        );
+    }
+
+    /// A texture the kind 8 codes cannot express is a named refusal before any
+    /// request, and a buffer is not treated as an attachment.
+    #[test]
+    fn an_inexpressible_attachment_is_a_named_refusal() {
+        use crate::native_metal::producer::ProducerError;
+        use crate::resource::{test_buffer, test_texture_at_address, test_texture_desc};
+
+        // DXGI 0 has no host code.
+        let resource = test_texture_at_address(test_texture_desc(64, 64, 0, 0), 0x2_E2A6_D000);
+        let mut sent = 0;
+        let result = attachment_resource(
+            resource,
+            crate::resource::ATTACHMENT_USAGE_COLOR,
+            "ClearRenderTargetView: render target is not registered with the host",
+            |_| false,
+            |_| {
+                sent += 1;
+                Ok((true, None))
+            },
+        );
+        assert_eq!(sent, 0, "no request for a shape it cannot express");
+        assert_eq!(
+            result,
+            Err(ProducerError::unregistered(
+                "ClearRenderTargetView: render target is not registered with the host"
+            ))
+        );
+
+        let buffer = test_buffer(64);
+        let result = attachment_resource(
+            buffer,
+            crate::resource::ATTACHMENT_USAGE_COLOR,
+            "ClearDepthStencilView: depth target is not registered with the host",
+            |_| false,
+            |_| unreachable!("a buffer is refused before any request"),
+        );
+        assert!(matches!(result, Err(ProducerError::Unsupported { .. })));
+    }
+
+    /// A clear of a target `OMSetRenderTargets` never bound still registers it:
+    /// both clear paths go through the same decision point with their own
+    /// usage.
+    #[test]
+    fn clearing_an_unbound_target_registers_it() {
+        use crate::resource::{test_texture_at_address, test_texture_desc};
+        use std::cell::RefCell;
+
+        let colour = test_texture_at_address(test_texture_desc(64, 64, 28, 0), 0x2_E2A6_E000);
+        let depth = test_texture_at_address(test_texture_desc(64, 64, 55, 0), 0x2_E2A6_F000);
+        let sent: RefCell<Vec<(u64, u8)>> = RefCell::new(Vec::new());
+
+        attachment_resource(
+            colour,
+            crate::resource::ATTACHMENT_USAGE_COLOR,
+            "ClearRenderTargetView: render target is not registered with the host",
+            |_| false,
+            |request| {
+                sent.borrow_mut().push((request.handle, request.usage));
+                Ok((true, None))
+            },
+        )
+        .expect("the colour clear registers its target");
+        attachment_resource(
+            depth,
+            crate::resource::ATTACHMENT_USAGE_DEPTH,
+            "ClearDepthStencilView: depth target is not registered with the host",
+            |_| false,
+            |request| {
+                sent.borrow_mut().push((request.handle, request.usage));
+                Ok((true, None))
+            },
+        )
+        .expect("the depth clear registers its target");
+
+        assert_eq!(
+            sent.borrow().as_slice(),
+            [(0x2_E2A6_E000, 1), (0x2_E2A6_F000, 2)],
+            "each clear registers with its own attachment usage"
+        );
     }
 }
