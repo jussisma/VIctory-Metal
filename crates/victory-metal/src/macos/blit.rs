@@ -18,10 +18,148 @@
 //! All sizes are texels. Every box is checked against the live texture geometry
 //! (`width`, `height`, `depth`, `mipmapLevelCount`) before a selector is sent.
 
+use std::sync::{Mutex, OnceLock};
+
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
 use crate::macos::render::{PixelFormat, RenderTarget};
 use crate::transport::MetalError;
+
+/// Largest number of distinct destination textures the bounded copy trace
+/// remembers. A title can create thousands of textures; the trace keeps the
+/// first 16 it sees and counts the rest as dropped, so memory is fixed.
+pub(crate) const COPY_TRACE_MAX_KEYS: usize = 16;
+
+/// The copy operation a host blit encoder ran into a texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlitCopyKind {
+    /// `MTLBlitCommandEncoder` texture-to-texture region copy. Guest
+    /// `CopyResource` lowers to this once its subresources are expanded.
+    CopyTextureRegion,
+    /// Multisample resolve through a render pass store action.
+    ResolveSubresource,
+}
+
+impl BlitCopyKind {
+    #[cfg(test)]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CopyTextureRegion => "copy_texture_region",
+            Self::ResolveSubresource => "resolve_subresource",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CopyTraceCount {
+    copy_texture_region: u64,
+    resolve_subresource: u64,
+    last: Option<BlitCopyKind>,
+}
+
+#[derive(Debug, Default)]
+struct CopyTrace {
+    keys: Vec<(usize, CopyTraceCount)>,
+    dropped_keys: u64,
+}
+
+static COPY_TRACE: OnceLock<Mutex<CopyTrace>> = OnceLock::new();
+
+fn copy_trace() -> &'static Mutex<CopyTrace> {
+    COPY_TRACE.get_or_init(|| Mutex::new(CopyTrace::default()))
+}
+
+/// Records one host copy into `texture`.
+///
+/// Counts only: the key is the texture's object address, which is process-local
+/// and names no title asset. The trace is bounded to
+/// [`COPY_TRACE_MAX_KEYS`] distinct destinations.
+pub(crate) fn note_copy_destination(kind: BlitCopyKind, texture: objc::Id) {
+    if texture.is_null() {
+        return;
+    }
+    let key = texture as usize;
+    let Ok(mut trace) = copy_trace().lock() else {
+        return;
+    };
+    let entry = match trace.keys.iter_mut().find(|(seen, _)| *seen == key) {
+        Some((_, counts)) => counts,
+        None => {
+            if trace.keys.len() >= COPY_TRACE_MAX_KEYS {
+                trace.dropped_keys = trace.dropped_keys.saturating_add(1);
+                return;
+            }
+            trace.keys.push((key, CopyTraceCount::default()));
+            &mut trace.keys.last_mut().expect("just pushed").1
+        }
+    };
+    match kind {
+        BlitCopyKind::CopyTextureRegion => {
+            entry.copy_texture_region = entry.copy_texture_region.saturating_add(1);
+        }
+        BlitCopyKind::ResolveSubresource => {
+            entry.resolve_subresource = entry.resolve_subresource.saturating_add(1);
+        }
+    }
+    entry.last = Some(kind);
+}
+
+/// The most recent host copy kind into `texture`, if any.
+pub(crate) fn copy_kind_for(texture: objc::Id) -> Option<BlitCopyKind> {
+    if texture.is_null() {
+        return None;
+    }
+    let key = texture as usize;
+    let trace = copy_trace().lock().ok()?;
+    trace
+        .keys
+        .iter()
+        .find(|(seen, _)| *seen == key)
+        .and_then(|(_, counts)| counts.last)
+}
+
+/// Total host copies (region and resolve) into `texture`.
+pub(crate) fn copy_count_for(texture: objc::Id) -> u64 {
+    if texture.is_null() {
+        return 0;
+    }
+    let key = texture as usize;
+    let Ok(trace) = copy_trace().lock() else {
+        return 0;
+    };
+    trace
+        .keys
+        .iter()
+        .find(|(seen, _)| *seen == key)
+        .map_or(0, |(_, counts)| {
+            counts
+                .copy_texture_region
+                .saturating_add(counts.resolve_subresource)
+        })
+}
+
+/// `(copy_texture_region, resolve_subresource, dropped_keys)` totals.
+#[cfg(test)]
+pub(crate) fn copy_trace_totals() -> (u64, u64, u64) {
+    let Ok(trace) = copy_trace().lock() else {
+        return (0, 0, 0);
+    };
+    let mut region = 0u64;
+    let mut resolve = 0u64;
+    for (_, counts) in &trace.keys {
+        region = region.saturating_add(counts.copy_texture_region);
+        resolve = resolve.saturating_add(counts.resolve_subresource);
+    }
+    (region, resolve, trace.dropped_keys)
+}
+
+/// Clears the bounded copy trace (tests and a fresh session).
+#[cfg(test)]
+pub(crate) fn reset_copy_trace() {
+    if let Ok(mut trace) = copy_trace().lock() {
+        *trace = CopyTrace::default();
+    }
+}
 
 /// `MTLLoadActionLoad`.
 const MTL_LOAD_ACTION_LOAD: usize = 1;
@@ -218,6 +356,7 @@ pub(crate) fn copy_texture_region(
         ));
     }
     region.validate()?;
+    note_copy_destination(BlitCopyKind::CopyTextureRegion, region.destination.texture);
     let origin = |values: [usize; 3]| MTLOrigin {
         x: values[0],
         y: values[1],
@@ -431,6 +570,7 @@ pub(crate) fn encode_resolve(
         return Err(MetalError::InvalidArg("command buffer is nil"));
     }
     validate_resolve(source, destination)?;
+    note_copy_destination(BlitCopyKind::ResolveSubresource, destination.texture);
 
     let _pool = AutoreleasePool::new();
     let cls = objc::class(c"MTLRenderPassDescriptor");
@@ -665,5 +805,31 @@ mod tests {
             validate_resolve(subresource, subresource),
             Err(MetalError::InvalidArg("texture is nil"))
         ));
+    }
+
+    #[test]
+    fn the_copy_trace_counts_by_kind_and_is_bounded() {
+        reset_copy_trace();
+        let first = 0x1000 as objc::Id;
+        let second = 0x2000 as objc::Id;
+        note_copy_destination(BlitCopyKind::CopyTextureRegion, first);
+        note_copy_destination(BlitCopyKind::CopyTextureRegion, first);
+        note_copy_destination(BlitCopyKind::ResolveSubresource, second);
+        assert_eq!(copy_kind_for(first), Some(BlitCopyKind::CopyTextureRegion));
+        assert_eq!(copy_kind_for(second), Some(BlitCopyKind::ResolveSubresource));
+        assert_eq!(
+            BlitCopyKind::CopyTextureRegion.as_str(),
+            "copy_texture_region"
+        );
+        assert_eq!(copy_trace_totals(), (2, 1, 0));
+
+        reset_copy_trace();
+        for index in 0..(COPY_TRACE_MAX_KEYS + 3) {
+            note_copy_destination(BlitCopyKind::CopyTextureRegion, (0x3000 + index) as objc::Id);
+        }
+        let (region, resolve, dropped) = copy_trace_totals();
+        assert_eq!(region, COPY_TRACE_MAX_KEYS as u64);
+        assert_eq!(resolve, 0);
+        assert_eq!(dropped, 3);
     }
 }

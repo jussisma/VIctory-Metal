@@ -1847,6 +1847,49 @@ pub(crate) fn texture_extent(this: This) -> Option<(u32, u32)> {
     ))
 }
 
+/// The resource-shape fields a whole-resource `CopyResource` must compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextureCopyLayout {
+    /// `D3D12_RESOURCE_DIMENSION`.
+    pub dimension: u32,
+    /// `DXGI_FORMAT`.
+    pub format: u32,
+    /// Top-level width in texels.
+    pub width: u64,
+    /// Top-level height in texels.
+    pub height: u32,
+    /// Array layers, or depth for a 3D texture.
+    pub depth_or_array_size: u16,
+    /// Mip levels.
+    pub mip_levels: u16,
+    /// Sample count.
+    pub sample_count: u32,
+    /// Mips times array slices (mips only for a 3D texture): the number of
+    /// subresources a whole-resource copy must move.
+    pub subresources: u32,
+}
+
+/// Reads [`TextureCopyLayout`] for a texture, or `None` for a buffer.
+pub(crate) fn texture_copy_layout(this: This) -> Option<TextureCopyLayout> {
+    let (_, desc) = texture_memory(this)?;
+    let mips = u32::from(desc.mip_levels.max(1));
+    let subresources = if desc.dimension == TEXTURE_3D {
+        mips
+    } else {
+        mips.saturating_mul(u32::from(desc.depth_or_array_size.max(1)))
+    };
+    Some(TextureCopyLayout {
+        dimension: desc.dimension,
+        format: desc.format,
+        width: desc.width,
+        height: desc.height,
+        depth_or_array_size: desc.depth_or_array_size,
+        mip_levels: desc.mip_levels,
+        sample_count: desc.sample_count.max(1),
+        subresources,
+    })
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
