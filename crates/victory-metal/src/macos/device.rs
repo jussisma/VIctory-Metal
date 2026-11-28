@@ -1205,6 +1205,14 @@ pub struct DirectMetalTransport {
     /// this counter (and the mix census) keeps the class visible instead of
     /// aborting the batch.
     descriptor_table_mixed_unrepresentables: std::sync::atomic::AtomicU64,
+    /// Mixed resource tables that bound the partition(s) their declared slots
+    /// could address and dropped the rest. Counted once per table, with
+    /// [`Self::descriptor_table_partition_residue_entry_count`] for the exact
+    /// number of entries the residue contained. This is the named class the
+    /// composition table used to disappear into.
+    descriptor_table_partial_bindings: std::sync::atomic::AtomicU64,
+    /// Entries dropped as the residue of a partially bound mixed table.
+    descriptor_table_partition_residue_entries: std::sync::atomic::AtomicU64,
     /// Persisted root arguments dropped when a pipeline change produced a
     /// layout that does not declare their `(space, register, kind)`.
     abi_stale_parameters_dropped: std::sync::atomic::AtomicU64,
@@ -1279,6 +1287,8 @@ impl DirectMetalTransport {
             descriptor_table_inert_acceptances: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_stale_refusals: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_mixed_unrepresentables: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_partial_bindings: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_partition_residue_entries: std::sync::atomic::AtomicU64::new(0),
             abi_stale_parameters_dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1350,6 +1360,32 @@ impl DirectMetalTransport {
     fn count_descriptor_table_mixed_unrepresentable(&self) {
         self.descriptor_table_mixed_unrepresentables
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mixed resource tables the host bound partially: the declared slots
+    /// carried the entries their ranges could address, and the rest were
+    /// counted as residue instead of accepting the whole table inertly.
+    pub fn descriptor_table_partial_binding_count(&self) -> u64 {
+        self.descriptor_table_partial_bindings
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries dropped as the residue of a partially bound mixed table.
+    ///
+    /// Read together with the per-partition census
+    /// (`DescriptorTableRefusalCensus::partition_residues`), which names the
+    /// slot index, declared kind, entry shape and count of every dropped
+    /// partition.
+    pub fn descriptor_table_partition_residue_entry_count(&self) -> u64 {
+        self.descriptor_table_partition_residue_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_descriptor_table_partial_binding(&self, dropped_entries: usize) {
+        self.descriptor_table_partial_bindings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.descriptor_table_partition_residue_entries
+            .fetch_add(dropped_entries as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Persisted root arguments dropped on a pipeline change.
@@ -4977,6 +5013,17 @@ fn wire_entry_shape(entry: &crate::wire_v3::DescriptorTableEntryV3) -> WireEntry
     }
 }
 
+impl WireEntryShape {
+    /// Bounded census name of the entry shape.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::Texture => "texture",
+            Self::Sampler => "sampler",
+        }
+    }
+}
+
 /// Splits a wire table into per-shape entry partitions, in first-entry order.
 ///
 /// D3D12 range descriptors are contiguous and each range is one descriptor
@@ -5053,22 +5100,57 @@ fn parameter_slot(parameter: &RootParameter) -> RootParameterSlot {
     )
 }
 
+/// One partition bound at a declared table slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixedTableBoundPartition {
+    /// Index into the wire table's shape partitions.
+    partition: usize,
+    /// The declared slot the partition binds.
+    slot: RootParameterSlot,
+    /// Flattened parameter index of that slot.
+    parameter_index: usize,
+}
+
+/// The partition of a mixed table no declared slot could address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixedTableResidue {
+    /// Index into the wire table's shape partitions.
+    partition: usize,
+    /// Flattened parameter index of the declared slot that could not carry it.
+    slot_index: usize,
+    /// Declared range kind of that slot.
+    declared_kind: DescriptorTableKind,
+}
+
+/// How a mixed resource table maps onto the declared table slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MixedTableSlotPlan {
+    /// Partitions bound to a declared slot, in slot order.
+    bound: Vec<MixedTableBoundPartition>,
+    /// Partitions the declared slots cannot address.
+    residue: Vec<MixedTableResidue>,
+}
+
 /// Maps the shape partitions of a mixed resource table onto the declared table
 /// parameters at the resolved ordinal and its consecutive successors.
 ///
-/// The converter flattens each D3D12 range as one table parameter in range
-/// order, so partition `i` must land on the `i`-th parameter after the resolved
-/// slot: a missing parameter, a non-table parameter, or a declared kind that
-/// cannot carry the partition's shape means the layout cannot represent the
-/// wire table. That returns `None` so the caller accepts the table inertly —
-/// never binds a partition to a slot of another kind.
+/// The preferred mapping is positional: the converter flattens a D3D12 table's
+/// ranges as consecutive table parameters in range order, so partition `i`
+/// lands on the `i`-th parameter after the resolved slot. When that is not
+/// possible (fewer slots than ranges, or a declared kind that cannot carry the
+/// partition at that position) the planner still binds what the layout can
+/// address: for each declared slot in register order it takes the longest
+/// remaining partition whose shape fits, then continues with the next slot.
+/// Partitions left over are returned as residue so the caller counts them by
+/// name instead of accepting the whole table inertly. `None` means no
+/// partition fits any declared slot, so the table really is unaddressable.
 fn plan_mixed_table_partition_slots(
     abi: &PipelineAbi,
     wire_set: usize,
     resolved: RootParameterSlot,
-    shapes: &[WireEntryShape],
+    partitions: &[(WireEntryShape, usize)],
     wire_kind: DescriptorKind,
-) -> Option<Vec<(RootParameterSlot, usize)>> {
+) -> Option<MixedTableSlotPlan> {
     for layout in abi.layouts() {
         let parameters = layout.parameters();
         // Prefer the parameter whose table ordinal is the wire set; a reflected
@@ -5094,18 +5176,88 @@ fn plan_mixed_table_partition_slots(
         let Some(start) = start else {
             continue;
         };
-        let mut plan = Vec::with_capacity(shapes.len());
-        for (offset, shape) in shapes.iter().enumerate() {
-            let parameter = parameters.get(start + offset)?;
+
+        // Positional mapping first: it is the exact converter flattening order.
+        let mut positional = Vec::with_capacity(partitions.len());
+        'positional: for (offset, (shape, _entries)) in partitions.iter().enumerate() {
+            let Some(parameter) = parameters.get(start + offset) else {
+                positional.clear();
+                break 'positional;
+            };
             let RootParameterKind::DescriptorTable(kind) = parameter.kind() else {
-                return None;
+                positional.clear();
+                break 'positional;
             };
             if !mixed_partition_fits(*shape, kind, wire_kind) {
-                return None;
+                positional.clear();
+                break 'positional;
             }
-            plan.push((parameter_slot(parameter), start + offset));
+            positional.push(MixedTableBoundPartition {
+                partition: offset,
+                slot: parameter_slot(parameter),
+                parameter_index: start + offset,
+            });
         }
-        return Some(plan);
+        if !positional.is_empty() && positional.len() == partitions.len() {
+            return Some(MixedTableSlotPlan {
+                bound: positional,
+                residue: Vec::new(),
+            });
+        }
+
+        // Fallback: bind the longest remaining partition each declared slot can
+        // carry, in register order, and name the residue. "Longest" is the
+        // partition with the most entries; ties keep the earlier partition.
+        let mut remaining: Vec<usize> = (0..partitions.len()).collect();
+        let mut bound = Vec::with_capacity(partitions.len());
+        let mut last_slot: Option<(usize, DescriptorTableKind)> = None;
+        let mut slot_index = start;
+        while !remaining.is_empty() {
+            let Some(parameter) = parameters.get(slot_index) else {
+                break;
+            };
+            let RootParameterKind::DescriptorTable(kind) = parameter.kind() else {
+                break;
+            };
+            last_slot = Some((slot_index, kind));
+            let mut best: Option<usize> = None;
+            for &partition in &remaining {
+                if !mixed_partition_fits(partitions[partition].0, kind, wire_kind) {
+                    continue;
+                }
+                if best.is_none_or(|known| partitions[partition].1 > partitions[known].1) {
+                    best = Some(partition);
+                }
+            }
+            if let Some(partition) = best {
+                remaining.retain(|&known| known != partition);
+                bound.push(MixedTableBoundPartition {
+                    partition,
+                    slot: parameter_slot(parameter),
+                    parameter_index: slot_index,
+                });
+            }
+            slot_index += 1;
+        }
+        if bound.is_empty() {
+            continue;
+        }
+        let (residue_slot_index, residue_kind) = last_slot.unwrap_or((
+            start,
+            match resolved.kind() {
+                RootParameterKind::DescriptorTable(kind) => kind,
+                _ => DescriptorTableKind::Unspecified,
+            },
+        ));
+        let residue = remaining
+            .into_iter()
+            .map(|partition| MixedTableResidue {
+                partition,
+                slot_index: residue_slot_index,
+                declared_kind: residue_kind,
+            })
+            .collect();
+        return Some(MixedTableSlotPlan { bound, residue });
     }
     None
 }
@@ -5116,10 +5268,18 @@ fn plan_mixed_table_partition_slots(
 /// table (buffer and texture entries, no sampler) is split by entry shape and
 /// bound to the resolved declared table parameter and its consecutive
 /// successors in converter flattening order, each partition with its own
-/// argument buffer and slot. A layout that has no matching consecutive slots is
-/// accepted inertly: the submission still encodes, the
-/// `mixed_table_unrepresentable` counter and the mix census (`outcome:
-/// "inert"`) keep the class visible, and `abi_refusals` does not move.
+/// argument buffer and slot. When the layout has fewer matching slots than
+/// entry shapes, the partitions the declared slots *can* address are still
+/// bound (longest fitting partition per slot, in register order) and the rest
+/// are counted as named residue
+/// ([`DirectMetalTransport::descriptor_table_partition_residue_entry_count`]
+/// and the census `partition_residues`), so the composition table's texture
+/// source becomes reachable instead of the whole table going inert.
+///
+/// A layout where no partition fits any declared slot is accepted inertly: the
+/// submission still encodes, the `mixed_table_unrepresentable` counter and the
+/// mix census (`outcome: "inert"`) keep the class visible, and `abi_refusals`
+/// does not move.
 ///
 /// A sampler entry inside a resource table (or a buffer/texture entry inside a
 /// sampler table) is illegal in D3D12: that case alone keeps the named,
@@ -5167,17 +5327,20 @@ fn prepare_descriptor_table_bindings(
         };
     };
 
-    let shapes: Vec<WireEntryShape> = partitions.iter().map(|(shape, _)| *shape).collect();
+    let partition_sizes: Vec<(WireEntryShape, usize)> = partitions
+        .iter()
+        .map(|(shape, entries)| (*shape, entries.len()))
+        .collect();
     let Some(plan) = plan_mixed_table_partition_slots(
         abi,
         usize::from(table.set),
         slot,
-        &shapes,
+        &partition_sizes,
         table.kind,
     ) else {
-        // The declared layout cannot represent this mix at consecutive slots.
-        // Accept inertly so the submission encodes; count both the class and
-        // the inert acceptance (the mix key says which).
+        // No declared slot can carry any partition. Accept inertly so the
+        // submission encodes; count both the class and the inert acceptance
+        // (the mix key says which).
         note_descriptor_table_mix(
             pipeline_id,
             table.set,
@@ -5189,36 +5352,65 @@ fn prepare_descriptor_table_bindings(
         return Ok(Vec::new());
     };
 
-    note_descriptor_table_mix(
-        pipeline_id,
-        table.set,
-        mix_class,
-        crate::macos::trace::OUTCOME_SPLIT,
-    );
-    let mut bindings = Vec::with_capacity(partitions.len());
-    for (partition, ((shape, entries), (partition_slot, parameter_index))) in partitions
-        .into_iter()
-        .zip(plan)
-        .enumerate()
-    {
-        let RootParameterKind::DescriptorTable(declared_kind) = partition_slot.kind() else {
+    if plan.residue.is_empty() {
+        note_descriptor_table_mix(
+            pipeline_id,
+            table.set,
+            mix_class,
+            crate::macos::trace::OUTCOME_SPLIT,
+        );
+    } else {
+        // The table is bound, but not whole. Name every dropped partition with
+        // the slot index it could not fill and its entry count so the drop is
+        // visible in telemetry instead of disappearing behind the resolution.
+        note_descriptor_table_mix(
+            pipeline_id,
+            table.set,
+            mix_class,
+            crate::macos::trace::OUTCOME_PARTIAL,
+        );
+        let dropped = plan
+            .residue
+            .iter()
+            .map(|residue| partition_sizes[residue.partition].1)
+            .sum::<usize>();
+        transport.count_descriptor_table_partial_binding(dropped);
+        for residue in &plan.residue {
+            let (shape, entries) = &partitions[residue.partition];
+            crate::macos::trace::note_descriptor_table_partition_residue(
+                crate::macos::trace::DescriptorTablePartitionResidueKey {
+                    pipeline_id,
+                    wire_set: table.set,
+                    slot_index: u16::try_from(residue.slot_index).unwrap_or(u16::MAX),
+                    declared_kind: residue.declared_kind.name(),
+                    entry_shape: shape.name(),
+                    dropped_entries: u16::try_from(entries.len()).unwrap_or(u16::MAX),
+                },
+            );
+        }
+    }
+
+    let mut bindings = Vec::with_capacity(plan.bound.len());
+    for bound in &plan.bound {
+        let (shape, entries) = &partitions[bound.partition];
+        let RootParameterKind::DescriptorTable(declared_kind) = bound.slot.kind() else {
             return Err(MetalError::InvalidArg(
                 "descriptor table names a non-table root parameter",
             )
             .into());
         };
-        debug_assert!(mixed_partition_fits(shape, declared_kind, table.kind));
+        debug_assert!(mixed_partition_fits(*shape, declared_kind, table.kind));
         bindings.push(build_descriptor_table_entries(
             device,
             state,
             allocations,
             table,
-            &entries,
+            entries,
             declared_kind,
-            partition_slot,
+            bound.slot,
             table.set,
-            u8::try_from(partition).unwrap_or(u8::MAX),
-            Some(parameter_index),
+            u8::try_from(bound.partition).unwrap_or(u8::MAX),
+            Some(bound.parameter_index),
         )?);
     }
     Ok(bindings)
@@ -13658,6 +13850,14 @@ mod descriptor_table_kind_tests {
             .collect()
     }
 
+    fn partition_sizes(table: &DescriptorTableV3) -> Vec<(WireEntryShape, usize)> {
+        descriptor_table_partitions(table)
+            .expect("a resource mix partitions")
+            .iter()
+            .map(|(shape, entries)| (*shape, entries.len()))
+            .collect()
+    }
+
     /// The census class names every entry combination exactly, without
     /// handles or payloads.
     #[test]
@@ -13709,61 +13909,133 @@ mod descriptor_table_kind_tests {
             WireEntryShape::Texture,
             WireEntryShape::Buffer,
         ]);
-        let plan =
-            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
-                .expect("two consecutive declared slots represent the mix");
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].1, 0);
-        assert_eq!(plan[1].1, 1);
+        let plan = plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        )
+        .expect("two consecutive declared slots represent the mix");
+        assert_eq!(plan.bound.len(), 2);
+        assert!(plan.residue.is_empty(), "both partitions have a slot");
+        assert_eq!(plan.bound[0].parameter_index, 0);
+        assert_eq!(plan.bound[1].parameter_index, 1);
         assert_eq!(
-            plan[0].0.kind(),
+            plan.bound[0].slot.kind(),
             RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
         );
         assert_eq!(
-            plan[1].0.kind(),
+            plan.bound[1].slot.kind(),
             RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView)
         );
-        // The reverse mix (buffer entries first) maps to the reverse plan.
+        // The reverse mix (buffer entries first) still binds by kind: the
+        // fallback binds the longest partition each declared slot can carry.
         let reversed = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
-        assert!(
-            plan_mixed_table_partition_slots(
-                &abi,
-                0,
-                resolved,
-                &partition_shapes(&reversed),
-                reversed.kind,
-            )
-            .is_none(),
-            "declared range order is authoritative; buffer-first does not fit [Texture, SRV]"
+        let plan = plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&reversed),
+            reversed.kind,
+        )
+        .expect("the by-kind fallback binds both partitions");
+        assert_eq!(plan.bound.len(), 2);
+        assert!(plan.residue.is_empty());
+        let mut by_slot = plan
+            .bound
+            .iter()
+            .map(|bound| (bound.parameter_index, bound.slot.kind()))
+            .collect::<Vec<_>>();
+        by_slot.sort_by_key(|(index, _)| *index);
+        assert_eq!(
+            by_slot,
+            vec![
+                (
+                    0,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+                ),
+                (
+                    1,
+                    RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::ShaderResourceView
+                    )
+                ),
+            ],
+            "the texture partition never fills the SRV slot"
         );
     }
 
-    /// One declared table slot cannot represent two partitions; the table is
-    /// inert, never bound to the wrong kind.
+    /// One declared table slot cannot carry both partitions. The texture
+    /// partition (the fragment's declared range) binds; the buffer entries are
+    /// the named residue, never an inert acceptance of the whole table.
     #[test]
-    fn a_mixed_resource_table_with_one_declared_slot_is_unrepresentable() {
+    fn a_mixed_resource_table_with_one_declared_slot_binds_its_texture_and_names_residue() {
         let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Texture]);
-        let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
-        assert!(
-            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
-                .is_none(),
-            "a second partition has no declared consecutive slot"
+        // The composition shape: buffer entries first, then the texture the
+        // fragment actually samples.
+        let wire = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
+        let plan = plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        )
+        .expect("the texture partition fits the one declared slot");
+        assert_eq!(plan.bound.len(), 1);
+        assert_eq!(plan.bound[0].partition, 1, "the texture partition binds");
+        assert_eq!(
+            plan.bound[0].slot.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+        );
+        assert_eq!(plan.residue.len(), 1);
+        assert_eq!(plan.residue[0].partition, 0, "the buffer partition is residue");
+        assert_eq!(plan.residue[0].slot_index, 0);
+        assert_eq!(
+            plan.residue[0].declared_kind,
+            DescriptorTableKind::Texture
         );
     }
 
-    /// A declared order that disagrees with the wire entry order is
-    /// unrepresentable rather than cross-bound.
+    /// A declared order that disagrees with the wire entry order binds by
+    /// kind; every entry still lands on a slot whose range can carry it.
     #[test]
-    fn a_mixed_resource_table_whose_declared_order_disagrees_is_unrepresentable() {
+    fn a_mixed_resource_table_whose_declared_order_disagrees_binds_by_kind() {
         let (abi, resolved) = table_layout_abi(&[
             DescriptorTableKind::ShaderResourceView,
             DescriptorTableKind::Texture,
         ]);
         let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
-        assert!(
-            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
-                .is_none(),
-            "a buffer partition must never fill a Texture slot"
+        let plan = plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        )
+        .expect("each partition fits one declared kind");
+        assert_eq!(plan.bound.len(), 2);
+        assert!(plan.residue.is_empty());
+        let texture = plan
+            .bound
+            .iter()
+            .find(|bound| bound.partition == 0)
+            .expect("the texture partition binds");
+        assert_eq!(texture.parameter_index, 1);
+        assert_eq!(
+            texture.slot.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+        );
+        let buffer = plan
+            .bound
+            .iter()
+            .find(|bound| bound.partition == 1)
+            .expect("the buffer partition binds");
+        assert_eq!(buffer.parameter_index, 0);
+        assert_eq!(
+            buffer.slot.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView)
         );
     }
 
