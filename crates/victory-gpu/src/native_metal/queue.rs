@@ -1250,6 +1250,9 @@ pub fn register_allocation_entry(allocation_id: u64) -> Result<(), BufferRegistr
         }
         register_buffer(id, byte_len).map_err(BufferRegistrationError::Queue)?;
     }
+    // A new allocation may complete a title-memory map whose chunks arrived
+    // before its kind 2 frame; send it now that every id exists.
+    let _ = sync_title_memory_map();
     Ok(())
 }
 
@@ -1386,6 +1389,52 @@ pub fn register_guest_buffers(
 pub fn register_resolved_range(range: &GuestRange) -> Result<(), BufferRegistrationError> {
     checked_guest_range(range)?;
     register_allocation_entry(range.allocation_id)
+}
+
+/// Generation of the last title-memory map the guest sent (ADR-055).
+static TITLE_MAP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Sends the guest's VA → share-allocation map when it changed (ADR-055).
+///
+/// The ranges come from the installed [`GuestRangeResolver::mappings`]: the
+/// views the guest actually mapped, never a guess. A process without a
+/// resolver, or with no host-visible mapping, sends nothing. The send is
+/// opt-out with `VICTORY_METAL_TITLE_MEMORY_MAP=0`, which keeps a new guest
+/// on an older host (that host refuses the kind explicitly, it does not
+/// misread it).
+///
+/// Returns whether a frame was sent. A transport problem is returned, but
+/// callers on the submission path may treat it as non-fatal: the page table is
+/// an optimization for shaders that use title memory, and dropping the frame
+/// never changes an existing submission's bytes.
+#[cfg(any(windows, test, target_os = "macos"))]
+pub fn sync_title_memory_map() -> Result<bool, NativeQueueError> {
+    if std::env::var_os("VICTORY_METAL_TITLE_MEMORY_MAP").is_some_and(|value| value == "0") {
+        return Ok(false);
+    }
+    let Some(resolver) = bindings::resolver() else {
+        return Ok(false);
+    };
+    let mappings = resolver.mappings();
+    if mappings.is_empty() {
+        return Ok(false);
+    }
+    let ranges: Vec<victory_metal::title_map::Range> = mappings
+        .into_iter()
+        .map(|mapping| victory_metal::title_map::Range {
+            guest_address: mapping.guest_address,
+            allocation_id: mapping.allocation_id,
+            byte_offset: mapping.byte_offset,
+            length: mapping.length,
+        })
+        .collect();
+    let mut queue = native_queue();
+    let Some(client) = queue.sink_mut().client_mut() else {
+        return Ok(false);
+    };
+    let generation = u32::try_from(TITLE_MAP_GENERATION.fetch_add(1, Ordering::Relaxed) % u64::from(u32::MAX - 1) + 1)
+        .unwrap_or(1);
+    client.send_title_memory_map(generation, &ranges)
 }
 
 /// Resolves one guest buffer range through `resolver` without pinning it.
@@ -1853,6 +1902,11 @@ pub fn submit_recorded_batch(
             false
         }
     };
+
+    // ADR-055: keep the host's title-memory page table current before the
+    // batch names it. The map is metadata; a failure here never changes the
+    // submission's bytes and is reported only in the host's own counters.
+    let _ = sync_title_memory_map();
 
     let mut queue = native_queue();
     let outcome = dispatch_measured(GpuBackend::Metal, &mut queue, submissions);

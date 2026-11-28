@@ -282,6 +282,8 @@ pub const KIND_TEXTURE_REG: u8 = 8;
 pub const KIND_SURFACE_REG: u8 = 9;
 /// Frame kind for reduced `MTLSamplerState` registration.
 pub const KIND_SAMPLER_REG: u8 = 10;
+/// Frame kind carrying one chunk of the guest's title-memory VA map (ADR-055).
+pub const KIND_TITLE_MAP: u8 = crate::title_map::KIND_TITLE_MAP;
 /// Exact length of a texture registration payload.
 pub const TEXTURE_REG_PAYLOAD_LEN: usize = 32;
 /// Length of the extended texture registration payload: the classic 32 bytes
@@ -526,6 +528,20 @@ pub trait BatchExecutor {
             "version 3 submission is not enabled by this executor",
         ))
     }
+    /// Installs the guest's VA → share-allocation map (ADR-055).
+    ///
+    /// `ranges` name live [`VmBufferId`]s the host already registered; the
+    /// executor builds or invalidates its title-memory page table from them.
+    /// The default keeps no map, so an executor without native title memory
+    /// still serves every submission (translated shaders then read the
+    /// zero-filled fallback, exactly as before this frame existed).
+    fn set_title_memory_map(
+        &self,
+        _generation: u32,
+        _ranges: &[crate::macos::title_memory::TitleRange],
+    ) -> Result<(), MetalError> {
+        Ok(())
+    }
     /// Loads a precompiled `.metallib` and registers `entry` as a compute
     /// pipeline, returning the native id used by later submissions.
     ///
@@ -721,6 +737,16 @@ impl BatchExecutor for DirectMetalTransport {
 
     fn load_pipeline(&self, metallib: &[u8], entry: &str) -> Result<VmPipelineId, MetalError> {
         DirectMetalTransport::load_metallib(self, metallib, entry)
+    }
+
+    fn set_title_memory_map(
+        &self,
+        generation: u32,
+        ranges: &[crate::macos::title_memory::TitleRange],
+    ) -> Result<(), MetalError> {
+        let mut state = self.lock_state()?;
+        state.title.set_map(generation, ranges.to_vec());
+        Ok(())
     }
 
     fn register_graphics_pipeline(
@@ -1216,6 +1242,14 @@ pub struct IpcHost<E: BatchExecutor> {
     texture_registration_refusals: u64,
     /// Last bounded texture-registration refusal reason, or `None`.
     last_texture_refusal_reason: Option<String>,
+    /// ADR-055: the guest's title-memory map, one row per guest address.
+    title_map: BTreeMap<u64, crate::title_map::Range>,
+    /// Newest mapping generation applied.
+    title_generation: u32,
+    /// Map chunks refused (malformed, overlapping or over a cap).
+    title_map_refusals: u64,
+    /// Last bounded title-map refusal reason.
+    last_title_refusal: Option<String>,
     ledger: ListLedger,
 }
 
@@ -1267,6 +1301,10 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_translation_reason: None,
             texture_registration_refusals: 0,
             last_texture_refusal_reason: None,
+            title_map: BTreeMap::new(),
+            title_generation: 0,
+            title_map_refusals: 0,
+            last_title_refusal: None,
             ledger: ListLedger::new(),
         })
     }
@@ -1481,6 +1519,20 @@ impl<E: BatchExecutor> IpcHost<E> {
                     let status = self.register_sampler(&payload);
                     write_frame(&mut stream, KIND_ACK, &[status])?;
                 }
+                KIND_TITLE_MAP => {
+                    // A malformed chunk is refused by name and leaves the
+                    // session open: the map is optional metadata, never a
+                    // reason to execute a guessed page.
+                    match self.apply_title_map(&payload) {
+                        Ok(()) => write_frame(&mut stream, KIND_ACK, &[0])?,
+                        Err(reason) => {
+                            self.title_map_refusals =
+                                self.title_map_refusals.saturating_add(1);
+                            self.last_title_refusal = Some(reason.to_string());
+                            write_frame(&mut stream, KIND_ACK, &[1])?;
+                        }
+                    }
+                }
                 KIND_SURFACE_REG => {
                     let status = self.register_surface(&payload);
                     write_frame(&mut stream, KIND_ACK, &[status])?;
@@ -1524,6 +1576,93 @@ impl<E: BatchExecutor> IpcHost<E> {
         }
     }
 
+    /// Applies one title-memory chunk (ADR-055).
+    ///
+    /// A newer generation replaces the map before the chunk is applied; an
+    /// older generation is stale and ignored. Every entry is validated by the
+    /// codec (alignment, 2^40, length), then merged idempotently. Overlapping
+    /// or over-cap maps are refused whole: a VA either keeps the mapping it had
+    /// or stays null, never a guessed page.
+    fn apply_title_map(&mut self, payload: &[u8]) -> Result<(), String> {
+        let chunk = crate::title_map::decode(payload).map_err(|error| error.to_string())?;
+        if chunk.generation < self.title_generation {
+            return Ok(());
+        }
+        if chunk.generation > self.title_generation {
+            self.title_map.clear();
+            self.title_generation = chunk.generation;
+        }
+        // Reject the whole chunk before changing anything.
+        let mut next = self.title_map.clone();
+        let mut pages = 0u64;
+        for range in &chunk.ranges {
+            if let Some(existing) = next.get(&range.guest_address) {
+                if existing != range {
+                    return Err(format!(
+                        "guest range 0x{:x} names two different mappings",
+                        range.guest_address
+                    ));
+                }
+                continue;
+            }
+            if let Some((_, before)) = next.range(..range.guest_address).next_back()
+                && before.guest_address + before.length > range.guest_address
+            {
+                return Err(format!(
+                    "guest range 0x{:x} overlaps 0x{:x}",
+                    range.guest_address, before.guest_address
+                ));
+            }
+            if let Some((_, after)) = next.range(range.guest_address..).next()
+                && range.guest_address + range.length > after.guest_address
+            {
+                return Err(format!(
+                    "guest range 0x{:x} overlaps 0x{:x}",
+                    range.guest_address, after.guest_address
+                ));
+            }
+            if next.len() >= crate::title_map::MAX_RANGES {
+                return Err("title-memory map names too many ranges".to_string());
+            }
+            next.insert(range.guest_address, *range);
+        }
+        for range in next.values() {
+            pages = pages
+                .checked_add(range.pages())
+                .filter(|pages| *pages <= crate::title_map::MAX_MAPPED_PAGES)
+                .ok_or_else(|| "title-memory map names too many pages".to_string())?;
+        }
+        self.title_map = next;
+        self.publish_title_map();
+        Ok(())
+    }
+
+    /// Hands the current map to the executor, once every named allocation is
+    /// registered. A range whose allocation is missing stays out entirely, so
+    /// the page table is never built from a partial address relation.
+    fn publish_title_map(&mut self) {
+        let mut ranges = Vec::with_capacity(self.title_map.len());
+        for range in self.title_map.values() {
+            let Some(allocation) = self.allocations.get(&range.allocation_id) else {
+                return;
+            };
+            ranges.push(crate::macos::title_memory::TitleRange {
+                guest_address: range.guest_address,
+                buffer: allocation.buffer_id,
+                byte_offset: range.byte_offset,
+                length: range.length,
+            });
+        }
+        if let Err(error) = self
+            .executor
+            .set_title_memory_map(self.title_generation, &ranges)
+        {
+            self.last_title_refusal = Some(error.to_string());
+        }
+    }
+
+    /// Applies one title-memory chunk and acknowledges it.
+    /// Applies one title-memory chunk and acknowledges it.
     fn register(&mut self, payload: &[u8]) -> Result<(), HostError> {
         if payload.len() != REGISTER_PAYLOAD_LEN {
             return Err(HostError::Protocol(
@@ -1555,6 +1694,8 @@ impl<E: BatchExecutor> IpcHost<E> {
             },
         );
         self.last_allocation_id = id;
+        // A map that arrived before this allocation can now be published.
+        self.publish_title_map();
         Ok(())
     }
 

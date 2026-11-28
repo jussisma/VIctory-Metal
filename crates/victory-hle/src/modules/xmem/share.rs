@@ -81,7 +81,7 @@ use super::{PAGE, Section};
 
 use victory_gpu::backend::GpuBackend;
 use victory_gpu::native_metal::bindings::{
-    self as bindings, GuestRange, GuestRangeResolver, ResolveError as SeamError,
+    self as bindings, GuestMapping, GuestRange, GuestRangeResolver, ResolveError as SeamError,
 };
 
 /// Names the session's directory for host-visible XMem backing.
@@ -1442,7 +1442,55 @@ impl GuestRangeResolver for ShareResolver {
     fn retire(&self, token: u64) -> Result<(), SeamError> {
         retire(token).map(|_| ()).map_err(seam_retire_error)
     }
+
+    /// Every tracked title view backed by a share file, as VA ranges.
+    ///
+    /// The relation comes from the views the guest actually mapped: a page no
+    /// view shows is not named, so the host's page table cannot invent one.
+    /// Views of a pagefile-backed section have no host-visible file and are
+    /// skipped; ids and generations are the share provider's own.
+    fn mappings(&self) -> Vec<GuestMapping> {
+        let physical = super::physical();
+        let mut out = Vec::new();
+        for (base, (size, slice)) in &physical.views {
+            let Some(backing) = slice.section.share.as_ref() else {
+                continue;
+            };
+            if backing.generation != GENERATION || backing.id == 0 {
+                continue;
+            }
+            let Ok(generation) = u32::try_from(backing.generation) else {
+                continue;
+            };
+            let Some(offset) = slice.index.checked_mul(PAGE) else {
+                continue;
+            };
+            let (Ok(guest_address), Ok(offset), Ok(length)) = (
+                u64::try_from(*base),
+                u64::try_from(offset),
+                u64::try_from(*size),
+            ) else {
+                continue;
+            };
+            out.push(GuestMapping {
+                guest_address,
+                allocation_id: backing.id,
+                generation,
+                byte_offset: offset,
+                length,
+            });
+            if out.len() >= MAPPINGS_CAP {
+                break;
+            }
+        }
+        out.sort_unstable_by_key(|mapping| mapping.guest_address);
+        out.dedup_by_key(|mapping| mapping.guest_address);
+        out
+    }
 }
+
+/// Bound on the VA ranges one enumeration returns (ADR-055).
+const MAPPINGS_CAP: usize = 1 << 16;
 
 fn seam_resolve_error(error: ResolveError, address: u64, len: u64) -> SeamError {
     match error {

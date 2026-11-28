@@ -30,6 +30,7 @@ pub mod guest_ipc;
 pub mod ipc_host;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod title_map;
 pub mod transport;
 pub mod wire;
 pub mod wire_v3;
