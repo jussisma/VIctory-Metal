@@ -1240,6 +1240,45 @@ fn frame_probe_json_for(
     }
 }
 
+/// Serialises the opt-in draw / offscreen-RT tracer report for telemetry.
+///
+/// The object is always present, even with the trace off, so a reader can tell
+/// "not armed" (`enabled: false`) from "armed and saw nothing" (all counters
+/// zero, `enabled: true`). Keys are fixed; `failure` is `null` until the
+/// tracer names one.
+#[cfg(target_os = "macos")]
+fn draw_trace_json() -> String {
+    draw_trace_json_for(&victory_metal::macos::trace::report())
+}
+
+/// The pure half of [`draw_trace_json`], so a unit test can pin every key
+/// without arming the process-wide tracer.
+#[cfg(target_os = "macos")]
+fn draw_trace_json_for(report: &victory_metal::macos::trace::TraceReport) -> String {
+    let failure = report.failure.as_deref().map_or_else(
+        || "null".to_string(),
+        |message| format!("\"{}\"", json_escape(message)),
+    );
+    format!(
+        concat!(
+            "{{",
+            "\"enabled\": {}, ",
+            "\"traced_work\": {}, ",
+            "\"traced_passes\": {}, ",
+            "\"last_offscreen_nonzero_bytes\": {}, ",
+            "\"last_offscreen_distinct_values\": {}, ",
+            "\"failure\": {}",
+            "}}"
+        ),
+        report.enabled,
+        report.traced_work,
+        report.traced_passes,
+        report.last_offscreen_nonzero_bytes,
+        report.last_offscreen_distinct_values,
+        failure
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn write_telemetry(
     path: &Path,
@@ -1290,6 +1329,7 @@ fn write_telemetry(
     );
     let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
+    let draw_trace = draw_trace_json();
 
     let json = format!(
         concat!(
@@ -1341,6 +1381,7 @@ fn write_telemetry(
             "  \"render_passes_encoded\": {render_passes_encoded},\n",
             "  \"clear_ops_encoded\": {clear_ops_encoded},\n",
             "  \"unknown_handle_site\": {unknown_handle_site},\n",
+            "  \"draw_trace\": {draw_trace},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0,\n",
@@ -1401,6 +1442,7 @@ fn write_telemetry(
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
+        draw_trace = draw_trace,
     );
 
     if let Some(parent) = path
@@ -1846,5 +1888,188 @@ mod frame_probe_json_tests {
     #[test]
     fn the_default_probe_interval_is_sixty_frames() {
         assert_eq!(FRAME_PROBE_DEFAULT_EVERY, 60);
+    }
+}
+
+/// Hermetic proofs for the folded `draw_trace` telemetry object (ADR-053).
+///
+/// The test builds reports directly, so it never arms the process-wide tracer
+/// and never touches a Metal device.
+#[cfg(all(test, target_os = "macos"))]
+mod draw_trace_json_tests {
+    use super::*;
+    use victory_metal::macos::trace::TraceReport;
+
+    /// Every key `draw_trace` must carry, in the emitted order.
+    const DRAW_TRACE_KEYS: [&str; 6] = [
+        "enabled",
+        "traced_work",
+        "traced_passes",
+        "last_offscreen_nonzero_bytes",
+        "last_offscreen_distinct_values",
+        "failure",
+    ];
+
+    fn object_keys(json: &str) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let mut keys = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                let start = index + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    if json[end + 1..].trim_start().starts_with(':') {
+                        keys.push(json[start..end].to_string());
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        keys
+    }
+
+    fn assert_complete_object(json: &str) {
+        assert!(!json.contains('\n'), "one line: {json}");
+        assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+        assert_eq!(object_keys(json), DRAW_TRACE_KEYS, "{json}");
+    }
+
+    /// The off object still carries every key, with `enabled: false` and zero
+    /// counters, so Boot #23 can tell "not armed" from "armed, saw nothing".
+    #[test]
+    fn a_disabled_report_carries_the_full_key_set() {
+        let json = draw_trace_json_for(&TraceReport::default());
+        assert_complete_object(&json);
+        for expected in [
+            "\"enabled\": false",
+            "\"traced_work\": 0",
+            "\"traced_passes\": 0",
+            "\"last_offscreen_nonzero_bytes\": 0",
+            "\"last_offscreen_distinct_values\": 0",
+            "\"failure\": null",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+
+    /// Marker values prove each field is wired to the right report member.
+    #[test]
+    fn a_traced_report_folds_every_field() {
+        let report = TraceReport {
+            enabled: true,
+            traced_work: 10,
+            traced_passes: 4,
+            last_offscreen_nonzero_bytes: 28_671,
+            last_offscreen_distinct_values: 7,
+            failure: Some("short-readback".to_string()),
+        };
+        let json = draw_trace_json_for(&report);
+        assert_complete_object(&json);
+        for expected in [
+            "\"enabled\": true",
+            "\"traced_work\": 10",
+            "\"traced_passes\": 4",
+            "\"last_offscreen_nonzero_bytes\": 28671",
+            "\"last_offscreen_distinct_values\": 7",
+            "\"failure\": \"short-readback\"",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+    }
+
+    /// Every top-level key telemetry carried before ADR-053 is still emitted,
+    /// and `draw_trace` is the one addition. `write_telemetry` is exercised
+    /// with default stats, so this is a pure serialisation contract.
+    #[test]
+    fn telemetry_keeps_every_legacy_key_and_adds_draw_trace() {
+        let path = std::env::temp_dir().join(format!(
+            "victory-telemetry-keys-{}.json",
+            std::process::id()
+        ));
+        write_telemetry(&path, 1, &Stats::default(), &[]).expect("telemetry writes");
+        let json = std::fs::read_to_string(&path).expect("telemetry reads");
+        let _ = std::fs::remove_file(&path);
+
+        const KEYS: [&str; 52] = [
+            "host",
+            "pid",
+            "port",
+            "sessions",
+            "submissions",
+            "frames",
+            "refused_submissions",
+            "p50_ms",
+            "p95_ms",
+            "p99_ms",
+            "fps",
+            "allocations",
+            "bytes_mapped",
+            "unsupported_opcodes",
+            "pipelines",
+            "graphics_status",
+            "present_status",
+            "present_checksum",
+            "window_presented",
+            "window_drawables",
+            "window_error",
+            "last_error",
+            "pool_status",
+            "pool_jobs",
+            "pool_cache_hits",
+            "pool_cache_misses",
+            "pool_worker_jobs",
+            "pool_worker_starts",
+            "pool_worker_restarts",
+            "host_translated_stages",
+            "host_translated_stage_vertex",
+            "host_translated_stage_pixel",
+            "host_translated_stage_mesh",
+            "host_translated_stage_object",
+            "host_translated_stage_compute",
+            "host_pipeline_translations_ok",
+            "host_pipeline_translations_refused",
+            "host_pipeline_cache_hits",
+            "host_translation_reason",
+            "draws_encoded",
+            "draw_indexed_encoded",
+            "dispatches_encoded",
+            "mesh_dispatches_encoded",
+            "indirect_encoded",
+            "render_passes_encoded",
+            "clear_ops_encoded",
+            "unknown_handle_site",
+            "draw_trace",
+            "d3dmetal_loaded",
+            "d3dmetal_images",
+            "d3dmetal_fallback_count",
+            "frame_probe",
+        ];
+        let keys: Vec<String> = json
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix('"')?;
+                let end = rest.find('"')?;
+                rest[end + 1..]
+                    .trim_start()
+                    .starts_with(':')
+                    .then(|| rest[..end].to_string())
+            })
+            .collect();
+        assert_eq!(keys, KEYS, "{json}");
+        assert!(
+            json.contains("  \"draw_trace\": {"),
+            "draw_trace is a nested object, not a scalar: {json}"
+        );
     }
 }

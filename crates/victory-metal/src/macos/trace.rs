@@ -12,10 +12,13 @@
 //! describes the encoder call (kind, pipeline id, counts, viewport, scissor,
 //! argument-buffer shape), the attachment geometry and format, whether that
 //! attachment is the registered swapchain surface, and a bounded pixel summary
-//! of the first traced offscreen render target.
+//! of the first traced offscreen render target. A pass is sampled only when its
+//! render segment encoded at least one draw/dispatch, so a clear-only pass is
+//! never reported as drawn output. [`report`] folds the bounded counts into the
+//! `draw_trace` object `telemetry.json` carries.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Environment flag that arms the tracer. Off when unset.
 pub const DRAW_TRACE_ENV: &str = "VICTORY_METAL_DRAW_TRACE";
@@ -161,8 +164,145 @@ impl CounterSnapshot {
     }
 }
 
-/// One attachment the tracer may sample.
+/// Maximum bytes kept in the bounded [`TraceReport::failure`] string.
+pub const MAX_FAILURE_BYTES: usize = 96;
+
+/// The tracer's answer for `telemetry.json` and the Boot #23 gate.
+///
+/// It is always present as an object, even when the trace is off: `enabled`
+/// distinguishes "never armed" from "armed and saw nothing". Every field is a
+/// count or a bounded string; no resource contents or title paths appear here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceReport {
+    /// Whether `VICTORY_METAL_DRAW_TRACE` armed the tracer in this process.
+    pub enabled: bool,
+    /// Draws/dispatches described by the tracer (bounded by
+    /// [`MAX_TRACED_WORK`]).
+    pub traced_work: u64,
+    /// Render passes whose pixels were sampled (bounded by
+    /// [`MAX_TRACED_PASSES`]).
+    pub traced_passes: u64,
+    /// `nonzero_bytes` of the last sampled offscreen attachment.
+    pub last_offscreen_nonzero_bytes: u64,
+    /// `distinct_values` of the last sampled offscreen attachment.
+    pub last_offscreen_distinct_values: u32,
+    /// First named tracer failure, truncated to [`MAX_FAILURE_BYTES`].
+    pub failure: Option<String>,
+}
+
+/// Attachment and pass context shared between [`TraceState::next_pass`] and
+/// [`sample_grid`], which the host calls through separate device functions.
 #[derive(Debug, Clone, Copy)]
+struct SampleContext {
+    pass: u32,
+    draws: u32,
+    target: Option<TraceTarget>,
+}
+
+/// Process-wide tracer state read by the host for telemetry and by the GPU
+/// proof. Only touched while [`enabled`] is true.
+#[derive(Default)]
+struct TraceLog {
+    records_described: u64,
+    passes_sampled: u64,
+    samples_recorded: u64,
+    last_offscreen_nonzero_bytes: u64,
+    last_offscreen_distinct_values: u32,
+    failure: Option<String>,
+    last_record: Option<DrawRecord>,
+    sample_context: Option<SampleContext>,
+    last_sample: Option<PixelStats>,
+}
+
+static TRACE_LOG: OnceLock<Mutex<TraceLog>> = OnceLock::new();
+
+fn trace_log() -> &'static Mutex<TraceLog> {
+    TRACE_LOG.get_or_init(|| Mutex::new(TraceLog::default()))
+}
+
+fn with_log<R>(f: impl FnOnce(&mut TraceLog) -> R) -> R {
+    let mut guard = trace_log()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    f(&mut guard)
+}
+
+/// Bounded picture of what the tracer saw, for `telemetry.json`.
+///
+/// When the trace is off this returns an all-zero report with
+/// `enabled: false` without allocating or locking the log.
+pub fn report() -> TraceReport {
+    let enabled = enabled();
+    if !enabled {
+        return TraceReport::default();
+    }
+    let log = trace_log()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // A pass that was selected but whose readback never reached `sample_grid`
+    // (commit error, dead texture, host shutdown) is visible as a mismatch
+    // instead of silently keeping stale zeroes.
+    let failure = log.failure.clone().or_else(|| {
+        (log.passes_sampled > log.samples_recorded).then(|| "sample-not-read".to_string())
+    });
+    TraceReport {
+        enabled,
+        traced_work: log.records_described,
+        traced_passes: log.passes_sampled,
+        last_offscreen_nonzero_bytes: log.last_offscreen_nonzero_bytes,
+        last_offscreen_distinct_values: log.last_offscreen_distinct_values,
+        failure,
+    }
+}
+
+/// The most recent described draw/dispatch, if the trace is on and one was
+/// encoded. Diagnostic accessor for the GPU proof; the host reads the counts.
+pub fn last_record() -> Option<DrawRecord> {
+    if !enabled() {
+        return None;
+    }
+    trace_log()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .last_record
+}
+
+/// The most recent pixel summary, if the trace is on and a pass was sampled.
+pub fn last_sample() -> Option<PixelStats> {
+    if !enabled() {
+        return None;
+    }
+    trace_log()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .last_sample
+}
+
+/// Records the first bounded tracer failure.
+///
+/// The device readback path currently prints `draw_trace_rt failure=...`
+/// directly; wiring it here as well is a device.rs follow-up.
+pub fn note_failure(message: &str) {
+    with_log(|log| {
+        if log.failure.is_none() {
+            let mut bounded = message.to_string();
+            bounded.truncate(MAX_FAILURE_BYTES);
+            log.failure = Some(bounded);
+        }
+    });
+}
+
+/// Clears the process-wide report.
+///
+/// Test-only: the GPU proof runs two attachments in one process, so each case
+/// starts from a clean report. Never called by the host.
+#[doc(hidden)]
+pub fn reset() {
+    with_log(|log| *log = TraceLog::default());
+}
+
+/// One attachment the tracer may sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceTarget {
     /// Level-0 texture of the pass's first colour attachment.
     ///
@@ -227,21 +367,27 @@ impl DrawRecord {
             self.abi_parameters, self.abi_bytes
         ));
         match self.target {
-            Some(target) => out.push_str(&format!(
-                " rt={} {}x{} {}",
-                if target.swapchain {
-                    "swapchain"
-                } else {
-                    "offscreen"
-                },
-                target.width,
-                target.height,
-                target.format
-            )),
+            Some(target) => out.push_str(&format!(" rt={}", target_name(&target))),
             None => out.push_str(" rt=none"),
         }
         out
     }
+}
+
+/// `offscreen|swapchain WIDTHxHEIGHT format`, the attachment shape both log
+/// lines name.
+fn target_name(target: &TraceTarget) -> String {
+    format!(
+        "{} {}x{} {}",
+        if target.swapchain {
+            "swapchain"
+        } else {
+            "offscreen"
+        },
+        target.width,
+        target.height,
+        target.format
+    )
 }
 
 /// Bounded per-process tracer state.
@@ -249,10 +395,17 @@ impl DrawRecord {
 pub struct TraceState {
     /// Traced calls, in encode order.
     pub records: Vec<DrawRecord>,
-    /// Render passes opened so far.
+    /// Passes offered to the sampler so far.
     pub passes: u32,
     /// Passes whose pixels were sampled.
     pub sampled_passes: u32,
+    /// Draws/dispatches recorded since the last sampling decision. A pass with
+    /// zero pending draws is never sampled.
+    pub pending_draws: u32,
+    /// Pending draws the last sampled pass carried.
+    pub last_pass_draws: u32,
+    /// Attachment of the most recent record, published with the pass line.
+    pub last_target: Option<TraceTarget>,
 }
 
 impl TraceState {
@@ -268,16 +421,45 @@ impl TraceState {
         }
         let line = record.line();
         self.records.push(record);
+        self.pending_draws = self.pending_draws.saturating_add(1);
+        self.last_target = record.target;
+        if enabled() {
+            with_log(|log| {
+                log.records_described = log.records_described.saturating_add(1);
+                log.last_record = Some(record);
+            });
+        }
         Some(line)
     }
 
-    /// Counts one opened pass and reports whether it should be sampled.
+    /// Counts one sampling opportunity and reports whether it should be
+    /// sampled.
+    ///
+    /// A pass whose render segment encoded no draw/dispatch returns `false`:
+    /// a clear-only pass must never be mistaken for drawn, non-zero output.
+    /// At most [`MAX_TRACED_PASSES`] passes are sampled.
     pub fn next_pass(&mut self) -> bool {
         self.passes = self.passes.saturating_add(1);
+        if self.pending_draws == 0 {
+            return false;
+        }
         if self.sampled_passes >= MAX_TRACED_PASSES {
             return false;
         }
         self.sampled_passes = self.sampled_passes.saturating_add(1);
+        self.last_pass_draws = self.pending_draws;
+        self.pending_draws = 0;
+        if enabled() {
+            let context = SampleContext {
+                pass: self.passes,
+                draws: self.last_pass_draws,
+                target: self.last_target,
+            };
+            with_log(|log| {
+                log.passes_sampled = log.passes_sampled.saturating_add(1);
+                log.sample_context = Some(context);
+            });
+        }
         true
     }
 }
@@ -291,14 +473,36 @@ pub struct PixelStats {
     pub sampled_bytes: u64,
     /// Distinct byte values, saturated at 256.
     pub distinct_values: u32,
+    /// Sampling-opportunity counter of the pass this summary belongs to; `0`
+    /// for a summary produced outside the device trace path.
+    pub pass: u32,
+    /// Draws/dispatches the sampled pass encoded; `0` when uncounted.
+    pub pass_draws: u32,
+    /// Attachment that was sampled, when the trace named one.
+    pub target: Option<TraceTarget>,
 }
 
 impl PixelStats {
-    /// One log line.
+    /// The pass line (when known) followed by the pixel summary line.
+    ///
+    /// The pass line always precedes its own summary so a reader can attribute
+    /// `nonzero_bytes` to a pass without correlating unrelated log lines.
     pub fn line(&self) -> String {
-        format!(
+        let summary = format!(
             "draw_trace_rt nonzero_bytes={} sampled_bytes={} distinct_values={}",
             self.nonzero_bytes, self.sampled_bytes, self.distinct_values
+        );
+        if self.pass == 0 {
+            return summary;
+        }
+        format!(
+            "draw_trace_pass pass={} draws={} rt={}\n{}",
+            self.pass,
+            self.pass_draws,
+            self.target
+                .as_ref()
+                .map_or_else(|| "none".to_string(), target_name),
+            summary
         )
     }
 }
@@ -310,11 +514,18 @@ impl PixelStats {
 /// At most [`RT_SAMPLE_EDGE`]² texels are read, so a 4K attachment costs the
 /// same bounded summary as a 64×64 one.
 pub fn sample_grid(bytes: &[u8], width: u32, height: u32) -> PixelStats {
+    let enabled = enabled();
     if width == 0 || height == 0 {
+        if enabled {
+            note_failure("empty-attachment");
+        }
         return PixelStats::default();
     }
     let row_bytes = width as usize * 4;
     if bytes.len() < row_bytes * height as usize {
+        if enabled {
+            note_failure("short-readback");
+        }
         return PixelStats::default();
     }
     let edge = RT_SAMPLE_EDGE.min(width).min(height);
@@ -329,7 +540,25 @@ pub fn sample_grid(bytes: &[u8], width: u32, height: u32) -> PixelStats {
             sample.extend_from_slice(&bytes[at..at + 4]);
         }
     }
-    pixel_stats(&sample)
+    let mut stats = pixel_stats(&sample);
+    if enabled {
+        with_log(|log| {
+            if let Some(context) = log.sample_context.take() {
+                stats.pass = context.pass;
+                stats.pass_draws = context.draws;
+                stats.target = context.target;
+            }
+            if let Some(target) = stats.target
+                && !target.swapchain
+            {
+                log.last_offscreen_nonzero_bytes = stats.nonzero_bytes;
+                log.last_offscreen_distinct_values = stats.distinct_values;
+            }
+            log.samples_recorded = log.samples_recorded.saturating_add(1);
+            log.last_sample = Some(stats);
+        });
+    }
+    stats
 }
 
 /// Summarizes a sampled attachment without copying it.
@@ -351,6 +580,7 @@ pub fn pixel_stats(bytes: &[u8]) -> PixelStats {
         nonzero_bytes: nonzero,
         sampled_bytes: bytes.len() as u64,
         distinct_values: distinct,
+        ..PixelStats::default()
     }
 }
 
@@ -427,9 +657,64 @@ mod tests {
                 .is_none()
         );
         for _ in 0..MAX_TRACED_PASSES {
+            state.pending_draws = 1;
             assert!(state.next_pass());
         }
+        state.pending_draws = 1;
         assert!(!state.next_pass());
+    }
+
+    #[test]
+    fn a_pass_without_draws_is_never_sampled() {
+        let mut state = TraceState::default();
+        assert!(!state.next_pass());
+        assert_eq!(state.sampled_passes, 0);
+        state.pending_draws = 2;
+        assert!(state.next_pass());
+        assert_eq!(state.last_pass_draws, 2);
+        assert_eq!(state.pending_draws, 0);
+    }
+
+    #[test]
+    fn the_pass_line_precedes_its_pixel_summary() {
+        let stats = PixelStats {
+            nonzero_bytes: 12,
+            sampled_bytes: 16384,
+            distinct_values: 3,
+            pass: 4,
+            pass_draws: 2,
+            target: Some(TraceTarget {
+                texture: 0,
+                width: 64,
+                height: 64,
+                format: "rgba8unorm",
+                swapchain: false,
+            }),
+        };
+        let line = stats.line();
+        let mut lines = line.lines();
+        assert_eq!(
+            lines.next(),
+            Some("draw_trace_pass pass=4 draws=2 rt=offscreen 64x64 rgba8unorm")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("draw_trace_rt nonzero_bytes=12 sampled_bytes=16384 distinct_values=3")
+        );
+    }
+
+    #[test]
+    fn an_uncounted_summary_stays_a_single_line() {
+        let stats = PixelStats {
+            nonzero_bytes: 0,
+            sampled_bytes: 4096,
+            distinct_values: 1,
+            ..PixelStats::default()
+        };
+        assert_eq!(
+            stats.line(),
+            "draw_trace_rt nonzero_bytes=0 sampled_bytes=4096 distinct_values=1"
+        );
     }
 
     #[test]
