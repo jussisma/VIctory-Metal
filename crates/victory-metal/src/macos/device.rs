@@ -6725,7 +6725,25 @@ impl DirectMetalTransport {
                 .ok_or(MetalError::InternalError(
                     "texture registry was not created".to_string(),
                 ))?;
-            registry.register(id, desc).map_err(registry_error)?;
+            match registry.register(id, desc.clone()) {
+                Ok(()) => {}
+                // A guest re-registers a handle after a reconnect or a
+                // resource re-create. The same descriptor is the same texture:
+                // accept it and republish the aliases rather than refusing a
+                // handle that already works. A different descriptor is a real
+                // conflict and stays named.
+                Err(RegistryError::DuplicateTexture(_)) => {
+                    let existing = registry.get(id).ok_or(MetalError::InternalError(
+                        "texture registry reported a duplicate for an absent handle".to_string(),
+                    ))?;
+                    if existing.desc() != &desc {
+                        return Err(MetalError::InternalError(format!(
+                            "texture handle {id:#x} is already registered with a different descriptor"
+                        )));
+                    }
+                }
+                Err(error) => return Err(registry_error(error)),
+            }
             registry
                 .raw(id)
                 .ok_or(MetalError::InternalError(

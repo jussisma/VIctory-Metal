@@ -851,6 +851,42 @@ pub fn register_texture(
     mip_levels: u16,
     array_layers: u16,
 ) -> Result<bool, NativeQueueError> {
+    register_texture_with_reason(
+        id,
+        generation,
+        dimension,
+        format,
+        usage,
+        sample_count,
+        width,
+        height,
+        depth,
+        mip_levels,
+        array_layers,
+    )
+    .map(|(accepted, _)| accepted)
+}
+
+/// [`register_texture`] with the host's bounded refusal reason.
+///
+/// `Ok((true, None))` registered; `Ok((false, Some(reason)))` is the host's
+/// named refusal; `Ok((false, None))` is an older host that answers with only
+/// the classic status byte.
+#[cfg(any(windows, test, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn register_texture_with_reason(
+    id: u64,
+    generation: u32,
+    dimension: u8,
+    format: u8,
+    usage: u8,
+    sample_count: u8,
+    width: u32,
+    height: u32,
+    depth: u32,
+    mip_levels: u16,
+    array_layers: u16,
+) -> Result<(bool, Option<String>), NativeQueueError> {
     ensure_live(LiveConfig::from_env)
         .map_err(|error| NativeQueueError::Transport(format!("{error}")))?;
     let mut queue = native_queue();
@@ -862,7 +898,7 @@ pub fn register_texture(
         // Several title resources share one memory (placed views and
         // aliases); the host registers the handle once.
         note_texture_format(id, format);
-        return Ok(true);
+        return Ok((true, None));
     }
     let client = queue.sink_mut().client_mut().ok_or_else(|| {
         NativeQueueError::Transport("no live Wire v3 host session".to_string())
@@ -880,12 +916,15 @@ pub fn register_texture(
         mip_levels,
         array_layers,
     )?;
-    if accepted {
+    let reason = if accepted {
         // Remember the host format so a headless surface installed from the
         // presented target keeps its own format (FP16 stays FP16).
         note_texture_format(id, format);
-    }
-    Ok(accepted)
+        None
+    } else {
+        client.last_texture_refusal_reason().map(str::to_string)
+    };
+    Ok((accepted, reason))
 }
 
 /// Host format codes of registered textures, keyed by handle.
