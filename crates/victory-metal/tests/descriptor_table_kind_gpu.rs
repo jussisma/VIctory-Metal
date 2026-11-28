@@ -568,11 +568,15 @@ fn kind_pipeline_state(entry: &str) -> Vec<u8> {
 }
 
 fn table_spec(kind: DescriptorTableKind) -> RootParameterSpec {
+    table_spec_at(kind, 0, 0)
+}
+
+fn table_spec_at(kind: DescriptorTableKind, space: u32, register: u32) -> RootParameterSpec {
     RootParameterSpec {
         kind: RootParameterKind::DescriptorTable(kind),
         size: 8,
-        register: 0,
-        space: 0,
+        register,
+        space,
     }
 }
 
@@ -603,6 +607,36 @@ fn sampler_then_view_abi() -> PipelineAbi {
         ),
     ]);
     PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map)
+}
+
+/// Boot #31's live shape without an authoritative map: converter reflection
+/// flattens the `Sampler` table before the view table, so the ordinal rule names
+/// the sampler even though the wire table is an SRV view.
+fn sampler_then_view_unmapped_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            table_spec(DescriptorTableKind::Sampler),
+            table_spec(DescriptorTableKind::ShaderResourceView),
+        ],
+    )
+    .expect("unmapped sampler-then-view fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
+}
+
+/// Two distinct view tables and a sampler, without an authoritative map: an
+/// `Srv` wire table has no unique compatible slot to reroute to.
+fn two_views_unmapped_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            table_spec(DescriptorTableKind::Sampler),
+            table_spec_at(DescriptorTableKind::ShaderResourceView, 0, 0),
+            table_spec_at(DescriptorTableKind::ShaderResourceView, 0, 1),
+        ],
+    )
+    .expect("unmapped two-view fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
 }
 
 /// Two kind-compatible SRV tables share the declared `(space, register)`; no
@@ -782,5 +816,119 @@ fn two_kind_compatible_candidates_stay_a_counted_refusal() {
     transport
         .unregister_buffer(side_id)
         .expect("unregister the side page");
+    reset_descriptor_table_refusal_census();
+}
+
+/// ADR-062: Boot #31's live shape has no authoritative map. Reflection
+/// flattens a `Sampler` table at wire ordinal 0 and the view table after it, so
+/// the ordinal rule alone returns the sampler. An `Srv` wire table must reroute
+/// to the unique view slot: the draw encodes, the table address lands at the
+/// view parameter, and no `{reflected_kind:"Sampler", wire_kind:"Srv"}` key is
+/// recorded. With two view candidates the reroute has no unique answer and
+/// stays a counted refusal.
+#[test]
+fn an_srv_table_skips_a_sampler_at_the_wire_ordinal_without_a_map() {
+    let Some(_lock) = GpuLock::acquire() else {
+        eprintln!("PARTIAL: another GPU run holds /tmp/victory-gpu.lock; proof skipped");
+        return;
+    };
+    reset_descriptor_table_refusal_census();
+
+    let dir = TempDir::new("descriptor-table-kind-unmapped");
+    let metallib = compile_metallib(dir.path(), "kindunmapped", KIND_ORDINAL_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), "target"),
+        )
+        .expect("registry texture must create");
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live, 16 KiB-aligned allocation that outlives the
+    // synchronous submission and is unregistered before it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_SIDE, 1), side_id);
+
+    const VIEW_HANDLE: u64 = 0x7003;
+    const AMBIGUOUS_HANDLE: u64 = 0x7004;
+    for (handle, abi) in [
+        (VIEW_HANDLE, sampler_then_view_unmapped_abi()),
+        (AMBIGUOUS_HANDLE, two_views_unmapped_abi()),
+    ] {
+        transport
+            .register_content_hashed_graphics_pipeline(
+                handle,
+                &metallib,
+                "kind_vertex",
+                &kind_pipeline_state("kind_fragment"),
+                abi,
+            )
+            .expect("content-hashed graphics pipeline must register");
+    }
+
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&sampled_submission(611, VIEW_HANDLE), &allocations)
+        .expect("an Srv table must skip the sampler at the wire ordinal without a map");
+    assert_eq!(reply.status, victory_metal::wire::ReplyStatus::Ok);
+    assert_eq!(stats.render_encoders, 1);
+    assert_eq!(transport.encode_counters().draws, 1);
+    assert_eq!(
+        transport.abi_refusal_count(),
+        0,
+        "a rerouted table is not an ABI refusal"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "no Sampler/Srv kind-mismatch key may be recorded: {}",
+        census.json_value()
+    );
+
+    let error = transport
+        .submit_v3_with_stats(&sampled_submission(612, AMBIGUOUS_HANDLE), &allocations)
+        .expect_err("two compatible view candidates must not be guessed");
+    assert!(
+        error.to_string().contains("ambiguous"),
+        "the reroute's ambiguity is named: {error}"
+    );
+    assert_eq!(
+        transport.abi_refusal_count(),
+        1,
+        "the ambiguous reroute is a counted ABI refusal"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "ambiguity is not a kind-mismatch key: {}",
+        census.json_value()
+    );
+
+    transport
+        .wait_for_gpu()
+        .expect("the constant pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_eq!(pixels.len(), PIXELS, "target pixel count");
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(
+            *pixel, DRAWN_RGBA,
+            "pixel {index}: the table address must land on the view parameter, not the sampler"
+        );
+    }
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
+    eprintln!(
+        "unmapped kind-compatible ordinal proof on {}: draws=1, abi_refusals=1 (ambiguous second), census={}",
+        info.name_str(),
+        census.json_value()
+    );
     reset_descriptor_table_refusal_census();
 }

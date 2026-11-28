@@ -3127,7 +3127,9 @@ pub struct PipelineAbi {
 pub enum DescriptorTableSet {
     /// The set names this declared descriptor-table parameter.
     Declared(RootParameterSlot),
-    /// Two shader stages declare different tables at this ordinal.
+    /// The set does not name one table: two shader stages declare different
+    /// tables at this ordinal, or more than one declared table's range accepts
+    /// the wire kind.
     Ambiguous,
     /// The signature declares no table at this ordinal.
     Missing,
@@ -3295,6 +3297,97 @@ impl PipelineAbi {
         // table here would wrongly collapse two real tables; position is the
         // only deterministic identity the reflection retains.
         DescriptorTableSet::Declared(candidate)
+    }
+
+    /// Resolves wire descriptor-table set `set` for a table of `wire_kind`.
+    ///
+    /// ADR-062: [`Self::descriptor_table_for_set`] selects by ordinal alone,
+    /// which is the converter's own parameter order. That order can flatten a
+    /// `Sampler` table before the view table the guest actually addresses — the
+    /// wire set then names a slot whose reflected range the wire kind cannot
+    /// fill, and `build_descriptor_table` refused all 40 of Boot #31's tables
+    /// exactly that way.
+    ///
+    /// The ordinal candidate is returned unchanged when the wire kind fills its
+    /// range. An incompatible candidate is rerouted to the unique declared
+    /// table whose range accepts the wire kind, searched in
+    /// [`Self::declared_descriptor_table_slots`] order. Two such declarations
+    /// are [`DescriptorTableSet::Ambiguous`] (a counted refusal, never the
+    /// first); none keeps the ordinal candidate so the caller's named
+    /// kind-mismatch refusal remains the outcome. Every other
+    /// [`DescriptorTableSet`] variant is returned unchanged.
+    pub fn descriptor_table_for_set_kind(
+        &self,
+        set: usize,
+        wire_kind: DescriptorKind,
+    ) -> DescriptorTableSet {
+        let candidate = self.descriptor_table_for_set(set);
+        let DescriptorTableSet::Declared(candidate_slot) = candidate else {
+            return candidate;
+        };
+        let RootParameterKind::DescriptorTable(candidate_kind) = candidate_slot.kind() else {
+            return candidate;
+        };
+        if crate::macos::root_arguments::wire_kind_fills_table(candidate_kind, wire_kind) {
+            return candidate;
+        }
+        let mut compatible: Option<RootParameterSlot> = None;
+        for slot in self.declared_descriptor_table_slots() {
+            let RootParameterKind::DescriptorTable(kind) = slot.kind() else {
+                continue;
+            };
+            if !crate::macos::root_arguments::wire_kind_fills_table(kind, wire_kind) {
+                continue;
+            }
+            if compatible.replace(slot).is_some() {
+                return DescriptorTableSet::Ambiguous;
+            }
+        }
+        compatible.map_or(candidate, DescriptorTableSet::Declared)
+    }
+
+    /// Every descriptor-table declaration this pipeline makes, in the ordinal
+    /// rule's deterministic order.
+    ///
+    /// The authoritative map's slots come first in slot order, then each stage
+    /// layout's table parameters in registration order (vertex, fragment, mesh,
+    /// object, compute). A declaration the map and a stage both describe — or
+    /// the same table two stages both expose — appears once: identity is
+    /// [`same_descriptor_table`], which treats the converter's `u32::MAX` field
+    /// as a wildcard.
+    fn declared_descriptor_table_slots(&self) -> Vec<RootParameterSlot> {
+        let mut tables: Vec<RootParameterSlot> = Vec::new();
+        if let Some(map) = self.root_parameters.as_ref() {
+            for slot in map.slots() {
+                if matches!(slot.kind(), RootParameterKind::DescriptorTable(_))
+                    && !tables
+                        .iter()
+                        .any(|known| same_descriptor_table(known, slot))
+                {
+                    tables.push(*slot);
+                }
+            }
+        }
+        for layout in self.layouts() {
+            for parameter in layout.parameters() {
+                if !matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
+                    continue;
+                }
+                let slot = RootParameterSlot::new(
+                    parameter.space(),
+                    parameter.register(),
+                    parameter.kind(),
+                    parameter.size(),
+                );
+                if !tables
+                    .iter()
+                    .any(|known| same_descriptor_table(known, &slot))
+                {
+                    tables.push(slot);
+                }
+            }
+        }
+        tables
     }
 
     /// Number of descriptor tables the pipeline declares.
@@ -4237,37 +4330,6 @@ fn resource_gpu_id(resource: objc::Id) -> u64 {
     unsafe { objc::msg_send_u64_0(resource, objc::sel(c"gpuResourceID")) }
 }
 
-/// Wire table kind a converted range kind requires.
-///
-/// Reflection supplies the *declared* range kind; the wire supplies the
-/// guest's descriptor type. The converter uses one 24-byte descriptor for
-/// every buffer range — a constant buffer view, a buffer shader resource view
-/// and a buffer unordered access view all encode `{device_address, 0, 0}` — so
-/// a title's CBV/SRV/UAV buffer range and a declared CBV/SRV/UAV range are
-/// shape-compatible in any combination. Only texture ids (`{id, id, 0}`) and
-/// sampler ids (`{id, 0, 0}`) are different shapes, and those stay exact:
-/// a sampler range accepts sampler entries only, and a `Texture` range accepts
-/// SRV/UAV entries only. `Unspecified` is the converter's `"Table"` with no
-/// caller-attached kind, so every wire kind is expressible and
-/// [`descriptor_table_shape`] decides from the entry variants.
-fn table_kind_accepts_wire(kind: DescriptorTableKind, wire_kind: DescriptorKind) -> bool {
-    match kind {
-        DescriptorTableKind::ConstantBufferView
-        | DescriptorTableKind::ShaderResourceView
-        | DescriptorTableKind::UnorderedAccessView => matches!(
-            wire_kind,
-            DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav
-        ),
-        DescriptorTableKind::Texture => {
-            matches!(wire_kind, DescriptorKind::Srv | DescriptorKind::Uav)
-        }
-        DescriptorTableKind::Sampler => wire_kind == DescriptorKind::Sampler,
-        // Reflection only says "Table". The wire entry variant selects the
-        // converter descriptor shape, so every wire kind is expressible here.
-        DescriptorTableKind::Unspecified => true,
-    }
-}
-
 /// Stable wire-kind name used by the kind-mismatch refusal and census.
 fn descriptor_kind_name(kind: DescriptorKind) -> &'static str {
     match kind {
@@ -4367,7 +4429,7 @@ fn check_table_kind(
     table: &crate::wire_v3::DescriptorTableV3,
     kind: DescriptorTableKind,
 ) -> Result<(), MetalError> {
-    if table_kind_accepts_wire(kind, table.kind) {
+    if crate::macos::root_arguments::wire_kind_fills_table(kind, table.kind) {
         return Ok(());
     }
     note_descriptor_table_kind_mismatch(pipeline_id, table, kind);
@@ -4885,9 +4947,11 @@ fn resolve_wire_root_argument(
 ///    (`descriptor table set names a table the bound pipeline does not declare`)
 ///    counted in [`DirectMetalTransport::descriptor_table_stale_refusal_count`],
 ///    never confused with "no declared root parameter";
-/// 3. without a plan entry, the deterministic ordinal rule of
-///    [`PipelineAbi::descriptor_table_for_set`]; an ambiguous ordinal is
-///    refused by name rather than guessed;
+/// 3. without a plan entry, the kind-compatible ordinal rule of
+///    [`PipelineAbi::descriptor_table_for_set_kind`]: a shape-incompatible
+///    ordinal is rerouted to the unique declared table whose range accepts the
+///    wire kind, and an ambiguous ordinal or candidate set is refused by name
+///    rather than guessed (ADR-062);
 /// 4. the set as a flattened root-parameter index, when that slot really is a
 ///    table (the legacy guest shape);
 /// 5. a set that names none of those on a signature that declares **no table at
@@ -4904,6 +4968,7 @@ fn resolve_descriptor_table_set(
     plan: Option<&RootParameterPlan>,
     pipeline_id: u64,
     set: u16,
+    wire_kind: DescriptorKind,
 ) -> Result<Option<RootParameterSlot>, PrepareAbort> {
     let entry = plan.and_then(|plan| plan.entry(set));
     if let Some(entry) = entry {
@@ -4962,7 +5027,7 @@ fn resolve_descriptor_table_set(
 
     let index = usize::from(set);
     transport.count_legacy_root_binding();
-    match abi.descriptor_table_for_set(index) {
+    match abi.descriptor_table_for_set_kind(index, wire_kind) {
         DescriptorTableSet::Declared(slot) => return Ok(Some(slot)),
         DescriptorTableSet::Ambiguous => {
             note_descriptor_table_event(
@@ -6021,6 +6086,7 @@ fn prepare_compute_segment(
                         root_plan,
                         current_pipeline_id,
                         table.set,
+                        table.kind,
                     )?
                     else {
                         // Named, counted inert acceptance: the bound pipeline
@@ -6942,6 +7008,7 @@ fn build_render_ops(
                         root_plan,
                         current_pipeline_id,
                         table.set,
+                        table.kind,
                     )?
                     else {
                         // Named, counted inert acceptance: the bound pipeline
@@ -10470,6 +10537,216 @@ mod tests {
         );
     }
 
+    /// Boot #31's reflected shape: no authoritative map, the converter
+    /// flattens the `Sampler` table before the view table, and the wire names
+    /// the view table at ordinal 0. The ordinal selector alone returns the
+    /// sampler; the kind-compatible resolver must return the view slot.
+    #[test]
+    fn boot_31_sampler_first_resolves_an_srv_wire_to_the_view_slot() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSlot,
+            RootParameterSpec, RootSignatureLayout,
+        };
+        use crate::wire_v3::DescriptorKind;
+
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: u32::MAX,
+                    space: u32::MAX,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::ShaderResourceView,
+                    ),
+                    size: 8,
+                    register: u32::MAX,
+                    space: u32::MAX,
+                },
+            ],
+        )
+        .expect("sampler-then-view reflection");
+        let sampler = RootParameterSlot::new(
+            u32::MAX,
+            u32::MAX,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+            8,
+        );
+        let view = RootParameterSlot::new(
+            u32::MAX,
+            u32::MAX,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+            8,
+        );
+        let abi = super::PipelineAbi::graphics(None, Some(layout));
+        assert_eq!(
+            abi.descriptor_table_for_set(0),
+            super::DescriptorTableSet::Declared(sampler),
+            "the ordinal rule alone names the sampler"
+        );
+        assert_eq!(
+            abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv),
+            super::DescriptorTableSet::Declared(view),
+            "an Srv wire table must reroute to the view slot, not the sampler"
+        );
+    }
+
+    /// A compatible ordinal candidate is returned unchanged: the wire set
+    /// already names the right table.
+    #[test]
+    fn a_compatible_ordinal_candidate_is_returned_unchanged() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        use crate::wire_v3::DescriptorKind;
+
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::ShaderResourceView,
+                    ),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: 1,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("view-then-sampler reflection");
+        let abi = super::PipelineAbi::graphics(None, Some(layout));
+        let candidate = abi.descriptor_table_for_set(0);
+        assert_eq!(
+            abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv),
+            candidate
+        );
+    }
+
+    /// Two declared tables accept the wire kind: the reroute has no unique
+    /// answer and must refuse as ambiguous rather than bind the first.
+    #[test]
+    fn two_compatible_declared_tables_are_ambiguous() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        use crate::wire_v3::DescriptorKind;
+
+        let table = |register: u32| RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+            size: 8,
+            register,
+            space: 0,
+        };
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+                table(0),
+                table(1),
+            ],
+        )
+        .expect("three-table reflection");
+        let abi = super::PipelineAbi::graphics(None, Some(layout));
+        assert_eq!(
+            abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv),
+            super::DescriptorTableSet::Ambiguous
+        );
+    }
+
+    /// With no declared table that accepts the wire kind, the ordinal candidate
+    /// is kept so `build_descriptor_table` raises its named, censused
+    /// kind-mismatch refusal. The selector never invents a slot.
+    #[test]
+    fn no_compatible_declared_table_keeps_the_named_refusal() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
+            RootSignatureLayout,
+        };
+        use crate::wire_v3::DescriptorKind;
+
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                size: 8,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("sampler-only reflection");
+        let abi = super::PipelineAbi::graphics(None, Some(layout));
+        let candidate = abi.descriptor_table_for_set(0);
+        assert_eq!(
+            abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv),
+            candidate,
+            "the genuinely impossible pair stays the ordinal candidate for the named refusal"
+        );
+    }
+
+    /// The search starts from the authoritative map and does not count a table
+    /// the map and a stage both describe twice.
+    #[test]
+    fn the_kind_search_starts_at_the_map_and_deduplicates_stage_tables() {
+        use crate::macos::bindings::{
+            DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterMap,
+            RootParameterSlot, RootParameterSpec, RootSignatureLayout,
+        };
+        use crate::wire_v3::DescriptorKind;
+
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(
+                        DescriptorTableKind::ShaderResourceView,
+                    ),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("sampler-then-view reflection");
+        let map = RootParameterMap::from_slots(vec![RootParameterSlot::new(
+            0,
+            0,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+            8,
+        )]);
+        let abi = super::PipelineAbi::graphics(None, Some(layout)).with_root_parameters(map);
+        assert_eq!(
+            abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv),
+            super::DescriptorTableSet::Declared(RootParameterSlot::new(
+                0,
+                0,
+                RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView),
+                8,
+            ))
+        );
+    }
+
     /// Encoder state is applied once per change: repeating the same wire state
     /// must not emit a second op, and a later change must be emitted again.
     #[test]
@@ -12145,8 +12422,9 @@ mod async_pipeline_tests {
 mod descriptor_table_kind_tests {
     use super::{
         DescriptorTableKind, check_table_kind, descriptor_table_entry_shape,
-        descriptor_table_shape, table_kind_accepts_wire,
+        descriptor_table_shape,
     };
+    use crate::macos::root_arguments::wire_kind_fills_table;
     use crate::wire::BufferBinding;
     use crate::wire_v3::{
         DescriptorKind, DescriptorTableEntryV3, DescriptorTableV3,
@@ -12201,7 +12479,7 @@ mod descriptor_table_kind_tests {
         ] {
             for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
                 assert!(
-                    table_kind_accepts_wire(reflected, wire),
+                    wire_kind_fills_table(reflected, wire),
                     "{reflected:?} must accept a {wire:?} buffer table"
                 );
                 let wire_table = buffer_table(wire);
@@ -12217,7 +12495,7 @@ mod descriptor_table_kind_tests {
                 );
             }
             assert!(
-                !table_kind_accepts_wire(reflected, DescriptorKind::Sampler),
+                !wire_kind_fills_table(reflected, DescriptorKind::Sampler),
                 "{reflected:?} must refuse a sampler id where an address is expected"
             );
             let refused = check_table_kind(2, &sampler_table(), reflected)
@@ -12235,7 +12513,7 @@ mod descriptor_table_kind_tests {
     #[test]
     fn a_texture_range_accepts_only_srv_and_uav_wire_kinds() {
         for wire in [DescriptorKind::Srv, DescriptorKind::Uav] {
-            assert!(table_kind_accepts_wire(DescriptorTableKind::Texture, wire));
+            assert!(wire_kind_fills_table(DescriptorTableKind::Texture, wire));
             let wire_table = texture_table(wire);
             assert_eq!(
                 descriptor_table_shape(&wire_table, DescriptorTableKind::Texture)
@@ -12246,7 +12524,7 @@ mod descriptor_table_kind_tests {
         }
         for wire in [DescriptorKind::Cbv, DescriptorKind::Sampler] {
             assert!(
-                !table_kind_accepts_wire(DescriptorTableKind::Texture, wire),
+                !wire_kind_fills_table(DescriptorTableKind::Texture, wire),
                 "a texture range must refuse {wire:?}"
             );
             let wire_table = match wire {
@@ -12269,13 +12547,13 @@ mod descriptor_table_kind_tests {
     /// A sampler range is exact: only sampler entries encode.
     #[test]
     fn a_sampler_range_accepts_only_sampler_wire_kinds() {
-        assert!(table_kind_accepts_wire(
+        assert!(wire_kind_fills_table(
             DescriptorTableKind::Sampler,
             DescriptorKind::Sampler
         ));
         assert!(check_table_kind(2, &sampler_table(), DescriptorTableKind::Sampler).is_ok());
         for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
-            assert!(!table_kind_accepts_wire(DescriptorTableKind::Sampler, wire));
+            assert!(!wire_kind_fills_table(DescriptorTableKind::Sampler, wire));
             let error = check_table_kind(2, &buffer_table(wire), DescriptorTableKind::Sampler)
                 .expect_err("an address table cannot fill a sampler range");
             assert!(error.to_string().contains("Sampler"));
@@ -12287,14 +12565,14 @@ mod descriptor_table_kind_tests {
     #[test]
     fn an_unspecified_range_accepts_every_wire_kind_and_uses_the_entry_shape() {
         for wire in [DescriptorKind::Cbv, DescriptorKind::Srv, DescriptorKind::Uav] {
-            assert!(table_kind_accepts_wire(DescriptorTableKind::Unspecified, wire));
+            assert!(wire_kind_fills_table(DescriptorTableKind::Unspecified, wire));
             assert_eq!(
                 descriptor_table_shape(&buffer_table(wire), DescriptorTableKind::Unspecified)
                     .expect("buffer entries resolve to the default address descriptor"),
                 DescriptorTableKind::Unspecified
             );
         }
-        assert!(table_kind_accepts_wire(
+        assert!(wire_kind_fills_table(
             DescriptorTableKind::Unspecified,
             DescriptorKind::Sampler
         ));

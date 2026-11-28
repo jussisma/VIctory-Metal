@@ -12,6 +12,32 @@
 //! search can be tested without a device.
 
 use crate::macos::bindings::{DescriptorTableKind, RootParameterKind, RootSignatureLayout};
+use crate::wire_v3::DescriptorKind;
+
+/// Whether a wire descriptor-table kind can fill a declared range kind.
+///
+/// This is the single shape matrix: the converter uses one 24-byte
+/// `{device_address, 0, 0}` descriptor for every buffer range, so a
+/// CBV/SRV/UAV range accepts a `Cbv`/`Srv`/`Uav` wire table; a `Texture` range
+/// accepts the texture-id (`Srv`/`Uav`) shapes only; a `Sampler` range accepts
+/// sampler ids only; and `Unspecified` (reflection's plain `"Table"`) accepts
+/// every wire kind because [`crate::macos::device`]'s shape check selects from
+/// the entry variants. A genuine mismatch is never coerced.
+pub(crate) fn wire_kind_fills_table(declared: DescriptorTableKind, wire: DescriptorKind) -> bool {
+    match declared {
+        DescriptorTableKind::ConstantBufferView
+        | DescriptorTableKind::ShaderResourceView
+        | DescriptorTableKind::UnorderedAccessView => {
+            matches!(
+                wire,
+                DescriptorKind::Cbv | DescriptorKind::Srv | DescriptorKind::Uav
+            )
+        }
+        DescriptorTableKind::Texture => matches!(wire, DescriptorKind::Srv | DescriptorKind::Uav),
+        DescriptorTableKind::Sampler => wire == DescriptorKind::Sampler,
+        DescriptorTableKind::Unspecified => true,
+    }
+}
 
 /// Whether a wire argument kind can address a reflected parameter kind.
 ///
@@ -116,11 +142,12 @@ pub(crate) fn unique_compatible_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{kinds_compatible, parameter_index};
+    use super::{kinds_compatible, parameter_index, wire_kind_fills_table};
     use crate::macos::bindings::{
         DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec,
         RootSignatureLayout,
     };
+    use crate::wire_v3::DescriptorKind;
 
     const SRV: RootParameterKind =
         RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView);
@@ -219,6 +246,62 @@ mod tests {
         // reflected parameter.
         let concrete = table_layout(&[(SRV, 0, 0)]);
         assert_eq!(parameter_index(&concrete, 0, 0, 0, unspecified), Some(0));
+    }
+
+    /// ADR-062: the shape matrix that both the resolver search and
+    /// `device::check_table_kind` consult. Every address range accepts every
+    /// address wire kind, a texture range accepts texture ids only, a sampler
+    /// range is exact, and `Unspecified` accepts every wire kind.
+    #[test]
+    fn the_wire_shape_matrix_is_exact() {
+        for declared in [
+            DescriptorTableKind::ConstantBufferView,
+            DescriptorTableKind::ShaderResourceView,
+            DescriptorTableKind::UnorderedAccessView,
+        ] {
+            for wire in [
+                DescriptorKind::Cbv,
+                DescriptorKind::Srv,
+                DescriptorKind::Uav,
+            ] {
+                assert!(
+                    wire_kind_fills_table(declared, wire),
+                    "{declared:?} must accept a {wire:?} buffer table"
+                );
+            }
+            assert!(
+                !wire_kind_fills_table(declared, DescriptorKind::Sampler),
+                "{declared:?} must refuse a sampler table"
+            );
+        }
+        for wire in [DescriptorKind::Srv, DescriptorKind::Uav] {
+            assert!(wire_kind_fills_table(DescriptorTableKind::Texture, wire));
+        }
+        for wire in [DescriptorKind::Cbv, DescriptorKind::Sampler] {
+            assert!(!wire_kind_fills_table(DescriptorTableKind::Texture, wire));
+        }
+        assert!(wire_kind_fills_table(
+            DescriptorTableKind::Sampler,
+            DescriptorKind::Sampler
+        ));
+        for wire in [
+            DescriptorKind::Cbv,
+            DescriptorKind::Srv,
+            DescriptorKind::Uav,
+        ] {
+            assert!(!wire_kind_fills_table(DescriptorTableKind::Sampler, wire));
+        }
+        for wire in [
+            DescriptorKind::Cbv,
+            DescriptorKind::Srv,
+            DescriptorKind::Uav,
+            DescriptorKind::Sampler,
+        ] {
+            assert!(wire_kind_fills_table(
+                DescriptorTableKind::Unspecified,
+                wire
+            ));
+        }
     }
 
     #[test]
