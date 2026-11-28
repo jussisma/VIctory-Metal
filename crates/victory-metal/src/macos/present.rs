@@ -526,6 +526,51 @@ impl PresentTraceReport {
             self.dropped_sources,
         )
     }
+
+    /// The report as the `present_trace` telemetry object (counts only).
+    ///
+    /// Field names are stable; no texture payload appears.
+    pub fn json_value(&self) -> String {
+        let count_for = |kind: PresentCopyKind| {
+            self.keys
+                .iter()
+                .filter(|entry| entry.copy_kind == kind)
+                .map(|entry| entry.count)
+                .fold(0u64, u64::saturating_add)
+        };
+        let source_is_presented: u64 = self
+            .keys
+            .iter()
+            .filter(|entry| entry.source_is_presented)
+            .map(|entry| entry.count)
+            .fold(0u64, u64::saturating_add);
+        let probe_sampled_presented: u64 = self
+            .keys
+            .iter()
+            .filter(|entry| entry.probe_sampled_presented)
+            .map(|entry| entry.count)
+            .fold(0u64, u64::saturating_add);
+        format!(
+            "{{\"frames\": {}, \"copied_into_source\": {}, \
+             \"copy_kind_copy_texture_region\": {}, \
+             \"copy_kind_resolve_subresource\": {}, \"copy_kind_none\": {}, \
+             \"source_is_presented\": {}, \"probe_sampled_presented\": {}, \
+             \"probe_source_mismatch\": {}, \"fallback_clear\": {}, \
+             \"distinct_keys\": {}, \"dropped_keys\": {}, \"dropped_sources\": {}}}",
+            self.frames,
+            self.copied_into_source,
+            count_for(PresentCopyKind::CopyTextureRegion),
+            count_for(PresentCopyKind::ResolveSubresource),
+            count_for(PresentCopyKind::None),
+            source_is_presented,
+            probe_sampled_presented,
+            self.probe_source_mismatch,
+            self.fallback_clear,
+            self.keys.len(),
+            self.dropped_keys,
+            self.dropped_sources,
+        )
+    }
 }
 
 /// Whether `sampled` is the same texture `presented` shows.

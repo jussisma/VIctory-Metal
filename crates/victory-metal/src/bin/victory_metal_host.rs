@@ -1363,6 +1363,9 @@ fn write_telemetry(
     let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
     let draw_trace = draw_trace_json();
+    let descriptor_table_census =
+        victory_metal::macos::trace::descriptor_table_refusal_census().json_value();
+    let present_trace = victory_metal::macos::present::present_trace_report().json_value();
 
     let json = format!(
         concat!(
@@ -1420,6 +1423,8 @@ fn write_telemetry(
             "  \"memory_space_bound\": {memory_space_bound},\n",
             "  \"memory_space_bytes\": {memory_space_bytes},\n",
             "  \"abi_refusals\": {abi_refusals},\n",
+            "  \"descriptor_table_refusal_census\": {descriptor_table_census},\n",
+            "  \"present_trace\": {present_trace},\n",
             "  \"draw_trace\": {draw_trace},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
@@ -1484,6 +1489,8 @@ fn write_telemetry(
         memory_space_bound = stats.memory_space_bound,
         memory_space_bytes = stats.memory_space_bytes,
         abi_refusals = stats.abi_refusals,
+        descriptor_table_census = descriptor_table_census,
+        present_trace = present_trace,
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
