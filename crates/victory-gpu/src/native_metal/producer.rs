@@ -3071,6 +3071,20 @@ pub(crate) fn reset_sequences(start: u32) {
     NEXT_SEQUENCE.store(start, Ordering::Relaxed);
 }
 
+/// One finished submission and the root-argument plan its producer recorded.
+///
+/// The plan names the translated `(space, register, kind)` each title
+/// root-parameter index feeds, which the wire's root commands cannot express;
+/// the bridge encodes it beside the unchanged frame
+/// ([`encode_root_arguments`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedSubmission {
+    /// The closed list's version 3 submission.
+    pub submission: SubmissionV3,
+    /// Root arguments recorded while it was recorded, in set order.
+    pub root_arguments: Vec<RootArgument>,
+}
+
 /// One recorded list on the native path: its producer and the submissions
 /// waiting for the bridge.
 ///
@@ -3083,7 +3097,7 @@ pub struct MetalList {
     list_id: u64,
     generation: u32,
     producer: MetalProducer,
-    pending: Vec<SubmissionV3>,
+    pending: Vec<RecordedSubmission>,
     failed: Option<ProducerError>,
     failures: u64,
 }
@@ -3137,7 +3151,13 @@ impl MetalList {
                 submission.sequence, UNASSIGNED_SEQUENCE,
                 "a list closes a submission before the transport assigns its sequence"
             );
-            self.pending.push(submission);
+            // The plan the list recorded travels with the submission it
+            // describes; it is encoded by the bridge, not here.
+            let root_arguments = self.producer.root_arguments().to_vec();
+            self.pending.push(RecordedSubmission {
+                submission,
+                root_arguments,
+            });
         }
         Ok(())
     }
@@ -3157,7 +3177,7 @@ impl MetalList {
             debug_assert!(
                 self.pending
                     .iter()
-                    .all(|submission| submission.sequence == UNASSIGNED_SEQUENCE),
+                    .all(|recorded| recorded.submission.sequence == UNASSIGNED_SEQUENCE),
                 "a pending submission is dropped before the transport assigned it a sequence"
             );
         }
@@ -3170,7 +3190,20 @@ impl MetalList {
     }
 
     /// Submissions finished by `Close` and not yet taken by the bridge.
+    ///
+    /// The root-argument plans are left behind: a caller that only needs the
+    /// frames uses this, one that carries the plan uses
+    /// [`take_with_root_arguments`](Self::take_with_root_arguments).
     pub fn take(&mut self) -> Vec<SubmissionV3> {
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|recorded| recorded.submission)
+            .collect()
+    }
+
+    /// Submissions finished by `Close` with the root-argument plan each one
+    /// recorded, for the transport that carries it.
+    pub fn take_with_root_arguments(&mut self) -> Vec<RecordedSubmission> {
         std::mem::take(&mut self.pending)
     }
 
