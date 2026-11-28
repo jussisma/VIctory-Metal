@@ -509,6 +509,11 @@ fn rect_list_expands_to_two_triangles() {
                         PrimitiveTopology::LineStrip => PrimitiveType::LineStrip,
                         PrimitiveTopology::TriangleList => PrimitiveType::Triangle,
                         PrimitiveTopology::TriangleStrip => PrimitiveType::TriangleStrip,
+                        // ADR-065: rect lists never use the plain topology
+                        // draw; they go through the expansion path above.
+                        PrimitiveTopology::RectList => {
+                            unreachable!("rect lists are drawn by their expansion")
+                        }
                     },
                     0,
                     vertices.len(),
