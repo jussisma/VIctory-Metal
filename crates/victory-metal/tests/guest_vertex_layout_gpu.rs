@@ -7,6 +7,11 @@
 //! descriptor reads the wrong stream and produces a different pixel, so the
 //! wrong descriptor cannot pass this proof.
 //!
+//! The second proof carries a per-instance slot: two instances translate one
+//! half-size quad left and right, so the exact pixels prove `setStepFunction:`
+//! and `setStepRate:` reached Metal; the same data under a per-vertex slot is
+//! the negative control.
+//!
 //! Run serialised; the test itself does not take the GPU lock (the harness
 //! does):
 //! ```text
@@ -49,12 +54,17 @@ const PACKED_STRIDE: u32 = 24;
 
 const TARGET_CORRECT: u64 = 0x2300;
 const TARGET_PACKED: u64 = 0x2301;
+const TARGET_INSTANCE: u64 = 0x2302;
+const TARGET_INSTANCE_VERTEX: u64 = 0x2303;
 
 const GREEN: [u8; 4] = [0, 255, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
+const CLEAR_BLUE: [u8; 4] = [0, 0, 255, 255];
 
 const HANDLE_CORRECT: u64 = 0x6300;
 const HANDLE_PACKED: u64 = 0x6301;
+const HANDLE_INSTANCE: u64 = 0x6302;
+const HANDLE_INSTANCE_VERTEX: u64 = 0x6303;
 
 /// Allocation ids in the wire snapshots.
 const TARGET_CORRECT_ALLOCATION: u64 = 1;
@@ -63,6 +73,17 @@ const SLOT1_ALLOCATION: u64 = 3;
 const TARGET_PACKED_ALLOCATION: u64 = 4;
 const INDEX_ALLOCATION: u64 = 5;
 const PACKED_ALLOCATION: u64 = 6;
+const TARGET_INSTANCE_ALLOCATION: u64 = 7;
+const TARGET_INSTANCE_VERTEX_ALLOCATION: u64 = 8;
+const POSITIONS_ALLOCATION: u64 = 9;
+const INSTANCES_ALLOCATION: u64 = 10;
+const INSTANCE_INDEX_ALLOCATION: u64 = 11;
+
+/// Per-vertex position stride for the instanced proof (one `float2`).
+const POSITION_STRIDE: u32 = 8;
+/// Per-instance data stride for the instanced proof (one `float4`:
+/// translation x, y, tint, unused).
+const INSTANCE_STRIDE: u32 = 16;
 
 /// Attribute 0 is a `float2` in vertex buffer 0 at offset 0; attribute 1 is a
 /// `float4` in vertex buffer 1 at offset 8. The fragment forces opaque alpha,
@@ -90,6 +111,35 @@ vertex VOut gv_vertex(VIn in [[stage_in]]) {
 
 fragment float4 gv_fragment(VOut in [[stage_in]]) {
     return float4(in.color.rgb, 1.0);
+}
+"#;
+
+/// The instanced proof: `attribute(0)` is a `float2` clip-space position
+/// (per-vertex, buffer 0) and `attribute(1)` is one `float4` per instance
+/// (per-instance, buffer 1) holding `(translate x, translate y, tint, unused)`.
+/// The quad is half-size, so instance 0 covers the left half and instance 1 the
+/// right half exactly; a per-vertex step would read one instance element per
+/// vertex and could not produce those two halves.
+const INSTANCE_LAYOUT_MSL: &str = r#"
+struct IIn {
+    float2 position [[attribute(0)]];
+    float4 instance [[attribute(1)]];
+};
+
+struct IOut {
+    float4 position [[position]];
+    float4 color [[flat]];
+};
+
+vertex IOut gvi_vertex(IIn in [[stage_in]]) {
+    IOut out;
+    out.position = float4(in.position * 0.5 + in.instance.xy, 0.0, 1.0);
+    out.color = float4(in.instance.z, 1.0 - in.instance.z, 0.0, 1.0);
+    return out;
+}
+
+fragment float4 gvi_fragment(IOut in [[stage_in]]) {
+    return in.color;
 }
 "#;
 
@@ -134,7 +184,11 @@ fn compile_metallib(dir: &Path) -> Option<Vec<u8>> {
     let source = dir.join("guest-layout.metal");
     let air = dir.join("guest-layout.air");
     let library = dir.join("guest-layout.metallib");
-    fs::write(&source, GUEST_LAYOUT_MSL).expect("write MSL source");
+    fs::write(
+        &source,
+        format!("{GUEST_LAYOUT_MSL}\n{INSTANCE_LAYOUT_MSL}"),
+    )
+    .expect("write MSL source");
     let compiled = Command::new(metal)
         .arg("-c")
         .arg(&source)
@@ -404,6 +458,102 @@ fn positions(stride: usize) -> Vec<u8> {
     data
 }
 
+/// The guest layout the instanced proof carries: `attribute(0)` per-vertex in
+/// buffer 0 and `attribute(1)` in buffer 1 with `step_function`/rate 1.
+fn instance_layout(step_function: VertexStepFunction) -> VertexLayout {
+    VertexLayout::from_attributes_and_slots(
+        vec![
+            VertexAttribute {
+                index: 0,
+                format: float_format(2),
+                offset: 0,
+                buffer_index: 0,
+                stride: POSITION_STRIDE,
+            },
+            VertexAttribute {
+                index: 1,
+                format: float_format(4),
+                offset: 0,
+                buffer_index: 1,
+                stride: INSTANCE_STRIDE,
+            },
+        ],
+        vec![
+            VertexSlot {
+                buffer_index: 0,
+                stride: POSITION_STRIDE,
+                step_function: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            VertexSlot {
+                buffer_index: 1,
+                stride: INSTANCE_STRIDE,
+                step_function,
+                step_rate: 1,
+            },
+        ],
+    )
+    .expect("a two-slot layout with one stepped slot")
+}
+
+/// The exact pixel pattern two per-instance translations must produce: the
+/// half-size quad is translated left by instance 0 and right by instance 1, so
+/// columns 0..32 are GREEN, 32..64 RED and the rest keeps the CLEAR_BLUE clear.
+fn instance_expected_pixels() -> Vec<[u8; 4]> {
+    let mut expected = Vec::with_capacity(PIXELS);
+    for row in 0..EDGE as usize {
+        for column in 0..EDGE as usize {
+            let color = if !(16..48).contains(&row) {
+                CLEAR_BLUE
+            } else if column < 32 {
+                GREEN
+            } else {
+                RED
+            };
+            expected.push(color);
+        }
+    }
+    expected
+}
+
+/// One full-viewport instanced draw of the half-size quad (six indices),
+/// instance 0 translating left and instance 1 translating right.
+fn instance_draw_commands(
+    pipeline_id: u64,
+    target_allocation: u64,
+    buffers: Vec<VertexBuffer>,
+) -> Vec<CommandV3> {
+    vec![
+        CommandV3::BeginRenderPass(BeginRenderPass {
+            colors: vec![color_attachment(target_allocation)],
+            depth_stencil: None,
+        }),
+        CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id }),
+        CommandV3::SetViewport(full_viewport()),
+        CommandV3::SetScissor(full_scissor()),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::SetVertexBuffers(VertexBufferSet {
+            start_slot: 0,
+            buffers,
+        }),
+        CommandV3::SetIndexBuffer(IndexBufferBinding {
+            allocation_id: INSTANCE_INDEX_ALLOCATION,
+            generation: 1,
+            offset: 0,
+            length: 12,
+            format: IndexFormat::Uint16,
+        }),
+        CommandV3::DrawIndexed(DrawIndexedState {
+            index_count: 6,
+            instance_count: 2,
+            start_index: 0,
+            base_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+    ]
+}
+
 #[test]
 fn guest_multi_slot_layout_draws_exact_pixels_and_the_packed_zero_layout_cannot() {
     let dir = TempDir::new("guest-vertex-layout");
@@ -588,5 +738,192 @@ fn guest_multi_slot_layout_draws_exact_pixels_and_the_packed_zero_layout_cannot(
         correct[0],
         packed[0],
         STRIDE
+    );
+}
+
+/// ADR-061: a per-instance slot must reach `setStepFunction:`/`setStepRate:`.
+///
+/// Two instances translate one half-size quad by `(-0.5, 0)` and `(+0.5, 0)`,
+/// so the correct descriptor covers the left and right halves exactly with two
+/// uniform colours. The same data under a per-vertex slot reads one instance
+/// element per vertex and cannot reproduce that pattern, so a host that lost
+/// the step function cannot pass this proof.
+#[test]
+fn guest_per_instance_slot_steps_once_per_instance() {
+    let dir = TempDir::new("guest-instance-layout");
+    let Some(metallib) = compile_metallib(dir.path()) else {
+        eprintln!("PARTIAL: Apple Metal toolchain (metal/metallib) not found; proof skipped");
+        return;
+    };
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    for target in [TARGET_INSTANCE, TARGET_INSTANCE_VERTEX] {
+        transport
+            .register_registry_texture(target, rgba8_desc())
+            .expect("registry colour target must create");
+    }
+    for (handle, layout) in [
+        (
+            HANDLE_INSTANCE,
+            instance_layout(VertexStepFunction::PerInstance),
+        ),
+        (
+            HANDLE_INSTANCE_VERTEX,
+            instance_layout(VertexStepFunction::PerVertex),
+        ),
+    ] {
+        transport
+            .register_content_hashed_graphics_pipeline(
+                handle,
+                &metallib,
+                "gvi_vertex",
+                &encoded_state(&layout),
+                PipelineAbi::graphics(None, None),
+            )
+            .expect("the stepped descriptor must let Metal create the pipeline");
+    }
+
+    // Vertex stream: a 2x2 quad in clip space, one float2 per vertex.
+    let mut positions = Vec::new();
+    for corner in [[-1.0f32, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]] {
+        positions.extend_from_slice(&corner[0].to_le_bytes());
+        positions.extend_from_slice(&corner[1].to_le_bytes());
+    }
+    let mut positions_page = HostPage::new(16 * 1024);
+    positions_page.write(0, &positions);
+    // SAFETY: `positions_page` is a live 16 KiB page outliving the submission.
+    let positions_id = unsafe { transport.register_zerocopy(positions_page.raw(), 16 * 1024) }
+        .expect("position page must register");
+
+    // Instance stream: entry 0 translates left (GREEN), entry 1 right (RED).
+    // Entries 2 and 3 exist so the per-vertex control reads defined data.
+    let mut instances = Vec::new();
+    for entry in [
+        [-0.5f32, 0.0, 0.0, 1.0],
+        [0.5, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 0.5, 1.0],
+        [0.0, 0.0, 0.5, 1.0],
+    ] {
+        for value in entry {
+            instances.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let mut instances_page = HostPage::new(16 * 1024);
+    instances_page.write(0, &instances);
+    // SAFETY: `instances_page` is a live 16 KiB page outliving the submission.
+    let instances_id = unsafe { transport.register_zerocopy(instances_page.raw(), 16 * 1024) }
+        .expect("instance page must register");
+
+    let mut index_page = HostPage::new(16 * 1024);
+    let mut index_bytes = Vec::new();
+    for index in [0u16, 1, 2, 2, 1, 3] {
+        index_bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    index_page.write(0, &index_bytes);
+    // SAFETY: `index_page` is a live 16 KiB page outliving the submission.
+    let index_id = unsafe { transport.register_zerocopy(index_page.raw(), 16 * 1024) }
+        .expect("index page must register");
+
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        (TARGET_INSTANCE_ALLOCATION, 1u32),
+        VmBufferId(TARGET_INSTANCE),
+    );
+    snapshot.insert(
+        (TARGET_INSTANCE_VERTEX_ALLOCATION, 1u32),
+        VmBufferId(TARGET_INSTANCE_VERTEX),
+    );
+    snapshot.insert((POSITIONS_ALLOCATION, 1u32), positions_id);
+    snapshot.insert((INSTANCES_ALLOCATION, 1u32), instances_id);
+    snapshot.insert((INSTANCE_INDEX_ALLOCATION, 1u32), index_id);
+
+    let buffers = vec![
+        VertexBuffer {
+            allocation_id: POSITIONS_ALLOCATION,
+            generation: 1,
+            offset: 0,
+            stride: POSITION_STRIDE,
+            length: 4 * u64::from(POSITION_STRIDE),
+        },
+        VertexBuffer {
+            allocation_id: INSTANCES_ALLOCATION,
+            generation: 1,
+            offset: 0,
+            stride: INSTANCE_STRIDE,
+            length: 4 * u64::from(INSTANCE_STRIDE),
+        },
+    ];
+
+    for (sequence, pipeline, target, label) in [
+        (
+            213u32,
+            HANDLE_INSTANCE,
+            TARGET_INSTANCE_ALLOCATION,
+            "per-instance",
+        ),
+        (
+            214,
+            HANDLE_INSTANCE_VERTEX,
+            TARGET_INSTANCE_VERTEX_ALLOCATION,
+            "per-vertex control",
+        ),
+    ] {
+        let submission = SubmissionV3 {
+            sequence,
+            list: None,
+            commands: instance_draw_commands(pipeline, target, buffers.clone()),
+        };
+        let (reply, stats) = transport
+            .submit_v3_with_stats(&submission, &snapshot)
+            .expect("the instanced layout pass must execute");
+        assert_eq!(
+            reply.status,
+            victory_metal::wire::ReplyStatus::Ok,
+            "{label} submission status"
+        );
+        assert_eq!(stats.render_encoders, 1, "{label}: one render encoder");
+        transport
+            .wait_for_gpu()
+            .expect("the instanced pass should complete");
+    }
+
+    let expected = instance_expected_pixels();
+    let stepped = transport
+        .read_registered_texture_rgba8(TARGET_INSTANCE)
+        .expect("per-instance target readback");
+    assert_eq!(stepped.len(), PIXELS, "per-instance pixel count");
+    for (index, pixel) in stepped.iter().enumerate() {
+        assert_eq!(
+            *pixel,
+            expected[index],
+            "per-instance pixel {index} (column {}, row {})",
+            index % EDGE as usize,
+            index / EDGE as usize
+        );
+    }
+
+    let per_vertex = transport
+        .read_registered_texture_rgba8(TARGET_INSTANCE_VERTEX)
+        .expect("per-vertex control readback");
+    let differing = per_vertex
+        .iter()
+        .zip(&expected)
+        .filter(|(actual, expected)| actual != expected)
+        .count();
+    assert!(
+        differing > 0,
+        "the per-vertex control must not reproduce the two-translation halves"
+    );
+
+    for id in [positions_id, instances_id, index_id] {
+        transport
+            .unregister_buffer(id)
+            .expect("unregister a test page");
+    }
+    eprintln!(
+        "per-instance proof on {}: {} pixels match the two translations exactly, per-vertex control differs in {differing} pixels",
+        info.name_str(),
+        stepped.len()
     );
 }

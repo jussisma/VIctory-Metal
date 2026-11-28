@@ -578,6 +578,32 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
     }
 }
 
+/// Records the `StrideInBytes` values of one `IASetVertexBuffers` call for the
+/// ADR-061 guest layout encoder.
+///
+/// D3D12 states a vertex buffer's stride only here, while the guest builds its
+/// `VMVD` v2 layout at pipeline creation — usually after the streams are bound.
+/// A zero stride is "not stated" (D3D12's null form), so it stays unknown: the
+/// encoder sends zero for that slot and the host counts it rather than
+/// inventing a packed stride.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn record_vertex_strides(start_slot: u32, strides: &[u32]) {
+    let observed: Vec<Option<u32>> = strides
+        .iter()
+        .map(|stride| (*stride != 0).then_some(*stride))
+        .collect();
+    crate::native_metal::state::note_vertex_buffer_strides(start_slot, &observed);
+}
+
+/// Records a null `IASetVertexBuffers`: D3D12's legal unbind of `count` slots.
+fn clear_vertex_strides(start_slot: u32, count: u32) {
+    let count = usize::try_from(count)
+        .unwrap_or(0)
+        .min(crate::native_metal::state::VERTEX_SLOTS);
+    let cleared = vec![None; count];
+    crate::native_metal::state::note_vertex_buffer_strides(start_slot, &cleared);
+}
+
 /// Resolves and records a title list's vertex buffers, pinning their backing.
 ///
 /// Each view's GPU virtual address goes through the `GuestRangeResolver` seam,
@@ -589,6 +615,11 @@ fn bind_graphics_root_view(this: This, slot: u32, address: u64) {
 #[cfg(windows)]
 fn bind_vertex_buffers(this: This, start: u32, views: &[MetalVertexView]) {
     use crate::native_metal::{bindings, queue};
+    // The guest's own call is recorded before any refusal: the layout encoder
+    // must see the stride the title stated, not just the ones this host could
+    // resolve.
+    let strides: Vec<u32> = views.iter().map(|view| view.stride).collect();
+    record_vertex_strides(start, &strides);
     let Some(resolver) = bindings::resolver() else {
         refuse_binding(
             this,
@@ -3502,7 +3533,7 @@ fn note_state_flush(this: This, value: u64) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, metal_resource, with_metal, with_state};
+    use super::{This, clear_vertex_strides, metal_resource, with_metal, with_state};
     use crate::backend::GpuBackend;
     use crate::draw::{IndexView, VertexView};
     use crate::native_metal::producer::{
@@ -3893,6 +3924,7 @@ mod state {
     ) {
         if metal() {
             if views.is_null() {
+                clear_vertex_strides(start, count);
                 with_metal(this, |p| p.clear_vertex_buffers(start, count));
             } else {
                 super::bind_vertex_buffers(
@@ -5691,5 +5723,76 @@ mod tests {
             [(0x2_E2A6_E000, 1), (0x2_E2A6_F000, 2)],
             "each clear registers with its own attachment usage"
         );
+    }
+
+    /// ADR-061: the stride a title states in `IASetVertexBuffers` is what the
+    /// v2 layout encoder sends, per slot, and an unstated slot stays counted
+    /// instead of being given an invented packed stride.
+    #[test]
+    fn vertex_buffer_strides_reach_the_guest_layout_encoder() {
+        use crate::native_metal::state::{self, GuestInputElement, GuestInputLayout};
+
+        state::reset_vertex_layout_telemetry();
+
+        // A multi-slot bind starting at slot 1; slot 2 states no stride.
+        record_vertex_strides(1, &[32, 0, 48]);
+        let strides = state::vertex_strides();
+        assert_eq!(strides[0], None, "a slot before the start is untouched");
+        assert_eq!(strides[1], Some(32));
+        assert_eq!(strides[2], None, "a zero stride is never adopted");
+        assert_eq!(strides[3], Some(48));
+
+        let elements = vec![
+            GuestInputElement {
+                index: 11,
+                format: 2,
+                offset: 0,
+                slot: 1,
+                per_instance: false,
+                step_rate: 0,
+            },
+            GuestInputElement {
+                index: 12,
+                format: 4,
+                offset: 0,
+                slot: 2,
+                per_instance: false,
+                step_rate: 0,
+            },
+        ];
+        let layout = GuestInputLayout::from_elements(elements, &state::vertex_strides())
+            .expect("both slots are declared");
+        let chunk = layout.encode();
+        // Six-byte header, eleven bytes per attribute: the stride is at +7.
+        assert_eq!(
+            u32::from_le_bytes(chunk[6 + 7..6 + 11].try_into().unwrap()),
+            32,
+            "the observed stride reaches the encoder"
+        );
+        let second = 6 + 11;
+        assert_eq!(
+            u32::from_le_bytes(chunk[second + 7..second + 11].try_into().unwrap()),
+            0,
+            "an unobserved slot is encoded zero, never a packed guess"
+        );
+        assert_eq!(
+            state::ia_stride_unknown(),
+            1,
+            "the unstated slot is counted"
+        );
+
+        // A null bind unbinds exactly the slots it names.
+        clear_vertex_strides(1, 2);
+        let strides = state::vertex_strides();
+        assert_eq!(strides[1], None);
+        assert_eq!(strides[2], None);
+        assert_eq!(
+            strides[3],
+            Some(48),
+            "a slot outside the clear keeps its stride"
+        );
+
+        state::reset_vertex_layout_telemetry();
+        assert_eq!(state::vertex_strides(), [None; state::VERTEX_SLOTS]);
     }
 }

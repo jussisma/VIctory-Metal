@@ -67,7 +67,7 @@ use std::mem;
 use crate::abi::VmBufferId;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
-use crate::macos::vertex_layout::{VertexLayout, VertexLayoutError};
+use crate::macos::vertex_layout::{VertexLayout, VertexLayoutError, VertexStepFunction};
 use crate::macos::views::FormatSupport;
 use crate::transport::MetalError;
 use crate::wire_v3::{
@@ -132,6 +132,8 @@ const MTL_FUNCTION_TYPE_OBJECT: usize = 8;
 
 /// `MTLVertexStepFunctionPerVertex`.
 const MTL_VERTEX_STEP_FUNCTION_PER_VERTEX: usize = 1;
+/// `MTLVertexStepFunctionPerInstance`.
+const MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE: usize = 2;
 
 /// Apple `NSRange` (`NSUInteger location, length`).
 #[repr(C)]
@@ -3384,13 +3386,61 @@ fn build_graphics_pso(
     })
 }
 
+/// The buffer-layout values one slot writes into `MTLVertexDescriptor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VertexSlotValues {
+    /// `setStride:` value in bytes.
+    stride: usize,
+    /// `setStepFunction:` value (`MTLVertexStepFunction`).
+    step_function: usize,
+    /// `setStepRate:` value.
+    step_rate: usize,
+}
+
+/// The descriptor values every slot of `layout` applies.
+///
+/// The values come from the decoded guest layout, so a per-instance slot keeps
+/// its guest step rate and a per-vertex slot is always rate 1 (the decode
+/// already normalised it). A per-instance slot with a zero rate is refused by
+/// name: Metal would read it as "advance never" instead of the guest's
+/// `InstanceDataStepRate`.
+fn vertex_slot_values(layout: &VertexLayout) -> Result<Vec<(u8, VertexSlotValues)>, RegistryError> {
+    let mut values = Vec::with_capacity(layout.slots().len());
+    for slot in layout.slots() {
+        let step_function = match slot.step_function {
+            VertexStepFunction::PerVertex => MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            VertexStepFunction::PerInstance => MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+        };
+        if slot.step_function == VertexStepFunction::PerInstance && slot.step_rate == 0 {
+            return Err(RegistryError::InvalidVertexLayout(format!(
+                "vertex buffer {} is per-instance with a zero step rate",
+                slot.buffer_index
+            )));
+        }
+        values.push((
+            slot.buffer_index,
+            VertexSlotValues {
+                stride: slot.stride as usize,
+                step_function,
+                step_rate: if slot.step_function == VertexStepFunction::PerVertex {
+                    1
+                } else {
+                    slot.step_rate as usize
+                },
+            },
+        ));
+    }
+    Ok(values)
+}
+
 /// Applies a derived vertex layout to a live `MTLRenderPipelineDescriptor`.
 ///
 /// The descriptor is the one Metal requires before it will accept a vertex
 /// function with `[[attribute(n)]]` inputs. Every attribute's format, offset
-/// and buffer index and every used buffer's stride are set; nothing is
-/// defaulted or dropped. The array subscripts return objects owned by the
-/// `MTLVertexDescriptor`, so they are never retained or released here.
+/// and buffer index and every used buffer's stride, step function and step
+/// rate are set; nothing is defaulted or dropped. The array subscripts return
+/// objects owned by the `MTLVertexDescriptor`, so they are never retained or
+/// released here.
 fn apply_vertex_descriptor(
     descriptor: objc::Id,
     layout: &VertexLayout,
@@ -3415,7 +3465,6 @@ fn apply_vertex_descriptor(
         )));
     }
 
-    let mut layouts: HashMap<u8, u32> = HashMap::new();
     for attribute in layout.attributes() {
         let target = unsafe {
             objc::msg_send_id_usize(
@@ -3445,9 +3494,6 @@ fn apply_vertex_descriptor(
                 usize::from(attribute.buffer_index),
             );
         }
-        layouts
-            .entry(attribute.buffer_index)
-            .or_insert(attribute.stride);
     }
 
     let layout_array =
@@ -3457,7 +3503,7 @@ fn apply_vertex_descriptor(
             "MTLVertexDescriptor layouts is nil".to_string(),
         )));
     }
-    for (buffer_index, stride) in layouts {
+    for (buffer_index, values) in vertex_slot_values(layout)? {
         let target = unsafe {
             objc::msg_send_id_usize(
                 layout_array,
@@ -3471,15 +3517,13 @@ fn apply_vertex_descriptor(
             )));
         }
         // SAFETY: `target` is a live buffer layout descriptor owned by the
-        // `MTLVertexDescriptor`; `stride` is 4-byte aligned and nonzero.
+        // `MTLVertexDescriptor`; `stride` is 4-byte aligned and nonzero, the
+        // step function is one of Metal's two values and a per-instance rate
+        // was validated nonzero above.
         unsafe {
-            objc::msg_send_void_usize(target, objc::sel(c"setStride:"), stride as usize);
-            objc::msg_send_void_usize(
-                target,
-                objc::sel(c"setStepFunction:"),
-                MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
-            );
-            objc::msg_send_void_usize(target, objc::sel(c"setStepRate:"), 1);
+            objc::msg_send_void_usize(target, objc::sel(c"setStride:"), values.stride);
+            objc::msg_send_void_usize(target, objc::sel(c"setStepFunction:"), values.step_function);
+            objc::msg_send_void_usize(target, objc::sel(c"setStepRate:"), values.step_rate);
         }
     }
 
@@ -4868,6 +4912,83 @@ mod tests {
             PipelineState::decode(&corrupt),
             Err(RegistryError::UnsupportedVertexFormat(0x31))
         ));
+    }
+
+    #[test]
+    fn a_per_instance_slot_reaches_the_descriptor_values() {
+        use crate::macos::vertex_layout::VertexSlot;
+
+        let float2 = VertexFormat::with_components(VertexFormat::FLOAT, 2).unwrap();
+        let float4 = VertexFormat::with_components(VertexFormat::FLOAT, 4).unwrap();
+        let layout = VertexLayout::from_attributes_and_slots(
+            vec![
+                VertexAttribute {
+                    index: 0,
+                    format: float2,
+                    offset: 0,
+                    buffer_index: 0,
+                    stride: 8,
+                },
+                VertexAttribute {
+                    index: 1,
+                    format: float4,
+                    offset: 0,
+                    buffer_index: 1,
+                    stride: 16,
+                },
+            ],
+            vec![
+                VertexSlot {
+                    buffer_index: 0,
+                    stride: 8,
+                    step_function: VertexStepFunction::PerVertex,
+                    step_rate: 1,
+                },
+                VertexSlot {
+                    buffer_index: 1,
+                    stride: 16,
+                    step_function: VertexStepFunction::PerInstance,
+                    step_rate: 2,
+                },
+            ],
+        )
+        .expect("a two-slot layout with one per-instance slot");
+
+        let decoded = VertexLayout::decode(&layout.encode()).expect("the v2 chunk decodes");
+        assert_eq!(decoded, layout, "the per-instance slot survives the wire");
+
+        assert_eq!(
+            vertex_slot_values(&decoded).expect("descriptor values are valid"),
+            vec![
+                (
+                    0,
+                    VertexSlotValues {
+                        stride: 8,
+                        step_function: MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+                        step_rate: 1,
+                    },
+                ),
+                (
+                    1,
+                    VertexSlotValues {
+                        stride: 16,
+                        step_function: MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE,
+                        step_rate: 2,
+                    },
+                ),
+            ],
+            "the apply loop writes the decoded step function and rate"
+        );
+
+        // The layout's own mapping and the registry's SDK constants agree.
+        assert_eq!(
+            VertexStepFunction::PerVertex.mtl_step_function(),
+            MTL_VERTEX_STEP_FUNCTION_PER_VERTEX as u32
+        );
+        assert_eq!(
+            VertexStepFunction::PerInstance.mtl_step_function(),
+            MTL_VERTEX_STEP_FUNCTION_PER_INSTANCE as u32
+        );
     }
 
     #[test]

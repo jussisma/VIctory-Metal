@@ -530,6 +530,15 @@ struct Stats {
     host_pipeline_translations_refused: u64,
     /// Stages answered from the host pool's disk cache.
     host_pipeline_cache_hits: u64,
+    /// Graphics pipelines whose descriptor came from the guest's `VMVD` v2
+    /// layout (ADR-061).
+    vertex_layout_guest: u64,
+    /// Graphics pipelines that fell back to the vertex stage's `ISG1`
+    /// signature because no guest layout was carried.
+    vertex_layout_signature: u64,
+    /// Guest slots whose stride was unknown when the layout was encoded; the
+    /// host derived the packed stride for those slots only.
+    vertex_layout_ia_stride_unknown: u64,
     /// Last bounded host-translation refusal reason.
     host_translation_reason: Option<String>,
     /// Kind 8 texture registrations refused by the host.
@@ -596,6 +605,9 @@ impl Default for Stats {
             host_pipeline_translations_ok: 0,
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
+            vertex_layout_guest: 0,
+            vertex_layout_signature: 0,
+            vertex_layout_ia_stride_unknown: 0,
             host_translation_reason: None,
             texture_registration_refusals: 0,
             texture_registration_reason: None,
@@ -1065,6 +1077,15 @@ fn publish_session_stats(stats: &Arc<Mutex<Stats>>, session: &SessionStats) {
     stats.host_pipeline_cache_hits = stats
         .host_pipeline_cache_hits
         .saturating_add(session.host_pipeline_cache_hits);
+    stats.vertex_layout_guest = stats
+        .vertex_layout_guest
+        .saturating_add(session.vertex_layout_guest);
+    stats.vertex_layout_signature = stats
+        .vertex_layout_signature
+        .saturating_add(session.vertex_layout_signature);
+    stats.vertex_layout_ia_stride_unknown = stats
+        .vertex_layout_ia_stride_unknown
+        .saturating_add(session.vertex_layout_ia_stride_unknown);
     for (index, count) in session.host_translated_stages.iter().enumerate() {
         stats.host_translated_stages[index] =
             stats.host_translated_stages[index].saturating_add(*count);
@@ -1437,6 +1458,9 @@ fn write_telemetry(
             "  \"host_pipeline_translations_ok\": {host_ok},\n",
             "  \"host_pipeline_translations_refused\": {host_refused},\n",
             "  \"host_pipeline_cache_hits\": {host_cache_hits},\n",
+            "  \"vertex_layout_guest\": {vertex_layout_guest},\n",
+            "  \"vertex_layout_signature\": {vertex_layout_signature},\n",
+            "  \"vertex_layout_ia_stride_unknown\": {vertex_layout_ia_stride_unknown},\n",
             "  \"host_translation_reason\": {host_translation_reason},\n",
             "  \"texture_registration_refusals\": {texture_refusals},\n",
             "  \"texture_registration_reason\": {texture_registration_reason},\n",
@@ -1517,6 +1541,9 @@ fn write_telemetry(
         host_ok = stats.host_pipeline_translations_ok,
         host_refused = stats.host_pipeline_translations_refused,
         host_cache_hits = stats.host_pipeline_cache_hits,
+        vertex_layout_guest = stats.vertex_layout_guest,
+        vertex_layout_signature = stats.vertex_layout_signature,
+        vertex_layout_ia_stride_unknown = stats.vertex_layout_ia_stride_unknown,
         host_translation_reason = host_translation_reason,
         texture_refusals = stats.texture_registration_refusals,
         texture_registration_reason = texture_registration_reason,
@@ -1839,6 +1866,9 @@ impl Clone for Stats {
             host_pipeline_translations_ok: self.host_pipeline_translations_ok,
             host_pipeline_translations_refused: self.host_pipeline_translations_refused,
             host_pipeline_cache_hits: self.host_pipeline_cache_hits,
+            vertex_layout_guest: self.vertex_layout_guest,
+            vertex_layout_signature: self.vertex_layout_signature,
+            vertex_layout_ia_stride_unknown: self.vertex_layout_ia_stride_unknown,
             host_translation_reason: self.host_translation_reason.clone(),
             texture_registration_refusals: self.texture_registration_refusals,
             texture_registration_reason: self.texture_registration_reason.clone(),
@@ -2167,6 +2197,9 @@ mod draw_trace_json_tests {
             "host_pipeline_translations_ok",
             "host_pipeline_translations_refused",
             "host_pipeline_cache_hits",
+            "vertex_layout_guest",
+            "vertex_layout_signature",
+            "vertex_layout_ia_stride_unknown",
             "host_translation_reason",
             "texture_registration_refusals",
             "texture_registration_reason",
@@ -2223,5 +2256,32 @@ mod draw_trace_json_tests {
             json.contains("  \"draw_trace\": {"),
             "draw_trace is a nested object, not a scalar: {json}"
         );
+    }
+
+    /// ADR-061: the three vertex-layout counters are published under stable
+    /// names, so Boot #32 can read the guest/signature split and the number of
+    /// slots that needed a packed stride.
+    #[test]
+    fn telemetry_publishes_the_vertex_layout_counters() {
+        let path = std::env::temp_dir().join(format!(
+            "victory-telemetry-vertex-layout-{}.json",
+            std::process::id()
+        ));
+        let stats = Stats {
+            vertex_layout_guest: 12,
+            vertex_layout_signature: 3,
+            vertex_layout_ia_stride_unknown: 2,
+            ..Stats::default()
+        };
+        write_telemetry(&path, 1, &stats, &[]).expect("telemetry writes");
+        let json = std::fs::read_to_string(&path).expect("telemetry reads");
+        let _ = std::fs::remove_file(&path);
+        for expected in [
+            "\"vertex_layout_guest\": 12",
+            "\"vertex_layout_signature\": 3",
+            "\"vertex_layout_ia_stride_unknown\": 2",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
     }
 }
