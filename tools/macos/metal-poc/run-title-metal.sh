@@ -73,6 +73,25 @@
 # one of its aliases) is given; children are still reaped and the orphan
 # assertion still runs when the session is kept.
 #
+# ADR-068 session hygiene: a boot copies several GB into
+# $TMPDIR/victory-title.XXXXXXXX, so a session that outlives its launcher is
+# expensive (67 stale directories held 111 GB on 2026-11-28). Two guards run
+# before a new session is created:
+#
+#   * `session_sweep` removes `$TMPDIR/victory-title.*` and
+#     `victory-title-out.*` directories whose `owner.pid` marker names a process
+#     that is gone (or a PID that was recycled by an unrelated process), and
+#     markerless directories older than VICTORY_SESSION_MAX_AGE seconds
+#     (default 7200 = 2 h; 0 disables the age rule). A directory whose owner is
+#     provably alive is never removed, whatever its age. It always prints one
+#     bounded `session_sweep removed=N kept=M` line.
+#   * `session_preflight` refuses to boot when fewer than VICTORY_MIN_FREE_GB
+#     GB (default 60; 0 disables) are free on the session volume, instead of
+#     filling the disk and failing halfway through a boot.
+#
+# The only cleanup hole left is SIGKILL: no trap can run after it, which is
+# exactly why the next launch (or victory-metal.sh's own exit sweep) sweeps.
+#
 # One GPU task at a time: the script takes /tmp/victory-gpu.lock. A hermetic
 # test may point VICTORY_GPU_LOCK at a private directory (the same ownership
 # protocol and owner record apply); a live run keeps the default so concurrent
@@ -235,20 +254,38 @@ fail_setup() {
 
 # Remove exactly the session directory this run created. WORK is the literal
 # `mktemp` result, so it is the ownership proof; there is no wildcard sweep of
-# $TMPDIR. The suffix check rejects a mutated or empty value instead of letting
-# a bug turn into a deletion of something else.
+# $TMPDIR here. `is_session_dir_path` rejects empty, `/`, `.` and `..` before the
+# `rm -rf`, so a mutated variable can never widen a deletion.
+is_session_dir_path() {
+    case "${1:-}" in
+        ''|/|.|..) return 1 ;;
+    esac
+    case "${1:-}" in
+        */victory-title.????????|*/victory-title-out.????????) return 0 ;;
+    esac
+    return 1
+}
+
+# Size of a session directory in MiB, printed as a number or `unknown`. Used by
+# the keep messages so a preserved session is never silent about its cost.
+session_size_mb() {
+    _ssm_kb="$(du -sk "${1:-}" 2>/dev/null | awk 'NR==1 {print $1}')"
+    case "$_ssm_kb" in
+        ''|*[!0-9]*) printf 'unknown\n'; return 0 ;;
+    esac
+    printf '%s\n' $(( _ssm_kb / 1024 ))
+}
+
 remove_session_work() {
     [ -n "${WORK:-}" ] || return 0
     [ -e "$WORK" ] || return 0
-    case "$WORK" in
-        */victory-title.????????) ;;
-        *)
-            echo "run-title-metal.sh: WARN: refusing to remove unexpected session path $WORK" >&2
-            return 1
-            ;;
-    esac
+    if ! is_session_dir_path "$WORK"; then
+        echo "run-title-metal.sh: WARN: refusing to remove unexpected session path $WORK" >&2
+        return 1
+    fi
     if victory_hygiene_keep_logs; then
         echo "run-title-metal.sh: kept session files in $WORK"
+        echo "run-title-metal.sh: WARNING: --keep-session (or an alias) disabled cleanup; $WORK is $(session_size_mb "$WORK") MiB. Remove it with: rm -rf -- \"$WORK\""
         return 0
     fi
     victory_hygiene_remove_work || true
@@ -270,15 +307,13 @@ remove_owned_out() {
     [ "${OUT_OWNED:-0}" = 1 ] || return 0
     [ -n "${OUT:-}" ] || return 0
     [ -e "$OUT" ] || return 0
-    case "$OUT" in
-        */victory-title-out.????????) ;;
-        *)
-            echo "run-title-metal.sh: WARN: refusing to remove unexpected diagnostics path $OUT" >&2
-            return 1
-            ;;
-    esac
+    if ! is_session_dir_path "$OUT"; then
+        echo "run-title-metal.sh: WARN: refusing to remove unexpected diagnostics path $OUT" >&2
+        return 1
+    fi
     if victory_hygiene_keep_logs; then
         echo "run-title-metal.sh: kept diagnostics in $OUT"
+        echo "run-title-metal.sh: WARNING: --keep-session (or an alias) disabled cleanup; $OUT is $(session_size_mb "$OUT") MiB. Remove it with: rm -rf -- \"$OUT\""
         return 0
     fi
     rm -rf -- "$OUT" 2>/dev/null || true
@@ -286,6 +321,197 @@ remove_owned_out() {
         echo "run-title-metal.sh: WARN: diagnostics directory survived removal: $OUT" >&2
         return 1
     fi
+    return 0
+}
+
+# --- ADR-068: stale-session sweep and free-space preflight -----------------
+# The sweep inspects only direct children of $TMPDIR, and only paths that pass
+# `is_session_dir_path`. Ownership is proven by the `owner.pid` marker this
+# launcher writes at creation (`<pid> <epoch>`): a live PID with a start time
+# that is not after the marker belongs to another live launcher and is kept.
+SESSION_ROOT="${TMPDIR:-/tmp}"
+while [ -n "$SESSION_ROOT" ] && [ "${SESSION_ROOT%/}" != "$SESSION_ROOT" ]; do
+    SESSION_ROOT="${SESSION_ROOT%/}"
+done
+[ -n "$SESSION_ROOT" ] || SESSION_ROOT=/tmp
+SESSION_MAX_AGE="${VICTORY_SESSION_MAX_AGE:-7200}"
+case "$SESSION_MAX_AGE" in
+    ''|*[!0-9]*) SESSION_MAX_AGE=7200 ;;
+esac
+SESSION_MIN_FREE_GB="${VICTORY_MIN_FREE_GB:-60}"
+case "$SESSION_MIN_FREE_GB" in
+    ''|*[!0-9]*) SESSION_MIN_FREE_GB=60 ;;
+esac
+
+# Print the epoch at which PID started, or nothing when it cannot be derived.
+# `ps -o etime=` is the portable source on macOS ([[dd-]hh:]mm:ss). The owner
+# marker stores the marker's creation epoch, which is always at or after the
+# owner's start: a process that started after it has a recycled PID.
+_session_start_epoch() {
+    _sse_etime="$(ps -o etime= -p "${1:-0}" 2>/dev/null | tr -d ' ')"
+    [ -n "$_sse_etime" ] || return 1
+    _sse_days=0
+    _sse_h=0
+    _sse_m=0
+    _sse_s=0
+    case "$_sse_etime" in
+        *-*)
+            _sse_days="${_sse_etime%%-*}"
+            _sse_etime="${_sse_etime#*-}"
+            ;;
+    esac
+    case "$_sse_etime" in
+        *:*:*)
+            _sse_h="${_sse_etime%%:*}"
+            _sse_rest="${_sse_etime#*:}"
+            _sse_m="${_sse_rest%%:*}"
+            _sse_s="${_sse_rest#*:}"
+            ;;
+        *:*)
+            _sse_m="${_sse_etime%%:*}"
+            _sse_s="${_sse_etime#*:}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    for _sse_n in "$_sse_days" "$_sse_h" "$_sse_m" "$_sse_s"; do
+        case "$_sse_n" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+    done
+    printf '%s\n' $(( _sse_days * 86400 + _sse_h * 3600 + _sse_m * 60 + _sse_s ))
+}
+
+# Print `alive`, `dead` or `none` for the session directory in $1.
+#   alive - the marker names a running process that started before the marker
+#           was written, so another live launcher owns this directory
+#   dead  - the marker names a PID that is gone, or that belongs to a process
+#           that started after the marker (the number was recycled)
+#   none  - no marker, or one that cannot be parsed; only its age can decide
+_session_owner_state() {
+    _sos_marker="${1:-}/owner.pid"
+    if [ ! -f "$_sos_marker" ]; then
+        printf 'none\n'
+        return 0
+    fi
+    _sos_pid=""
+    _sos_start=""
+    _sos_rest=""
+    read -r _sos_pid _sos_start _sos_rest <"$_sos_marker" 2>/dev/null || true
+    case "$_sos_pid" in
+        ''|0|*[!0-9]*) printf 'none\n'; return 0 ;;
+    esac
+    if ! kill -0 "$_sos_pid" 2>/dev/null; then
+        # kill(2) also fails with EPERM for a live process owned by another
+        # user, so confirm absence with ps before calling the owner dead.
+        if ps -p "$_sos_pid" >/dev/null 2>&1; then
+            printf 'alive\n'
+            return 0
+        fi
+        printf 'dead\n'
+        return 0
+    fi
+    case "$_sos_start" in
+        ''|*[!0-9]*) printf 'alive\n'; return 0 ;;
+    esac
+    _sos_live="$(_session_start_epoch "$_sos_pid" || true)"
+    case "$_sos_live" in
+        ''|*[!0-9]*) printf 'alive\n'; return 0 ;;
+    esac
+    # Five seconds of slack covers `ps` second rounding. The direction matters:
+    # only a process that started after the marker can be a recycled PID, so a
+    # live owner is never mistaken for a stale one.
+    if [ "$_sos_live" -gt $(( _sos_start + 5 )) ]; then
+        printf 'dead\n'
+        return 0
+    fi
+    printf 'alive\n'
+}
+
+# Write this run's ownership marker into a session directory it created.
+session_marker_write() {
+    [ -n "${1:-}" ] || return 0
+    [ -d "${1:-}" ] || return 0
+    printf '%s %s\n' "$$" "$(date +%s)" >"$1/owner.pid" 2>/dev/null || true
+}
+
+# Remove stale `victory-title.*` / `victory-title-out.*` sessions under
+# $SESSION_ROOT, then print exactly one `session_sweep removed=N kept=M` line.
+session_sweep() {
+    _sss_removed=0
+    _sss_kept=0
+    _sss_minutes=$(( (SESSION_MAX_AGE + 59) / 60 ))
+    [ "$_sss_minutes" -ge 1 ] || _sss_minutes=1
+    if [ -d "$SESSION_ROOT" ]; then
+        for _sss_dir in "$SESSION_ROOT"/victory-title.* "$SESSION_ROOT"/victory-title-out.*; do
+            [ -d "$_sss_dir" ] || continue
+            # This run's own paths can never be stale (the sweep also runs from
+            # the wrapper's teardown, while its directories still exist).
+            if [ "$_sss_dir" = "${WORK:-}" ] || [ "$_sss_dir" = "${OUT:-}" ]; then
+                _sss_kept=$((_sss_kept + 1))
+                continue
+            fi
+            if ! is_session_dir_path "$_sss_dir"; then
+                _sss_kept=$((_sss_kept + 1))
+                continue
+            fi
+            case "$(_session_owner_state "$_sss_dir")" in
+                alive)
+                    _sss_kept=$((_sss_kept + 1))
+                    continue
+                    ;;
+                dead)
+                    : # the owner is gone: stale at any age
+                    ;;
+                *)
+                    # No usable marker: only a bounded age makes it stale. A
+                    # fresh markerless directory is a launcher mid-creation.
+                    if [ "$SESSION_MAX_AGE" -gt 0 ] && \
+                        [ -n "$(find "$_sss_dir" -maxdepth 0 -mmin "+$_sss_minutes" 2>/dev/null)" ]; then
+                        : # aged out
+                    else
+                        _sss_kept=$((_sss_kept + 1))
+                        continue
+                    fi
+                    ;;
+            esac
+            if rm -rf -- "$_sss_dir" 2>/dev/null && [ ! -e "$_sss_dir" ]; then
+                _sss_removed=$((_sss_removed + 1))
+            else
+                _sss_kept=$((_sss_kept + 1))
+            fi
+        done
+    fi
+    echo "session_sweep removed=$_sss_removed kept=$_sss_kept"
+}
+
+# Free GB on the volume that holds $1 (integer, truncated), or nothing when df
+# cannot be read. `df -k` keeps the units KiB and is identical on macOS and
+# Linux; no GNU-only flag is used anywhere here.
+session_free_gb() {
+    _sfg_kb="$(df -k "${1:-$SESSION_ROOT}" 2>/dev/null | awk 'END {print $4}')"
+    case "$_sfg_kb" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' $(( _sfg_kb / 1048576 ))
+}
+
+# Refuse to boot when the session volume cannot hold several sessions.
+session_preflight() {
+    [ "$SESSION_MIN_FREE_GB" -gt 0 ] || return 0
+    _sp_free="$(session_free_gb "$SESSION_ROOT" || true)"
+    case "$_sp_free" in
+        ''|*[!0-9]*)
+            echo "run-title-metal.sh: WARN: cannot read free space for $SESSION_ROOT; skipping the disk preflight" >&2
+            return 0
+            ;;
+    esac
+    if [ "$_sp_free" -lt "$SESSION_MIN_FREE_GB" ]; then
+        echo "run-title-metal.sh: FAIL: only ${_sp_free} GB free on the session volume ($SESSION_ROOT), below the ${SESSION_MIN_FREE_GB} GB preflight (a title boot copies several GB per session). Free space or lower VICTORY_MIN_FREE_GB." >&2
+        return 1
+    fi
+    echo "disk_preflight root=$SESSION_ROOT free_gb=$_sp_free required_gb=$SESSION_MIN_FREE_GB"
     return 0
 }
 
@@ -317,6 +543,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
+# --- ADR-068: sweep first, preflight second, then create -------------------
+# Nothing this run owns exists yet, so a sweep here can only remove sessions
+# whose owner is provably gone and a failed preflight leaves the disk untouched.
+session_sweep
+if ! session_preflight; then
+    exit 3
+fi
+
 if [ -n "$OUT" ]; then
     case "$OUT" in
         /*) ;;
@@ -330,6 +564,9 @@ else
     OUT_OWNED=1
 fi
 OUT="$(cd "$OUT" && pwd)"
+if [ "$OUT_OWNED" = 1 ]; then
+    session_marker_write "$OUT"
+fi
 
 if [ -z "${WINE:-}" ]; then
     for wine in "$ROOT/target/wine-cx/bin/wine" \
@@ -348,6 +585,10 @@ export WINE
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/victory-title.XXXXXXXX")" \
     || fail_setup "cannot create the session directory"
+# The ownership marker is written before anything else touches WORK: the sweep
+# in another (or the next) launcher keeps a session whose marker names a live
+# process, so an interrupted boot is recoverable without a SIGKILL trap.
+session_marker_write "$WORK"
 SHARE="$WORK/share"
 SECRET="$WORK/secret.hex"
 FENCE_PAGE="$SHARE/gpu-fence.v1.page"

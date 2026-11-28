@@ -27,7 +27,13 @@
 #      second signal (driven with a private GPU lock and WINE stubs);
 #   8. ADR-038: the host-only converter variables reach victory_metal_host and
 #      never the Wine guest even when they are exported by the caller;
-#   9. `sh -n` parses both launchers, the hygiene helper and this test.
+#   9. ADR-068: the stale-session sweep removes a directory whose owner PID is
+#      gone, keeps one whose owner is alive, keeps a fresh markerless one, and
+#      keeps an explicitly kept one until the next launch reclaims it; the
+#      free-space preflight refuses an impossibly high threshold without
+#      creating anything; SIGTERM and SIGINT during a delegated run leave zero
+#      new session directories; `--keep-session` keeps exactly one pair;
+#  10. `sh -n` parses both launchers, the hygiene helper and this test.
 #
 # Usage: sh tools/macos/metal-poc/test-launcher-session.sh
 set -eu
@@ -468,7 +474,151 @@ unset VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE WINE
 reset_tmp
 pass "ADR-038 converter variables reach the host and never the guest"
 
-# --- 9. Every launcher and helper parses under `sh -n` --------------------
+# --- 9. ADR-068: stale-session sweep, free-space preflight, signals --------
+# Hermetic: the real run-title-metal.sh in d3d12 mode (no daemon), WINE stubs,
+# the private TMPDIR from the top of this file and a private GPU lock. The
+# sweep and the preflight are driven through their environment overrides, so
+# nothing here reads or writes the real $TMPDIR and the real disk is never
+# touched by the threshold case.
+mkdir -p "$BASE/locks"
+VICTORY_GPU_LOCK="$BASE/locks/gpu.lock"
+VICTORY_HYGIENE_GRACE=1
+VICTORY_BACKEND=d3d12
+WINE=/usr/bin/false
+export VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE VICTORY_BACKEND WINE
+unset VICTORY_MIN_FREE_GB VICTORY_SESSION_MAX_AGE
+
+# A PID that is provably gone: start a short child, reap it, confirm kill -0
+# cannot see it. The sweep treats that marker as a dead owner at any age.
+dead_pid=""
+dead_tries=0
+while [ -z "$dead_pid" ] && [ "$dead_tries" -lt 20 ]; do
+    sh -c 'exit 0' &
+    dead_candidate=$!
+    wait "$dead_candidate" 2>/dev/null || true
+    if ! kill -0 "$dead_candidate" 2>/dev/null; then
+        dead_pid="$dead_candidate"
+    fi
+    dead_tries=$((dead_tries + 1))
+done
+[ -n "$dead_pid" ] || fail "could not obtain a dead PID for the sweep test"
+
+# (a) a session whose owner marker names a dead PID is removed.
+reset_tmp
+STALE="$TMPDIR/victory-title.STALE001"
+mkdir -p "$STALE/share"
+printf 'stale session\n' >"$STALE/share/filler"
+printf '%s %s\n' "$dead_pid" "$(date +%s)" >"$STALE/owner.pid"
+run_runner sweep-dead --headless -- /usr/bin/false
+expect_rc 10 "sweep of a dead owner"
+[ ! -e "$STALE" ] || fail "the sweep kept a session whose owner pid ($dead_pid) is gone"
+grep_out '^session_sweep removed=1 kept=0' "sweep of a dead owner"
+expect_zero_sessions "sweep of a dead owner"
+pass "sweep removes a stale session whose owner marker names a dead PID"
+
+# (b) a session whose owner marker names a live PID is kept, whatever its age.
+reset_tmp
+LIVE="$TMPDIR/victory-title.LIVE0001"
+mkdir -p "$LIVE/share"
+printf 'live session\n' >"$LIVE/share/filler"
+printf '%s %s\n' "$$" "$(date +%s)" >"$LIVE/owner.pid"
+run_runner sweep-live --headless -- /usr/bin/false
+expect_rc 10 "sweep with a live owner"
+[ -d "$LIVE" ] || fail "the sweep removed a session owned by the live pid $$"
+[ -f "$LIVE/share/filler" ] || fail "the sweep emptied a live session"
+grep_out '^session_sweep removed=0 kept=1' "sweep with a live owner"
+[ "$(count_dirs 'victory-title.*')" -eq 1 ] \
+    || fail "sweep with a live owner: $(count_dirs 'victory-title.*') victory-title.* dirs, expected 1"
+rm -rf -- "$LIVE"
+reset_tmp
+pass "sweep keeps a session whose owner PID is alive"
+
+# (c) a fresh markerless directory is a launcher mid-creation and is kept.
+reset_tmp
+FRESH="$TMPDIR/victory-title.FRESH001"
+mkdir -p "$FRESH"
+printf 'fresh session\n' >"$FRESH/filler"
+run_runner sweep-fresh --headless -- /usr/bin/false
+expect_rc 10 "sweep with a fresh markerless session"
+[ -d "$FRESH" ] || fail "the sweep removed a fresh markerless session directory"
+grep_out '^session_sweep removed=0 kept=1' "sweep with a fresh markerless session"
+rm -rf -- "$FRESH"
+reset_tmp
+pass "sweep keeps a fresh markerless directory inside the age window"
+
+# (d) the free-space preflight refuses an impossible threshold before creating
+# any session or --out directory. It never touches the real disk.
+reset_tmp
+VICTORY_MIN_FREE_GB=999999999
+export VICTORY_MIN_FREE_GB
+run_runner preflight --headless -- /usr/bin/false
+expect_rc 3 "free-space preflight"
+grep_out 'below the 999999999 GB preflight' "free-space preflight"
+expect_zero_sessions "free-space preflight"
+[ "$(count_entries)" -eq 0 ] || fail "a refused preflight created entries under TMPDIR"
+unset VICTORY_MIN_FREE_GB
+pass "free-space preflight refuses an impossible threshold and creates nothing"
+
+# (e) SIGTERM and SIGINT while a delegated run owns its session leave zero new
+# session directories. `set -m` gives the launcher its own process group with
+# SIGINT at the default disposition: a plain background job of a non-interactive
+# shell inherits SIGINT ignored and its trap would never run. The guest stub
+# ignores TERM, so cleanup has to escalate before it can remove WORK. The signal
+# is sent only after the launcher's session directory exists, so the case is
+# timing-independent (no fixed boot delay to outgrow).
+WINE="$BASE/wine-stubborn.sh"
+export WINE
+set -m
+for sig_case in TERM:143 INT:130; do
+    sig_name="${sig_case%%:*}"
+    sig_expect="${sig_case##*:}"
+    reset_tmp
+    LAST_OUT="$BASE/sweep-$sig_name.out"
+    LAST_RC=0
+    sh "$RUNNER" --headless -- /usr/bin/false >"$LAST_OUT" 2>&1 &
+    sig_pid=$!
+    sig_waited=0
+    while [ "$(count_dirs 'victory-title.*')" -eq 0 ] && [ "$sig_waited" -lt 100 ]; do
+        sleep 0.1
+        sig_waited=$((sig_waited + 1))
+    done
+    [ "$(count_dirs 'victory-title.*')" -gt 0 ] \
+        || fail "SIG$sig_name sweep: the launcher never created a session to interrupt"
+    kill -"$sig_name" "$sig_pid" 2>/dev/null || true
+    wait "$sig_pid" || LAST_RC=$?
+    expect_rc "$sig_expect" "SIG$sig_name sweep"
+    expect_zero_sessions "SIG$sig_name sweep"
+    [ "$(count_entries)" -eq 0 ] || fail "SIG$sig_name left entries under TMPDIR"
+    grep_out 'removed the session directory' "SIG$sig_name sweep"
+done
+set +m
+WINE=/usr/bin/false
+export WINE
+pass "SIGTERM and SIGINT during a delegated run leave zero session directories"
+
+# (f) --keep-session keeps exactly one session and one diagnostics directory,
+# both with an ownership marker; the next launch reclaims the kept session
+# because its owner is gone (keep is not a permanent exemption).
+reset_tmp
+run_runner real-keep --headless --keep-session -- /usr/bin/false
+expect_rc 10 "keep-session real run"
+[ "$(count_dirs 'victory-title.*')" -eq 1 ] \
+    || fail "keep-session real run: $(count_dirs 'victory-title.*') victory-title.* dirs, expected 1"
+[ "$(count_dirs 'victory-title-out.*')" -eq 1 ] \
+    || fail "keep-session real run: $(count_dirs 'victory-title-out.*') victory-title-out.* dirs, expected 1"
+grep_out 'WARNING: --keep-session' "keep-session real run"
+kept_session="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d -name 'victory-title.*')"
+[ -f "$kept_session/owner.pid" ] || fail "the kept session has no owner.pid marker"
+run_runner reclaim-kept --headless -- /usr/bin/false
+expect_rc 10 "reclaim of a kept session"
+expect_zero_sessions "reclaim of a kept session"
+grep_out '^session_sweep removed=2 kept=0' "reclaim of a kept session"
+reset_tmp
+pass "--keep-session keeps exactly one pair; the next launch reclaims it"
+
+unset VICTORY_GPU_LOCK VICTORY_HYGIENE_GRACE VICTORY_BACKEND WINE
+
+# --- 10. Every launcher and helper parses under `sh -n` -------------------
 for script in "$WRAPPER" "$RUNNER" "$HERE/process-hygiene.sh" "$0"; do
     sh -n "$script" || fail "sh -n failed: $script"
 done

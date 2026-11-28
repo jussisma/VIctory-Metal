@@ -71,6 +71,16 @@
 # The session secret is never printed or logged. Teardown of the guest session
 # belongs entirely to run-title-metal.sh; this wrapper waits for it, propagates
 # its status and removes only the --out directory it created itself.
+#
+# ADR-068 session hygiene: this wrapper also sweeps `victory-title.*` /
+# `victory-title-out.*` sessions under $TMPDIR at start-up and on exit (never
+# when --keep-session was given), so a run whose launcher was SIGKILLed from
+# another shell — leaving no trap to run — leaves the disk clean at the next
+# launch instead of accumulating multi-GB directories. The sweep removes only
+# directories whose `owner.pid` marker names a process that is gone, or
+# markerless directories older than VICTORY_SESSION_MAX_AGE (default 7200 s, 0
+# disables). A live owner is never removed. It prints one
+# `session_sweep removed=N kept=M` line.
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -299,6 +309,146 @@ keep_session() {
     return 1
 }
 
+# --- ADR-068: stale-session sweep -----------------------------------------
+# run-title-metal.sh owns the delegate session; this wrapper repeats the sweep
+# so a previous run that was SIGKILLed is cleaned even when this run stops
+# before the delegate starts (build failure, usage error after teardown was
+# installed, outer timeout). Same marker, same age rule, same one-line report.
+SESSION_ROOT="${TMPDIR:-/tmp}"
+while [ -n "$SESSION_ROOT" ] && [ "${SESSION_ROOT%/}" != "$SESSION_ROOT" ]; do
+    SESSION_ROOT="${SESSION_ROOT%/}"
+done
+[ -n "$SESSION_ROOT" ] || SESSION_ROOT=/tmp
+SESSION_MAX_AGE="${VICTORY_SESSION_MAX_AGE:-7200}"
+case "$SESSION_MAX_AGE" in
+    ''|*[!0-9]*) SESSION_MAX_AGE=7200 ;;
+esac
+
+# Epoch at which PID started, from the portable `ps -o etime=` form, or nothing.
+_session_start_epoch() {
+    _sse_etime="$(ps -o etime= -p "${1:-0}" 2>/dev/null | tr -d ' ')"
+    [ -n "$_sse_etime" ] || return 1
+    _sse_days=0
+    _sse_h=0
+    _sse_m=0
+    _sse_s=0
+    case "$_sse_etime" in
+        *-*)
+            _sse_days="${_sse_etime%%-*}"
+            _sse_etime="${_sse_etime#*-}"
+            ;;
+    esac
+    case "$_sse_etime" in
+        *:*:*)
+            _sse_h="${_sse_etime%%:*}"
+            _sse_rest="${_sse_etime#*:}"
+            _sse_m="${_sse_rest%%:*}"
+            _sse_s="${_sse_rest#*:}"
+            ;;
+        *:*)
+            _sse_m="${_sse_etime%%:*}"
+            _sse_s="${_sse_etime#*:}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    for _sse_n in "$_sse_days" "$_sse_h" "$_sse_m" "$_sse_s"; do
+        case "$_sse_n" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+    done
+    printf '%s\n' $(( _sse_days * 86400 + _sse_h * 3600 + _sse_m * 60 + _sse_s ))
+}
+
+# alive | dead | none for the session directory in $1 (see run-title-metal.sh).
+_session_owner_state() {
+    _sos_marker="${1:-}/owner.pid"
+    if [ ! -f "$_sos_marker" ]; then
+        printf 'none\n'
+        return 0
+    fi
+    _sos_pid=""
+    _sos_start=""
+    _sos_rest=""
+    read -r _sos_pid _sos_start _sos_rest <"$_sos_marker" 2>/dev/null || true
+    case "$_sos_pid" in
+        ''|0|*[!0-9]*) printf 'none\n'; return 0 ;;
+    esac
+    if ! kill -0 "$_sos_pid" 2>/dev/null; then
+        # kill(2) also fails with EPERM for a live process owned by another
+        # user, so confirm absence with ps before calling the owner dead.
+        if ps -p "$_sos_pid" >/dev/null 2>&1; then
+            printf 'alive\n'
+            return 0
+        fi
+        printf 'dead\n'
+        return 0
+    fi
+    case "$_sos_start" in
+        ''|*[!0-9]*) printf 'alive\n'; return 0 ;;
+    esac
+    _sos_live="$(_session_start_epoch "$_sos_pid" || true)"
+    case "$_sos_live" in
+        ''|*[!0-9]*) printf 'alive\n'; return 0 ;;
+    esac
+    if [ "$_sos_live" -gt $(( _sos_start + 5 )) ]; then
+        printf 'dead\n'
+        return 0
+    fi
+    printf 'alive\n'
+}
+
+is_session_dir_path() {
+    case "${1:-}" in
+        ''|/|.|..) return 1 ;;
+    esac
+    case "${1:-}" in
+        */victory-title.????????|*/victory-title-out.????????) return 0 ;;
+    esac
+    return 1
+}
+
+session_sweep() {
+    _sss_removed=0
+    _sss_kept=0
+    _sss_minutes=$(( (SESSION_MAX_AGE + 59) / 60 ))
+    [ "$_sss_minutes" -ge 1 ] || _sss_minutes=1
+    if [ -d "$SESSION_ROOT" ]; then
+        for _sss_dir in "$SESSION_ROOT"/victory-title.* "$SESSION_ROOT"/victory-title-out.*; do
+            [ -d "$_sss_dir" ] || continue
+            if [ "$_sss_dir" = "${OUT:-}" ] || ! is_session_dir_path "$_sss_dir"; then
+                _sss_kept=$((_sss_kept + 1))
+                continue
+            fi
+            case "$(_session_owner_state "$_sss_dir")" in
+                alive)
+                    _sss_kept=$((_sss_kept + 1))
+                    continue
+                    ;;
+                dead)
+                    :
+                    ;;
+                *)
+                    if [ "$SESSION_MAX_AGE" -gt 0 ] && \
+                        [ -n "$(find "$_sss_dir" -maxdepth 0 -mmin "+$_sss_minutes" 2>/dev/null)" ]; then
+                        :
+                    else
+                        _sss_kept=$((_sss_kept + 1))
+                        continue
+                    fi
+                    ;;
+            esac
+            if rm -rf -- "$_sss_dir" 2>/dev/null && [ ! -e "$_sss_dir" ]; then
+                _sss_removed=$((_sss_removed + 1))
+            else
+                _sss_kept=$((_sss_kept + 1))
+            fi
+        done
+    fi
+    echo "session_sweep removed=$_sss_removed kept=$_sss_kept"
+}
+
 wrapper_cleanup() {
     status=$?
     trap '' INT TERM HUP
@@ -315,6 +465,7 @@ wrapper_cleanup() {
         if [ -n "$OUT" ]; then
             if keep_session; then
                 echo "victory-metal.sh: kept session files in $OUT"
+                echo "victory-metal.sh: WARNING: --keep-session (or an alias) disabled cleanup; remove $OUT with: rm -rf -- \"$OUT\""
             else
                 rm -rf -- "$OUT" 2>/dev/null || true
                 if [ -e "$OUT" ]; then
@@ -325,6 +476,12 @@ wrapper_cleanup() {
             fi
         fi
     fi
+    # ADR-068: the delegate removes its own session; this sweep is the second
+    # chance for a session a previous run leaked when no trap could run. A
+    # --keep-session run opts out of every removal, including this one.
+    if [ "$DRY_RUN" != 1 ] && ! keep_session; then
+        session_sweep
+    fi
     trap - EXIT INT TERM HUP
     exit "$status"
 }
@@ -332,6 +489,12 @@ trap wrapper_cleanup EXIT
 trap 'forward_and_exit 130' INT
 trap 'forward_and_exit 143' TERM
 trap 'forward_and_exit 129' HUP
+
+# ADR-068: clean stale delegate sessions before this run creates anything. A
+# dry run stays side-effect free and lets `--keep-session` opt out of removal.
+if [ "$DRY_RUN" != 1 ] && ! keep_session; then
+    session_sweep
+fi
 
 if [ -n "$OUT_ARG" ]; then
     case "$OUT_ARG" in
