@@ -5062,10 +5062,13 @@ fn flush_render_abi(
         pending.clear();
         return Ok(());
     };
-    if pending.is_empty() {
+    let stages = abi_render_stages(abi, mesh_family);
+    // ADR-058: a translated stage whose MEMORY_SPACE t0/u0 is host-owned has
+    // no pending wire binding, so the empty-pending shortcut must not skip the
+    // live page-table bind.
+    if pending.is_empty() && !crate::macos::memory_space_bind::declares_memory_space(&stages) {
         return Ok(());
     }
-    let stages = abi_render_stages(abi, mesh_family);
     let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
@@ -5089,14 +5092,14 @@ fn flush_compute_abi(
         pending.clear();
         return Ok(());
     };
-    if pending.is_empty() {
-        return Ok(());
-    }
     let stages: Vec<(ShaderStage, RootSignatureLayout)> = abi
         .stages_for(ReflectedStage::Compute)
         .into_iter()
         .map(|(stage, layout)| (stage, layout.clone()))
         .collect();
+    if pending.is_empty() && !crate::macos::memory_space_bind::declares_memory_space(&stages) {
+        return Ok(());
+    }
     let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedComputeOp::ArgumentBuffer(buffer));

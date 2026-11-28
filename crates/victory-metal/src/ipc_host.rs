@@ -220,7 +220,7 @@
 //! The secret is compared in constant time, is never written to a log or an
 //! error message, and is redacted from `Debug`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1206,6 +1206,18 @@ pub struct SessionStats {
     pub pool_status: &'static str,
     /// Shared pool counters (all zero when the pool was never created).
     pub pool: PoolStats,
+    /// Accepted title-memory map applications (ADR-058).
+    pub title_map_applied: u64,
+    /// Accepted map applications that changed the range set.
+    pub title_map_updates: u64,
+    /// Maps handed to the executor (all named allocations registered).
+    pub title_map_published: u64,
+    /// Allocations the installed map still waits for.
+    pub title_map_missing: usize,
+    /// Ranges the installed map names.
+    pub title_map_ranges: usize,
+    /// Newest mapping generation applied.
+    pub title_generation: u32,
 }
 
 /// Synchronous single-peer host session.
@@ -1293,6 +1305,18 @@ pub struct IpcHost<E: BatchExecutor> {
     title_map_refusals: u64,
     /// Last bounded title-map refusal reason.
     last_title_refusal: Option<String>,
+    /// Allocation ids the installed map still names before they register.
+    ///
+    /// The map is published only when this set is empty, so a published table
+    /// never names a guessed page; a registration that is not in the set does
+    /// no work (ADR-058, bounded liveness).
+    title_missing: BTreeSet<u64>,
+    /// Accepted map applications.
+    title_map_applied: u64,
+    /// Accepted map applications that changed the range set.
+    title_map_updates: u64,
+    /// Maps handed to the executor.
+    title_map_published: u64,
     ledger: ListLedger,
 }
 
@@ -1348,6 +1372,10 @@ impl<E: BatchExecutor> IpcHost<E> {
             title_generation: 0,
             title_map_refusals: 0,
             last_title_refusal: None,
+            title_missing: BTreeSet::new(),
+            title_map_applied: 0,
+            title_map_updates: 0,
+            title_map_published: 0,
             ledger: ListLedger::new(),
         })
     }
@@ -1458,6 +1486,12 @@ impl<E: BatchExecutor> IpcHost<E> {
                 .map(|pool| pool.stats())
                 .or_else(shared_pool_stats)
                 .unwrap_or_default(),
+            title_map_applied: self.title_map_applied,
+            title_map_updates: self.title_map_updates,
+            title_map_published: self.title_map_published,
+            title_map_missing: self.title_missing.len(),
+            title_map_ranges: self.title_map.len(),
+            title_generation: self.title_generation,
         }
     }
 
@@ -1631,12 +1665,15 @@ impl<E: BatchExecutor> IpcHost<E> {
         if chunk.generation < self.title_generation {
             return Ok(());
         }
-        if chunk.generation > self.title_generation {
-            self.title_map.clear();
-            self.title_generation = chunk.generation;
-        }
-        // Reject the whole chunk before changing anything.
-        let mut next = self.title_map.clone();
+        // A newer generation starts from an empty map, but the old map stays
+        // installed until this chunk validates: a refused chunk never erases
+        // an address relation the title was drawing with.
+        let newer = chunk.generation > self.title_generation;
+        let mut next = if newer {
+            BTreeMap::new()
+        } else {
+            self.title_map.clone()
+        };
         let mut pages = 0u64;
         for range in &chunk.ranges {
             if let Some(existing) = next.get(&range.guest_address) {
@@ -1675,32 +1712,51 @@ impl<E: BatchExecutor> IpcHost<E> {
                 .filter(|pages| *pages <= crate::title_map::MAX_MAPPED_PAGES)
                 .ok_or_else(|| "title-memory map names too many pages".to_string())?;
         }
+        self.title_map_applied = self.title_map_applied.saturating_add(1);
+        if !newer && next == self.title_map {
+            // A resent identical chunk changes nothing and rebuilds nothing.
+            return Ok(());
+        }
+        self.title_map_updates = self.title_map_updates.saturating_add(1);
+        self.title_generation = chunk.generation;
         self.title_map = next;
         self.publish_title_map();
         Ok(())
     }
 
     /// Hands the current map to the executor, once every named allocation is
-    /// registered. A range whose allocation is missing stays out entirely, so
-    /// the page table is never built from a partial address relation.
+    /// registered. A range whose allocation is missing keeps the whole map
+    /// pending: the page table is never built from a partial address
+    /// relation, and the received map is never discarded (ADR-058).
+    ///
+    /// The missing set is recorded so a later registration of an unrelated
+    /// allocation does no work; the map is republished exactly when the last
+    /// named allocation registers, not once per registration.
     fn publish_title_map(&mut self) {
+        self.title_missing.clear();
         let mut ranges = Vec::with_capacity(self.title_map.len());
         for range in self.title_map.values() {
-            let Some(allocation) = self.allocations.get(&range.allocation_id) else {
-                return;
-            };
-            ranges.push(crate::macos::title_memory::TitleRange {
-                guest_address: range.guest_address,
-                buffer: allocation.buffer_id,
-                byte_offset: range.byte_offset,
-                length: range.length,
-            });
+            match self.allocations.get(&range.allocation_id) {
+                Some(allocation) => ranges.push(crate::macos::title_memory::TitleRange {
+                    guest_address: range.guest_address,
+                    buffer: allocation.buffer_id,
+                    byte_offset: range.byte_offset,
+                    length: range.length,
+                }),
+                None => {
+                    self.title_missing.insert(range.allocation_id);
+                }
+            }
         }
-        if let Err(error) = self
+        if !self.title_missing.is_empty() {
+            return;
+        }
+        match self
             .executor
             .set_title_memory_map(self.title_generation, &ranges)
         {
-            self.last_title_refusal = Some(error.to_string());
+            Ok(()) => self.title_map_published = self.title_map_published.saturating_add(1),
+            Err(error) => self.last_title_refusal = Some(error.to_string()),
         }
     }
 
@@ -1737,8 +1793,12 @@ impl<E: BatchExecutor> IpcHost<E> {
             },
         );
         self.last_allocation_id = id;
-        // A map that arrived before this allocation can now be published.
-        self.publish_title_map();
+        // A map that arrived before this allocation is republished exactly
+        // when this registration completes its last missing allocation; an
+        // unrelated registration does no work (ADR-058).
+        if self.title_missing.remove(&id) && self.title_missing.is_empty() {
+            self.publish_title_map();
+        }
         Ok(())
     }
 
@@ -4401,6 +4461,9 @@ mod tests {
         compute_pipelines: Vec<(u64, Vec<(u8, Vec<u8>, String)>, Vec<u8>, PipelineAbi)>,
         /// Refusals the executor returned to the host, in arrival order.
         refusals: Vec<String>,
+        /// Title-memory maps the host handed the executor, in arrival order
+        /// (ADR-058 liveness proof).
+        title_maps: Vec<(u32, Vec<crate::macos::title_memory::TitleRange>)>,
     }
 
     struct StubExecutor {
@@ -4475,6 +4538,15 @@ mod tests {
     impl BatchExecutor for StubExecutor {
         fn page_size(&self) -> Result<u64, MetalError> {
             Ok(self.page_size)
+        }
+
+        fn set_title_memory_map(
+            &self,
+            generation: u32,
+            ranges: &[crate::macos::title_memory::TitleRange],
+        ) -> Result<(), MetalError> {
+            self.state().title_maps.push((generation, ranges.to_vec()));
+            Ok(())
         }
 
         fn register_window(&self, ptr: *mut u8, len: usize) -> Result<VmBufferId, MetalError> {
@@ -7462,5 +7534,79 @@ exit 0
         let (result, host) = server.handle.join().expect("server thread");
         assert!(result.is_ok());
         assert!(host.executor.state().compute_pipelines.is_empty());
+    }
+
+    fn title_range(allocation_id: u64) -> crate::title_map::Range {
+        crate::title_map::Range {
+            guest_address: 0x1_0000,
+            allocation_id,
+            byte_offset: 0,
+            length: 65_536,
+        }
+    }
+
+    /// ADR-058: the guest may send the map before the share allocations are
+    /// registered. The host keeps the decoded map and publishes it exactly when
+    /// the last named allocation registers.
+    #[test]
+    fn a_title_map_before_registration_is_published_when_the_allocation_arrives() {
+        let dir = TestDir::new();
+        let mut host = host(&dir, StubExecutor::new(4096));
+        let map = crate::title_map::encode(1, 0, 1, &[title_range(ALLOCATION_ID)]).expect("encode");
+
+        host.apply_title_map(&map).expect("apply the map first");
+        assert!(
+            host.executor.state().title_maps.is_empty(),
+            "a missing allocation keeps the whole map pending"
+        );
+        let stats = host.session_stats();
+        assert_eq!(stats.title_map_applied, 1);
+        assert_eq!(stats.title_map_updates, 1);
+        assert_eq!(stats.title_map_published, 0);
+        assert_eq!(stats.title_map_missing, 1);
+
+        dir.write_allocation(ALLOCATION_ID, &vec![0u8; BYTES]);
+        host.register(&registration(ALLOCATION_ID, BYTES as u64))
+            .expect("register the allocation second");
+        let maps = host.executor.state().title_maps.clone();
+        assert_eq!(maps.len(), 1, "the stored map is handed over once");
+        assert_eq!(maps[0].0, 1);
+        assert_eq!(maps[0].1.len(), 1);
+        assert_eq!(maps[0].1[0].guest_address, 0x1_0000);
+        assert_eq!(maps[0].1[0].byte_offset, 0);
+        let stats = host.session_stats();
+        assert_eq!(stats.title_map_published, 1);
+        assert_eq!(stats.title_map_missing, 0);
+
+        // A resent identical chunk changes nothing and publishes nothing twice.
+        host.apply_title_map(&map).expect("resend");
+        assert_eq!(host.executor.state().title_maps.len(), 1);
+        assert_eq!(host.session_stats().title_map_updates, 1);
+    }
+
+    /// ADR-058 bound: registering an allocation the pending map does not name
+    /// does no republish work, so registration order cannot rescan the map.
+    #[test]
+    fn an_unrelated_registration_does_not_republish_a_pending_map() {
+        let dir = TestDir::new();
+        let mut host = host(&dir, StubExecutor::new(4096));
+        let map = crate::title_map::encode(1, 0, 1, &[title_range(2)]).expect("encode");
+        host.apply_title_map(&map).expect("apply the map first");
+        assert_eq!(host.session_stats().title_map_missing, 1);
+
+        dir.write_allocation(1, &vec![0u8; BYTES]);
+        host.register(&registration(1, BYTES as u64))
+            .expect("register an unrelated allocation");
+        assert!(
+            host.executor.state().title_maps.is_empty(),
+            "an allocation the map does not name cannot publish it"
+        );
+        assert_eq!(host.session_stats().title_map_missing, 1);
+
+        dir.write_allocation(2, &vec![0u8; BYTES]);
+        host.register(&registration(2, BYTES as u64))
+            .expect("register the map's last allocation");
+        assert_eq!(host.executor.state().title_maps.len(), 1);
+        assert_eq!(host.session_stats().title_map_missing, 0);
     }
 }

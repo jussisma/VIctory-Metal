@@ -8,6 +8,7 @@ pub mod cache;
 pub mod device;
 pub mod indirect;
 pub mod irconverter;
+pub mod memory_space_bind;
 pub mod msc;
 pub mod mesh;
 pub(crate) mod objc;
