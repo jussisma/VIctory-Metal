@@ -712,6 +712,32 @@ impl PipelineCensusSnapshot {
                 first.reason
             ));
         }
+        // Named refusal classes: `kind/class=count`. A boot whose first
+        // refusal is compute/host-translation also shows every other class it
+        // hit, so an empty reason can never be the only diagnostic.
+        text.push_str(" pipeline_refusal_classes=[");
+        for (index, ((kind, class), count)) in self.refusals.iter().enumerate() {
+            if index > 0 {
+                text.push_str("; ");
+            }
+            text.push_str(&format!("{kind}/{class}={count}"));
+        }
+        text.push(']');
+        // Compute threadgroup discovery/application census (ADR-067 diag):
+        // parsed/state/missing say what registration knew, applied/unapplied
+        // say what `SetComputePipeline` could apply, and registered says how
+        // many compute PSOs the guest recorded at all.
+        let threadgroup = compute_threadgroup_census::counts();
+        text.push_str(&format!(
+            " compute_threadgroup=[parsed={} state={} missing={} applied={} unapplied={} \
+             registered={}]",
+            threadgroup[compute_threadgroup_census::PARSED],
+            threadgroup[compute_threadgroup_census::STATE],
+            threadgroup[compute_threadgroup_census::MISSING],
+            threadgroup[compute_threadgroup_census::APPLIED],
+            threadgroup[compute_threadgroup_census::UNAPPLIED],
+            threadgroup[compute_threadgroup_census::REGISTERED],
+        ));
         text
     }
 }
@@ -768,6 +794,21 @@ pub fn bounded_refusal_reason(text: &str) -> String {
     } else {
         bounded.to_string()
     }
+}
+
+/// Names a host-owned refusal, so no refusal can carry an empty reason.
+///
+/// `bounded_refusal_reason` already replaces whitespace-only text with
+/// `unknown refusal`; this wrapper makes the transport-level case explicit: a
+/// host reply whose reason trailer is missing or lost becomes a stable named
+/// fallback, never `reason=""`. Boot #37's `compute/host-translation` with an
+/// empty reason is the defect this prevents.
+#[cfg(any(windows, test))]
+fn named_host_refusal(reason: &str, fallback: &'static str) -> String {
+    if reason.trim().is_empty() {
+        return fallback.to_string();
+    }
+    bounded_refusal_reason(reason)
 }
 
 /// The process-wide pipeline-attempt census.
@@ -1079,14 +1120,17 @@ pub mod compute_threadgroup_census {
     pub const APPLIED: usize = 3;
     /// `SetComputePipeline` found no recorded size.
     pub const UNAPPLIED: usize = 4;
+    /// A compute PSO registered successfully (with or without a size).
+    pub const REGISTERED: usize = 5;
 
     /// The static counter names, in the order of the constants above.
-    pub const NAMES: [&str; 5] = [
+    pub const NAMES: [&str; 6] = [
         "compute_threadgroup_parsed",
         "compute_threadgroup_state",
         "compute_threadgroup_missing",
         "compute_threadgroup_applied",
         "compute_threadgroup_unapplied",
+        "compute_pso_registered",
     ];
 
     static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
@@ -2921,7 +2965,10 @@ fn register_with_host_translation(
     ) {
         Ok(id) => id,
         Err(crate::native_metal::queue::NativeQueueError::Refused(reason)) => {
-            let error = PipelineError::HostTranslation(bounded_refusal_reason(&reason));
+            let error = PipelineError::HostTranslation(named_host_refusal(
+                &reason,
+                "the host refused the pipeline without a named reason",
+            ));
             poison_pipeline(key, &error.to_string());
             return Err(error);
         }
@@ -2931,6 +2978,7 @@ fn register_with_host_translation(
     // The census memory only records that this content is hosted; a later
     // reconnect must still ask the (new) host session again.
     if kind == PipelineKind::Compute {
+        compute_threadgroup_census::note(compute_threadgroup_census::REGISTERED);
         match compute_threadgroup_of(programs) {
             Some(size) => {
                 record_compute_threadgroup(id, size);
@@ -3046,6 +3094,7 @@ fn register_with_details_inner(
         .iter()
         .any(|program| program.stage == PipelineStage::Compute)
     {
+        compute_threadgroup_census::note(compute_threadgroup_census::REGISTERED);
         match compute_threadgroup {
             Some(_) => {
                 compute_threadgroup_census::note(compute_threadgroup_census::PARSED);
@@ -3248,7 +3297,9 @@ fn register_and_cache_refusal(
 #[cfg(any(windows, test))]
 fn map_queue_error(error: crate::native_metal::queue::NativeQueueError) -> PipelineError {
     match error {
-        crate::native_metal::queue::NativeQueueError::Refused(why) => PipelineError::Refused(why),
+        crate::native_metal::queue::NativeQueueError::Refused(why) => PipelineError::Refused(
+            named_host_refusal(&why, "the host refused the pipeline without a named reason"),
+        ),
         other => PipelineError::Transport(other.to_string()),
     }
 }
@@ -5522,5 +5573,102 @@ mod tests {
         let mut truncated = encoded;
         truncated.pop();
         assert_eq!(compute_threadgroup_from_state(&truncated), None);
+    }
+
+    /// Boot #37 regression: a compute container without `PSV0` threadgroup
+    /// metadata still produces a registrable compute state (empty), so the
+    /// stage is not refused; the size is counted `missing` instead.
+    #[test]
+    fn a_compute_container_without_threadgroup_metadata_registers_as_missing() {
+        let full = fixture(PipelineStage::Compute);
+        let parsed = victory_shader::Container::parse(&full).expect("the compute fixture parses");
+        let dxil = parsed
+            .part(victory_shader::FourCC::DXIL)
+            .expect("the compute fixture carries DXIL")
+            .data;
+        let without_psv0 = dxbc_container(&[(victory_shader::FourCC::DXIL, dxil)]);
+        assert_eq!(
+            compute_threadgroup_from_container(&without_psv0),
+            None,
+            "no PSV0 threadgroup record is not a size"
+        );
+        let program =
+            stage_program(PipelineStage::Compute, &without_psv0).expect("a complete DXBC stage");
+        let state = host_pipeline_state(
+            std::slice::from_ref(&program),
+            &PipelineDetails::default(),
+            PipelineKind::Compute,
+        )
+        .expect("missing threadgroup metadata is not a translation refusal");
+        assert!(
+            state.is_empty(),
+            "a missing size carries no state chunk: {state:?}"
+        );
+
+        // The same path still carries the exact chunk when the metadata exists.
+        let with_metadata =
+            stage_program(PipelineStage::Compute, &full).expect("the fixture is a complete stage");
+        let state = host_pipeline_state(
+            &[with_metadata],
+            &PipelineDetails::default(),
+            PipelineKind::Compute,
+        )
+        .expect("a declared size is readable");
+        assert_eq!(
+            compute_threadgroup_from_state(&state),
+            Some([64, 1, 1]),
+            "the declared [numthreads] is the state the host registers"
+        );
+    }
+
+    /// An empty host reason is impossible: the guest names the refusal class
+    /// even when the host's text is missing or whitespace-only.
+    #[test]
+    fn a_host_translation_refusal_always_carries_a_named_reason() {
+        const FALLBACK: &str = "the host refused the pipeline without a named reason";
+        for empty in ["", "   ", "\n\t "] {
+            let reason = named_host_refusal(empty, FALLBACK);
+            assert_eq!(reason, FALLBACK, "whitespace-only text names the fallback");
+            let error = PipelineError::HostTranslation(reason);
+            assert_eq!(
+                RefusalClass::of(&error),
+                RefusalClass::HostTranslation,
+                "the class survives an empty host text"
+            );
+            assert!(
+                !error.to_string().trim_end().ends_with(':'),
+                "the display never ends at the separator: {error}"
+            );
+        }
+        let named = named_host_refusal(
+            "the compute pipeline state is not a valid VPS1 blob",
+            FALLBACK,
+        );
+        assert!(named.contains("compute pipeline state"), "{named}");
+        assert!(!named.trim().is_empty());
+    }
+
+    /// The pipeline census line names every refusal class and carries the
+    /// compute threadgroup census, so Boot #38 is not limited to the first
+    /// refusal's text.
+    #[test]
+    fn the_pipeline_census_names_refusal_classes_and_threadgroup_counts() {
+        reset_census();
+        note_refused(
+            AttemptKind::Compute,
+            RefusalClass::HostTranslation,
+            "the host refused the compute pipeline",
+        );
+        let fields = census().fields();
+        assert!(
+            fields.contains("pipeline_first_refusal=compute/host-translation"),
+            "{fields}"
+        );
+        assert!(
+            fields.contains("pipeline_refusal_classes=[compute/host-translation=1]"),
+            "{fields}"
+        );
+        assert!(fields.contains("compute_threadgroup=[parsed="), "{fields}");
+        assert!(fields.contains("registered="), "{fields}");
     }
 }

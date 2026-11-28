@@ -6154,6 +6154,30 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }
         );
     }
 
+    /// Boot #37 regression: a compute state with no `VCTG` metadata records
+    /// `missing` (`Ok(None)`), so registration is never vetoed for missing
+    /// metadata. Only a `VCTG`-prefixed record that contradicts itself is a
+    /// named refusal.
+    #[test]
+    fn a_compute_state_without_threadgroup_metadata_records_missing() {
+        assert!(
+            matches!(compute_threadgroup_from_state(&[]), Ok(None)),
+            "an empty compute state records a missing size, not a refusal"
+        );
+        assert!(
+            matches!(
+                compute_threadgroup_from_state(b"VPS1 opaque compute state"),
+                Ok(None)
+            ),
+            "historical opaque compute state is still accepted"
+        );
+        // A container with no PSV0 part yields no size rather than a refusal.
+        assert_eq!(
+            compute_threadgroup_from_dxil_container(b"DXBC but not a real container"),
+            None
+        );
+    }
+
     /// The compute threadgroup chunk round-trips and a malformed record is a
     /// named refusal, never a guessed size.
     #[test]

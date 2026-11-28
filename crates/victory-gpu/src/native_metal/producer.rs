@@ -2170,7 +2170,23 @@ impl MetalProducer {
     /// `Dispatch`: the local threadgroup size must be known (set from the
     /// compute pipeline). A dispatch with an unknown size is refused rather
     /// than guessed.
+    ///
+    /// Every call is counted as an attempt before validation, so the guest
+    /// telemetry line separates "the title never dispatched" (`attempted == 0`)
+    /// from "a dispatch was refused" (`attempted > 0`, `encoded` short of it).
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), ProducerError> {
+        crate::native_metal::telemetry::note_compute_dispatch_attempted();
+        let result = self.dispatch_validated(x, y, z);
+        match &result {
+            Ok(()) => crate::native_metal::telemetry::note_compute_dispatch_encoded(),
+            Err(_) => crate::native_metal::telemetry::note_compute_dispatch_refused(),
+        }
+        result
+    }
+
+    /// [`Self::dispatch`] without the attempt census; the refusal reasons are
+    /// unchanged and always name their class.
+    fn dispatch_validated(&mut self, x: u32, y: u32, z: u32) -> Result<(), ProducerError> {
         if x == 0 || y == 0 || z == 0 {
             // A zero group count is refused explicitly: it must never encode a
             // dispatch the host would silently drop.
@@ -4518,6 +4534,31 @@ mod tests {
             error.to_string().contains("zero group count"),
             "the refusal names the zero group count: {error}"
         );
+    }
+
+    /// A refused `Dispatch` is counted as an attempt and a refusal, never as
+    /// encoded: Boot #38 can separate "the title never dispatched" from "the
+    /// guest refused a dispatch".
+    #[test]
+    fn compute_dispatch_attempts_are_counted_before_refusal() {
+        let before = crate::native_metal::telemetry::compute_dispatch_counts();
+        let unknown = 0xC22_00FF;
+        assert_eq!(crate::native_metal::pso::compute_threadgroup_for(unknown), None);
+        let mut producer = MetalProducer::new(0xC22, 1).expect("producer");
+        producer
+            .set_compute_pipeline(unknown)
+            .expect("compute pipeline");
+        let error = producer
+            .dispatch(1, 1, 1)
+            .expect_err("the missing size is refused by name");
+        assert!(
+            error.to_string().contains("compute threadgroup size not set"),
+            "{error}"
+        );
+        let after = crate::native_metal::telemetry::compute_dispatch_counts();
+        assert_eq!(after.0 - before.0, 1, "one attempt");
+        assert_eq!(after.1 - before.1, 0, "nothing encoded");
+        assert_eq!(after.2 - before.2, 1, "one named refusal");
     }
 
     /// `flush` is sequence-free: the transport (the native queue at enqueue,

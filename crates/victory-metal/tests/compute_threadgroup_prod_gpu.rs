@@ -308,3 +308,97 @@ fn a_registered_compute_pso_dispatches_with_its_parsed_threadgroup() {
         counters_after.dispatches, counters_before.dispatches
     );
 }
+
+/// ADR-067 regression (Boot #37): a compute PSO whose container has no
+/// threadgroup metadata still registers. The registry records the size as
+/// `missing` (`None`), which is the input to the guest's named `Dispatch`
+/// refusal — never a translation or registration refusal.
+#[test]
+fn a_compute_pso_without_threadgroup_metadata_registers_as_missing() {
+    let Ok(transport) = DirectMetalTransport::new() else {
+        eprintln!("skipping: no Metal device on this host");
+        return;
+    };
+    let dir = TempDir::new("compute-threadgroup-missing");
+    let Some(metallib) = compile_metallib(dir.path(), "write_words", COMPUTE_MSL) else {
+        eprintln!("skipping: the Metal shader toolchain is unavailable");
+        return;
+    };
+    let stages = [StageLibrary {
+        role: FunctionRole::Kernel,
+        metallib: metallib.as_slice(),
+        entry: "write_words",
+    }];
+
+    // The empty state is exactly what a container without PSV0 metadata
+    // produces: no `VCTG` chunk.
+    let state: &[u8] = &[];
+    assert_eq!(
+        victory_metal::macos::registry::compute_threadgroup_from_state(state)
+            .expect("an empty state is not a malformed record"),
+        None,
+        "an empty compute state records a missing size"
+    );
+
+    // 1. Registration through the production device path succeeds.
+    transport
+        .register_content_hashed_compute_pipeline_stages(
+            HANDLE,
+            &stages,
+            state,
+            PipelineAbi::default(),
+        )
+        .expect("a compute PSO without threadgroup metadata still registers");
+
+    // 2. The registry reports the size as missing, not as a refusal.
+    let mut registry = PipelineRegistry::new(&transport).expect("registry");
+    let key = PipelineKey::from_stages(
+        &stages,
+        victory_metal::macos::registry::PipelineStage::Compute,
+        state,
+    );
+    let id = registry
+        .register_compute_stages(key, &stages, state)
+        .expect("the registry registers a compute pipeline with no threadgroup record");
+    assert_eq!(
+        registry.get(id).and_then(|entry| entry.compute_threadgroup()),
+        None,
+        "the registered pipeline reports `missing`, not a guessed size"
+    );
+
+    // 3. The guest's refusal is by name: with no recorded size there is no
+    //    valid `threads_per_group`, and the wire decoder rejects a zero
+    //    dimension with a named error rather than encoding a silent dispatch.
+    let malformed = SubmissionV3 {
+        sequence: 1,
+        list: None,
+        commands: vec![
+            CommandV3::SetComputePipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::Dispatch3d(Dispatch3d {
+                pipeline_id: HANDLE,
+                group_counts: [1, 1, 1],
+                threads_per_group: [0, 1, 1],
+                bindings: Vec::new(),
+            }),
+        ],
+    };
+    let error = victory_metal::wire_v3::encode_submission_v3(&malformed)
+        .expect_err("a Dispatch cannot encode a zero threadgroup dimension");
+    let text = error.to_string();
+    assert!(
+        text.to_lowercase().contains("dimension") || text.to_lowercase().contains("zero"),
+        "the refusal names the zero threadgroup dimension: {text}"
+    );
+
+    // 4. The registration itself did not encode a dispatch.
+    assert_eq!(
+        transport.encode_counters().dispatches,
+        0,
+        "registration and a refused Dispatch encode nothing"
+    );
+    eprintln!(
+        "compute threadgroup missing proof: registry reports None; wire refused `{text}`"
+    );
+}
