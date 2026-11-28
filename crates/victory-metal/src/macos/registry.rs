@@ -67,6 +67,7 @@ use std::mem;
 use crate::abi::VmBufferId;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, MTLSize, ObjcObject};
+use crate::macos::vertex_layout::{VertexLayout, VertexLayoutError};
 use crate::macos::views::FormatSupport;
 use crate::transport::MetalError;
 use crate::wire_v3::{
@@ -128,6 +129,9 @@ const MTL_FUNCTION_TYPE_KERNEL: usize = 3;
 const MTL_FUNCTION_TYPE_MESH: usize = 7;
 /// `MTLFunctionTypeObject`.
 const MTL_FUNCTION_TYPE_OBJECT: usize = 8;
+
+/// `MTLVertexStepFunctionPerVertex`.
+const MTL_VERTEX_STEP_FUNCTION_PER_VERTEX: usize = 1;
 
 /// Apple `NSRange` (`NSUInteger location, length`).
 #[repr(C)]
@@ -202,6 +206,12 @@ pub enum RegistryError {
     /// The opaque pipeline state blob is malformed.
     #[error("pipeline state blob is invalid: {0}")]
     InvalidState(&'static str),
+    /// A vertex-layout chunk in the state blob is malformed.
+    #[error("vertex layout is invalid: {0}")]
+    InvalidVertexLayout(String),
+    /// A vertex-layout chunk names a format this host cannot express in Metal.
+    #[error("vertex attribute format code {0} is not supported")]
+    UnsupportedVertexFormat(u8),
     /// A Metal object could not be created.
     #[error(transparent)]
     Metal(#[from] MetalError),
@@ -2048,6 +2058,14 @@ pub struct PipelineState {
     pub depth_stencil: Option<DepthStencilState>,
     /// Rasterizer state carried in the content key (cycle 06 encoder state).
     pub rasterizer: Option<RasterizerState>,
+    /// Metal vertex layout appended after the state encoding.
+    ///
+    /// Most state blobs do not carry one: a graphics pipeline whose vertex
+    /// function reads no `[[attribute(n)]]` input needs no descriptor. A
+    /// version 3 host translation appends a chunk derived from the vertex
+    /// stage's DXIL `ISG1` signature, and the descriptor is set from it before
+    /// the pipeline state is created.
+    pub vertex_layout: Option<VertexLayout>,
 }
 
 /// Render-state section flag: a [`BlendState`] follows.
@@ -2110,6 +2128,11 @@ impl PipelineState {
         out.extend_from_slice(&self.max_total_threadgroups_per_mesh_grid.to_le_bytes());
         if has_render_state {
             self.encode_render_state(&mut out);
+        }
+        if let Some(layout) = self.vertex_layout.as_ref()
+            && !layout.is_empty()
+        {
+            layout.append_to(&mut out);
         }
         out
     }
@@ -2228,9 +2251,28 @@ impl PipelineState {
         } else {
             (None, None, None)
         };
-        if !reader.is_empty() {
-            return Err(RegistryError::InvalidState("trailing bytes"));
-        }
+        // A version 3 host translation appends the vertex stage's layout after
+        // the state. A blob without one keeps its historical meaning exactly.
+        let vertex_layout = if reader.is_empty() {
+            None
+        } else {
+            let remaining = reader.remaining();
+            if !remaining.starts_with(&crate::macos::vertex_layout::VERTEX_LAYOUT_MAGIC) {
+                // Historical VPS1/VPS2 blobs reject every trailing byte; the
+                // only trailing section this host now understands is a chunk
+                // that starts with its own magic.
+                return Err(RegistryError::InvalidState("trailing bytes"));
+            }
+            match VertexLayout::decode(remaining) {
+                Ok(layout) => Some(layout),
+                Err(VertexLayoutError::UnknownFormat(code)) => {
+                    return Err(RegistryError::UnsupportedVertexFormat(code));
+                }
+                Err(error) => {
+                    return Err(RegistryError::InvalidVertexLayout(error.to_string()));
+                }
+            }
+        };
         Ok(Self {
             color_formats,
             depth_format,
@@ -2243,6 +2285,7 @@ impl PipelineState {
             blend,
             depth_stencil,
             rasterizer,
+            vertex_layout,
         })
     }
 }
@@ -2479,6 +2522,10 @@ impl<'a> BlobReader<'a> {
 
     fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
     }
 }
 
@@ -3085,6 +3132,11 @@ fn build_graphics_pso(
         );
     }
     set_attachment_formats(descriptor.as_raw(), state)?;
+    if let Some(layout) = state.vertex_layout.as_ref()
+        && !layout.is_empty()
+    {
+        apply_vertex_descriptor(descriptor.as_raw(), layout)?;
+    }
 
     let mut err = objc::empty_id();
     let raw = unsafe {
@@ -3101,6 +3153,119 @@ fn build_graphics_pso(
             "graphics `{vertex_entry}` / `{fragment_entry}` pipeline: {message}"
         )))
     })
+}
+
+/// Applies a derived vertex layout to a live `MTLRenderPipelineDescriptor`.
+///
+/// The descriptor is the one Metal requires before it will accept a vertex
+/// function with `[[attribute(n)]]` inputs. Every attribute's format, offset
+/// and buffer index and every used buffer's stride are set; nothing is
+/// defaulted or dropped. The array subscripts return objects owned by the
+/// `MTLVertexDescriptor`, so they are never retained or released here.
+fn apply_vertex_descriptor(
+    descriptor: objc::Id,
+    layout: &VertexLayout,
+) -> Result<(), RegistryError> {
+    let class = objc::class(c"MTLVertexDescriptor");
+    if class.is_null() {
+        return Err(RegistryError::Unsupported(
+            "MTLVertexDescriptor is unavailable on this host",
+        ));
+    }
+    let raw = unsafe { objc::msg_send_id_0(class, objc::sel(c"new")) };
+    let vertex_descriptor = ObjcObject::from_retained(raw).ok_or_else(|| {
+        RegistryError::Metal(MetalError::InternalError(
+            "MTLVertexDescriptor creation returned null".to_string(),
+        ))
+    })?;
+    let attributes = unsafe {
+        objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"attributes"))
+    };
+    if attributes.is_null() {
+        return Err(RegistryError::Metal(MetalError::InternalError(
+            "MTLVertexDescriptor attributes is nil".to_string(),
+        )));
+    }
+
+    let mut layouts: HashMap<u8, u32> = HashMap::new();
+    for attribute in layout.attributes() {
+        let target = unsafe {
+            objc::msg_send_id_usize(
+                attributes,
+                objc::sel(c"objectAtIndexedSubscript:"),
+                usize::from(attribute.index),
+            )
+        };
+        if target.is_null() {
+            return Err(RegistryError::InvalidVertexLayout(format!(
+                "attribute {} has no Metal attribute descriptor",
+                attribute.index
+            )));
+        }
+        // SAFETY: `target` is a live attribute descriptor owned by the
+        // `MTLVertexDescriptor`; every value is the documented NSUInteger form.
+        unsafe {
+            objc::msg_send_void_usize(
+                target,
+                objc::sel(c"setFormat:"),
+                attribute.format.mtl_format(),
+            );
+            objc::msg_send_void_usize(target, objc::sel(c"setOffset:"), attribute.offset as usize);
+            objc::msg_send_void_usize(
+                target,
+                objc::sel(c"setBufferIndex:"),
+                usize::from(attribute.buffer_index),
+            );
+        }
+        layouts
+            .entry(attribute.buffer_index)
+            .or_insert(attribute.stride);
+    }
+
+    let layout_array = unsafe {
+        objc::msg_send_id_0(vertex_descriptor.as_raw(), objc::sel(c"layouts"))
+    };
+    if layout_array.is_null() {
+        return Err(RegistryError::Metal(MetalError::InternalError(
+            "MTLVertexDescriptor layouts is nil".to_string(),
+        )));
+    }
+    for (buffer_index, stride) in layouts {
+        let target = unsafe {
+            objc::msg_send_id_usize(
+                layout_array,
+                objc::sel(c"objectAtIndexedSubscript:"),
+                usize::from(buffer_index),
+            )
+        };
+        if target.is_null() {
+            return Err(RegistryError::InvalidVertexLayout(format!(
+                "buffer {buffer_index} has no Metal vertex layout descriptor"
+            )));
+        }
+        // SAFETY: `target` is a live buffer layout descriptor owned by the
+        // `MTLVertexDescriptor`; `stride` is 4-byte aligned and nonzero.
+        unsafe {
+            objc::msg_send_void_usize(target, objc::sel(c"setStride:"), stride as usize);
+            objc::msg_send_void_usize(
+                target,
+                objc::sel(c"setStepFunction:"),
+                MTL_VERTEX_STEP_FUNCTION_PER_VERTEX,
+            );
+            objc::msg_send_void_usize(target, objc::sel(c"setStepRate:"), 1);
+        }
+    }
+
+    // SAFETY: `descriptor` is the live pipeline descriptor under construction
+    // and `vertex_descriptor` is a complete MTLVertexDescriptor.
+    unsafe {
+        objc::msg_send_void_1(
+            descriptor,
+            objc::sel(c"setVertexDescriptor:"),
+            vertex_descriptor.as_raw(),
+        );
+    }
+    Ok(())
 }
 
 fn create_mesh_pso(
@@ -3779,6 +3944,9 @@ fn check_completion(cb: objc::Id, what: &'static str) -> Result<(), RegistryErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macos::vertex_layout::{
+        VERTEX_LAYOUT_HEADER_LEN, VERTEX_LAYOUT_MAGIC, VertexAttribute, VertexFormat,
+    };
 
     fn desc() -> TextureDesc {
         TextureDesc {
@@ -4324,6 +4492,7 @@ mod tests {
             blend: Some(test_blend(true, BlendFactor::SrcAlpha, BlendFactor::InvSrcAlpha)),
             depth_stencil: Some(test_depth_stencil()),
             rasterizer: Some(test_rasterizer()),
+            ..PipelineState::default()
         };
         let encoded = state.encode(PipelineStage::Mesh);
         assert_eq!(PipelineState::decode(&encoded).unwrap(), state);
@@ -4393,6 +4562,62 @@ mod tests {
         let empty_bytes = empty.encode(PipelineStage::Compute);
         assert_eq!(empty_bytes[..4], *b"VPS1");
         assert_eq!(PipelineState::decode(&empty_bytes).unwrap(), empty);
+    }
+
+    #[test]
+    fn pipeline_state_carries_an_appended_vertex_layout() {
+        let float4 = VertexFormat::with_components(VertexFormat::FLOAT, 4).unwrap();
+        let layout = VertexLayout::from_attributes(vec![
+            VertexAttribute {
+                index: 0,
+                format: float4,
+                offset: 0,
+                buffer_index: 0,
+                stride: 32,
+            },
+            VertexAttribute {
+                index: 1,
+                format: float4,
+                offset: 16,
+                buffer_index: 0,
+                stride: 32,
+            },
+        ])
+        .expect("two float4 attributes");
+        let state = PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            fragment_entry: Some("fs_main".to_string()),
+            vertex_layout: Some(layout.clone()),
+            ..PipelineState::default()
+        };
+        let encoded = state.encode(PipelineStage::Graphics);
+        let decoded = PipelineState::decode_for(&encoded, PipelineStage::Graphics).unwrap();
+        assert_eq!(decoded.vertex_layout, Some(layout));
+        // The chunk is at the very end and keeps the VPS1 header.
+        assert_eq!(&encoded[..4], b"VPS1");
+        let magic = encoded
+            .windows(4)
+            .position(|window| window == VERTEX_LAYOUT_MAGIC)
+            .expect("the encoded state carries a vertex layout chunk");
+        assert_eq!(&encoded[magic..magic + 4], &VERTEX_LAYOUT_MAGIC);
+        assert_eq!(encoded[magic + 5], 2, "two attributes are encoded");
+
+        // A state without a layout still decodes with no descriptor.
+        let plain = PipelineState {
+            color_formats: vec![TextureFormat::Rgba8Unorm],
+            fragment_entry: Some("fs_main".to_string()),
+            ..PipelineState::default()
+        }
+        .encode(PipelineStage::Graphics);
+        assert_eq!(PipelineState::decode(&plain).unwrap().vertex_layout, None);
+
+        // A chunk format outside the supported set is a named RegistryError.
+        let mut corrupt = encoded.clone();
+        corrupt[magic + VERTEX_LAYOUT_HEADER_LEN + 1] = 0x31;
+        assert!(matches!(
+            PipelineState::decode(&corrupt),
+            Err(RegistryError::UnsupportedVertexFormat(0x31))
+        ));
     }
 
     #[test]

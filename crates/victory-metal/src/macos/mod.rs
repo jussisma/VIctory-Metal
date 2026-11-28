@@ -18,5 +18,6 @@ pub mod residency;
 pub mod retire;
 pub mod state;
 pub mod texture;
+pub mod vertex_layout;
 pub mod views;
 pub mod window;

@@ -235,6 +235,7 @@ use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
     TextureDimension, TextureFormat, TextureUsage,
 };
+use crate::macos::vertex_layout::VertexLayout;
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
     self, BufferBinding, Command, ListIdentity, Reply, ReplyStatus, Submission, WireError,
@@ -2419,6 +2420,31 @@ impl<E: BatchExecutor> IpcHost<E> {
             Err(reason) => return self.reject_host_translation(reason),
         };
 
+        // A graphics vertex function with `[[attribute(n)]]` inputs needs a
+        // Metal vertex descriptor that the guest's state blob does not carry.
+        // The vertex stage's own DXIL container is the only signature source;
+        // a layout is appended after the state so the BatchExecutor trait and
+        // every older guest frame keep their exact back-compatible shape.
+        let mut state = request.state.clone();
+        if request.kind == PIPELINE_KIND_GRAPHICS {
+            let Some(vertex_index) = request
+                .stages
+                .iter()
+                .position(|stage| stage.stage == PIPELINE_STAGE_VERTEX)
+            else {
+                return self.reject_host_translation("a graphics pipeline needs a vertex stage");
+            };
+            match VertexLayout::from_dxil_container(&dxil[vertex_index]) {
+                Ok(layout) if !layout.is_empty() => layout.append_to(&mut state),
+                Ok(_) => {}
+                Err(error) => {
+                    return self.reject_host_translation(format!(
+                        "the vertex input signature cannot become a Metal vertex layout: {error}"
+                    ));
+                }
+            }
+        }
+
         let stages: Vec<PipelineStageLibrary<'_>> = request
             .stages
             .iter()
@@ -2438,19 +2464,19 @@ impl<E: BatchExecutor> IpcHost<E> {
             PIPELINE_KIND_COMPUTE => self.executor.register_compute_pipeline_stages(
                 handle,
                 &stages,
-                &request.state,
+                &state,
                 abi,
             ),
             PIPELINE_KIND_GRAPHICS => self.executor.register_graphics_pipeline_stages(
                 handle,
                 &stages,
-                &request.state,
+                &state,
                 abi,
             ),
             PIPELINE_KIND_MESH => self.executor.register_mesh_pipeline_stages(
                 handle,
                 &stages,
-                &request.state,
+                &state,
                 abi,
             ),
             _ => {
