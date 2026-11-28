@@ -44,6 +44,13 @@
 //! id, generation, byte offset and length; a lookup for a missing or stale
 //! range is an explicit error, never an empty or zero-filled range.
 //!
+//! A guest range may be shown by several adjacent views of one section: the
+//! views are walked page by page and produce one covering window. A range
+//! whose pages come from two share files is refused by name
+//! ([`ResolveError::CrossBacking`]) and counted once per request in the
+//! bounded [`cross_backing_refusals`] census: one wire allocation id names
+//! exactly one file, so no partial or invented binding is ever produced.
+//!
 //! Retirement is deliberately not idempotent: a duplicate fence callback or
 //! a second release is reported ([`RegistryError::Retired`] or
 //! [`RegistryError::NotRetained`]), because it means the submission
@@ -721,6 +728,15 @@ pub(crate) enum ResolveError {
     TitleCommitted,
     /// The views do not show one contiguous run of one section.
     NotContiguous,
+    /// The range spans two share files. One wire allocation id names exactly
+    /// one file, so the range cannot be expressed as one binding. The two
+    /// ids and lengths are named; a path and the bytes themselves never are.
+    CrossBacking {
+        first_id: u64,
+        first_length: u64,
+        second_id: u64,
+        second_length: u64,
+    },
     /// The backing is not this session's: a foreign id or generation.
     Stale,
     /// The section is pagefile-backed (provider unset or unavailable).
@@ -729,18 +745,33 @@ pub(crate) enum ResolveError {
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            ResolveError::Empty => "the range is empty",
-            ResolveError::OutOfBounds => "the range leaves its section",
-            ResolveError::NotMapped => "the range is not mapped by tracked views",
-            ResolveError::TitleCommitted => {
-                "the range is committed title memory with no host-visible share backing"
+        match self {
+            ResolveError::Empty => f.write_str("the range is empty"),
+            ResolveError::OutOfBounds => f.write_str("the range leaves its section"),
+            ResolveError::NotMapped => f.write_str("the range is not mapped by tracked views"),
+            ResolveError::TitleCommitted => f.write_str(
+                "the range is committed title memory with no host-visible share backing",
+            ),
+            ResolveError::NotContiguous => {
+                f.write_str("the range is not one contiguous section run")
             }
-            ResolveError::NotContiguous => "the range is not one contiguous section run",
-            ResolveError::Stale => "the range's backing is stale or not this session's",
-            ResolveError::Pagefile => "the range's section has no host-visible backing",
-        };
-        f.write_str(message)
+            ResolveError::CrossBacking {
+                first_id,
+                first_length,
+                second_id,
+                second_length,
+            } => write!(
+                f,
+                "the range spans share allocations {first_id} ({first_length} bytes) \
+                 and {second_id} ({second_length} bytes)"
+            ),
+            ResolveError::Stale => {
+                f.write_str("the range's backing is stale or not this session's")
+            }
+            ResolveError::Pagefile => {
+                f.write_str("the range's section has no host-visible backing")
+            }
+        }
     }
 }
 
@@ -1096,6 +1127,59 @@ fn discard(section: Arc<Section>) {
     }
 }
 
+/// Cross-backing refusals seen in this process, as a bounded census: the
+/// count is the whole state, never a list of ranges, and a log line is
+/// emitted only when the count is a power of two.
+static CROSS_BACKING_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// The census counter's name, for the one log line per power of two.
+const CROSS_BACKING_COUNTER: &str = "xmem_cross_backing_refusals";
+
+/// How many guest ranges have been refused because they span two share files.
+///
+/// Bounded and monotonic for the process: one atomic, no per-range map, so a
+/// title that asks for the same cross-file span every frame cannot grow the
+/// resolver's memory.
+pub(crate) fn cross_backing_refusals() -> u64 {
+    CROSS_BACKING_REFUSALS.load(Ordering::Relaxed)
+}
+
+/// Counts one cross-backing refusal and returns the exact error for it.
+///
+/// The message names only the two allocation ids and their file lengths, both
+/// of which the caller's requested range already touches. It never names a
+/// path and never records the guest's bytes.
+fn cross_backing(
+    first: &Backing,
+    first_length: u64,
+    second: &Backing,
+    second_length: u64,
+) -> ResolveError {
+    let count = CROSS_BACKING_REFUSALS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            count.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .unwrap_or(u64::MAX);
+    if count.is_power_of_two() {
+        tracing::warn!(
+            counter = CROSS_BACKING_COUNTER,
+            count,
+            first_id = first.id,
+            first_length,
+            second_id = second.id,
+            second_length,
+            "xmem share resolver: a guest range spans two share files"
+        );
+    }
+    ResolveError::CrossBacking {
+        first_id: first.id,
+        first_length,
+        second_id: second.id,
+        second_length,
+    }
+}
+
 /// Resolves the guest byte range `[at, at + len)` to a share file, offset and
 /// length.
 ///
@@ -1103,9 +1187,17 @@ fn discard(section: Arc<Section>) {
 /// containing `at` and covers every page the range touches, so the host can
 /// map it. The whole rounded span must be shown by the existing tracked
 /// views and be one contiguous run of pages of one section, all within the
-/// section. In particular, a range whose last byte is mapped is still
+/// section. The views may be split at any page boundary, and the same
+/// section may be shown by several adjacent views: they still produce one
+/// window. In particular, a range whose last byte is mapped is still
 /// refused if rounding it would reach an unmapped or foreign page: never
 /// grant a page the guest did not map.
+///
+/// A range whose pages come from two different share files is
+/// [`ResolveError::CrossBacking`]: one wire allocation id names one file, so
+/// there is no honest single window for it. That refusal is counted in the
+/// bounded [`cross_backing_refusals`] census and logs the two allocation ids
+/// and lengths on the first bind of each power-of-two count.
 ///
 /// This takes the physical-page lock only to inspect and clone what the
 /// views already hold; the returned lease keeps the section (and its file)
@@ -1125,13 +1217,16 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
     let mut section: Option<Arc<Section>> = None;
     let mut first_index = None;
     let mut next_index = None;
-    let mut cursor = start;
-    while cursor < stop {
-        let Some((base, size, slice)) = view_at(&physical, cursor) else {
+    // Walk the tracked views one 64 KiB page at a time. A view may show many
+    // pages, and one section may be shown by several adjacent views; only the
+    // section-level order matters, not where the views happen to be split.
+    let mut page = start;
+    while page < stop {
+        let Some((base, _size, slice)) = view_at(&physical, page) else {
             // A page no view shows may still be committed guest memory (the
             // title's own allocator): name that precisely instead of reading
             // like an `xmem` miss. Still a refusal, never a fabricated range.
-            return Err(if committed_readable(cursor, stop) {
+            return Err(if committed_readable(page, stop) {
                 ResolveError::TitleCommitted
             } else {
                 ResolveError::NotMapped
@@ -1139,24 +1234,57 @@ pub(crate) fn resolve_guest_range(at: usize, len: usize) -> Result<Lease, Resolv
         };
         let index = slice
             .index
-            .checked_add((cursor - base) / PAGE)
+            .checked_add((page - base) / PAGE)
             .ok_or(ResolveError::OutOfBounds)?;
         match &section {
             None => {
                 section = Some(slice.section.clone());
                 first_index = Some(index);
             }
-            Some(section) if !Arc::ptr_eq(section, &slice.section) => {
-                return Err(ResolveError::NotContiguous);
+            Some(first) if !Arc::ptr_eq(first, &slice.section) => {
+                // A second section is either memory the wire cannot name as
+                // one allocation, or a genuine gap whose views disagree. Two
+                // distinct valid share ids are exactly the former: one wire
+                // allocation id is one file, so the span is refused by name
+                // and counted. A pagefile/mixed page keeps the old refusal.
+                //
+                // Views of one file always clone the allocation's single
+                // `Arc<Section>` (`XMemMapPhysicalPages`, `unmap` and
+                // `map_alias` all keep it), so two Section objects with the
+                // same id cannot be adjacent in this page table. Merging on
+                // the id alone would be unproven, so it stays NotContiguous.
+                let mixed = match (first.share.as_ref(), slice.section.share.as_ref()) {
+                    (Some(first_backing), Some(second_backing))
+                        if first_backing.generation == GENERATION
+                            && second_backing.generation == GENERATION
+                            && first_backing.id != 0
+                            && second_backing.id != 0
+                            && first_backing.id != second_backing.id =>
+                    {
+                        Some((first_backing, second_backing))
+                    }
+                    _ => None,
+                };
+                return Err(match mixed {
+                    Some((first_backing, second_backing)) => cross_backing(
+                        first_backing,
+                        first.map_size as u64,
+                        second_backing,
+                        slice.section.map_size as u64,
+                    ),
+                    None => ResolveError::NotContiguous,
+                });
             }
             Some(_) => {}
         }
+        // Pages must be one strictly increasing run of the section's page
+        // indices: a jump would name bytes the guest did not map contiguously.
         if next_index.is_some_and(|next| next != index) {
             return Err(ResolveError::NotContiguous);
         }
         next_index = index.checked_add(1);
-        let view_end = base.checked_add(size).ok_or(ResolveError::OutOfBounds)?;
-        cursor = view_end.min(stop);
+        // Advance exactly one page: the walk is page-granular by definition.
+        page = page.checked_add(PAGE).ok_or(ResolveError::OutOfBounds)?;
     }
     let section = section.ok_or(ResolveError::NotMapped)?;
     let offset = first_index
@@ -1258,8 +1386,8 @@ fn remember(range: GuestRange, lease: Lease) {
 /// The share provider as the native backend's [`GuestRangeResolver`].
 ///
 /// A range that is not shown by tracked views, leaves its section, spans two
-/// sections, or lives in a pagefile-backed section is an explicit error. The
-/// pagefile path itself is untouched: nothing here runs unless the native
+/// share files, or lives in a pagefile-backed section is an explicit error.
+/// The pagefile path itself is untouched: nothing here runs unless the native
 /// backend asks, and the provider stays off when
 /// `VICTORY_METAL_SHARE_DIR` is unset.
 pub(crate) struct ShareResolver;
@@ -1326,6 +1454,12 @@ fn seam_resolve_error(error: ResolveError, address: u64, len: u64) -> SeamError 
         ResolveError::NotContiguous => {
             SeamError::Invalid("the range is not one contiguous shared allocation")
         }
+        // One wire allocation id names one file; a span of two files cannot be
+        // expressed, so it is refused as unsupported rather than malformed.
+        // The detailed ids and lengths stay in the resolver's bounded log.
+        ResolveError::CrossBacking { .. } => SeamError::Unsupported(
+            "the range spans two share files; one allocation id names one file",
+        ),
         ResolveError::Stale => {
             SeamError::Invalid("the range's backing is stale or not this session's")
         }
@@ -2015,7 +2149,7 @@ mod tests {
             "a page gap must not resolve"
         );
 
-        // Adjacent pages of two sections are not one run either.
+        // Adjacent pages of two share files cannot be one wire allocation.
         let other = allocate(1);
         let mixed = reserve(2 * PAGE);
         let mixed_next = mixed
@@ -2027,11 +2161,19 @@ mod tests {
             XMemMapPhysicalPages(mixed_next, 1, other.as_ptr()),
             mixed_next
         );
-        assert_eq!(
-            resolve_guest_range(mixed as usize, 2 * PAGE).unwrap_err(),
-            ResolveError::NotContiguous,
-            "pages of two sections must not resolve"
-        );
+        match resolve_guest_range(mixed as usize, 2 * PAGE).unwrap_err() {
+            ResolveError::CrossBacking {
+                first_id,
+                first_length,
+                second_id,
+                second_length,
+            } => {
+                assert_ne!(first_id, second_id, "two files, two ids");
+                assert_eq!(first_length, PAGE as u64);
+                assert_eq!(second_length, PAGE as u64);
+            }
+            other => panic!("two share files must be named as CrossBacking, got {other}"),
+        }
 
         // Arithmetic and rounding are checked, never wrapped.
         assert_eq!(
@@ -2044,8 +2186,8 @@ mod tests {
             "rounding the last byte up would overflow"
         );
         // The byte past the last mapped page is not granted by rounding. An
-        // adjacent view of another section may make the refusal
-        // `NotContiguous` rather than `NotMapped`; either way it must refuse.
+        // adjacent view of another share file may make the refusal
+        // `CrossBacking` rather than `NotMapped`; either way it must refuse.
         assert!(
             resolve_guest_range(at as usize + 4 * PAGE - 1, 2).is_err(),
             "the byte past the last mapped page must not be granted by rounding"
@@ -2057,6 +2199,252 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(mixed, 2, std::ptr::null()), mixed);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
+    }
+
+    /// One section shown by several adjacent views resolves as one exact
+    /// window: a request may cross a page boundary inside a view and a view
+    /// boundary, and starts mid-page. The lease pins exactly one range, and
+    /// retirement releases it (no pin is leaked by the walk).
+    #[test]
+    fn multi_view_ranges_of_one_section_resolve_exactly_and_balance_pins() {
+        let share = SyntheticShare::new(4);
+        let id = share.section.share.as_ref().expect("a share backing").id;
+        // Page 0-1 in one view, then one view per page: the boundaries are
+        // where a request would previously have had to stop.
+        let _first = FakeView::install(
+            FAKE,
+            2 * PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 0,
+            },
+        );
+        let _second = FakeView::install(
+            FAKE + 2 * PAGE,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 2,
+            },
+        );
+        let _third = FakeView::install(
+            FAKE + 3 * PAGE,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 3,
+            },
+        );
+
+        // Starts near the end of page 0, ends inside page 2: crosses a page
+        // boundary inside the first view and the boundary into the second.
+        let across = resolve_guest_range(FAKE + PAGE - 0x40, PAGE + 0x80)
+            .expect("a range straddling a view boundary resolves");
+        assert_eq!((across.range.id, across.range.generation), (id, GENERATION));
+        assert_eq!(
+            (across.range.offset, across.range.length),
+            (0, (3 * PAGE) as u64)
+        );
+        assert_eq!(across.file_size(), (4 * PAGE) as u64);
+
+        // Starts mid-page in the first view and ends mid-page in the last:
+        // every view boundary is crossed and neither end is page aligned.
+        let all = resolve_guest_range(FAKE + PAGE + 0x40, 2 * PAGE)
+            .expect("a range across all three views resolves");
+        assert_eq!((all.range.id, all.range.generation), (id, GENERATION));
+        assert_eq!(
+            (all.range.offset, all.range.length),
+            (PAGE as u64, (3 * PAGE) as u64)
+        );
+        assert_eq!(all.file_size(), (4 * PAGE) as u64);
+
+        // The same bytes shown by a single view resolve to the same window.
+        let one_view = resolve_guest_range(FAKE + 2 * PAGE + 0x30, 0x20)
+            .expect("a subrange of one view resolves");
+        assert_eq!(
+            (
+                one_view.range.id,
+                one_view.range.offset,
+                one_view.range.length
+            ),
+            (id, (2 * PAGE) as u64, PAGE as u64)
+        );
+        drop((across, one_view));
+
+        // The multi-view lease is one range: retain pins it once, retire
+        // drops it, and the registry is left without it.
+        let submission = fresh_submission();
+        let key = all
+            .retain(submission)
+            .expect("the multi-view range retains");
+        assert!(is_retained(key), "the multi-view range is registered");
+        assert_eq!(retire(submission).expect("the submission retires"), 1);
+        assert!(
+            !is_retained(key),
+            "retirement drops the multi-view range; no pin is leaked"
+        );
+        drop(all);
+    }
+
+    /// A range whose pages come from two share files is refused by name,
+    /// counted exactly once per request, and never resolved as a partial
+    /// bind. The same request through the seam keeps a bounded static reason
+    /// and creates no pin.
+    #[test]
+    fn cross_backing_is_named_and_counted_once_per_request() {
+        let first = SyntheticShare::new(1);
+        let second = SyntheticShare::new(1);
+        let first_id = first.section.share.as_ref().expect("a backing").id;
+        let second_id = second.section.share.as_ref().expect("a backing").id;
+        let _first = FakeView::install(
+            FAKE,
+            PAGE,
+            super::super::Slice {
+                section: first.section.clone(),
+                index: 0,
+            },
+        );
+        let _second = FakeView::install(
+            FAKE + PAGE,
+            PAGE,
+            super::super::Slice {
+                section: second.section.clone(),
+                index: 0,
+            },
+        );
+
+        let before = cross_backing_refusals();
+        let error = resolve_guest_range(FAKE, 2 * PAGE).unwrap_err();
+        match &error {
+            ResolveError::CrossBacking {
+                first_id: a,
+                first_length,
+                second_id: b,
+                second_length,
+            } => {
+                assert_eq!((*a, *b), (first_id, second_id));
+                assert_eq!((*first_length, *second_length), (PAGE as u64, PAGE as u64));
+            }
+            other => panic!("two share files must be named as CrossBacking, got {other}"),
+        }
+        assert_eq!(
+            cross_backing_refusals(),
+            before + 1,
+            "one request must move the census exactly once"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains(&first_id.to_string()),
+            "the first id is named"
+        );
+        assert!(
+            text.contains(&second_id.to_string()),
+            "the second id is named"
+        );
+        assert!(!text.contains('/'), "no path is named: {text}");
+        assert!(!text.contains(".bin"), "no file name is named: {text}");
+
+        // A range inside either file alone is not a cross-backing refusal.
+        let alone = resolve_guest_range(FAKE, PAGE).expect("one file's page resolves");
+        assert_eq!(
+            cross_backing_refusals(),
+            before + 1,
+            "a single-file range must not move the census"
+        );
+        drop(alone);
+
+        // The seam keeps the refusal bounded and pins nothing.
+        let resolver = ShareResolver;
+        let before_seam = cross_backing_refusals();
+        let seam = resolver
+            .resolve(FAKE as u64, (2 * PAGE) as u64)
+            .expect_err("two share files cannot be one wire allocation");
+        assert!(
+            matches!(&seam, SeamError::Unsupported(message) if message.contains("two share files")),
+            "the seam names the protocol limit: {seam}"
+        );
+        assert_eq!(
+            cross_backing_refusals(),
+            before_seam + 1,
+            "the seam refusal counts once"
+        );
+    }
+
+    /// The page walk keeps every real refusal: a page-index gap inside one
+    /// section, a page beyond `map_size`, and a pagefile page mixed with a
+    /// share-backed one.
+    #[test]
+    fn multi_view_walk_preserves_gap_bounds_and_pagefile_refusals() {
+        let share = SyntheticShare::new(2);
+        // Page index 0 then 2: both pages are mapped at adjacent addresses but
+        // the section run has a hole, so no window may name it.
+        let _hole_first = FakeView::install(
+            FAKE,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 0,
+            },
+        );
+        let _hole_second = FakeView::install(
+            FAKE + PAGE,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 2,
+            },
+        );
+        assert_eq!(
+            resolve_guest_range(FAKE, 2 * PAGE).unwrap_err(),
+            ResolveError::NotContiguous,
+            "a page-index jump must not resolve"
+        );
+
+        // A view that claims a second page of a one-page section: the window
+        // would leave the file, so it is refused rather than granted.
+        let one = SyntheticShare::new(1);
+        let beyond = FAKE + 16 * PAGE;
+        let _beyond = FakeView::install(
+            beyond,
+            2 * PAGE,
+            super::super::Slice {
+                section: one.section.clone(),
+                index: 0,
+            },
+        );
+        assert_eq!(
+            resolve_guest_range(beyond, 2 * PAGE).unwrap_err(),
+            ResolveError::OutOfBounds,
+            "a page beyond map_size must not be granted"
+        );
+
+        // A pagefile page next to a share-backed page is still a mixed
+        // refusal, not a fabricated allocation id.
+        let file = tempfile::tempfile().expect("a temporary file");
+        file.set_len(PAGE as u64).expect("one page");
+        let pagefile = super::super::file_section(&file, PAGE, None).expect("a pagefile section");
+        let mixed = FAKE + 32 * PAGE;
+        let _mixed_share = FakeView::install(
+            mixed,
+            PAGE,
+            super::super::Slice {
+                section: share.section.clone(),
+                index: 0,
+            },
+        );
+        let _mixed_pagefile = FakeView::install(
+            mixed + PAGE,
+            PAGE,
+            super::super::Slice {
+                section: pagefile,
+                index: 0,
+            },
+        );
+        assert_eq!(
+            resolve_guest_range(mixed, 2 * PAGE).unwrap_err(),
+            ResolveError::NotContiguous,
+            "a pagefile page has no share id to merge"
+        );
     }
 
     /// A section without host-visible backing (the pagefile fallback, or a
