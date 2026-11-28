@@ -112,6 +112,79 @@ fn colour_attachment(load: LoadOp, clear: [f64; 4]) -> ColorAttachment {
     }
 }
 
+/// A fragment shader that writes zeros over its whole triangle.
+const ZERO_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut zero_vertex(uint vid [[vertex_id]]) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(3.0, -1.0),
+        float2(-1.0, 3.0),
+    };
+    VOut out;
+    out.position = float4(positions[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 zero_fragment() {
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+"#;
+
+/// A pipeline that clears/loads, draws one full-viewport triangle and ends the
+/// pass.
+fn draw_commands(pipeline_id: u64, load: LoadOp, clear: [f64; 4]) -> Vec<CommandV3> {
+    vec![
+        begin_pass(load, clear),
+        CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id }),
+        CommandV3::SetViewport(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(EDGE),
+            height: f64::from(EDGE),
+            near: 0.0,
+            far: 1.0,
+        }),
+        CommandV3::SetScissor(ScissorRect {
+            x: 0,
+            y: 0,
+            width: EDGE,
+            height: EDGE,
+        }),
+        CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+        CommandV3::Draw(DrawState {
+            vertex_count: 3,
+            instance_count: 1,
+            start_vertex: 0,
+            start_instance: 0,
+        }),
+        CommandV3::EndRenderPass,
+    ]
+}
+
+/// Compiles the zero-writing pipeline on a real device.
+fn zero_pipeline(transport: &DirectMetalTransport) -> u64 {
+    let pipeline = GraphicsPipeline::compile(
+        transport,
+        ZERO_MSL,
+        "zero_vertex",
+        "zero_fragment",
+        PixelFormat::Rgba8Unorm,
+        None,
+    )
+    .expect("zero pipeline compiles");
+    transport
+        .register_graphics_pipeline_state(pipeline)
+        .expect("zero pipeline registers")
+        .0
+}
+
 fn begin_pass(load: LoadOp, clear: [f64; 4]) -> CommandV3 {
     CommandV3::BeginRenderPass(BeginRenderPass {
         colors: vec![colour_attachment(load, clear)],
@@ -124,11 +197,20 @@ fn submit(
     allocations: &HashMap<(u64, u32), VmBufferId>,
     commands: Vec<CommandV3>,
 ) -> Duration {
+    submit_sequence(transport, allocations, commands, SEQUENCE)
+}
+
+fn submit_sequence(
+    transport: &DirectMetalTransport,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    commands: Vec<CommandV3>,
+    sequence: u32,
+) -> Duration {
     let started = Instant::now();
     let (reply, _stats) = transport
         .submit_v3_with_stats(
             &SubmissionV3 {
-                sequence: SEQUENCE,
+                sequence,
                 list: None,
                 commands,
             },
@@ -290,6 +372,99 @@ fn a_clear_only_pass_is_not_sampled_as_drawn_output() {
         submit_cost.as_micros()
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADR-068: "written after last clear" evidence on the real GPU.
+//
+// Boot #36 reported `non_black_pixels = 0` on a pass the tracer had sampled and
+// could not say whether the shader drew zeros, a later clear erased non-zero
+// pixels, or the non-zero RT was never shown. These three cases pin each class
+// on a 64x64 offscreen target.
+// ---------------------------------------------------------------------------
+
+/// A zero clear followed by the red draw is `written-after-clear`: the clear
+/// alone accounts for zero bytes and the readback is non-zero.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn a_nonzero_draw_after_a_zero_clear_is_written_after_clear() {
+    enable_trace();
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let (target, allocations) = create_target(&transport);
+    let pipeline_id = pipeline(&transport);
+    submit(
+        &transport,
+        &allocations,
+        draw_commands(pipeline_id, LoadOp::Clear, [0.0, 0.0, 0.0, 0.0]),
+    );
+
+    let sample = trace::last_sample().expect("the drawn pass was sampled");
+    assert_eq!(sample.draws_since_clear, 1, "{sample:?}");
+    assert_eq!(sample.clear_color, Some([0.0, 0.0, 0.0, 0.0]));
+    assert_eq!(
+        sample.nonzero_bytes_after_clear,
+        Some(0),
+        "a zero clear writes zero bytes: {sample:?}"
+    );
+    assert!(
+        sample.nonzero_bytes_after_draws() > 0,
+        "the red draw must survive the clear: {sample:?}"
+    );
+    assert_eq!(
+        sample.distinct_pixels_after_draws, 1,
+        "a full-viewport red draw is one distinct pixel even though it has \
+         two distinct byte values: {sample:?}"
+    );
+    assert!(sample.distinct_values >= 2, "{sample:?}");
+
+    let evidence = trace::rt_write_evidence();
+    assert_eq!(evidence.rt_traced, 1, "{evidence:?}");
+    assert_eq!(evidence.rt_sampled, 1, "{evidence:?}");
+    assert_eq!(evidence.rt_written_after_clear, 1, "{evidence:?}");
+    assert_eq!(evidence.rts[0].class, trace::RT_CLASS_WRITTEN);
+    let _ = target;
+}
+
+/// A non-zero clear followed by a draw that writes zeros is `drew-zeros`: the
+/// analytic clear bytes are non-zero and the readback is zero.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn a_zero_draw_over_a_nonzero_clear_is_drew_zeros() {
+    enable_trace();
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let (target, allocations) = create_target(&transport);
+    let pipeline_id = zero_pipeline(&transport);
+    let clear = [0.25, 0.5, 0.75, 1.0];
+    submit(
+        &transport,
+        &allocations,
+        draw_commands(pipeline_id, LoadOp::Clear, clear),
+    );
+
+    let sample = trace::last_sample().expect("the drawn pass was sampled");
+    assert_eq!(sample.draws_since_clear, 1, "{sample:?}");
+    assert_eq!(sample.clear_color, Some(clear));
+    assert_eq!(
+        sample.nonzero_bytes_after_clear,
+        Some(sample.sampled_bytes),
+        "every channel of the clear is non-zero: {sample:?}"
+    );
+    assert_eq!(
+        sample.nonzero_bytes_after_draws(),
+        0,
+        "the shader wrote zeros over the clear: {sample:?}"
+    );
+    assert_eq!(sample.distinct_pixels_after_draws, 1, "{sample:?}");
+
+    let evidence = trace::rt_write_evidence();
+    assert_eq!(evidence.rt_traced, 1, "{evidence:?}");
+    assert_eq!(
+        evidence.rt_written_after_clear, 0,
+        "a zero draw is not written output: {evidence:?}"
+    );
+    assert_eq!(evidence.rts[0].class, trace::RT_CLASS_ZERO);
+    let _ = target;
+}
+
 
 // ---------------------------------------------------------------------------
 // Cycle 18B: the encoder-state trace (`VICTORY_METAL_STATE_TRACE=1`).

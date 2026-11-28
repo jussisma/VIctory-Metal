@@ -377,6 +377,21 @@ struct PresentTrace {
     fallback_clear: u64,
     keys: Vec<(PresentTraceKey, u64)>,
     dropped_keys: u64,
+    /// ADR-068: last presented frame's composition source class
+    /// (`pass-target`, `copy`, `never-sampled` or empty before the first).
+    composition_source: &'static str,
+    /// ADR-068: draw-trace ordinal of the RT that wrote the presented surface
+    /// (`0` when the tracer named none).
+    composition_source_rt: u32,
+    /// ADR-068: that RT's written-after-clear class word.
+    composition_source_rt_class: &'static str,
+    /// Presents whose source was itself a traced pass target.
+    composition_source_pass_target: u64,
+    /// Presents whose source received a host copy.
+    composition_source_copy: u64,
+    /// Presents whose source was neither: nothing the tracer sampled reached
+    /// the surface.
+    composition_source_never_sampled: u64,
     /// Copy count observed at the previous present of each source texture, so
     /// a copy from an earlier frame is not counted again.
     source_copies: Vec<(usize, u64)>,
@@ -687,6 +702,49 @@ fn note_surface_census(
     }
 }
 
+/// Fixed class word: the presented surface was itself a draw-trace pass target.
+pub const COMPOSITION_SOURCE_PASS_TARGET: &str = "pass-target";
+
+/// Fixed class word: a host copy wrote the presented surface.
+pub const COMPOSITION_SOURCE_COPY: &str = "copy";
+
+/// Fixed class word: nothing the tracer observed reached the presented surface.
+pub const COMPOSITION_SOURCE_NEVER_SAMPLED: &str = "never-sampled";
+
+/// Fixed class word: this present recorded no source texture at all.
+pub const COMPOSITION_SOURCE_NONE: &str = "none";
+
+/// ADR-068: classifies where one presented frame's pixels came from.
+///
+/// The three classes answer the boot question directly: `pass-target` means the
+/// exact object the surface shows was a traced draw target, `copy` means a host
+/// copy moved another object's pixels into it, and `never-sampled` means
+/// neither — the shader's non-zero pixels (if any) never reached the swapchain
+/// through a path this trace observed. The draw-trace ordinal and class come
+/// from the bounded per-RT history keyed by the contributing texture.
+fn classify_composition_source(
+    has_source: bool,
+    target_is_surface: bool,
+    copy_into_surface: bool,
+    copy_source: usize,
+    surface: usize,
+) -> (&'static str, u32, &'static str) {
+    if !has_source {
+        return (COMPOSITION_SOURCE_NONE, 0, trace::RT_CLASS_UNTRACED);
+    }
+    let (class, rt) = if target_is_surface {
+        (COMPOSITION_SOURCE_PASS_TARGET, surface)
+    } else if copy_into_surface {
+        (COMPOSITION_SOURCE_COPY, copy_source)
+    } else {
+        (COMPOSITION_SOURCE_NEVER_SAMPLED, 0)
+    };
+    match trace::rt_evidence_for(rt) {
+        Some(entry) => (class, entry.rt, entry.class),
+        None => (class, 0, trace::RT_CLASS_UNTRACED),
+    }
+}
+
 /// Records one presented frame.
 ///
 /// `source` is the texture `Present` was asked to show, `presented` is the
@@ -855,6 +913,38 @@ fn record_present_trace_targets(
     let target_is_surface = !source.is_null() && target_keys.contains(&surface_key);
     let copy_into_surface =
         copy_dest_is_surface > 0 || (copied_since_last_present && !target_is_surface);
+    // ADR-068: name the RT the presented surface came from and classify the
+    // composition path in one word. The copy source is the object a copy for
+    // this frame actually wrote into the surface.
+    let copy_source = copy_events
+        .iter()
+        .find(|event| event.destination == surface_key)
+        .map_or(0, |event| event.source);
+    let (composition_source, composition_rt, composition_rt_class) =
+        classify_composition_source(
+            !source.is_null(),
+            target_is_surface,
+            copy_into_surface,
+            copy_source,
+            surface_key,
+        );
+    trace.composition_source = composition_source;
+    trace.composition_source_rt = composition_rt;
+    trace.composition_source_rt_class = composition_rt_class;
+    match composition_source {
+        COMPOSITION_SOURCE_PASS_TARGET => {
+            trace.composition_source_pass_target =
+                trace.composition_source_pass_target.saturating_add(1);
+        }
+        COMPOSITION_SOURCE_COPY => {
+            trace.composition_source_copy = trace.composition_source_copy.saturating_add(1);
+        }
+        COMPOSITION_SOURCE_NEVER_SAMPLED => {
+            trace.composition_source_never_sampled =
+                trace.composition_source_never_sampled.saturating_add(1);
+        }
+        _ => {}
+    }
     let mut foreign_same_descriptor = false;
     let mut foreign_same_handle = false;
     if let Some(shape) = descriptor
@@ -952,7 +1042,7 @@ fn record_present_trace_targets(
 }
 
 /// Snapshot of the bounded present trace, for telemetry and tests.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PresentTraceReport {
     /// Frames recorded by this process.
     pub frames: u64,
@@ -1021,6 +1111,23 @@ pub struct PresentTraceReport {
     pub composition_copy_dest_is_surface: u64,
     /// Presents with no copy at all since the previous present.
     pub composition_present_without_copy: u64,
+    /// One-word class of where the last presented frame's pixels came from:
+    /// `pass-target`, `copy`, `never-sampled`, or `none` before the first
+    /// present.
+    pub composition_source: &'static str,
+    /// Draw-trace ordinal of the RT that contributed (`0` when untraced).
+    pub composition_source_rt: u32,
+    /// That RT's written-after-clear class word (`not-traced` when untraced).
+    pub composition_source_rt_class: &'static str,
+    /// Presents whose source texture was itself a traced pass target.
+    pub composition_source_pass_target: u64,
+    /// Presents whose source received a host copy.
+    pub composition_source_copy: u64,
+    /// Presents whose source was neither.
+    pub composition_source_never_sampled: u64,
+    /// ADR-068 per-RT written-after-clear evidence of the draw tracer, folded
+    /// so `telemetry.json` carries it in the object the host already writes.
+    pub rt_evidence: trace::RtWriteEvidence,
 }
 
 /// Distinct `MTLTexture` objects seen for one descriptor.
@@ -1281,6 +1388,21 @@ pub fn present_trace_report() -> PresentTraceReport {
         composition_copy_source_is_pass_target: trace.composition_copy_source_is_pass_target,
         composition_copy_dest_is_surface: trace.composition_copy_dest_is_surface,
         composition_present_without_copy: trace.composition_present_without_copy,
+        composition_source: if trace.composition_source.is_empty() {
+            COMPOSITION_SOURCE_NONE
+        } else {
+            trace.composition_source
+        },
+        composition_source_rt: trace.composition_source_rt,
+        composition_source_rt_class: if trace.composition_source_rt_class.is_empty() {
+            trace::RT_CLASS_UNTRACED
+        } else {
+            trace.composition_source_rt_class
+        },
+        composition_source_pass_target: trace.composition_source_pass_target,
+        composition_source_copy: trace.composition_source_copy,
+        composition_source_never_sampled: trace.composition_source_never_sampled,
+        rt_evidence: trace::rt_write_evidence(),
     }
 }
 
@@ -1321,7 +1443,10 @@ impl PresentTraceReport {
              surface_path_pass_target={} surface_path_copy_dest={} \
              surface_path_alias_missing={} surface_path_unrelated={} \
              composition_copies={} composition_copy_source_is_pass_target={} \
-             composition_copy_dest_is_surface={} composition_present_without_copy={} {}",
+             composition_copy_dest_is_surface={} composition_present_without_copy={} \
+             composition_source={} composition_source_rt={} \
+             composition_source_rt_class={} composition_source_pass_target={} \
+             composition_source_copy={} composition_source_never_sampled={} {}",
             self.frames,
             self.copied_into_source,
             count_for(PresentCopyKind::CopyTextureRegion),
@@ -1351,6 +1476,12 @@ impl PresentTraceReport {
             self.composition_copy_source_is_pass_target,
             self.composition_copy_dest_is_surface,
             self.composition_present_without_copy,
+            self.composition_source,
+            self.composition_source_rt,
+            self.composition_source_rt_class,
+            self.composition_source_pass_target,
+            self.composition_source_copy,
+            self.composition_source_never_sampled,
             self.surface_log_fields(),
         )
     }
@@ -1502,6 +1633,11 @@ impl PresentTraceReport {
              \"composition_copy_source_is_pass_target\": {}, \
              \"composition_copy_dest_is_surface\": {}, \
              \"composition_present_without_copy\": {}, \
+             \"composition_source\": \"{}\", \"composition_source_rt\": {}, \
+             \"composition_source_rt_class\": \"{}\", \
+             \"composition_source_pass_target\": {}, \"composition_source_copy\": {}, \
+             \"composition_source_never_sampled\": {}, \
+             \"rt_evidence\": {}, \
              \"surfaces\": [{}], \"pass_targets\": [{}], \
              \"texture_objects_per_descriptor\": [{}], \
              \"texture_objects_per_allocation\": [{}]}}",
@@ -1535,6 +1671,13 @@ impl PresentTraceReport {
             self.composition_copy_source_is_pass_target,
             self.composition_copy_dest_is_surface,
             self.composition_present_without_copy,
+            self.composition_source,
+            self.composition_source_rt,
+            self.composition_source_rt_class,
+            self.composition_source_pass_target,
+            self.composition_source_copy,
+            self.composition_source_never_sampled,
+            self.rt_evidence.json_value(),
             surfaces,
             pass_targets,
             texture_objects,
@@ -5866,5 +6009,93 @@ mod tests {
         };
         assert_eq!(report.non_black_pixels, 0);
         assert!(report.log_line().contains("probe_source_mismatch=1"));
+    }
+
+    /// ADR-068: the composition-source classifier names all three paths.
+    ///
+    /// The report-level cases below use synthetic surfaces and no pass target:
+    /// recording a synthetic address as a pass target would dereference it, so
+    /// the `pass-target` arm is proven through the pure classifier and the
+    /// counter, and the hardware identity cases cover the real object.
+    #[test]
+    fn composition_source_names_pass_target_copy_and_never_sampled() {
+        let surface = 0xA000usize;
+        assert_eq!(
+            classify_composition_source(false, false, false, 0, surface),
+            (COMPOSITION_SOURCE_NONE, 0, trace::RT_CLASS_UNTRACED)
+        );
+        assert_eq!(
+            classify_composition_source(true, true, false, 0, surface).0,
+            COMPOSITION_SOURCE_PASS_TARGET
+        );
+        assert_eq!(
+            classify_composition_source(true, false, true, 0xB000, surface).0,
+            COMPOSITION_SOURCE_COPY
+        );
+        assert_eq!(
+            classify_composition_source(true, false, false, 0, surface).0,
+            COMPOSITION_SOURCE_NEVER_SAMPLED
+        );
+        assert_eq!(
+            classify_composition_source(true, true, false, 0, surface).2,
+            trace::RT_CLASS_UNTRACED,
+            "the tracer is off in this process"
+        );
+
+        reset_present_trace();
+        blit::reset_copy_trace();
+
+        // (1) A host copy moved another object's pixels into the surface.
+        let surface = token(0xA100);
+        let source = token(0xA200);
+        blit::note_copy_event(blit::BlitCopyKind::CopyTextureRegion, source, surface);
+        record_present_trace(surface, token(0xA300), None, false, None, None);
+        let report = present_trace_report();
+        assert_eq!(report.composition_source, COMPOSITION_SOURCE_COPY);
+        assert_eq!(report.composition_source_copy, 1);
+        assert_eq!(report.composition_source_rt, 0);
+        assert!(report.log_line().contains("composition_source=copy"));
+
+        // (2) Neither: nothing the tracer observed reached the surface, which
+        // is exactly Boot #36's swapchain state.
+        let surface = token(0xA400);
+        record_present_trace(surface, token(0xA500), None, false, None, None);
+        let report = present_trace_report();
+        assert_eq!(
+            report.composition_source,
+            COMPOSITION_SOURCE_NEVER_SAMPLED
+        );
+        assert_eq!(report.composition_source_never_sampled, 1);
+        assert_eq!(report.composition_source_copy, 1, "kept per class");
+        assert_eq!(report.composition_source_rt, 0, "no traced RT");
+        assert_eq!(report.composition_source_rt_class, trace::RT_CLASS_UNTRACED);
+        let line = report.log_line();
+        for expected in [
+            "composition_source=never-sampled",
+            "composition_source_rt=0",
+            "composition_source_rt_class=not-traced",
+            "composition_source_copy=1",
+            "composition_source_never_sampled=1",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from {line}");
+        }
+        let json = report.json_value();
+        for expected in [
+            "\"composition_source\": \"never-sampled\"",
+            "\"composition_source_rt\": 0",
+            "\"composition_source_rt_class\": \"not-traced\"",
+            "\"composition_source_copy\": 1",
+            "\"composition_source_never_sampled\": 1",
+            "\"rt_evidence\": {",
+            "\"rt_written_after_clear\": 0",
+            "\"rt_erased_by_later_clear\": 0",
+            "\"rt_never_sampled\": 0",
+            "\"rts\": []",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
+        reset_present_trace();
+        blit::reset_copy_trace();
     }
 }

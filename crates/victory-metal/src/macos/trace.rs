@@ -16,6 +16,15 @@
 //! render segment encoded at least one draw/dispatch, so a clear-only pass is
 //! never reported as drawn output. [`report`] folds the bounded counts into the
 //! `draw_trace` object `telemetry.json` carries.
+//!
+//! ADR-068 adds the per-render-target "written after last clear" evidence. Each
+//! sampled pass already carries its clear state, so the same bounded readback
+//! now answers three questions a black boot could not: did the shader draw
+//! zeros (`drew-zeros`), did a later clear erase non-zero pixels
+//! (`erased-by-later-clear`), or was the RT never sampled at all
+//! (`never-sampled`)? The evidence lives in a [`MAX_RT_HISTORY`]-bounded
+//! history keyed by texture handle; no readback, allocation or state grows with
+//! the pass count.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -31,6 +40,21 @@ pub const MAX_TRACED_PASSES: u32 = 10;
 
 /// Edge, in texels, of the bounded offscreen-RT pixel sample.
 pub const RT_SAMPLE_EDGE: u32 = 64;
+
+/// Distinct RGBA texels [`pixel_stats`] reports at most.
+///
+/// The grid holds at most [`RT_SAMPLE_EDGE`]² texels; the counter stops there
+/// like `distinct_values` stops at 256 so the summary stays a bounded integer.
+pub const MAX_DISTINCT_PIXELS: u32 = 256;
+
+/// Distinct render targets the per-RT written-after-clear history retains.
+///
+/// A boot encodes thousands of passes but the tracer samples at most
+/// [`MAX_TRACED_PASSES`] of them and describes at most [`MAX_TRACED_WORK`]
+/// draws, so this bound is never reached by traced work alone; it exists so a
+/// hostile or degenerate stream cannot grow host memory. Keys past the cap are
+/// counted as dropped.
+pub const MAX_RT_HISTORY: usize = 32;
 
 /// Environment flag that arms the tracer, read once.
 pub fn enabled() -> bool {
@@ -852,6 +876,17 @@ pub struct TraceReport {
     pub failure: Option<String>,
 }
 
+impl TraceReport {
+    /// ADR-068: the bounded per-RT written-after-clear evidence.
+    ///
+    /// It is read from the same process-wide log as the counters, so the host
+    /// can fold it beside the existing keys without a second trace path. It is
+    /// empty while the tracer is off.
+    pub fn rt_evidence(&self) -> RtWriteEvidence {
+        rt_write_evidence()
+    }
+}
+
 /// Attachment and pass context shared between [`TraceState::next_pass`] and
 /// [`sample_grid`], which the host calls through separate device functions.
 #[derive(Debug, Clone, Copy)]
@@ -889,6 +924,8 @@ struct TraceLog {
     last_record: Option<DrawRecord>,
     sample_context: Option<SampleContext>,
     last_sample: Option<PixelStats>,
+    /// ADR-068: bounded per-RT written-after-clear history.
+    rts: RtHistory,
 }
 
 static TRACE_LOG: OnceLock<Mutex<TraceLog>> = OnceLock::new();
@@ -1618,6 +1655,11 @@ impl TraceState {
             with_log(|log| {
                 log.records_described = log.records_described.saturating_add(1);
                 log.last_record = Some(record);
+                // ADR-068: a described draw is a draw target even when its pass
+                // is never sampled (the record bound saturated first).
+                if let Some(target) = record.target {
+                    log.rts.note_draw_target(target);
+                }
             });
         }
         Some(line)
@@ -1659,6 +1701,12 @@ impl TraceState {
             with_log(|log| {
                 log.passes_sampled = log.passes_sampled.saturating_add(1);
                 log.sample_context = Some(context);
+                // ADR-068: the pass is a per-RT event even before its pixels
+                // are read; a cleared pass of an already-written target is the
+                // "erased by a later clear" class.
+                if let Some(target) = context.target {
+                    log.rts.note_pass(target, clear);
+                }
             });
         }
         true
@@ -1666,14 +1714,35 @@ impl TraceState {
 }
 
 /// Bounded summary of a sampled `RGBA8`/`BGRA8` attachment.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// ADR-068: the last five fields are the "written after last clear" evidence.
+/// They separate (a) a shader that drew zeros from (b) a shader that drew
+/// non-zero pixels the window's clear never preserved, without a second boot.
+/// `Eq` is not derived because a clear colour is `f64`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PixelStats {
-    /// Bytes that are not zero.
+    /// Bytes that are not zero (the real readback count).
     pub nonzero_bytes: u64,
     /// Bytes sampled.
     pub sampled_bytes: u64,
     /// Distinct byte values, saturated at 256.
     pub distinct_values: u32,
+    /// Distinct RGBA texels in the sampled grid, saturated at
+    /// [`MAX_DISTINCT_PIXELS`].
+    ///
+    /// The pixel-level companion of [`Self::distinct_values`]: a uniform red
+    /// grid is one distinct pixel but two distinct byte values, so the two
+    /// counters are never conflated.
+    pub distinct_pixels_after_draws: u32,
+    /// Draws/dispatches of the sampling window that follow the window's clear;
+    /// `0` when the pass loads instead of clearing.
+    pub draws_since_clear: u32,
+    /// Colour the window's clear wrote; `None` when the pass loaded.
+    pub clear_color: Option<[f64; 4]>,
+    /// Non-zero bytes the clear alone accounts for: four bytes per sampled
+    /// texel when any clear channel is non-zero, zero when every channel is
+    /// zero, `None` on a load (the previous contents are unknown).
+    pub nonzero_bytes_after_clear: Option<u64>,
     /// Sampling-opportunity counter of the pass this summary belongs to; `0`
     /// for a summary produced outside the device trace path.
     pub pass: u32,
@@ -1684,28 +1753,83 @@ pub struct PixelStats {
 }
 
 impl PixelStats {
+    /// Non-zero bytes the draws left: the real readback count.
+    ///
+    /// This is [`Self::nonzero_bytes`] under the ADR-068 name, so a reader of
+    /// `telemetry.json` never has to infer which count is the drawn one.
+    pub fn nonzero_bytes_after_draws(&self) -> u64 {
+        self.nonzero_bytes
+    }
+
     /// The pass line (when known) followed by the pixel summary line.
     ///
     /// The pass line always precedes its own summary so a reader can attribute
-    /// `nonzero_bytes` to a pass without correlating unrelated log lines.
+    /// `nonzero_bytes` to a pass without correlating unrelated log lines. Every
+    /// pre-ADR-068 `key=value` token keeps its spelling and position; the new
+    /// evidence is appended.
     pub fn line(&self) -> String {
+        let clear_color = self.clear_color.map_or_else(
+            || "none".to_string(),
+            |[r, g, b, a]| format!("{r:.3},{g:.3},{b:.3},{a:.3}"),
+        );
+        let nonzero_after_clear = self
+            .nonzero_bytes_after_clear
+            .map_or_else(|| "unknown".to_string(), |bytes| bytes.to_string());
         let summary = format!(
-            "draw_trace_rt nonzero_bytes={} sampled_bytes={} distinct_values={}",
-            self.nonzero_bytes, self.sampled_bytes, self.distinct_values
+            "draw_trace_rt nonzero_bytes={} sampled_bytes={} distinct_values={} \
+             draws_since_clear={} clear_color={} nonzero_bytes_after_clear={} \
+             nonzero_bytes_after_draws={} distinct_pixels_after_draws={}",
+            self.nonzero_bytes,
+            self.sampled_bytes,
+            self.distinct_values,
+            self.draws_since_clear,
+            clear_color,
+            nonzero_after_clear,
+            self.nonzero_bytes_after_draws(),
+            self.distinct_pixels_after_draws,
         );
         if self.pass == 0 {
             return summary;
         }
         format!(
-            "draw_trace_pass pass={} draws={} rt={}\n{}",
+            "draw_trace_pass pass={} draws={} rt={} draws_since_clear={} clear={}\n{}",
             self.pass,
             self.pass_draws,
             self.target
                 .as_ref()
                 .map_or_else(|| "none".to_string(), target_name),
+            self.draws_since_clear,
+            if self.clear_color.is_some() {
+                "clear"
+            } else {
+                "load"
+            },
             summary
         )
     }
+}
+
+/// ADR-068: derives the clear evidence of one sample window from its context.
+///
+/// A window that clears attributes every sampled non-zero texel byte to the
+/// clear colour: four bytes per texel when any channel is non-zero, zero when
+/// the clear is fully zero. A window that loads cannot be attributed, so the
+/// analytic count is `None` and `draws_since_clear` is `0` (no clear in the
+/// window to count draws after).
+fn apply_clear(stats: &mut PixelStats, clear: Option<TraceClear>) {
+    let Some(clear) = clear.filter(|clear| clear.is_clear) else {
+        stats.draws_since_clear = 0;
+        stats.clear_color = None;
+        stats.nonzero_bytes_after_clear = None;
+        return;
+    };
+    stats.draws_since_clear = stats.pass_draws;
+    stats.clear_color = Some(clear.color);
+    stats.nonzero_bytes_after_clear = Some(if clear.color.iter().any(|channel| *channel != 0.0) {
+        stats.sampled_bytes
+    } else {
+        0
+    });
 }
 
 /// Summarizes a `RT_SAMPLE_EDGE`-square grid of evenly spaced texels from a
@@ -1748,6 +1872,11 @@ pub fn sample_grid(bytes: &[u8], width: u32, height: u32) -> PixelStats {
                 stats.pass = context.pass;
                 stats.pass_draws = context.draws;
                 stats.target = context.target;
+                // ADR-068: attribute the sampled bytes to the window's clear.
+                apply_clear(&mut stats, context.clear);
+            }
+            if let Some(target) = stats.target {
+                log.rts.note_sample(target, &stats);
             }
             if let Some(target) = stats.target
                 && !target.swapchain
@@ -1777,12 +1906,447 @@ pub fn pixel_stats(bytes: &[u8]) -> PixelStats {
             distinct += 1;
         }
     }
+    // Distinct RGBA texels, saturated at MAX_DISTINCT_PIXELS. A uniform grid is
+    // one distinct pixel even when its bytes are several distinct values.
+    let mut pixels: Vec<[u8; 4]> = Vec::new();
+    for texel in bytes.chunks_exact(4) {
+        let pixel = [texel[0], texel[1], texel[2], texel[3]];
+        if pixels.contains(&pixel) {
+            continue;
+        }
+        pixels.push(pixel);
+        if pixels.len() as u32 >= MAX_DISTINCT_PIXELS {
+            break;
+        }
+    }
     PixelStats {
         nonzero_bytes: nonzero,
         sampled_bytes: bytes.len() as u64,
         distinct_values: distinct,
+        distinct_pixels_after_draws: pixels.len() as u32,
         ..PixelStats::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-068: bounded per-RT "written after last clear" history.
+//
+// Boot #36 sampled 4 of 156 passes and reported `non_black_pixels = 0` without
+// distinguishing "the shader drew zeros" from "the shader drew non-zero pixels
+// a later clear erased" from "the shader drew into an RT nothing ever showed".
+// The history below answers that per render-target, from the passes the tracer
+// already samples, with no extra readback and no unbounded state.
+// ---------------------------------------------------------------------------
+
+/// Fixed class word: the RT's sample showed non-zero drawn pixels after a clear.
+pub const RT_CLASS_WRITTEN: &str = "written-after-clear";
+
+/// Fixed class word: a later pass cleared an RT that had already been written.
+pub const RT_CLASS_ERASED: &str = "erased-by-later-clear";
+
+/// Fixed class word: the RT was named as a draw target but never sampled.
+pub const RT_CLASS_NEVER_SAMPLED: &str = "never-sampled";
+
+/// Fixed class word: sampled after a clear and read back all zero.
+pub const RT_CLASS_ZERO: &str = "drew-zeros";
+
+/// Fixed class word: only ever sampled on a load, so attribution is unknown.
+pub const RT_CLASS_LOADED: &str = "loaded-unknown";
+
+/// Fixed class word: no draw-trace evidence exists for this texture.
+pub const RT_CLASS_UNTRACED: &str = "not-traced";
+
+/// One render target's bounded written-after-clear record.
+///
+/// Every field is a count, a fixed word or a clear colour: no texture address,
+/// title path or pixel payload is ever published.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RtWriteRecord {
+    /// One-based first-seen ordinal published instead of the raw handle.
+    rt: u32,
+    /// Attachment geometry the first time this target was seen.
+    target: Option<TraceTarget>,
+    /// Traced draw/dispatch records that named this target.
+    draw_notes: u32,
+    /// Sampling opportunities (passes) this target was offered with.
+    passes: u32,
+    /// Passes of this target whose pixels were read back.
+    sampled_passes: u32,
+    /// Offered passes that began with a clear of this target.
+    clears: u32,
+    /// The most recent clear colour this target was written with.
+    last_clear: Option<TraceClear>,
+    /// Draws the last sample counted after its clear.
+    last_draws_since_clear: u32,
+    /// Analytic clear-only non-zero bytes of the last sample.
+    last_nonzero_bytes_after_clear: Option<u64>,
+    /// Real readback non-zero bytes of the last sample.
+    last_nonzero_bytes_after_draws: u64,
+    /// Distinct RGBA texels of the last sample.
+    last_distinct_pixels_after_draws: u32,
+    /// A sample read back non-zero bytes drawn after a clear.
+    written_after_clear: bool,
+    /// Samples that read back all zero after a clear.
+    zero_after_clear: u32,
+    /// A later cleared pass of this target followed a written sample.
+    erased_by_later_clear: bool,
+}
+
+impl RtWriteRecord {
+    /// The one-word class the record currently supports.
+    fn class(&self) -> &'static str {
+        if self.erased_by_later_clear {
+            RT_CLASS_ERASED
+        } else if self.sampled_passes == 0 && (self.passes > 0 || self.draw_notes > 0) {
+            RT_CLASS_NEVER_SAMPLED
+        } else if self.written_after_clear {
+            RT_CLASS_WRITTEN
+        } else if self.zero_after_clear > 0 {
+            RT_CLASS_ZERO
+        } else if self.sampled_passes > 0 {
+            RT_CLASS_LOADED
+        } else {
+            RT_CLASS_UNTRACED
+        }
+    }
+}
+
+/// The bounded per-RT history, keyed by texture handle.
+///
+/// It is a plain value so the pure classification can be proven without a GPU
+/// or the process-wide tracer. [`MAX_RT_HISTORY`] caps distinct targets; an
+/// existing key is always updated, so a cap hit never hides later evidence for
+/// a target already retained.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RtHistory {
+    entries: Vec<RtWriteRecord>,
+    dropped: u64,
+}
+
+impl RtHistory {
+    /// Retained distinct targets (`<= MAX_RT_HISTORY`).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no target was retained.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Distinct targets that did not fit [`MAX_RT_HISTORY`].
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Retained record for `texture`, if any.
+    fn record(&self, texture: usize) -> Option<&RtWriteRecord> {
+        self.entries
+            .iter()
+            .find(|entry| entry.target.is_some_and(|target| target.texture == texture))
+    }
+
+    /// Finds or creates the record for `target`.
+    ///
+    /// Returns `None` when the history is full and the target is new; the
+    /// caller's event is then only counted as dropped.
+    fn upsert(&mut self, target: TraceTarget) -> Option<usize> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.target.is_some_and(|seen| seen.texture == target.texture))
+        {
+            return Some(index);
+        }
+        if self.entries.len() >= MAX_RT_HISTORY {
+            self.dropped = self.dropped.saturating_add(1);
+            return None;
+        }
+        let rt = self.entries.len() as u32 + 1;
+        self.entries.push(RtWriteRecord {
+            rt,
+            target: Some(target),
+            ..RtWriteRecord::default()
+        });
+        Some(self.entries.len() - 1)
+    }
+
+    /// Records that one traced draw/dispatch named `target`.
+    pub fn note_draw_target(&mut self, target: TraceTarget) -> Option<u32> {
+        let index = self.upsert(target)?;
+        let entry = &mut self.entries[index];
+        entry.draw_notes = entry.draw_notes.saturating_add(1);
+        Some(entry.rt)
+    }
+
+    /// Records one sampling opportunity of `target` with its clear state.
+    ///
+    /// A cleared pass of a target that was already written is exactly the
+    /// "erased by a later clear" class, and it is recorded here even when the
+    /// later pass's own pixels are zero.
+    pub fn note_pass(&mut self, target: TraceTarget, clear: Option<TraceClear>) -> Option<u32> {
+        let index = self.upsert(target)?;
+        let entry = &mut self.entries[index];
+        entry.passes = entry.passes.saturating_add(1);
+        if let Some(clear) = clear.filter(|clear| clear.is_clear) {
+            entry.clears = entry.clears.saturating_add(1);
+            entry.last_clear = Some(clear);
+            if entry.written_after_clear {
+                entry.erased_by_later_clear = true;
+            }
+        }
+        Some(entry.rt)
+    }
+
+    /// Records the readback summary of one sampled pass of `target`.
+    pub fn note_sample(&mut self, target: TraceTarget, stats: &PixelStats) -> Option<u32> {
+        let index = self.upsert(target)?;
+        let entry = &mut self.entries[index];
+        entry.sampled_passes = entry.sampled_passes.saturating_add(1);
+        entry.last_draws_since_clear = stats.draws_since_clear;
+        if let Some(color) = stats.clear_color {
+            entry.last_clear = Some(TraceClear {
+                is_clear: true,
+                color,
+            });
+        }
+        entry.last_nonzero_bytes_after_clear = stats.nonzero_bytes_after_clear;
+        entry.last_nonzero_bytes_after_draws = stats.nonzero_bytes;
+        entry.last_distinct_pixels_after_draws = stats.distinct_pixels_after_draws;
+        if stats.draws_since_clear > 0 {
+            if stats.nonzero_bytes > 0 {
+                entry.written_after_clear = true;
+            } else {
+                entry.zero_after_clear = entry.zero_after_clear.saturating_add(1);
+            }
+        }
+        Some(entry.rt)
+    }
+
+    /// One target's published evidence, by texture handle.
+    pub fn entry(&self, texture: usize) -> Option<RtWriteEntry> {
+        self.record(texture).map(RtWriteEntry::from_record)
+    }
+
+    /// One target's class word, by texture handle.
+    pub fn class_of(&self, texture: usize) -> Option<&'static str> {
+        self.record(texture).map(RtWriteRecord::class)
+    }
+
+    /// The whole bounded history as the telemetry value.
+    pub fn evidence(&self) -> RtWriteEvidence {
+        let rts: Vec<RtWriteEntry> = self.entries.iter().map(RtWriteEntry::from_record).collect();
+        RtWriteEvidence {
+            rt_traced: rts.len() as u64,
+            rt_sampled: rts.iter().filter(|entry| entry.sampled_passes > 0).count() as u64,
+            rt_written_after_clear: rts
+                .iter()
+                .filter(|entry| entry.written_after_clear)
+                .count() as u64,
+            rt_erased_by_later_clear: rts
+                .iter()
+                .filter(|entry| entry.erased_by_later_clear)
+                .count() as u64,
+            rt_never_sampled: rts
+                .iter()
+                .filter(|entry| entry.class == RT_CLASS_NEVER_SAMPLED)
+                .count() as u64,
+            rt_dropped: self.dropped,
+            rts,
+        }
+    }
+}
+
+/// One render target's published written-after-clear evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RtWriteEntry {
+    /// One-based first-seen ordinal (never the raw texture address).
+    pub rt: u32,
+    /// Attachment width in texels.
+    pub width: u32,
+    /// Attachment height in texels.
+    pub height: u32,
+    /// Attachment pixel-format name.
+    pub format: &'static str,
+    /// The target is a registered swapchain surface.
+    pub swapchain: bool,
+    /// Traced draw/dispatch records that named this target.
+    pub draw_notes: u32,
+    /// Sampling opportunities this target was offered with.
+    pub passes: u32,
+    /// Passes of this target whose pixels were read back.
+    pub sampled_passes: u32,
+    /// Offered passes that began with a clear of this target.
+    pub clears: u32,
+    /// Last clear colour, `None` when every pass loaded.
+    pub clear_color: Option<[f64; 4]>,
+    /// Draws the last sample counted after its clear.
+    pub draws_since_clear: u32,
+    /// Analytic clear-only non-zero bytes of the last sample.
+    pub nonzero_bytes_after_clear: Option<u64>,
+    /// Real readback non-zero bytes of the last sample.
+    pub nonzero_bytes_after_draws: u64,
+    /// Distinct RGBA texels of the last sample.
+    pub distinct_pixels_after_draws: u32,
+    /// A sample read back non-zero bytes drawn after a clear.
+    pub written_after_clear: bool,
+    /// A later cleared pass followed a written sample.
+    pub erased_by_later_clear: bool,
+    /// Fixed class word derived from the flags above.
+    pub class: &'static str,
+}
+
+impl RtWriteEntry {
+    fn from_record(record: &RtWriteRecord) -> Self {
+        let target = record.target.unwrap_or_else(default_target);
+        Self {
+            rt: record.rt,
+            width: target.width,
+            height: target.height,
+            format: target.format,
+            swapchain: target.swapchain,
+            draw_notes: record.draw_notes,
+            passes: record.passes,
+            sampled_passes: record.sampled_passes,
+            clears: record.clears,
+            clear_color: record.last_clear.map(|clear| clear.color),
+            draws_since_clear: record.last_draws_since_clear,
+            nonzero_bytes_after_clear: record.last_nonzero_bytes_after_clear,
+            nonzero_bytes_after_draws: record.last_nonzero_bytes_after_draws,
+            distinct_pixels_after_draws: record.last_distinct_pixels_after_draws,
+            written_after_clear: record.written_after_clear,
+            erased_by_later_clear: record.erased_by_later_clear,
+            class: record.class(),
+        }
+    }
+}
+
+/// A zeroed target placeholder: a record always has one, this only satisfies
+/// the type without inventing geometry.
+fn default_target() -> TraceTarget {
+    TraceTarget {
+        texture: 0,
+        width: 0,
+        height: 0,
+        format: "none",
+        swapchain: false,
+    }
+}
+
+/// Bounded written-after-clear evidence for every retained render target.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RtWriteEvidence {
+    /// Distinct targets retained (`<= MAX_RT_HISTORY`).
+    pub rt_traced: u64,
+    /// Retained targets that produced at least one pixel sample.
+    pub rt_sampled: u64,
+    /// Targets whose sample showed non-zero drawn bytes after a clear.
+    pub rt_written_after_clear: u64,
+    /// Targets a later cleared pass followed after they had been written.
+    pub rt_erased_by_later_clear: u64,
+    /// Targets named as draw targets but never sampled.
+    pub rt_never_sampled: u64,
+    /// Targets that did not fit [`MAX_RT_HISTORY`].
+    pub rt_dropped: u64,
+    /// Per-target rows in first-seen order.
+    pub rts: Vec<RtWriteEntry>,
+}
+
+impl RtWriteEvidence {
+    /// The evidence as the `draw_trace` members (no surrounding braces).
+    ///
+    /// Field names, in emitted order: `rt_traced`, `rt_sampled`,
+    /// `rt_written_after_clear`, `rt_erased_by_later_clear`,
+    /// `rt_never_sampled`, `rt_dropped`, `rts`. Each row carries `rt`, `width`,
+    /// `height`, `format`, `swapchain`, `draw_notes`, `passes`, `sampled`,
+    /// `clears`, `clear_color`, `draws_since_clear`,
+    /// `nonzero_bytes_after_clear`, `nonzero_bytes_after_draws`,
+    /// `distinct_pixels_after_draws` and `class`.
+    pub fn json_members(&self) -> String {
+        let rts = self
+            .rts
+            .iter()
+            .map(|entry| {
+                let clear_color = entry.clear_color.map_or_else(
+                    || "null".to_string(),
+                    |[r, g, b, a]| format!("[{r:.3}, {g:.3}, {b:.3}, {a:.3}]"),
+                );
+                let nonzero_after_clear = entry
+                    .nonzero_bytes_after_clear
+                    .map_or_else(|| "null".to_string(), |bytes| bytes.to_string());
+                format!(
+                    "{{\"rt\": {}, \"width\": {}, \"height\": {}, \"format\": \"{}\", \
+                     \"swapchain\": {}, \"draw_notes\": {}, \"passes\": {}, \
+                     \"sampled\": {}, \"clears\": {}, \"clear_color\": {}, \
+                     \"draws_since_clear\": {}, \"nonzero_bytes_after_clear\": {}, \
+                     \"nonzero_bytes_after_draws\": {}, \
+                     \"distinct_pixels_after_draws\": {}, \"class\": \"{}\"}}",
+                    entry.rt,
+                    entry.width,
+                    entry.height,
+                    entry.format,
+                    entry.swapchain,
+                    entry.draw_notes,
+                    entry.passes,
+                    entry.sampled_passes,
+                    entry.clears,
+                    clear_color,
+                    entry.draws_since_clear,
+                    nonzero_after_clear,
+                    entry.nonzero_bytes_after_draws,
+                    entry.distinct_pixels_after_draws,
+                    entry.class,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "\"rt_traced\": {}, \"rt_sampled\": {}, \"rt_written_after_clear\": {}, \
+             \"rt_erased_by_later_clear\": {}, \"rt_never_sampled\": {}, \
+             \"rt_dropped\": {}, \"rts\": [{}]",
+            self.rt_traced,
+            self.rt_sampled,
+            self.rt_written_after_clear,
+            self.rt_erased_by_later_clear,
+            self.rt_never_sampled,
+            self.rt_dropped,
+            rts
+        )
+    }
+
+    /// The evidence as one JSON object.
+    pub fn json_value(&self) -> String {
+        format!("{{{}}}", self.json_members())
+    }
+}
+
+/// The process-wide per-RT written-after-clear evidence.
+///
+/// It is empty while the tracer is off: reading it never arms the tracer.
+pub fn rt_write_evidence() -> RtWriteEvidence {
+    if !enabled() {
+        return RtWriteEvidence::default();
+    }
+    with_log(|log| log.rts.evidence())
+}
+
+/// One render target's evidence, looked up by texture handle.
+///
+/// The handle is used only as a key here; the returned value carries the
+/// one-based ordinal, never the address.
+pub fn rt_evidence_for(texture: usize) -> Option<RtWriteEntry> {
+    if !enabled() || texture == 0 {
+        return None;
+    }
+    with_log(|log| log.rts.entry(texture))
+}
+
+/// One render target's class word, looked up by texture handle.
+pub fn rt_class_for(texture: usize) -> Option<&'static str> {
+    if !enabled() || texture == 0 {
+        return None;
+    }
+    with_log(|log| log.rts.class_of(texture))
 }
 
 #[cfg(test)]
@@ -1918,6 +2482,10 @@ mod tests {
             nonzero_bytes: 12,
             sampled_bytes: 16384,
             distinct_values: 3,
+            distinct_pixels_after_draws: 2,
+            draws_since_clear: 2,
+            clear_color: Some([0.0, 0.0, 0.0, 0.0]),
+            nonzero_bytes_after_clear: Some(0),
             pass: 4,
             pass_draws: 2,
             target: Some(TraceTarget {
@@ -1932,11 +2500,19 @@ mod tests {
         let mut lines = line.lines();
         assert_eq!(
             lines.next(),
-            Some("draw_trace_pass pass=4 draws=2 rt=offscreen 64x64 rgba8unorm")
+            Some(
+                "draw_trace_pass pass=4 draws=2 rt=offscreen 64x64 rgba8unorm \
+                 draws_since_clear=2 clear=clear"
+            )
         );
         assert_eq!(
             lines.next(),
-            Some("draw_trace_rt nonzero_bytes=12 sampled_bytes=16384 distinct_values=3")
+            Some(
+                "draw_trace_rt nonzero_bytes=12 sampled_bytes=16384 distinct_values=3 \
+                 draws_since_clear=2 clear_color=0.000,0.000,0.000,0.000 \
+                 nonzero_bytes_after_clear=0 nonzero_bytes_after_draws=12 \
+                 distinct_pixels_after_draws=2"
+            )
         );
     }
 
@@ -1950,7 +2526,9 @@ mod tests {
         };
         assert_eq!(
             stats.line(),
-            "draw_trace_rt nonzero_bytes=0 sampled_bytes=4096 distinct_values=1"
+            "draw_trace_rt nonzero_bytes=0 sampled_bytes=4096 distinct_values=1 \
+             draws_since_clear=0 clear_color=none nonzero_bytes_after_clear=unknown \
+             nonzero_bytes_after_draws=0 distinct_pixels_after_draws=0"
         );
     }
 
@@ -2298,5 +2876,301 @@ mod tests {
         assert_eq!(stats.nonzero_bytes, 2);
         assert_eq!(stats.distinct_values, 3);
         assert_eq!(stats.sampled_bytes, 4096);
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-068: per-RT written-after-last-clear evidence. Every case is pure:
+    // no GPU, no environment flag, no process-wide state.
+    // -----------------------------------------------------------------------
+
+    fn target(texture: usize) -> TraceTarget {
+        TraceTarget {
+            texture,
+            width: 64,
+            height: 64,
+            format: "rgba8unorm",
+            swapchain: false,
+        }
+    }
+
+    fn window(draws: u32, clear: Option<TraceClear>, nonzero: u64) -> PixelStats {
+        let sampled_bytes = 64 * 64 * 4;
+        let mut stats = PixelStats {
+            nonzero_bytes: nonzero,
+            sampled_bytes,
+            distinct_values: 2,
+            distinct_pixels_after_draws: 2,
+            pass: 1,
+            pass_draws: draws,
+            target: Some(target(7)),
+            ..PixelStats::default()
+        };
+        apply_clear(&mut stats, clear);
+        stats
+    }
+
+    /// A zero clear attributes zero bytes; a non-zero clear attributes four
+    /// bytes per sampled texel; a load leaves the answer unknown.
+    #[test]
+    fn clear_derivation_names_zero_nonzero_and_unknown() {
+        let zero = window(
+            3,
+            Some(TraceClear {
+                is_clear: true,
+                color: [0.0, 0.0, 0.0, 0.0],
+            }),
+            0,
+        );
+        assert_eq!(zero.draws_since_clear, 3);
+        assert_eq!(zero.clear_color, Some([0.0, 0.0, 0.0, 0.0]));
+        assert_eq!(zero.nonzero_bytes_after_clear, Some(0));
+        assert_eq!(zero.nonzero_bytes_after_draws(), 0);
+
+        let pink = window(
+            2,
+            Some(TraceClear {
+                is_clear: true,
+                color: [0.25, 0.5, 0.75, 1.0],
+            }),
+            0,
+        );
+        assert_eq!(pink.draws_since_clear, 2);
+        assert_eq!(pink.nonzero_bytes_after_clear, Some(64 * 64 * 4));
+        assert_eq!(
+            pink.nonzero_bytes_after_draws(),
+            0,
+            "the shader drew zeros over a non-zero clear"
+        );
+
+        let loaded = window(
+            4,
+            Some(TraceClear {
+                is_clear: false,
+                color: [1.0, 0.0, 0.0, 1.0],
+            }),
+            4096,
+        );
+        assert_eq!(loaded.draws_since_clear, 0, "no clear in the window");
+        assert_eq!(loaded.clear_color, None);
+        assert_eq!(loaded.nonzero_bytes_after_clear, None);
+        assert_eq!(loaded.nonzero_bytes_after_draws(), 4096);
+        assert_eq!(loaded.distinct_pixels_after_draws, 2);
+    }
+
+    /// `next_pass_with_clear` is the only source of `draws_since_clear`, so a
+    /// drawless pass never claims draws after a clear.
+    #[test]
+    fn draws_since_clear_is_the_sampled_window_only() {
+        let mut state = TraceState::default();
+        assert!(!state.next_pass_with_clear(Some(TraceClear {
+            is_clear: true,
+            color: [0.0; 4],
+        })));
+        state.last_pass_draws = 0;
+        let mut stats = PixelStats {
+            pass_draws: 0,
+            ..PixelStats::default()
+        };
+        apply_clear(
+            &mut stats,
+            Some(TraceClear {
+                is_clear: true,
+                color: [0.0; 4],
+            }),
+        );
+        assert_eq!(stats.draws_since_clear, 0);
+    }
+
+    /// A draw sample read back non-zero is `written-after-clear`; a later
+    /// cleared pass of the same target is `erased-by-later-clear`.
+    #[test]
+    fn a_later_clear_erases_a_written_target() {
+        let mut history = RtHistory::default();
+        let rt = target(0x1000);
+        let clear = TraceClear {
+            is_clear: true,
+            color: [0.0; 4],
+        };
+        history.note_draw_target(rt);
+        assert_eq!(history.note_pass(rt, Some(clear)), Some(1));
+        assert_eq!(history.note_sample(rt, &window(1, Some(clear), 16_384)), Some(1));
+        assert_eq!(history.class_of(rt.texture), Some(RT_CLASS_WRITTEN));
+
+        // The second pass clears the same target before encoding its draw.
+        assert_eq!(history.note_pass(rt, Some(clear)), Some(1));
+        assert_eq!(history.class_of(rt.texture), Some(RT_CLASS_ERASED));
+        assert_eq!(
+            history.note_sample(rt, &window(1, Some(clear), 0)),
+            Some(1)
+        );
+        let evidence = history.evidence();
+        assert_eq!(evidence.rt_traced, 1);
+        assert_eq!(evidence.rt_sampled, 1);
+        assert_eq!(evidence.rt_written_after_clear, 1);
+        assert_eq!(evidence.rt_erased_by_later_clear, 1);
+        assert_eq!(evidence.rt_never_sampled, 0);
+        let entry = evidence.rts.first().expect("one retained RT");
+        assert_eq!(entry.rt, 1, "the ordinal, not the texture address");
+        assert_eq!(entry.clear_color, Some([0.0; 4]));
+        assert_eq!(entry.draws_since_clear, 1);
+        assert_eq!(entry.nonzero_bytes_after_clear, Some(0));
+        assert_eq!(entry.nonzero_bytes_after_draws, 0);
+        assert!(entry.written_after_clear);
+        assert!(entry.erased_by_later_clear);
+    }
+
+    /// A target named by a draw but never sampled is `never-sampled`.
+    #[test]
+    fn a_draw_target_that_is_never_sampled_is_named() {
+        let mut history = RtHistory::default();
+        let rt = target(0x2000);
+        assert_eq!(history.note_draw_target(rt), Some(1));
+        let evidence = history.evidence();
+        assert_eq!(evidence.rt_traced, 1);
+        assert_eq!(evidence.rt_sampled, 0);
+        assert_eq!(evidence.rt_never_sampled, 1);
+        assert_eq!(evidence.rts[0].class, RT_CLASS_NEVER_SAMPLED);
+        assert_eq!(history.class_of(rt.texture), Some(RT_CLASS_NEVER_SAMPLED));
+    }
+
+    /// A cleared sample that reads back all zero is `drew-zeros`, not erased.
+    #[test]
+    fn a_zero_draw_after_a_clear_is_drew_zeros() {
+        let mut history = RtHistory::default();
+        let rt = target(0x3000);
+        let clear = TraceClear {
+            is_clear: true,
+            color: [0.0, 0.0, 0.0, 0.0],
+        };
+        history.note_pass(rt, Some(clear));
+        history.note_sample(rt, &window(2, Some(clear), 0));
+        assert_eq!(history.class_of(rt.texture), Some(RT_CLASS_ZERO));
+        let evidence = history.evidence();
+        assert_eq!(evidence.rt_written_after_clear, 0);
+        assert_eq!(evidence.rt_never_sampled, 0);
+        assert_eq!(evidence.rts[0].class, RT_CLASS_ZERO);
+    }
+
+    /// The history never grows past `MAX_RT_HISTORY`; a retained key keeps
+    /// updating after the cap.
+    #[test]
+    fn the_rt_history_is_bounded() {
+        let mut history = RtHistory::default();
+        for texture in 0..MAX_RT_HISTORY {
+            assert_eq!(
+                history.note_draw_target(target(0x4000 + texture)),
+                Some(texture as u32 + 1)
+            );
+        }
+        assert_eq!(history.len(), MAX_RT_HISTORY);
+        assert!(!history.is_empty());
+        assert_eq!(history.dropped(), 0);
+        for texture in MAX_RT_HISTORY..MAX_RT_HISTORY + 8 {
+            assert_eq!(history.note_draw_target(target(0x4000 + texture)), None);
+        }
+        assert_eq!(history.len(), MAX_RT_HISTORY, "the cap holds");
+        assert_eq!(history.dropped(), 8);
+        // An already-retained target still records after the cap.
+        assert_eq!(history.note_draw_target(target(0x4000)), Some(1));
+        assert_eq!(history.evidence().rts[0].draw_notes, 2);
+        let evidence = history.evidence();
+        assert_eq!(evidence.rt_traced, MAX_RT_HISTORY as u64);
+        assert_eq!(evidence.rt_dropped, 8);
+    }
+
+    /// The telemetry JSON carries the required class counters and per-RT rows.
+    #[test]
+    fn the_rt_evidence_json_names_the_classes() {
+        let mut history = RtHistory::default();
+        let clear = TraceClear {
+            is_clear: true,
+            color: [0.0, 0.0, 0.0, 0.0],
+        };
+        let written = target(0x5000);
+        history.note_pass(written, Some(clear));
+        history.note_sample(written, &window(1, Some(clear), 16_384));
+        let never = target(0x5001);
+        history.note_draw_target(never);
+        let erased = target(0x5002);
+        history.note_pass(erased, Some(clear));
+        history.note_sample(erased, &window(1, Some(clear), 16_384));
+        history.note_pass(erased, Some(clear));
+
+        let evidence = history.evidence();
+        assert_eq!(evidence.rt_traced, 3);
+        assert_eq!(evidence.rt_sampled, 2);
+        assert_eq!(evidence.rt_written_after_clear, 2);
+        assert_eq!(evidence.rt_erased_by_later_clear, 1);
+        assert_eq!(evidence.rt_never_sampled, 1);
+        let json = evidence.json_value();
+        for expected in [
+            "\"rt_traced\": 3",
+            "\"rt_sampled\": 2",
+            "\"rt_written_after_clear\": 2",
+            "\"rt_erased_by_later_clear\": 1",
+            "\"rt_never_sampled\": 1",
+            "\"rt_dropped\": 0",
+            "\"rts\": [",
+            "\"rt\": 1",
+            "\"format\": \"rgba8unorm\"",
+            "\"swapchain\": false",
+            "\"clear_color\": [0.000, 0.000, 0.000, 0.000]",
+            "\"nonzero_bytes_after_clear\": 0",
+            "\"nonzero_bytes_after_draws\": 16384",
+            "\"distinct_pixels_after_draws\": 2",
+            "\"class\": \"written-after-clear\"",
+            "\"class\": \"erased-by-later-clear\"",
+            "\"class\": \"never-sampled\"",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+        // A loaded window serializes the unknown counts as null.
+        let mut loaded = RtHistory::default();
+        let load = target(0x5003);
+        loaded.note_pass(
+            load,
+            Some(TraceClear {
+                is_clear: false,
+                color: [0.0; 4],
+            }),
+        );
+        loaded.note_sample(
+            load,
+            &window(
+                4,
+                Some(TraceClear {
+                    is_clear: false,
+                    color: [0.0; 4],
+                }),
+                4096,
+            ),
+        );
+        let json = loaded.evidence().json_value();
+        assert!(json.contains("\"clear_color\": null"), "{json}");
+        assert!(json.contains("\"nonzero_bytes_after_clear\": null"), "{json}");
+        assert!(json.contains("\"class\": \"loaded-unknown\""), "{json}");
+    }
+
+    /// Distinct pixels and distinct bytes are different counters.
+    #[test]
+    fn distinct_pixels_are_not_distinct_bytes() {
+        let uniform = vec![0xff_u8, 0x00, 0x00, 0xff].repeat(64 * 64);
+        let stats = pixel_stats(&uniform);
+        assert_eq!(stats.distinct_pixels_after_draws, 1);
+        assert_eq!(stats.distinct_values, 2);
+
+        let mixed = [
+            [0_u8, 0, 0, 0].repeat(8),
+            [0xff_u8, 0, 0, 0xff].repeat(8),
+        ]
+        .concat();
+        let stats = pixel_stats(&mixed);
+        assert_eq!(stats.distinct_pixels_after_draws, 2);
+        assert_eq!(stats.distinct_values, 2);
     }
 }
