@@ -2288,3 +2288,131 @@ runs at this head (`run1_gate: ok=1`, `run2_gate: ok=1`,
   ARM64 `victory_metal_host` build all exit 0; `git diff --check` clean.
 - Worker `target/` directories pruned after every wave; zero orphaned
   processes; GPU lock free.
+
+## 20. Cycle 20 — the composition fragment table binds, the compute PSO registers, and the per-RT trace names the remaining zero
+
+Cycle 19 ended with three named causes: an inert fragment descriptor table
+(`declared=1, bound=0`), compute that never encodes (`dispatches=0`), and no
+per-render-target evidence separating "drew zeros" from "drew, then got
+cleared". Cycle 20 addressed all three and then used the new evidence to move
+the blocker one level upstream.
+
+### 20.1 ADR-066 — reflected fragment table kind and slot count
+
+The converted pipeline's own reflected parameter kind and slot count now drive
+the descriptor-table packing, so a wire table that partitions into
+texture/sampler ranges fills the declared fragment field instead of being
+dropped as inert. The GPU proof (M4 Max) draws exact texels `[10, 20, 30, 255]`
+through a reflected fragment table plus sampler and reports
+`declared=2, bound=2, dropped=0, inert=0`; the single-table case binds with
+`outcome=merged`. In the live title, `fragment_texture_sources_declared=1`
+reached **`bound=1, dropped=0`**, and inert table acceptances fell **102 → 47**
+(the remainder is a different pipeline class that declares no table at all).
+
+### 20.2 ADR-067 — production `set_compute_threadgroup_size`
+
+`[numthreads]` is now parsed from the translated compute container during
+production PSO registration (`VCTG`/`PSV0` metadata) and applied automatically;
+a container without that metadata still registers and counts `missing` instead of
+being refused. The GPU proof parses `[64, 1, 1]` and encodes the first dispatch
+(`dispatches 0 → 1`, 64 exact words). Boot #37 briefly regressed compute stage
+translation to zero with an *empty* refusal reason; the fix separates the three
+decisions (translate / register / dispatch) and gives every refusal a named
+class. Boot #38: `compute_stages_translated=1`, `pipelines_registered=1`,
+`threadgroup_parsed=1`, `missing=0`, and **`dispatch_attempted=0`** — the host
+path is now open and the title simply issues no compute command in the sampled
+window.
+
+### 20.3 ADR-068 — per-RT written-after-clear evidence and session hygiene
+
+`draw_trace` now carries a `rt_evidence` object (per RT: format/size, clear
+colour, `draws_since_clear`, `nonzero_bytes_after_clear`,
+`nonzero_bytes_after_draws`, `distinct_pixels_after_draws`, one class word,
+bounded history) and `sampled_textures` (per fragment binding: ordinal, format,
+size, whether it is also a pass target, and a bounded 8×8 content sample with a
+`zero`/`non-zero`/`partial`/`unreadable` class). Both are opt-in under
+`VICTORY_METAL_DRAW_TRACE=1` and bounded to 2 readbacks per submission and 4
+submissions per process.
+
+The same decision made temp-session hygiene mandatory: the launchers sweep
+stale `victory-title.*` sessions (owner-PID marker plus age), refuse to start
+below a free-space threshold, and remove their session on EXIT/INT/TERM/HUP.
+The 15-check hermetic launcher test covers the dead-owner, live-owner, fresh,
+preflight, double-signal and `--keep-session` cases. Sixty-seven stale sessions
+(111 GB) were removed at the start of the cycle; free space never fell below
+124 GB afterwards.
+
+### 20.4 Windowed boots (probe on, draw trace on; #38 also state trace)
+
+| metric | #36 (Cycle 19) | #37 | #38 |
+|---|---|---|---|
+| submissions / refused | 15937 / 0 | 16844 / 0 | 16747 / 0 |
+| draws encoded | 154 | 157 | 142 |
+| draw indexed | 0 | 0 | 0 |
+| dispatches encoded | 0 | 0 | 0 |
+| render passes | 156 | 159 | 144 |
+| ABI bound / unbound | 205 / 51 | 261 / 0 | 236 / 0 |
+| inert table acceptances | 102 | 52 | 47 |
+| fragment declared / bound | 1 / 0 | 1 / 1 | 1 / 1 |
+| fragment dropped / inert | 1 / 1 | 0 / 0 | 0 / 0 |
+| host translated stages (compute) | 11 (1) | 10 (0) | 11 (1) |
+| translations ok / refused | 6 / 0 | 5 / 1 | 6 / 0 |
+| compute PSOs registered / parsed | — | — | 1 / 1 |
+| compute dispatches attempted | — | — | 0 |
+| traced RTs / sampled | — | 3 / 3 | 3 / 3 |
+| RT `nonzero_bytes_after_draws` | — | 0 | 0 |
+| RT `distinct_pixels_after_draws` | — | 1 | 1 |
+| RT classes | — | loaded-unknown | loaded-unknown |
+| sampled textures / zero class | — | — | 3 / 3 |
+| sampled texture is pass target | — | — | 3 / 3 |
+| composition source | pass-target | pass-target | pass-target |
+| swapchain non-black px | 0 | 0 | 0 |
+| swapchain luma buckets | 1 | 1 | 1 |
+| uniform colour | transparent_black | same | same |
+| cull none / back | unset | unset | 142 / 0 |
+| colour load clear / load | 53 / 103 | — | 49 / 95 |
+| window frames presented | 4004 | 4231 | 4206 |
+| host p50 / p95 ms | 0.004 / 0.013 | 0.004 / 0.012 | 0.004 / 0.013 |
+| D3DMetal fallback | 0 | 0 | 0 |
+| host D3D12 attempts | 0 | 0 | 0 |
+
+### 20.5 What Boots #37–#38 proved and what they did not
+
+- Proved: the composition fragment table binds its reflected texture and sampler
+  handles; a compute PSO translates, registers and parses `[numthreads]`; the
+  rasterizer decision is now recorded per draw (`cull=none, winding=cw` for all
+  142 draws, source `default`); every sampled RT classifies as `loaded-unknown`
+  with zero bytes after draws, and every sampled fragment texture classifies as
+  `zero` and is itself a pass target.
+- Therefore the composition pipeline is not sampling the wrong resource and the
+  rasterizer is not culling the frame: the render target the composition reads
+  is genuinely all zero. The next gap is upstream — nothing writes non-zero
+  bytes into the scene RT before the composition pass samples it.
+- Not proved: any non-black pixel, any title FPS, or that the title ever asks
+  for a compute dispatch inside the sampled window (it does not:
+  `dispatch_attempted=0`).
+
+### 20.6 Gate and local tag
+
+`tools/macos/metal-poc/aaa-preboot-gate.sh --runs 2` exits **0 PASS** on both
+runs (`not_observed=none`, identical presented checksum
+`11527919792119713699`, `d3dmetal_fallback_count=0`, zero survivors). Local
+annotated tag `cycle-20` marks this head.
+
+### 20.7 Counts at the integration head
+
+- `victory-metal` lib **521 passed / 0 failed / 10 ignored**; `victory-gpu` lib
+  **461 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus **3 / 0 / 1**;
+  Wine `victory-hle` **198 / 0 / 1** (actually run, not compile-only);
+  `victory` bin **20 / 0 / 0**.
+- New GPU proofs: `fragment_table_binding_gpu` 2/2,
+  `compute_threadgroup_prod_gpu` 2/2, `draw_trace_gpu` 1/2 with the remaining
+  hardware proofs `#[ignore]`d, `descriptor_table_plan_gpu` 2/2,
+  `srv_texture_table_gpu` 7/7, `rasterizer_cover_gpu` 4/4.
+- Win64 `diag` build, three Windows all-targets checks, x86_64
+  `victory-irconverter` and ARM64 `victory_metal_host` exit 0;
+  `git diff --check` clean; zero orphaned processes; zero session leftovers.
+- Known pre-existing failure, unchanged by this cycle and verified at both
+  `87d1c7cd` and the seam commit: `descriptor_table_kind_gpu::
+  an_unrepresentable_mixed_table_is_inert_and_encodes` returns `UnknownHandle`
+  instead of accepting the table inertly.
