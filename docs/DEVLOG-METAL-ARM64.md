@@ -1962,3 +1962,111 @@ used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
 - Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.832 / p95 0.912 / p99 0.955 ms, 1,200 FPS,
   checksum unchanged (`11527919792119713699`).
 - Worker `target/` directories pruned after each wave; zero orphaned processes.
+
+## 17. Cycle 17 — descriptor-table set mapping, live `MEMORY_SPACE` plumbing, and present-surface truth
+
+### 17.1 What changed
+
+- **ADR-057, the descriptor-table ABI is total and named.** The translated root
+  signature from `victory-shader` never declares a descriptor table: every title
+  table is lowered to directly-indexed heap access. A plan-less `SetDescriptorTable`
+  on such a signature is therefore not an error; it is an **inert acceptance**
+  that encodes the batch and is counted (41 batches in Boot #30). Every frame now
+  carries a `VRAB` plan (an empty plan is the versioned header), sets resolve by
+  a documented ordinal rule shared by the graphics and compute arms, and genuine
+  contradictions are separate named classes: a stale set (named table the bound
+  pipeline lacks), and a wire/reflected **kind** mismatch, which is censused as
+  `(pipeline, set, reflected kind, wire kind, entry shape)` under the one 16-key
+  cap. Address-class pairs (CBV/SRV/UAV buffer ranges, all one 24-byte
+  `{device_address,0,0}` descriptor) are accepted; texture and sampler shapes
+  stay exact and an impossible pair is refused by name.
+- **ADR-058, `MEMORY_SPACE` is live end to end.** The empty-`pending` shortcut in
+  `flush_render_abi`/`flush_compute_abi` skipped the only caller that binds the
+  page table, so a host-owned `t0`/`u0` never bound. The gate now asks the
+  reflected stages; the map is kept across allocation-registration order and
+  published for the resolvable ranges (unregistered pages keep the null block),
+  republishing when a named allocation appears. Exact counters:
+  `memory_space_{updates,pages,bindings,misses,invalidations,ranges,heap_pairs,
+  declared_stages,gate_checks,requests,no_map}`. On hardware the emitted VS+PS
+  path binds (`updates=1, pages=1, bindings>=2, misses=0`) and the control VS
+  rasterizes exact pixels; the translated pixel stage still reads black because
+  the converter's heap-entry stride is unresolved (tracked as `C17-MEMSPACE-HEAP`,
+  the one ignored test).
+- **ADR-059, present identity and the missing copy.** Present identity was already
+  correct, and the missing step was a copy: guest texture `CopyResource` had no
+  lowering and is now expanded per mip/slice into exact `CopyTextureRegion`
+  extents. New bounded `present_trace` reports per present: copy kind into the
+  source, `source_is_presented`, `probe_sampled_presented`, a counted
+  `probe_source_mismatch` that suppresses pixel success, and per-surface
+  `(format, size, usage, targeted_by_pass, targeted_by_copy)`. A hardware test
+  proves offscreen draw → region copy → IOSurface present with 4096/4096
+  non-black pixels and identity.
+
+### 17.2 Windowed boots (probe on, draw trace on)
+
+| | #28 | **#29** | **#30** | **#31** |
+|---|---|---|---|---|
+| submissions / refused | 4312 / 51 | 4262 / 44 | 4246 / 41 | **4218 / 40** |
+| `abi_refusals` | 51 | 44 | **0** | **0** |
+| inert table acceptances / stale | — | — | 41 / 0 | **40 / 0** |
+| **draws / indexed / dispatches** | 52 / 0 / 0 | 45 / 0 / 0 | 83 / 0 / 0 | **81 / 0 / 0** |
+| render passes | 54 | 47 | 85 | **83** |
+| `memory_space_updates` / `pages` | — / — | 0 / 0 | 0 / 0 | **0 / 0** |
+| `memory_space_gate_checks` / declared | — | — | 83 / 0 | **81 / 0** |
+| offscreen RT non-zero bytes / distinct | 0 / 1 | 0 / 1 | 0 / 1 | **0 / 1** |
+| swapchain `non_black_pixels` / buckets | 0 / 1 | 0 / 1 | 0 / 1 | **0 / 1** |
+| `uniform_color` | transparent_black | same | same | **same** |
+| surface targeted by pass / by copy | — | — | 0 / 0 | **0 / 0** |
+| present copy kind | — | — | none 4203 | **none 4176** |
+| host p50 / p95 ms | .012 / .030 | .012 / .027 | .012 / .028 | **.010 / .011** |
+| D3DMetal fallback / host D3D12 | 0 / 0 | 0 / 0 | 0 / 0 | **0 / 0** |
+
+### 17.3 What the boots proved
+
+- The whole "descriptor table names no declared root parameter" class is gone:
+  `abi_refusals` 0 in Boot #30 and #31, and the batches encode — draws rose from
+  45 to 83 (81 in the repeat run; the title's submission count varies a few
+  percent between runs).
+- The remaining 40 refusals are one precisely named class:
+  `descriptor table wire kind Srv cannot fill a reflected Sampler range`, i.e. a
+  wire table ordinal that lands on a reflected **sampler** parameter. This is the
+  next mapping question, not an attachment, format or framing problem.
+- `MEMORY_SPACE` liveness is fully instrumented and the mechanism is proven on
+  hardware, but **no translated title stage declares `MEMORY_SPACE`**
+  (`gate_checks` 81–83, `declared_stages` 0). Title-memory reads are therefore
+  not the current black-pixel cause on this title; the counters say so directly.
+- Present truth: the guest says its surface is a pass target
+  (`targeted_by_pass=1`), the host says the registered surface object is not the
+  object the passes target (`surface_targeted_by_pass=0`,
+  `surface_pass_targets_not_surface=1`) with identical 3840×2160 `rgba8unorm`
+  descriptors. Two host objects exist for one guest texture.
+
+### 17.4 What is still not true
+
+- **No non-black pixel and no title FPS are claimed.** Every probe sample is
+  `transparent_black` and the traced 4K attachment still holds one distinct
+  value. An encoded draw is not a drawn pixel.
+- The audit names the two gates that can consume all draws while every counter
+  advances: **G6** (declared root-argument data never uploaded because the flush
+  returns early on an empty `pending`) and **G7** (the vertex descriptor is
+  host-invented: buffer 0 and a signature-packed stride, while the guest's
+  slot/stride are dropped).
+- The presented-surface alias split is unresolved: `C17C-PRESENT-ALIAS` was left
+  uncommitted after its identity hardware test spun at ~100% CPU in two attempts;
+  the watchdog killed the hung leaf and the worktree was not integrated.
+- `C17-MEMSPACE-HEAP` (converter heap-entry stride) keeps one hardware pixel
+  proof ignored.
+
+### 17.5 Counts at the integration head
+
+- `victory-metal` **451 passed / 0 failed / 10 ignored** (lib, no outer GPU lock);
+  `victory-gpu` **429 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus **3 / 0 / 1**;
+  Wine `victory-hle` **198 / 0 / 1** (plus 1 lane test); `victory` bin
+  **16 / 2 / 1**.
+- Win64 `diag` build, three Windows all-targets checks, x86_64
+  `victory-irconverter` build and the ARM64 host build all exit 0;
+  `git diff --check` clean.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.841 / p95 0.893 / p99 0.904 ms,
+  1,200 FPS, checksum unchanged (`11527919792119713699`).
+- Worker `target/` directories pruned after every wave; zero orphaned processes;
+  the stale GPU lock left by a killed hung test was reclaimed by PID check.
