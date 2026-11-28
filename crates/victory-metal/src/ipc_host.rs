@@ -2610,8 +2610,10 @@ fn abi_from_converter_reflections(
         if text.trim().is_empty() {
             return Err(format!("the {label} stage reflection is empty"));
         }
-        let layout = RootSignatureLayout::from_converter_reflection_json(text)
-            .map_err(|_| format!("the {label} stage reflection is not a usable root layout"))?;
+        let layout = RootSignatureLayout::from_converter_reflection_json_detailed(text)
+            .map_err(|error| {
+                format!("the {label} stage reflection is not a usable root layout: {error}")
+            })?;
         if !layout.entry_point().is_empty() && layout.entry_point() != stage.entry {
             return Err(format!(
                 "the {label} stage reflection names a different entry point"
