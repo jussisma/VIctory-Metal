@@ -242,6 +242,12 @@ cbuffer RC : register(b2) { float4 rc; };
 struct VSOut { float4 pos : SV_Position; };
 struct PSOut { float4 a : SV_Target0; float4 b : SV_Target1; };
 [RootSignature("$RS")]
+// The coverage counters are UAV writes. Without this attribute Metal runs the
+// fragment function before the depth test (late fragment tests) when a stage
+// writes a UAV, so a depth-rejected draw would still increment the counter.
+// Request early depth/stencil so the counters record fragments that actually
+// pass the depth test, as the gate's depth_test/back_face_cull stages assert.
+[earlydepthstencil]
 PSOut main(VSOut input) {
     PSOut o;
     float bias = float(s0[0] + s1[0]) * 0.0;
