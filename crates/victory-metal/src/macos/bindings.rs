@@ -277,6 +277,29 @@ impl RootParameter {
     }
 }
 
+/// One descriptor table a stage layout declares, as registration recorded it.
+///
+/// ADR-066: converter reflection types a flattened descriptor-table field by
+/// the range kind it guessed (`"Table"`, `"Sampler"`, or a view family) and
+/// reports the field's descriptor extent in `Size`. Both are carried per stage
+/// so the host binding path can decide, without re-parsing reflection, which
+/// declared table a wire set addresses and whether that field is the
+/// converter's 24-byte descriptor array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredTable {
+    /// Flattened argument-buffer parameter index of the table's field.
+    pub parameter: usize,
+    /// Reflected range kind of the field ([`DescriptorTableKind::Unspecified`]
+    /// for the converter's kind-less `"Table"`).
+    pub kind: DescriptorTableKind,
+    /// Reflected extent of the field in bytes (`RootParameter::size`).
+    pub field_bytes: usize,
+    /// Descriptor slots the reflected field spans: `field_bytes` divided by
+    /// [`TEXTURE_DESCRIPTOR_BYTES`], at least one. This is the count the wire
+    /// set is packed against.
+    pub slots: u32,
+}
+
 /// Declaration used by [`RootSignatureLayout::from_parameters`].
 ///
 /// This is the converter-independent form for callers that already hold a
@@ -780,6 +803,33 @@ impl RootSignatureLayout {
     /// Reflected shader stage.
     pub fn stage(&self) -> ReflectedStage {
         self.stage
+    }
+
+    /// Descriptor tables this stage layout declares, in flattened parameter
+    /// order, with the reflected kind and descriptor slot count registration
+    /// carried (ADR-066).
+    ///
+    /// The count is the reflection's own: a field with an 8-byte or 24-byte
+    /// `Size` spans one converter descriptor, so `slots` is `1` for the shapes
+    /// this converter emits. It exists so the binding path never has to guess
+    /// the count from the wire alone.
+    pub fn declared_tables(&self) -> Vec<DeclaredTable> {
+        self.parameters
+            .iter()
+            .enumerate()
+            .filter_map(|(parameter, entry)| {
+                let RootParameterKind::DescriptorTable(kind) = entry.kind else {
+                    return None;
+                };
+                let slots = entry.size.div_ceil(TEXTURE_DESCRIPTOR_BYTES).max(1);
+                Some(DeclaredTable {
+                    parameter,
+                    kind,
+                    field_bytes: entry.size,
+                    slots: u32::try_from(slots).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
     }
 
     /// Reflected entry-point name (empty for `from_parameters`).
@@ -2583,6 +2633,40 @@ mod tests {
     /// converter's 24-byte descriptor extent. Field names and values only; no
     /// source bytes.
     const PIXEL_SAMPLER_REFLECTION: &str = r#"{"EntryPoint":"main","Features":0,"FunctionConstants":[],"HasYieldLoop":false,"NeedsFunctionConstants":false,"ResourceCount":1,"ResourceUsages":0,"SamplerIndices":[],"ShaderType":"Fragment","TopLevelArgumentBuffer":[{"EltOffset":0,"Name":"","Size":24,"Slot":0,"Space":0,"Type":"CBV"},{"EltOffset":24,"Name":"","Size":24,"Slot":0,"Space":0,"Type":"Sampler"}],"UnorderedAccessViewIndices":[],"UsedResources":[],"UsesRayQuery":false}"#;
+
+    #[test]
+    fn declared_tables_carry_the_reflected_kind_and_slot_count() {
+        // The composition shape: a view field, then a `Sampler` table field
+        // with the converter's 24-byte descriptor extent. Both the guessed
+        // kind and the descriptor slot count reach the binding path.
+        let layout =
+            RootSignatureLayout::from_converter_reflection_json(PIXEL_SAMPLER_REFLECTION)
+                .expect("the observed pixel reflection must parse");
+        let tables = layout.declared_tables();
+        assert_eq!(tables.len(), 1, "only the sampler field is a table");
+        assert_eq!(tables[0].parameter, 1);
+        assert_eq!(tables[0].kind, DescriptorTableKind::Sampler);
+        assert_eq!(tables[0].field_bytes, 24);
+        assert_eq!(tables[0].slots, 1, "one 24-byte converter descriptor");
+
+        // A plain `Table` keeps the kind-less reflected kind, and an 8-byte
+        // field still spans one descriptor slot.
+        let unspecified = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified),
+                size: 8,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("one kind-less table");
+        let tables = unspecified.declared_tables();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].kind, DescriptorTableKind::Unspecified);
+        assert_eq!(tables[0].field_bytes, 8);
+        assert_eq!(tables[0].slots, 1);
+    }
 
     #[test]
     fn observed_pixel_sampler_reflection_is_a_usable_layout() {
