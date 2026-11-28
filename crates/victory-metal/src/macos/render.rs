@@ -3402,7 +3402,6 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
             | CommandV3::SetIndexBuffer(_)
             | CommandV3::SetRootConstants(_)
             | CommandV3::SetDescriptorTable(_)
-            | CommandV3::SetDescriptorHeaps(_)
             | CommandV3::SetRootBufferView(_)
             | CommandV3::SetBlendState(_)
             | CommandV3::SetDepthStencilState(_)
@@ -3416,6 +3415,10 @@ pub fn plan_encoder_segments(commands: &[CommandV3]) -> Result<Vec<Segment>, Met
                 }
                 pending_work_state += 1;
             }
+            // ADR-064: `SetDescriptorHeaps` carries no GPU work of its own; the
+            // table entries it governs were resolved on the guest. It is legal
+            // anywhere on a list and never leaves pending state behind.
+            CommandV3::SetDescriptorHeaps(_) => {}
             CommandV3::ClearRenderTargetView(_) | CommandV3::ClearDepthStencilView(_) => {
                 if pass_open.is_none() {
                     return Err(plan_error(

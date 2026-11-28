@@ -7696,6 +7696,11 @@ fn build_render_ops(
                 ]);
                 ops.push(PreparedRenderOp::Scissor(validated));
             }
+            // ADR-064: the guest resolved this command's heap entries into the
+            // descriptor tables themselves, so replaying it inside a sub-pass
+            // records no encoder state. It is accepted wherever the title put
+            // it instead of failing the segment.
+            CommandV3::SetDescriptorHeaps(_) => {}
             CommandV3::SetPrimitiveTopology(wire_topology) => {
                 match *wire_topology {
                     // ADR-065: rect lists are encoded by their own expansion
