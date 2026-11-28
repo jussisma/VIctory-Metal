@@ -4257,6 +4257,22 @@ fn abi_kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -
 /// (converter reflection reports every table that way) and then matches any
 /// requested value. A sampler table never names a root parameter: the
 /// translated signature's samplers are static samplers.
+/// Whether a translated parameter kind can carry a plan argument kind,
+/// independent of space and register.
+fn root_kind_matches(kind: RootParameterKind, plan: PlanArgumentKind) -> bool {
+    match plan {
+        PlanArgumentKind::Constants => kind == RootParameterKind::Constants,
+        PlanArgumentKind::RootView => matches!(
+            kind,
+            RootParameterKind::ConstantBufferView
+                | RootParameterKind::ShaderResourceView
+                | RootParameterKind::UnorderedAccessView
+        ),
+        PlanArgumentKind::DescriptorTable => matches!(kind, RootParameterKind::DescriptorTable(_)),
+        PlanArgumentKind::SamplerTable => false,
+    }
+}
+
 fn root_slot_declares_argument(
     slot: &RootParameterSlot,
     space: u16,
@@ -4357,7 +4373,74 @@ fn resolve_wire_root_argument(
     if let Some(entry) = plan.and_then(|plan| plan.entry(wire_slot)) {
         return planned_root_parameter(transport, abi, entry, site.kind, site.mismatched);
     }
+    // Without a plan entry, a translated parameter is still derivable from the
+    // converter's own reflection: its register numbers follow the shader's
+    // bindings, and the wire slot is the title's root-parameter index, which
+    // names that register. Search the reflected layouts by kind and register
+    // (the reflected space can differ from the emitter's `ROOT_CBV_SPACE`
+    // convention, as Boot #28 showed: the converter reports the root CBV at
+    // space 0). This is narrower than the legacy slot lookup, which reads a
+    // translated index as a title index and can land on a constants block.
+    if let Some(slot) = abi.layouts().find_map(|layout| {
+        layout
+            .parameters()
+            .iter()
+            .find(|parameter| {
+                parameter.register() == u32::from(wire_slot)
+                    && root_kind_matches(parameter.kind(), site.kind)
+            })
+            .map(|parameter| {
+                RootParameterSlot::new(
+                    parameter.space(),
+                    parameter.register(),
+                    parameter.kind(),
+                    parameter.size(),
+                )
+            })
+    }) {
+        return Ok(slot);
+    }
+    // A descriptor table names its base register, not the title's root index,
+    // so the register search above cannot map it. When the translated signature
+    // declares exactly one parameter of the command's kind, that parameter is
+    // the binding: unambiguous, and never a guess between two tables.
+    let mut only: Option<RootParameterSlot> = None;
+    let mut several = false;
+    for layout in abi.layouts() {
+        for parameter in layout.parameters() {
+            if !root_kind_matches(parameter.kind(), site.kind) {
+                continue;
+            }
+            let slot = RootParameterSlot::new(
+                parameter.space(),
+                parameter.register(),
+                parameter.kind(),
+                parameter.size(),
+            );
+            match &only {
+                None => only = Some(slot),
+                Some(existing)
+                    if existing.space() == slot.space()
+                        && existing.register() == slot.register() => {}
+                Some(_) => several = true,
+            }
+        }
+    }
+    if !several && let Some(slot) = only {
+        return Ok(slot);
+    }
     transport.count_legacy_root_binding();
+    // Bounded stderr (the daemon installs no tracing subscriber): names whether
+    // the guest sent a plan at all and how many entries it carried.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOTES: AtomicU64 = AtomicU64::new(0);
+    if NOTES.fetch_add(1, Ordering::Relaxed) < 8 {
+        eprintln!(
+            "victory-metal-host: legacy root binding wire_slot={wire_slot} plan_present={} plan_entries={}",
+            plan.is_some(),
+            plan.map_or(0, |plan| plan.len()),
+        );
+    }
     abi.root_parameter(usize::from(wire_slot)).ok_or_else(|| {
         transport.count_abi_refusal();
         MetalError::InvalidArg(site.undeclared).into()

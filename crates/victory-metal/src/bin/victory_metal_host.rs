@@ -2052,7 +2052,7 @@ mod draw_trace_json_tests {
         let json = std::fs::read_to_string(&path).expect("telemetry reads");
         let _ = std::fs::remove_file(&path);
 
-        const KEYS: [&str; 57] = [
+        const KEYS: [&str; 58] = [
             "host",
             "pid",
             "port",
