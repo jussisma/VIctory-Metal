@@ -2070,3 +2070,117 @@ used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
   1,200 FPS, checksum unchanged (`11527919792119713699`).
 - Worker `target/` directories pruned after every wave; zero orphaned processes;
   the stale GPU lock left by a killed hung test was reclaimed by PID check.
+
+## 18. Cycle 18 — root-argument upload, guest IA layout, kind-compatible tables, present composition
+
+### 18.1 What changed
+
+- **ADR-060, the root argument buffer is always bound.** `flush_render_abi`/
+  `flush_compute_abi` no longer skip the top-level argument buffer when
+  `pending` is empty: a declaring stage receives a zero-filled argument buffer
+  at `buffer(2)`, root arguments persist as D3D12 state across pipeline
+  changes, and `abi_bound_parameters` / `abi_unbound_parameters` /
+  `abi_bound_bytes` / `bound=constants|view|table` are reported per draw and in
+  `telemetry.json`. Boot #32 first measured the title's own writes: 85 draws,
+  85 bound parameters, 0 defaults.
+- **ADR-061, the guest input layout is authoritative.** `VMVD` version 2 carries
+  the guest `D3D12_INPUT_LAYOUT` (element order, format, slot, byte offset,
+  slot class, step rate) and per-slot strides; the host builds
+  `MTLVertexDescriptor` from it, applies per-instance step function/rate, and
+  falls back to the `ISG1` layout only when no guest layout is carried
+  (`vertex_layout_source` counters). A two-slot padded-stride hardware proof
+  draws exact pixels; the old packed-buffer-0 control differs.
+- **ADR-062a, kind-compatible descriptor tables.** The ordinal resolver never
+  matches an `Srv`/`Uav`/`Cbv` table to a reflected `Sampler` parameter; when
+  the ordinal is incompatible it selects the unique shape-compatible declared
+  table, and ambiguity stays a counted refusal. Mixed resource tables (buffer +
+  texture entries in one heap) are split across consecutive declared table
+  slots; an unrepresentable mix is an inert acceptance, not a submission
+  abort. Boot #33: refused submissions 42 → 0.
+- **ADR-062b, present composition.** One full-resource same-format RTV resolves
+  to the base `MTLTexture` (no pixel-format wrapper); copy destinations and
+  pass targets are censused per allocation; all GPU completion waits are
+  bounded (30 s, named timeout), which removes the Cycle 17 hang. The presenter
+  rebinds the surface to the latest drawn composition target with a counted,
+  non-fatal fallback: Boot #32 `surface_targeted_by_pass=0`,
+  `source_is_presented=4196` → Boot #33 `surface_targeted_by_pass=1`,
+  `source_is_presented=4180`.
+- **ADR-063, carried depth state and encoder state trace.** A content-hashed or
+  indirect pipeline applies the depth-stencil state carried in its
+  `PipelineState`; a wire state set before a pass is re-bound in the drawing
+  encoder. An opt-in `state_trace` records topology, colour/depth load/store,
+  depth-state class, blend/write mask, cull/winding and a bounded after-draw
+  attachment sample. It proved the previously unobservable gates: 136 triangles,
+  47 clear/91 load colour passes, 46 depth passes, 3 blended pipelines, 0
+  zero-write masks.
+- **Fragment ABI observability.** Per draw, per stage: declared parameters,
+  bound parameters by kind, declared/bound texture sources, inert tables and a
+  fixed `fragment_source_unreachable` reason. Boot #33 reads
+  `ps_abi_parameters=2`, `ps_bound_parameters=1`,
+  `fragment_texture_sources_declared=1`, `bound=0`, and the reason
+  `no wire SetDescriptorHeaps command and the fragment declares no
+  table/texture root parameter` (45 draws).
+
+### 18.2 Windowed boots (probe, draw trace, state trace)
+
+| | **#31** | **#32** | **#33** |
+|---|---|---|---|
+| submissions / refused | 4218 / 40 | 4240 / 42 | **4227 / 0** |
+| `abi_refusals` | 0 | 0 | **0** |
+| draws / indexed / dispatches | 81 / 0 / 0 | 85 / 0 / 0 | **136 / 0 / 0** |
+| render passes | 83 | 87 | **138** |
+| `abi_bound` / `abi_unbound` | — / — | 85 / 0 | **181 / 45** |
+| inert table acceptances | 40 | 42 | **90** |
+| `vertex_layout_guest` / signature | — / — | 4 / 0 | **4 / 0** |
+| RT non-zero bytes / distinct | 0 / 1 | 0 / 1 | **0 / 1** |
+| swapchain `non_black_pixels` / buckets | 0 / 1 | 0 / 1 | **0 / 1** |
+| `uniform_color` | transparent_black | same | **same** |
+| surfaces / targeted by pass | 1 / 0 | 1 / 0 | **4 / 1** |
+| `source_is_presented` | 0 | 4196 | **4180** |
+| host p50 / p95 ms | .010 / .011 | .012 / .026 | **.012 / .030** |
+| D3DMetal fallback / host D3D12 | 0 / 0 | 0 / 0 | **0 / 0** |
+
+### 18.3 What Boot #33 proved and what it did not
+
+- The named refusal class is gone: mixed tables no longer abort a submission
+  (42 → 0), draws rose 85 → 136, and the presented surface is the drawn target
+  (`surface_targeted_by_pass=1`).
+- Root arguments are now measurably uploaded (181 bound, 45 zero defaults) and
+  the guest IA layout is the source for all carried pipelines.
+- **No non-black pixel and no title FPS are claimed.** The first evidence-ranked
+  gate is now named: every declaring fragment stage samples one texture source,
+  the wire carries no `SetDescriptorHeaps`, and the fragment's texture is not a
+  root-signature table/root view (`fragment_source_unreachable=45`, exact
+  reason). Descriptor-heap forwarding plus fragment texture/sampler binding is
+  the Cycle 19 milestone; no draw of the 136 can shade correctly without it.
+
+### 18.4 Pre-boot gate regression (open)
+
+- The `aaa-preboot-gate.sh --runs 1` gate **fails at this head**:
+  `depth_test_pixels` (near 64,512,000 vs expected 32,256,000, far 129,024,000),
+  `not_observed=depth_test,back_face_cull`. It passed at `0d7ad290` (the seam
+  plus kind-compatible tables) in two consecutive runs and fails
+  deterministically from `205dc962` (ADR-060) onward.
+- Bisect evidence: old guest + new host passes; old host + new guest fails;
+  reverting the guest counters does not fix it; reverting each ADR-060 runtime
+  delta (empty-pending shortcut, binding retention, `set` vs `push`, zero
+  stage bytes, transparent argument buffers) does not fix it; a tree that is
+  file-identical to `0d7ad290` in the same worktree passes. A pure-counter
+  change therefore flips the gate, which points at a gate-side
+  registration/state timing race rather than a rendering-semantics change.
+- The local annotated tag **`cycle-18` was withheld** because the hard gate is
+  not green. Smallest next action: make the gate's pipeline/state registration
+  deterministic (wait for the registration epoch before the measured frames),
+  re-run `--runs 1`; if green, tag this head without further code changes.
+
+### 18.5 Counts at the integration head
+
+- `victory-metal` lib **484 passed / 0 failed / 10 ignored** (no outer GPU
+  lock); `victory-gpu` **440 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus
+  **3 / 0 / 1**; Wine `victory-hle` **198 / 0 / 1**; `victory` bin **16 / 2 / 1**.
+- Win64 `diag` build, three Windows all-targets checks, x86_64
+  `victory-irconverter` and the ARM64 host build all exit 0; `git diff --check`
+  clean.
+- Worker `target/` directories pruned after every wave; zero orphaned
+  processes; GPU lock free. Free SSD 42 GB (APFS snapshots hold the rest;
+  `sudo tmutil` is outside authority).
