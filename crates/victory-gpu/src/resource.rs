@@ -2296,9 +2296,7 @@ pub(crate) fn note_colour_target(handle: u64, desc: &ResourceDesc) {
 /// The allocation the last colour pass targeted that can be presented.
 ///
 /// Returns `None` until the presenter has registered a surface and a matching
-/// colour pass has run. The presenter's per-frame rebind needs permission to
-/// change `native_metal::queue`; this accessor is the decision it will use.
-#[allow(dead_code)]
+/// colour pass has run. The presenter's per-frame rebind uses this selection.
 pub(crate) fn latest_composition_target() -> Option<u64> {
     let census = composition_census()
         .lock()
@@ -2311,6 +2309,104 @@ pub(crate) fn latest_composition_target() -> Option<u64> {
 pub(crate) fn reset_composition_census() {
     if let Ok(mut census) = composition_census().lock() {
         *census = CompositionCensus::default();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Present composition rebind counters
+// ---------------------------------------------------------------------------
+//
+// Counts of the presenter's per-frame decision to show the freshly drawn
+// allocation. Every outcome is named; nothing here changes pixels, copies or
+// the installed extent/format.
+
+static COMPOSITION_REBIND_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static COMPOSITION_REBIND_ACCEPTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static COMPOSITION_REBIND_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static COMPOSITION_REBIND_FROZEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static COMPOSITION_TARGET_ABSENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One snapshot of the present composition rebind counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CompositionRebindCounts {
+    /// Targets whose registration the presenter attempted.
+    pub attempts: u64,
+    /// Registrations the host accepted; the presenter followed that target.
+    pub accepted: u64,
+    /// Registrations the host refused (or a bounded/unknown target).
+    pub refused: u64,
+    /// Frames that kept the frozen surface after a refusal.
+    pub frozen: u64,
+    /// Frames with no selected composition target at all.
+    pub absent: u64,
+}
+
+/// Counts one rebind attempt, before the host is asked.
+pub(crate) fn note_composition_rebind_attempt() {
+    COMPOSITION_REBIND_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts a rebind the host accepted.
+pub(crate) fn note_composition_rebind_accepted() {
+    COMPOSITION_REBIND_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts a rebind the host refused (or a rotation set past its bound).
+pub(crate) fn note_composition_rebind_refused() {
+    COMPOSITION_REBIND_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one presented frame that kept the frozen surface after a refusal.
+pub(crate) fn note_composition_rebind_frozen() {
+    COMPOSITION_REBIND_FROZEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one frame whose present found no selected composition target.
+pub(crate) fn note_composition_target_absent() {
+    COMPOSITION_TARGET_ABSENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The present composition rebind counters.
+pub(crate) fn composition_rebind_counts() -> CompositionRebindCounts {
+    let load = |counter: &std::sync::atomic::AtomicU64| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    CompositionRebindCounts {
+        attempts: load(&COMPOSITION_REBIND_ATTEMPTS),
+        accepted: load(&COMPOSITION_REBIND_ACCEPTED),
+        refused: load(&COMPOSITION_REBIND_REFUSED),
+        frozen: load(&COMPOSITION_REBIND_FROZEN),
+        absent: load(&COMPOSITION_TARGET_ABSENT),
+    }
+}
+
+/// The rebind counters as one stable line naming each counter exactly.
+pub(crate) fn composition_rebind_line() -> String {
+    let counts = composition_rebind_counts();
+    format!(
+        "composition_rebind_attempts={} composition_rebind_accepted={} \
+         composition_rebind_refused={} composition_rebind_frozen={} \
+         composition_target_absent={}",
+        counts.attempts, counts.accepted, counts.refused, counts.frozen, counts.absent,
+    )
+}
+
+/// Clears the rebind counters (tests).
+#[cfg(test)]
+pub(crate) fn reset_composition_rebind_for_test() {
+    for counter in [
+        &COMPOSITION_REBIND_ATTEMPTS,
+        &COMPOSITION_REBIND_ACCEPTED,
+        &COMPOSITION_REBIND_REFUSED,
+        &COMPOSITION_REBIND_FROZEN,
+        &COMPOSITION_TARGET_ABSENT,
+    ] {
+        counter.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -5956,5 +6052,39 @@ mod tests {
         );
         assert!(line.contains("dropped_surfaces=3"), "{line}");
         reset_present_surface_census();
+    }
+
+    /// Every rebind outcome is counted under the name the boot digest reads.
+    #[test]
+    fn composition_rebind_counters_name_every_outcome() {
+        reset_composition_rebind_for_test();
+        note_composition_rebind_attempt();
+        note_composition_rebind_accepted();
+        note_composition_rebind_attempt();
+        note_composition_rebind_refused();
+        note_composition_rebind_frozen();
+        note_composition_target_absent();
+
+        assert_eq!(
+            composition_rebind_counts(),
+            CompositionRebindCounts {
+                attempts: 2,
+                accepted: 1,
+                refused: 1,
+                frozen: 1,
+                absent: 1,
+            }
+        );
+        let line = composition_rebind_line();
+        for expected in [
+            "composition_rebind_attempts=2",
+            "composition_rebind_accepted=1",
+            "composition_rebind_refused=1",
+            "composition_rebind_frozen=1",
+            "composition_target_absent=1",
+        ] {
+            assert!(line.contains(expected), "{line}");
+        }
+        reset_composition_rebind_for_test();
     }
 }

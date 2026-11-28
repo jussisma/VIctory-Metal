@@ -2501,20 +2501,61 @@ pub fn present_registered() -> Result<PresentedSurface, NativeQueueError> {
     result
 }
 
+/// Next list id handed to a wire present producer.
+///
+/// Process-wide, like the presenter: two presenters never share a list id even
+/// when a test installs one after another.
+static PRESENT_LIST_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Restarts the wire present list ids (tests that assert the first id).
+#[cfg(test)]
+fn reset_present_list_sequence() {
+    PRESENT_LIST_NEXT.store(1, Ordering::Relaxed);
+}
+
 /// The native presenter used by the real title path: it carries one
 /// `CommandV3::Present` to the host through the session queue.
 ///
 /// No pixels cross the boundary: the host owns the surface (registered with
-/// kind 9) and presents it. A refused registration or submission is returned
+/// kind 9) and presents it. A refused *first* registration is returned
 /// unchanged, so the guest `Present` entry point returns a real failure
 /// HRESULT instead of falling back.
+///
+/// The title composes by drawing into a rotating set of frame-sized colour
+/// allocations and presenting the last one, with no copy. Once the frozen
+/// surface is registered, every frame consults
+/// [`crate::resource::latest_composition_target`] and registers the drawn
+/// allocation as a kind-9 surface, then presents that surface id. The host
+/// accepts one kind-9 registration per surface id, so the rebind uses the
+/// allocation's own guest handle as the surface id rather than replacing the
+/// frozen surface's id. A refusal keeps the last accepted surface (never the
+/// frame) and is counted.
 pub struct WirePresenter {
+    /// The surface the installed swapchain froze; the fallback.
     surface_id: u64,
+    /// The frozen surface's backing texture.
     texture_id: u64,
+    /// Whether the frozen surface was accepted by the host.
     registered: bool,
+    /// Surface id the frame is presented through.
+    present_surface_id: u64,
+    /// Composition target currently presented, if a rebind landed.
+    following: Option<u64>,
+    /// Last target whose registration was refused, so it is not retried every
+    /// frame; a different target clears the hold.
+    held_target: Option<u64>,
+    /// Drawn targets already registered as kind-9 surfaces (bounded rotation).
+    rebound: Vec<u64>,
 }
 
 impl WirePresenter {
+    /// Distinct drawn allocations one presenter follows.
+    ///
+    /// A title composes into a small rotation of same-descriptor allocations;
+    /// a larger set is not a rotation this shortcut can follow, so the rebind
+    /// stops and the last accepted surface is kept (counted, never guessed).
+    const REBOUND_SURFACE_MAX: usize = 8;
+
     /// A presenter for `surface_id`, backed by the already-registered
     /// `texture_id`.
     pub fn new(surface_id: u64, texture_id: u64) -> Self {
@@ -2522,12 +2563,103 @@ impl WirePresenter {
             surface_id,
             texture_id,
             registered: false,
+            present_surface_id: surface_id,
+            following: None,
+            held_target: None,
+            rebound: Vec::new(),
+        }
+    }
+
+    /// Follows the allocation the last colour pass targeted, when it changed.
+    ///
+    /// The host accepts kind 9 only for a texture it already registered. A
+    /// refused or over-bound target keeps the last accepted surface, is
+    /// counted, and is not retried until the target changes again.
+    fn follow_composition_target(&mut self, target: Option<u64>) {
+        let Some(target) = target else {
+            let first = crate::resource::composition_rebind_counts().absent == 0;
+            crate::resource::note_composition_target_absent();
+            if first {
+                tracing::info!("{}", crate::resource::composition_rebind_line());
+            }
+            return;
+        };
+        if self.following == Some(target) {
+            return;
+        }
+        if target == self.texture_id {
+            // The frozen surface's own allocation is the frame again.
+            self.following = None;
+            self.present_surface_id = self.surface_id;
+            self.held_target = None;
+            return;
+        }
+        if self.held_target == Some(target) {
+            // The latest target is the one already refused; keep the last
+            // accepted surface without asking the host again this frame.
+            crate::resource::note_composition_rebind_frozen();
+            return;
+        }
+        self.held_target = None;
+        if self.rebound.iter().any(|registered| *registered == target) {
+            self.following = Some(target);
+            self.present_surface_id = target;
+            return;
+        }
+        crate::resource::note_composition_rebind_attempt();
+        if self.rebound.len() >= Self::REBOUND_SURFACE_MAX {
+            self.hold_frozen(target);
+            return;
+        }
+        match crate::native_metal::queue::register_surface(target, target) {
+            Ok(true) => {
+                self.rebound.push(target);
+                self.following = Some(target);
+                self.present_surface_id = target;
+                crate::resource::note_composition_rebind_accepted();
+                tracing::info!(
+                    target = format_args!("{target:#x}"),
+                    "{}",
+                    crate::resource::composition_rebind_line()
+                );
+            }
+            Ok(false) => {
+                self.hold_frozen(target);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target = format_args!("{target:#x}"),
+                    %error,
+                    "the composition rebind could not reach the host"
+                );
+                self.hold_frozen(target);
+            }
+        }
+    }
+
+    /// Keeps the last accepted surface after one refused rebind.
+    fn hold_frozen(&mut self, target: u64) {
+        self.held_target = Some(target);
+        crate::resource::note_composition_rebind_refused();
+        crate::resource::note_composition_rebind_frozen();
+        // A rotation of refused targets changes every frame; the counters stay
+        // exact while the log line is bounded.
+        if crate::resource::composition_rebind_counts().refused <= 8 {
+            tracing::info!(
+                target = format_args!("{target:#x}"),
+                "{}",
+                crate::resource::composition_rebind_line()
+            );
         }
     }
 }
 
 impl SurfacePresenter for WirePresenter {
     fn present(&mut self, frame: PresentedSurface) -> Result<(), PresentError> {
+        // Read the drawn composition target before this frame's first
+        // registration; the presenter follows it once the frozen surface is
+        // registered.
+        let composition_target = crate::resource::latest_composition_target();
         if !self.registered {
             match crate::native_metal::queue::register_surface(self.surface_id, self.texture_id) {
                 Ok(true) => self.registered = true,
@@ -2548,9 +2680,8 @@ impl SurfacePresenter for WirePresenter {
                 }
             }
         }
-        use std::sync::atomic::AtomicU64;
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let list_id = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+        self.follow_composition_target(composition_target);
+        let list_id = PRESENT_LIST_NEXT.fetch_add(1, Ordering::Relaxed).max(1);
         let mut producer =
             crate::native_metal::producer::MetalProducer::new(list_id, 1).map_err(|error| {
                 PresentError::SinkRefused {
@@ -2559,7 +2690,7 @@ impl SurfacePresenter for WirePresenter {
                 }
             })?;
         producer
-            .present(self.surface_id, frame.sync_interval.as_wire())
+            .present(self.present_surface_id, frame.sync_interval.as_wire())
             .map_err(|error| PresentError::SinkRefused {
                 frame_index: frame.frame_index,
                 reason: error.to_string(),
@@ -3839,6 +3970,7 @@ mod tests {
         let path = test_page("present");
         let (ready, ready_rx) = mpsc::channel();
         let (carried, carried_rx) = mpsc::channel();
+        crate::resource::reset_composition_census();
         let (endpoint, handle) = page_host(ready, move |stream| {
             let (kind, payload) = read_frame(stream);
             assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
@@ -3867,6 +3999,7 @@ mod tests {
         native_queue_install_client(client);
         ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
         install_wire_present(42, 42, 64, 64).expect("install the wire presenter");
+        reset_present_list_sequence();
         let before = telemetry::global().present_counts();
 
         let frame = present_registered().expect("the host accepted the frame");
@@ -3904,6 +4037,7 @@ mod tests {
         let _ = take_present();
         let path = test_page("present-refused");
         let (ready, ready_rx) = mpsc::channel();
+        crate::resource::reset_composition_census();
         let (endpoint, handle) = page_host(ready, move |stream| {
             let (kind, _payload) = read_frame(stream);
             assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
@@ -3935,6 +4069,312 @@ mod tests {
         assert_eq!(telemetry::global().d3dmetal_fallback_count(), 0);
         let _ = take_present();
         native_queue_reset();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The drawn allocation a present follows; its guest handle is also the
+    /// surface id the kind-9 rebind registers.
+    const REBIND_TARGET: u64 = 0x500;
+
+    /// A changed composition target is registered once as a kind-9 surface and
+    /// presented through that surface id; the next frame naming the same target
+    /// registers nothing.
+    #[test]
+    fn a_changed_composition_target_rebinds_the_present_surface_once() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        crate::resource::reset_composition_census();
+        crate::resource::reset_composition_rebind_for_test();
+        let _ = take_present();
+        let path = test_page("present-rebind");
+        let (ready, ready_rx) = mpsc::channel();
+        let (carried, carried_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, move |stream| {
+            // The drawn allocation is a texture the host already knows.
+            let (kind, _payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_TEXTURE_REG);
+            write_frame(stream, KIND_ACK, &[0]);
+            // The frozen surface, then the drawn allocation's own surface id.
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            assert_eq!(payload.len(), 16);
+            write_frame(stream, KIND_ACK, &[0]);
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            assert_eq!(
+                u64::from_le_bytes(payload[0..8].try_into().expect("surface id")),
+                REBIND_TARGET,
+                "the rebind registers the drawn allocation's own surface id"
+            );
+            assert_eq!(
+                u64::from_le_bytes(payload[8..16].try_into().expect("texture id")),
+                REBIND_TARGET,
+                "the rebind registers the drawn allocation"
+            );
+            write_frame(stream, KIND_ACK, &[0]);
+            for _ in 0..2 {
+                let (kind, payload) = read_frame(stream);
+                assert_eq!(kind, KIND_SUBMISSION_V3);
+                let inner = carried_submission(&payload);
+                carried.send(inner.clone()).expect("report the present");
+                let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
+                    sequence: inner.sequence,
+                    status: ReplyStatus::Ok,
+                })
+                .expect("reply encodes");
+                write_frame(stream, KIND_SUBMISSION_V3, &reply);
+            }
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
+        assert!(
+            register_texture(REBIND_TARGET, 1, 3, 28, 1, 1, 64, 64, 1, 1, 1)
+                .expect("the drawn allocation registers as a texture")
+        );
+        install_wire_present(42, 42, 64, 64).expect("install the wire presenter");
+        let desc = crate::resource::test_texture_desc(64, 64, 28, 0x1);
+        crate::resource::note_present_surface(42, &desc);
+        crate::resource::note_colour_target(REBIND_TARGET, &desc);
+
+        let first = present_registered().expect("the rebind frame presents");
+        assert_eq!((first.surface_id, first.frame_index), (42, 0));
+        let delivered = carried_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the host saw the first present");
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == REBIND_TARGET
+            ),
+            "the present must name the drawn allocation: {:?}",
+            delivered.commands
+        );
+        let counts = crate::resource::composition_rebind_counts();
+        assert_eq!(
+            (counts.attempts, counts.accepted, counts.refused, counts.frozen),
+            (1, 1, 0, 0),
+            "one accepted rebind: {counts:?}"
+        );
+
+        let second = present_registered().expect("the unchanged target presents");
+        assert_eq!((second.surface_id, second.frame_index), (42, 1));
+        let delivered = carried_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the host saw the second present");
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == REBIND_TARGET
+            ),
+            "an unchanged target still presents through the rebind: {:?}",
+            delivered.commands
+        );
+        let counts = crate::resource::composition_rebind_counts();
+        assert_eq!(
+            (counts.attempts, counts.accepted, counts.refused, counts.frozen),
+            (1, 1, 0, 0),
+            "an unchanged target must not register again: {counts:?}"
+        );
+
+        let _ = take_present();
+        native_queue_reset();
+        crate::resource::reset_composition_census();
+        crate::resource::reset_composition_rebind_for_test();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused rebind keeps the frozen surface, does not fail `present`, and
+    /// does not ask the host again for the same target on the next frame.
+    #[test]
+    fn a_refused_composition_rebind_keeps_the_frozen_surface() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        crate::resource::reset_composition_census();
+        crate::resource::reset_composition_rebind_for_test();
+        let _ = take_present();
+        let path = test_page("present-rebind-refused");
+        let (ready, ready_rx) = mpsc::channel();
+        let (carried, carried_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, move |stream| {
+            let (kind, _payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_TEXTURE_REG);
+            write_frame(stream, KIND_ACK, &[0]);
+            let (kind, _payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            write_frame(stream, KIND_ACK, &[0]);
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            assert_eq!(
+                u64::from_le_bytes(payload[0..8].try_into().expect("surface id")),
+                REBIND_TARGET,
+                "the rebind names the drawn allocation's own surface id"
+            );
+            assert_eq!(
+                u64::from_le_bytes(payload[8..16].try_into().expect("texture id")),
+                REBIND_TARGET,
+                "the rebind names the drawn allocation"
+            );
+            // The host refuses the new backing texture.
+            write_frame(stream, KIND_ACK, &[1]);
+            // Both frames present the frozen surface; only one rebind was asked.
+            for _ in 0..2 {
+                let (kind, payload) = read_frame(stream);
+                assert_eq!(kind, KIND_SUBMISSION_V3);
+                let inner = carried_submission(&payload);
+                carried.send(inner.clone()).expect("report the present");
+                let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
+                    sequence: inner.sequence,
+                    status: ReplyStatus::Ok,
+                })
+                .expect("reply encodes");
+                write_frame(stream, KIND_SUBMISSION_V3, &reply);
+            }
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
+        assert!(register_texture(REBIND_TARGET, 1, 3, 28, 1, 1, 64, 64, 1, 1, 1).expect("register"));
+        install_wire_present(42, 42, 64, 64).expect("install the wire presenter");
+        let desc = crate::resource::test_texture_desc(64, 64, 28, 0x1);
+        crate::resource::note_present_surface(42, &desc);
+        crate::resource::note_colour_target(REBIND_TARGET, &desc);
+
+        let first = present_registered().expect("a refused rebind never fails the frame");
+        assert_eq!((first.surface_id, first.frame_index), (42, 0));
+        let delivered = carried_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the host saw the frozen present");
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == 42
+            ),
+            "a refusal keeps the frozen surface: {:?}",
+            delivered.commands
+        );
+        let counts = crate::resource::composition_rebind_counts();
+        assert_eq!(
+            (counts.attempts, counts.accepted, counts.refused, counts.frozen),
+            (1, 0, 1, 1),
+            "one refused rebind: {counts:?}"
+        );
+
+        let second = present_registered().expect("the held frame still presents");
+        assert_eq!((second.surface_id, second.frame_index), (42, 1));
+        let delivered = carried_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the host saw the held present");
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == 42
+            ),
+            "the held target keeps the frozen surface: {:?}",
+            delivered.commands
+        );
+        let counts = crate::resource::composition_rebind_counts();
+        assert_eq!(
+            (counts.attempts, counts.accepted, counts.refused, counts.frozen),
+            (1, 0, 1, 2),
+            "the refused target is not retried every frame: {counts:?}"
+        );
+
+        let _ = take_present();
+        native_queue_reset();
+        crate::resource::reset_composition_census();
+        crate::resource::reset_composition_rebind_for_test();
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With no selected composition target the frozen surface is presented and
+    /// the absence is counted; no registration is attempted.
+    #[test]
+    fn without_a_composition_target_the_frozen_surface_presents() {
+        let _serial = serialized();
+        native_queue_reset();
+        telemetry::global().reset();
+        crate::resource::reset_composition_census();
+        crate::resource::reset_composition_rebind_for_test();
+        let _ = take_present();
+        let path = test_page("present-no-target");
+        let (ready, ready_rx) = mpsc::channel();
+        let (carried, carried_rx) = mpsc::channel();
+        let (endpoint, handle) = page_host(ready, move |stream| {
+            let (kind, _payload) = read_frame(stream);
+            assert_eq!(kind, crate::native_metal::client::KIND_SURFACE_REG);
+            write_frame(stream, KIND_ACK, &[0]);
+            let (kind, payload) = read_frame(stream);
+            assert_eq!(kind, KIND_SUBMISSION_V3);
+            let inner = carried_submission(&payload);
+            carried.send(inner.clone()).expect("report the present");
+            let reply = victory_metal::wire::encode_reply(&victory_metal::wire::Reply {
+                sequence: inner.sequence,
+                status: ReplyStatus::Ok,
+            })
+            .expect("reply encodes");
+            write_frame(stream, KIND_SUBMISSION_V3, &reply);
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+        let client = WireV3Client::connect_with_fence_page(
+            &endpoint,
+            &SECRET,
+            TEST_TIMEOUT,
+            Some(path.clone()),
+        )
+        .expect("an authenticated client");
+        native_queue_install_client(client);
+        ready_rx.recv_timeout(TEST_TIMEOUT).expect("registered");
+        install_wire_present(42, 42, 64, 64).expect("install the wire presenter");
+
+        let frame = present_registered().expect("the frozen surface presents");
+        assert_eq!((frame.surface_id, frame.frame_index), (42, 0));
+        let delivered = carried_rx.recv_timeout(TEST_TIMEOUT).expect("the host saw it");
+        assert!(
+            matches!(
+                delivered.commands.as_slice(),
+                [victory_metal::wire_v3::CommandV3::Present(present)]
+                    if present.surface_id == 42
+            ),
+            "without a target the frozen surface is presented: {:?}",
+            delivered.commands
+        );
+        let counts = crate::resource::composition_rebind_counts();
+        assert_eq!(
+            (counts.attempts, counts.accepted, counts.absent),
+            (0, 0, 1),
+            "absence is counted and nothing is registered: {counts:?}"
+        );
+
+        let _ = take_present();
+        native_queue_reset();
+        crate::resource::reset_composition_rebind_for_test();
         drop(handle);
         let _ = std::fs::remove_file(&path);
     }
