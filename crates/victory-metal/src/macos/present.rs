@@ -712,6 +712,7 @@ fn record_present_trace(
         fallback_clear,
         source == presented,
         descriptor,
+        take_identity_pass_target(),
         &[pass_target],
     );
 }
@@ -722,6 +723,10 @@ fn record_present_trace(
 /// as this present's surface (the headless image itself, or the window's
 /// registered present texture). Together with `source == presented` it is the
 /// identity verdict: the texture being shown is the surface host work targeted.
+/// `explicit_pass_target` is the one-shot identity target taken by the caller,
+/// so the same evidence that chose the sampled object is the evidence the
+/// verdict is computed from.
+#[allow(clippy::too_many_arguments)]
 fn record_present_trace_targets(
     source: objc::Id,
     presented: objc::Id,
@@ -729,13 +734,13 @@ fn record_present_trace_targets(
     fallback_clear: bool,
     registered_source: bool,
     descriptor: Option<SurfaceDescriptor>,
+    explicit_pass_target: Option<(usize, bool)>,
     pass_targets: &[Option<trace::TraceTarget>],
 ) {
     // Object identity is recorded before the trace lock is taken: the census
     // reads immutable texture properties and takes the same lock. `descriptor`
     // is `Some` only for a live texture (a synthetic test token passes `None`),
     // so no selector is ever sent to a fake address.
-    let explicit_pass_target = take_identity_pass_target();
     if descriptor.is_some() && !source.is_null() {
         note_texture_object(source, TextureObjectOrigin::Surface);
     }
@@ -1574,6 +1579,51 @@ pub struct NativeSwapchain {
     /// drawable, so the diagnostic fallback is named once instead of once per
     /// frame.
     fallback_reported: bool,
+    /// Tracer progress observed at the previous present (`traced_work`,
+    /// `traced_passes`). A traced pass target is this frame's only when the
+    /// tracer advanced past these marks; otherwise it is carried evidence from
+    /// an earlier pass and is ranked last.
+    tracer_marks: (u64, u64),
+    /// The presented surface object and its host copy count at the previous
+    /// present. A new copy between two presents is a write for this frame.
+    source_copies: (usize, u64),
+    /// Set once when a presented surface had no write of its own and the frame
+    /// was presented empty rather than sampling a foreign allocation.
+    refusal_reported: bool,
+}
+
+/// Why a windowed present sampled the object it did.
+///
+/// The window samples the object a pass actually drew. When the presented
+/// surface was written for this frame it is that object; when it was not, the
+/// object a pass wrote is adopted only with evidence (a declared identity
+/// target, a traced pass target, or the registry's own record of the
+/// descriptor-identical surface). With no such evidence nothing is sampled:
+/// an unrelated allocation is never substituted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentResolution {
+    /// The presented surface object itself was written this frame.
+    NamedSurface,
+    /// The one-shot identity target a caller declared for this present.
+    DeclaredPassTarget,
+    /// A pass target the tracer recorded for this present.
+    FreshPassTarget,
+    /// A pass target the tracer recorded earlier, used only because the
+    /// presented surface has no write of its own.
+    CarriedPassTarget,
+    /// A foreign descriptor-identical pass target was offered but is not one of
+    /// the host's registered surfaces (or is stale): nothing is sampled.
+    Refused,
+}
+
+/// Whether a traced target's attachment has the presented surface's shape.
+///
+/// Shape, not usage: a texture registered first as storage and later widened
+/// for an RTV keeps the usage it was created with.
+fn target_matches_shape(target: &trace::TraceTarget, shape: &SurfaceDescriptor) -> bool {
+    target.format == pixel_format_name(shape.format)
+        && usize::try_from(target.width).ok() == Some(shape.width)
+        && usize::try_from(target.height).ok() == Some(shape.height)
 }
 
 impl NativeSwapchain {
@@ -1599,6 +1649,9 @@ impl NativeSwapchain {
             height,
             probe,
             fallback_reported: false,
+            tracer_marks: (0, 0),
+            source_copies: (0, 0),
+            refusal_reported: false,
         })
     }
 
@@ -1624,6 +1677,144 @@ impl NativeSwapchain {
     /// Drawables presented so far.
     pub fn presented(&self) -> u64 {
         self.presented
+    }
+
+    /// Chooses the object this frame's present samples.
+    ///
+    /// The object a pass actually drew is the presented surface when a pass
+    /// named it (or a host copy wrote it) for this frame. Otherwise the
+    /// descriptor-identical object a pass wrote is adopted, in this order of
+    /// evidence:
+    ///
+    /// 1. the declared one-shot identity target (exactly this frame);
+    /// 2. a traced pass target the tracer recorded since the previous present;
+    /// 3. a traced pass target recorded earlier (sticky tracer evidence);
+    ///
+    /// with the registry's shared-handle/view alias preferred over a plain
+    /// descriptor match, then the higher registration ordinal. Registration
+    /// order alone never decides the alias: an object the registry never
+    /// created is never adopted, and a descriptor mismatch is never aliased.
+    /// When a foreign descriptor-identical target exists and none is
+    /// adoptable, nothing is sampled — an unrelated allocation is not shown.
+    fn resolve_present_source(
+        &mut self,
+        source: Option<objc::Id>,
+        explicit: Option<(usize, bool)>,
+        observed: &[Option<trace::TraceTarget>; 2],
+    ) -> (Option<objc::Id>, PresentResolution) {
+        let Some(named) = source.filter(|texture| !texture.is_null()) else {
+            return (None, PresentResolution::NamedSurface);
+        };
+        let Some(shape) = surface_descriptor_of(named) else {
+            return (Some(named), PresentResolution::NamedSurface);
+        };
+        let named_key = named as usize;
+
+        // Freshness: did the tracer describe work since the previous present?
+        let report = trace::report();
+        let marks = (report.traced_work, report.traced_passes);
+        let fresh = marks != self.tracer_marks;
+        self.tracer_marks = marks;
+
+        // A copy into the named surface between the previous present and this
+        // one is a host write for this frame, exactly as the trace counts it.
+        let copies = blit::copy_count_for(named);
+        let copied_since = self.source_copies.0 == named_key && copies > self.source_copies.1;
+        self.source_copies = (named_key, copies);
+
+        let named_written = copied_since
+            || explicit.is_some_and(|(object, _)| object == named_key)
+            || observed
+                .iter()
+                .flatten()
+                .any(|target| target.texture == named_key);
+        if named_written {
+            return (Some(named), PresentResolution::NamedSurface);
+        }
+
+        // Best candidate key: lowest evidence rank, then a shared-handle/view
+        // alias, then the newest registration.
+        let mut best: Option<(u8, u8, u64, usize, PresentResolution)> = None;
+        let mut foreign_same_shape = false;
+        let mut consider = |object: usize,
+                            swapchain: bool,
+                            declared: bool,
+                            recorded: Option<&trace::TraceTarget>| {
+            if object == 0 || object == named_key {
+                return;
+            }
+            let recorded_shape =
+                recorded.is_some_and(|target| target_matches_shape(target, &shape));
+            if !swapchain {
+                // Not one of the host's registered surfaces. Its address is
+                // never dereferenced; a recorded shape is enough to name the
+                // split but never enough to alias it.
+                foreign_same_shape |= recorded_shape;
+                return;
+            }
+            // SAFETY: a target the host classified as a registered present
+            // surface is retained by the transport for the process lifetime, and
+            // a declared identity target is a live texture the caller just
+            // encoded. Only an object with one of those provenances is
+            // dereferenced.
+            let Some(candidate_shape) = surface_descriptor_of(object as objc::Id) else {
+                return;
+            };
+            if candidate_shape.format != shape.format
+                || candidate_shape.width != shape.width
+                || candidate_shape.height != shape.height
+            {
+                return;
+            }
+            foreign_same_shape = true;
+            let rank = if declared {
+                0
+            } else if fresh {
+                1
+            } else {
+                2
+            };
+            let shared = u8::from(!crate::macos::registry::texture_objects_share_handle(
+                named_key, object,
+            ));
+            let order = crate::macos::registry::texture_object_registration_order(object)
+                .map_or(0, |order| u64::MAX - order);
+            let resolution = match rank {
+                0 => PresentResolution::DeclaredPassTarget,
+                1 => PresentResolution::FreshPassTarget,
+                _ => PresentResolution::CarriedPassTarget,
+            };
+            let key = (rank, shared, order);
+            if best.is_none_or(|(best_rank, best_shared, best_order, ..)| {
+                key < (best_rank, best_shared, best_order)
+            }) {
+                best = Some((key.0, key.1, key.2, object, resolution));
+            }
+        };
+        if let Some((object, swapchain)) = explicit {
+            consider(object, swapchain, true, None);
+        }
+        for target in observed.iter().flatten() {
+            consider(target.texture, target.swapchain, false, Some(target));
+        }
+
+        match best {
+            Some((_, _, _, object, resolution)) => (Some(object as objc::Id), resolution),
+            None if foreign_same_shape => {
+                if !self.refusal_reported {
+                    self.refusal_reported = true;
+                    tracing::warn!(
+                        surface_width = shape.width,
+                        surface_height = shape.height,
+                        "VICTORY_BACKEND=metal: the presented surface was not written this frame \
+                         and the pass target is not one of the host's registered surfaces; \
+                         presenting nothing instead of an unrelated allocation"
+                    );
+                }
+                (None, PresentResolution::Refused)
+            }
+            None => (Some(named), PresentResolution::NamedSurface),
+        }
     }
 
     /// Acquires the next drawable and retains it until [`Self::present`].
@@ -1656,22 +1847,47 @@ impl NativeSwapchain {
     /// title back-buffer visible in a 1280x720 window instead of the
     /// diagnostic clear. A source the layer cannot display still falls back to
     /// the clear, named once rather than silently.
+    ///
+    /// `source` is the surface the present named. The object that is actually
+    /// copied into the drawable is the object a pass wrote this frame (see
+    /// [`Self::resolve_present_source`]): when the named surface was not
+    /// written and a descriptor-identical registered surface was, that surface
+    /// is shown instead of showing an undrawn buffer. When nothing wrote a
+    /// same-shape object, the drawable is cleared rather than sampling a
+    /// foreign allocation.
     pub fn present(&mut self, source: Option<objc::Id>) -> Result<(), PresentError> {
         let mut drawable = self.current.take().ok_or_else(|| {
             PresentError::Metal("no CAMetalLayer drawable was acquired".to_string())
         })?;
         let _pool = AutoreleasePool::new();
 
-        // Read the source's immutable properties once, before the drawable can
-        // be released and re-acquired.
-        // SAFETY: `source` is a live `MTLTexture` retained by the caller; these
-        // accessors only read immutable properties.
-        let source_info: Option<(objc::Id, usize, usize, usize)> = source.map(|source| unsafe {
+        // The evidence that chooses the sampled object is taken before the
+        // drawable is touched, so it describes this frame's pass and not a
+        // drawable transition. `named` stays the surface the present named:
+        // copy bookkeeping and the identity verdict are about it even when a
+        // different object is shown.
+        let explicit_pass_target = take_identity_pass_target();
+        let observed = observed_pass_targets();
+        let named = source.filter(|texture| !texture.is_null());
+        let (sample, resolution) =
+            self.resolve_present_source(source, explicit_pass_target, &observed);
+        let trace_source = if resolution == PresentResolution::Refused {
+            named
+        } else {
+            sample
+        };
+
+        // Read the sampled object's immutable properties once, before the
+        // drawable can be released and re-acquired.
+        // SAFETY: `sample` is a live `MTLTexture` (the named surface retained by
+        // the caller, or a surface the transport retains); these accessors only
+        // read immutable properties.
+        let source_info: Option<(objc::Id, usize, usize, usize)> = sample.map(|sample| unsafe {
             (
-                source,
-                objc::msg_send_usize_0(source, objc::sel(c"pixelFormat")),
-                objc::msg_send_usize_0(source, objc::sel(c"width")),
-                objc::msg_send_usize_0(source, objc::sel(c"height")),
+                sample,
+                objc::msg_send_usize_0(sample, objc::sel(c"pixelFormat")),
+                objc::msg_send_usize_0(sample, objc::sel(c"width")),
+                objc::msg_send_usize_0(sample, objc::sel(c"height")),
             )
         });
 
@@ -1805,15 +2021,16 @@ impl NativeSwapchain {
         }
 
         record_present_trace_targets(
-            source_info.map_or(std::ptr::null_mut(), |(source, ..)| source),
+            trace_source.unwrap_or(std::ptr::null_mut()),
             target,
             probe_sampled,
             !filled,
-            // `NativeWindow` only ever hands this path the texture it retained
-            // from the transport's registered surface table.
-            source_info.is_some(),
-            source.and_then(surface_descriptor_of),
-            &observed_pass_targets(),
+            // The named surface is always the texture the host registered for
+            // this present, whether or not it is the object sampled.
+            named.is_some(),
+            trace_source.and_then(surface_descriptor_of),
+            explicit_pass_target,
+            &observed,
         );
 
         self.presented = self.presented.wrapping_add(1);
@@ -3742,6 +3959,7 @@ impl<'a> PresentPath<'a> {
             false,
             true,
             surface_descriptor_of(texture),
+            take_identity_pass_target(),
             &observed_pass_targets(),
         );
         self.in_flight = Some(frame);

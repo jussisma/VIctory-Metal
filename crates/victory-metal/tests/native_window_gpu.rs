@@ -62,6 +62,13 @@ const DRAWN_HEIGHT: u32 = 96;
 /// Second MRT colour and the depth target the built-in pipeline expects.
 const COLOR1_ID: u64 = 8;
 const DEPTH_ID: u64 = 9;
+/// A descriptor-identical colour allocation that is registered as its own
+/// present surface and used as the pass target, while the frame presents
+/// `SURFACE_ID` (another object of the same shape). This is the composition
+/// shape the boot shows: the drawn object and the presented object are
+/// different `MTLTexture`s with one descriptor.
+const PASS_TARGET_ID: u64 = 12;
+const PASS_TARGET_SURFACE_ID: u64 = 13;
 
 unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *const c_void;
@@ -429,6 +436,22 @@ fn read_pipeline_id(path: &Path) -> u64 {
 /// Builds the AAA frame-gate draw: two RGBA8 targets plus D32F, a full-target
 /// triangle from the host's built-in pipeline, and a `Present` of colour 0.
 fn drawn_frame(pipeline: u64, width: u32, height: u32) -> Vec<CommandV3> {
+    drawn_frame_into(pipeline, width, height, TEXTURE_ID, SURFACE_ID)
+}
+
+/// [`drawn_frame`] with an explicit pass target and presented surface.
+///
+/// The pass's first colour attachment is `target`, and the frame presents
+/// `surface`. A test can therefore draw into one descriptor-identical object
+/// and present another, which is exactly the identity split the present path
+/// must resolve to the drawn object.
+fn drawn_frame_into(
+    pipeline: u64,
+    width: u32,
+    height: u32,
+    target: u64,
+    surface: u64,
+) -> Vec<CommandV3> {
     // The built-in `vm_frame_vertex` reads two RGBA tints from root constants.
     let tints: [f32; 8] = [1.0, 128.0 / 255.0, 0.0, 1.0, 0.0, 128.0 / 255.0, 1.0, 1.0];
     let mut constants = Vec::with_capacity(32);
@@ -439,7 +462,7 @@ fn drawn_frame(pipeline: u64, width: u32, height: u32) -> Vec<CommandV3> {
         CommandV3::BeginRenderPass(BeginRenderPass {
             colors: vec![
                 ColorAttachment {
-                    allocation_id: TEXTURE_ID,
+                    allocation_id: target,
                     generation: GENERATION,
                     mip_level: 0,
                     slice: 0,
@@ -500,7 +523,7 @@ fn drawn_frame(pipeline: u64, width: u32, height: u32) -> Vec<CommandV3> {
         }),
         CommandV3::EndRenderPass,
         CommandV3::Present(Present {
-            surface_id: SURFACE_ID,
+            surface_id: surface,
             sync_interval: 1,
         }),
     ]
@@ -671,5 +694,264 @@ fn native_window_acquires_and_presents_two_frames_matching_headless() {
     eprintln!(
         "native window gate: drawables=2 presented=2 checksum={headless_checksum} \
          (headless == windowed), D3DMetal images=0"
+    );
+}
+
+/// Runs one drawn frame through the windowed host with the frame probe on and
+/// returns its telemetry JSON.
+///
+/// `register` declares the textures/surfaces the frame uses and `commands`
+/// builds the submission from the host's published pipeline id. `draw_trace`
+/// arms the bounded draw tracer, which is the only source of "which object did
+/// a pass write" the present path accepts. An empty string means the documented
+/// window-server skip.
+fn run_drawn_window_frame(
+    tag: &str,
+    draw_trace: bool,
+    register: impl FnOnce(&mut Client),
+    commands: impl FnOnce(u64) -> Vec<CommandV3>,
+) -> String {
+    if !window_server_available() {
+        eprintln!(
+            "SKIP: no window server session (CGSessionCopyCurrentDictionary is null); \
+             {tag} frame not exercised"
+        );
+        return String::new();
+    }
+
+    let share = TempDir::new(tag);
+    let telemetry = share.path().join("telemetry.json");
+    let telemetry_text = telemetry.to_string_lossy().into_owned();
+    let args = vec!["--aaa-frame", "--telemetry-json", telemetry_text.as_str()];
+    let mut envs = vec![
+        ("VICTORY_METAL_WINDOW", "64x64"),
+        ("VICTORY_METAL_FRAME_PROBE", "1"),
+    ];
+    if draw_trace {
+        // The tracer must be armed in the host process: the pass target is the
+        // evidence the present path resolves the presented object with.
+        envs.push(("VICTORY_METAL_DRAW_TRACE", "1"));
+    }
+    let host = Host::spawn_with_env(&share, &args, &envs);
+    let pipeline = read_pipeline_id(&share.path().join(GRAPHICS_PIPELINE_FILE));
+
+    let mut client = Client::connect(host.port);
+    register(&mut client);
+    let reply = client.submit_commands(1, commands(pipeline));
+    assert_eq!(reply.status, ReplyStatus::Ok, "frame was refused: {reply:?}");
+    drop(client);
+
+    let output = host.wait();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no window server session") {
+            eprintln!("SKIP: the host reported no window server session:\n{stderr}");
+            return String::new();
+        }
+        panic!(
+            "host failed: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
+    std::fs::read_to_string(&telemetry).expect("telemetry JSON was written")
+}
+
+/// The presented surface is a second, descriptor-identical object that no pass
+/// wrote; the pass wrote another registered surface of the same shape.
+///
+/// The window must sample the object the pass actually drew (the exact uniform
+/// colour the frame-gate fragment writes), and the trace must name that
+/// resolution with `surface_path_pass_target`. Before the resolution this frame
+/// was counted as `surface_path_unrelated` and the window showed the undrawn
+/// surface's bytes.
+#[test]
+fn native_window_samples_the_pass_target_object_not_an_undrawn_surface() {
+    let json = run_drawn_window_frame(
+        "pass-target",
+        true,
+        |client| {
+            // The presented surface, the drawn object, the second MRT colour and
+            // the depth target all share one 128x96 RGBA8 shape.
+            client.register_texture_as(TEXTURE_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_texture_as(PASS_TARGET_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_texture_as(COLOR1_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_texture_as(DEPTH_ID, 7, 2, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_surface_as(SURFACE_ID, TEXTURE_ID);
+            // The drawn object is one of the host's registered surfaces, so the
+            // present path can adopt it without fabricating an alias.
+            client.register_surface_as(PASS_TARGET_SURFACE_ID, PASS_TARGET_ID);
+        },
+        |pipeline| {
+            drawn_frame_into(
+                pipeline,
+                DRAWN_WIDTH,
+                DRAWN_HEIGHT,
+                PASS_TARGET_ID,
+                SURFACE_ID,
+            )
+        },
+    );
+    if json.is_empty() {
+        return;
+    }
+
+    assert_eq!(
+        number_field(&json, "window_drawables"),
+        Some(1),
+        "the window must acquire one drawable: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "window_presented"),
+        Some(1),
+        "the window must present one drawable: {json}"
+    );
+    assert!(
+        json.contains("\"window_error\": null"),
+        "the window path reported an error: {json}"
+    );
+    // The resolution: the pass target was adopted, so the frame is a pass-target
+    // frame and not an unrelated-allocation frame.
+    assert_eq!(
+        number_field(&json, "surface_path_pass_target"),
+        Some(1),
+        "the presented frame must be the pass target: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "surface_path_unrelated"),
+        Some(0),
+        "a pass wrote a same-shape surface this frame, so no frame may be \
+         unrelated: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "surface_path_alias_missing"),
+        Some(0),
+        "the alias was resolved, not missing: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "composition_copies"),
+        Some(0),
+        "the resolution is an alias, not a copy: {json}"
+    );
+
+    // Exact pixel proof: the drawable holds the colour the fragment wrote into
+    // the pass target. The undrawn surface was cleared to transparent black, so
+    // any pixel read is the adopted object's content.
+    assert_eq!(
+        number_field(&json, "sampled_frames"),
+        Some(1),
+        "the frame probe must sample the presented drawable: {json}"
+    );
+    let non_black = number_field(&json, "non_black_pixels").expect("probe non_black_pixels");
+    let probe_pixels = number_field(&json, "probe_pixels").expect("probe probe_pixels");
+    assert_eq!(
+        non_black, probe_pixels,
+        "every sampled pixel must be the drawn colour: {json}"
+    );
+    assert!(
+        json.contains("\"uniform_color\": \"swatch_ff8000\""),
+        "the presented drawable must hold the exact drawn colour (255,128,0): {json}"
+    );
+    assert_ne!(
+        number_field(&json, "nonzero_bytes"),
+        Some(0),
+        "the sampled drawable must not be an all-zero surface: {json}"
+    );
+    assert!(
+        json.contains("\"fallback_clear\": false"),
+        "the drawn object reached the drawable, not the diagnostic clear: {json}"
+    );
+
+    eprintln!(
+        "native window pass-target gate: surface={DRAWN_WIDTH}x{DRAWN_HEIGHT} \
+         presented=1 surface_path_pass_target=1 surface_path_unrelated=0 \
+         non_black_pixels={non_black} uniform_color=swatch_ff8000"
+    );
+}
+
+/// Negative control for the resolution: the pass wrote a descriptor-identical
+/// object that is *not* one of the host's registered surfaces.
+///
+/// Such an object cannot be shown without fabricating an alias, so the frame
+/// presents nothing (the diagnostic clear) and stays counted as
+/// `surface_path_unrelated`. The probe must never read the foreign object's
+/// drawn colour.
+#[test]
+fn native_window_never_samples_an_unrelated_pass_target() {
+    let json = run_drawn_window_frame(
+        "unrelated",
+        true,
+        |client| {
+            client.register_texture_as(TEXTURE_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            // The pass target is registered as a texture only: it is not a
+            // present surface, so it has no alias the present path may use.
+            client.register_texture_as(PASS_TARGET_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_texture_as(COLOR1_ID, 0, 1, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_texture_as(DEPTH_ID, 7, 2, DRAWN_WIDTH, DRAWN_HEIGHT);
+            client.register_surface_as(SURFACE_ID, TEXTURE_ID);
+        },
+        |pipeline| {
+            drawn_frame_into(
+                pipeline,
+                DRAWN_WIDTH,
+                DRAWN_HEIGHT,
+                PASS_TARGET_ID,
+                SURFACE_ID,
+            )
+        },
+    );
+    if json.is_empty() {
+        return;
+    }
+
+    assert_eq!(
+        number_field(&json, "window_presented"),
+        Some(1),
+        "the window must present one (cleared) drawable: {json}"
+    );
+    assert!(
+        json.contains("\"window_error\": null"),
+        "the window path reported an error: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "surface_path_unrelated"),
+        Some(1),
+        "the unrelated-allocation path stays counted: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "surface_path_pass_target"),
+        Some(0),
+        "a foreign object must never be presented as the pass target: {json}"
+    );
+    assert!(
+        json.contains("\"surface_object_mismatch_reason\": \"surface-is-unrelated-allocation\""),
+        "the split is named, not folded into success: {json}"
+    );
+
+    // Nothing was sampled: the drawable is the diagnostic clear, so no pixel of
+    // the foreign object is read.
+    assert_eq!(
+        number_field(&json, "sampled_frames"),
+        Some(1),
+        "the frame probe must sample the presented drawable: {json}"
+    );
+    assert_eq!(
+        number_field(&json, "non_black_pixels"),
+        Some(0),
+        "a foreign allocation's pixels must not reach the drawable: {json}"
+    );
+    assert!(
+        json.contains("\"uniform_color\": \"swatch_0d1a33\""),
+        "the drawable must hold the diagnostic clear, not the drawn colour: {json}"
+    );
+    assert!(
+        json.contains("\"fallback_clear\": true"),
+        "the frame presented nothing: {json}"
+    );
+
+    eprintln!(
+        "native window unrelated gate: surface={DRAWN_WIDTH}x{DRAWN_HEIGHT} presented=1 \
+         surface_path_unrelated=1 surface_path_pass_target=0 non_black_pixels=0"
     );
 }
