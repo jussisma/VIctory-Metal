@@ -544,6 +544,8 @@ struct Stats {
     indirect_encoded: u64,
     render_passes_encoded: u64,
     clear_ops_encoded: u64,
+    /// ADR-052: handle class of the last `UnknownHandle` refusal.
+    unknown_handle_site: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -581,6 +583,7 @@ impl Default for Stats {
             indirect_encoded: 0,
             render_passes_encoded: 0,
             clear_ops_encoded: 0,
+            unknown_handle_site: None,
         }
     }
 }
@@ -854,6 +857,13 @@ impl BatchExecutor for DaemonExecutor {
             stats.indirect_encoded = counters.indirect;
             stats.render_passes_encoded = counters.render_passes;
             stats.clear_ops_encoded = counters.clear_ops;
+            if matches!(&result, Ok(reply) if reply.status == ReplyStatus::UnknownHandle) {
+                let site = victory_metal::macos::device::last_unknown_site().to_string();
+                stats.last_error = Some(format!(
+                    "the executor answered UnknownHandle at {site}"
+                ));
+                stats.unknown_handle_site = Some(site);
+            }
         }
         result
     }
@@ -1330,6 +1340,7 @@ fn write_telemetry(
             "  \"indirect_encoded\": {indirect_encoded},\n",
             "  \"render_passes_encoded\": {render_passes_encoded},\n",
             "  \"clear_ops_encoded\": {clear_ops_encoded},\n",
+            "  \"unknown_handle_site\": {unknown_handle_site},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0,\n",
@@ -1383,6 +1394,10 @@ fn write_telemetry(
         indirect_encoded = stats.indirect_encoded,
         render_passes_encoded = stats.render_passes_encoded,
         clear_ops_encoded = stats.clear_ops_encoded,
+        unknown_handle_site = stats
+            .unknown_handle_site
+            .as_deref()
+            .map_or_else(|| "null".to_string(), |site| format!("\"{site}\"")),
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
@@ -1677,6 +1692,7 @@ impl Clone for Stats {
             indirect_encoded: self.indirect_encoded,
             render_passes_encoded: self.render_passes_encoded,
             clear_ops_encoded: self.clear_ops_encoded,
+            unknown_handle_site: self.unknown_handle_site.clone(),
         }
     }
 }

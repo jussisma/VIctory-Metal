@@ -3380,6 +3380,39 @@ fn index_stride(index_type: IndexType) -> u64 {
 /// Returns the raw `MTLBuffer`, the byte offset and the declared range length.
 /// `None` means an unknown handle, zero field or an out-of-bounds range, which
 /// the caller reports as `UnknownHandle` exactly like [`Self::submit_batch`].
+/// ADR-052: the handle class preparation reached before it refused.
+///
+/// The reply status carries no reason, so the failing resolution names itself
+/// here; the host folds it into `telemetry.json` as `unknown_handle_site`.
+static UNKNOWN_SITE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Names of the bounded refusal sites, indexed by [`UNKNOWN_SITE`].
+pub const UNKNOWN_SITES: [&str; 8] = [
+    "unknown",
+    "buffer",
+    "texture",
+    "pipeline:compute",
+    "pipeline:mesh",
+    "pipeline:graphics",
+    "sampler",
+    "surface",
+];
+
+/// Records the resolution site that is about to be attempted.
+fn note_unknown_site(site: &'static str) {
+    let index = UNKNOWN_SITES
+        .iter()
+        .position(|candidate| *candidate == site)
+        .unwrap_or(0);
+    UNKNOWN_SITE.store(index as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The last resolution site that refused an unknown handle.
+pub fn last_unknown_site() -> &'static str {
+    let index = UNKNOWN_SITE.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    UNKNOWN_SITES[index % UNKNOWN_SITES.len()]
+}
+
 fn resolve_buffer_range(
     state: &DeviceState,
     allocations: &HashMap<(u64, u32), VmBufferId>,
@@ -3388,6 +3421,7 @@ fn resolve_buffer_range(
     offset: u64,
     length: u64,
 ) -> Option<(objc::Id, usize, u64)> {
+    note_unknown_site("buffer");
     if allocation_id == 0
         || generation == 0
         || length == 0
@@ -3420,6 +3454,7 @@ fn resolve_texture(
     allocation_id: u64,
     generation: u32,
 ) -> Option<(objc::Id, crate::macos::render::TextureInfo)> {
+    note_unknown_site("texture");
     if allocation_id == 0 || generation == 0 {
         return None;
     }
@@ -3761,6 +3796,7 @@ fn build_descriptor_table(
                 resources.push((texture, usage));
             }
             DescriptorTableEntryV3::Sampler(handle) if shape == DescriptorTableKind::Sampler => {
+                note_unknown_site("sampler");
                 let sampler = state
                     .samplers
                     .get(handle)
@@ -4214,6 +4250,7 @@ fn resolve_compute_pipeline(
             thread_limit: pipeline_thread_limit(pso),
         });
     }
+    note_unknown_site("pipeline:compute");
     let entry = resolve_content_pipeline(state, id, PipelineStage::Compute)?;
     // SAFETY: `entry` owns a live `MTLComputePipelineState`.
     let limit =
@@ -6159,6 +6196,11 @@ fn resolve_content_pipeline(
     id: u64,
     expected: PipelineStage,
 ) -> Result<&crate::macos::registry::PipelineEntry, PrepareAbort> {
+    note_unknown_site(match expected {
+        PipelineStage::Graphics => "pipeline:graphics",
+        PipelineStage::Compute => "pipeline:compute",
+        PipelineStage::Mesh => "pipeline:mesh",
+    });
     let pipeline = state
         .content_pipelines
         .get(&id)
@@ -6896,6 +6938,7 @@ impl DirectMetalTransport {
             if let CommandV3::Present(present) = command
                 && !state.surfaces.contains_key(&present.surface_id)
             {
+                note_unknown_site("surface");
                 self.note_refusal();
                 return Ok((reply(ReplyStatus::UnknownHandle), EncoderStats::default()));
             }
