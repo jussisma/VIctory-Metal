@@ -1941,6 +1941,24 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
 
         if !self.v3_references_valid(submission) {
+            if let Some((class, allocation_id, generation)) = submission
+                .commands
+                .iter()
+                .find_map(|command| self.v3_first_invalid_reference(command))
+            {
+                // The host binary installs no tracing subscriber: a bounded
+                // stderr line is what `host.log` keeps (ADR-054 diagnosis).
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NOTES: AtomicU64 = AtomicU64::new(0);
+                if NOTES.fetch_add(1, Ordering::Relaxed) < 16 {
+                    eprintln!(
+                        "victory-metal-host: submission {} references an unknown {class} id={allocation_id:#x} generation={generation} in_allocations={} in_textures={}",
+                        submission.sequence,
+                        self.allocations.contains_key(&allocation_id),
+                        self.textures.contains_key(&allocation_id),
+                    );
+                }
+            }
             self.note_refusal(
                 ReplyStatus::UnknownHandle,
                 "version 3 submission references an unregistered allocation, texture or sampler",
@@ -2151,8 +2169,91 @@ impl<E: BatchExecutor> IpcHost<E> {
         })
     }
 
-    fn reference_valid(&self, allocation_id: u64, generation: u32) -> bool {
-        if self.allocations.contains_key(&allocation_id) {
+    /// The first reference in `command` that fails validation, for the bounded
+    /// ADR-054 diagnostic. `None` when the command is valid.
+    fn v3_first_invalid_reference(
+        &self,
+        command: &CommandV3,
+    ) -> Option<(&'static str, u64, u32)> {
+        match command {
+            CommandV3::Dispatch1d(dispatch) => self.first_invalid_binding(&dispatch.bindings),
+            CommandV3::Dispatch3d(dispatch) => self.first_invalid_binding(&dispatch.bindings),
+            CommandV3::DispatchMesh(dispatch) => self.first_invalid_binding(&dispatch.bindings),
+            CommandV3::SetDescriptorTable(table) => table.bindings.iter().find_map(|entry| {
+                match entry {
+                    DescriptorTableEntryV3::Buffer(binding) => {
+                        (!self.range_valid(
+                            binding.allocation_id,
+                            binding.generation,
+                            binding.offset,
+                            binding.length,
+                        ))
+                        .then_some(("table-buffer", binding.allocation_id, binding.generation))
+                    }
+                    DescriptorTableEntryV3::Texture(handle) => (!self.textures.contains_key(handle))
+                        .then_some(("table-texture", *handle, BASE_GENERATION)),
+                    DescriptorTableEntryV3::Sampler(handle) => (!self.samplers.contains_key(handle))
+                        .then_some(("table-sampler", *handle, BASE_GENERATION)),
+                }
+            }),
+            CommandV3::BeginRenderPass(pass) => pass
+                .colors
+                .iter()
+                .find(|color| !self.reference_valid(color.allocation_id, color.generation))
+                .map(|color| ("colour-attachment", color.allocation_id, color.generation))
+                .or_else(|| {
+                    pass.depth_stencil
+                        .as_ref()
+                        .filter(|depth| {
+                            !self.reference_valid(depth.allocation_id, depth.generation)
+                        })
+                        .map(|depth| {
+                            ("depth-attachment", depth.allocation_id, depth.generation)
+                        })
+                }),
+            CommandV3::SetVertexBuffers(set) => set.buffers.iter().find_map(|buffer| {
+                (!self.range_valid(
+                    buffer.allocation_id,
+                    buffer.generation,
+                    buffer.offset,
+                    buffer.length,
+                ))
+                .then_some(("vertex-buffer", buffer.allocation_id, buffer.generation))
+            }),
+            CommandV3::SetIndexBuffer(binding) => (!self.range_valid(
+                binding.allocation_id,
+                binding.generation,
+                binding.offset,
+                binding.length,
+            ))
+            .then_some(("index-buffer", binding.allocation_id, binding.generation)),
+            CommandV3::SetRootBufferView(view) => (!self.range_valid(
+                view.allocation_id,
+                view.generation,
+                view.offset,
+                view.length,
+            ))
+            .then_some(("root-view", view.allocation_id, view.generation)),
+            _ => None,
+        }
+    }
+
+    fn first_invalid_binding(
+        &self,
+        bindings: &[BufferBinding],
+    ) -> Option<(&'static str, u64, u32)> {
+        bindings.iter().find_map(|binding| {
+            (!self.range_valid(
+                binding.allocation_id,
+                binding.generation,
+                binding.offset,
+                binding.length,
+            ))
+            .then_some(("dispatch-binding", binding.allocation_id, binding.generation))
+        })
+    }
+
+    fn reference_valid(&self, allocation_id: u64, generation: u32) -> bool {        if self.allocations.contains_key(&allocation_id) {
             return generation == BASE_GENERATION;
         }
         self.textures

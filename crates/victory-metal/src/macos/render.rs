@@ -41,7 +41,12 @@ const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
 /// `MTLPixelFormatDepth32Float`.
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: usize = 252;
 /// `MTLPixelFormatDepth32Float_Stencil8`.
-const MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8: usize = 253;
+///
+/// Apple's value is **260** (`MTLPixelFormatDepth24Unorm_Stencil8` is 253).
+/// The wrong constant here made `texture_info` reject every
+/// `D32_FLOAT_S8X24_UINT` attachment, which is why Boot #26 refused all 52
+/// `BeginRenderPass` batches on one depth target (ADR-054).
+const MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8: usize = 260;
 /// `MTLStorageModeShared`.
 const MTL_STORAGE_MODE_SHARED: usize = 0;
 /// `MTLStorageModePrivate`.
@@ -3034,6 +3039,22 @@ unsafe fn msg_send_copy_texture_to_buffer(
 mod tests {
     use super::*;
     use crate::transport::MetalTransport;
+
+    /// Apple's `MTLPixelFormatDepth32Float_Stencil8` is 260, not 253
+    /// (`Depth24Unorm_Stencil8` is 253). The wrong constant here made every
+    /// `D32_FLOAT_S8X24_UINT` render attachment unresolvable and was the true
+    /// cause of Boot #26's 52 `BeginRenderPass` refusals (ADR-054).
+    #[test]
+    fn depth32_float_stencil8_uses_metals_real_pixel_format_value() {
+        assert_eq!(PixelFormat::Depth32FloatStencil8.mtl_pixel_format(), 260);
+        assert_eq!(
+            PixelFormat::from_mtl_pixel_format(260),
+            Some(PixelFormat::Depth32FloatStencil8)
+        );
+        assert_eq!(PixelFormat::from_mtl_pixel_format(253), None);
+        assert!(PixelFormat::Depth32FloatStencil8.is_depth());
+        assert!(PixelFormat::Depth32FloatStencil8.has_stencil());
+    }
 
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 64;

@@ -3624,16 +3624,63 @@ fn resolve_texture(
 ) -> Option<(objc::Id, crate::macos::render::TextureInfo)> {
     note_unknown_site("texture");
     if allocation_id == 0 || generation == 0 {
+        note_attachment_miss(format_args!(
+            "reference is zero id={allocation_id:#x} generation={generation}"
+        ));
         return None;
     }
-    let registered_id = *allocations.get(&(allocation_id, generation))?;
+    let Some(registered_id) = allocations.get(&(allocation_id, generation)).copied() else {
+        note_attachment_miss(format_args!(
+            "not in the session snapshot id={allocation_id:#x} generation={generation} snapshot={} in_textures={} in_registry={}",
+            allocations.len(),
+            state.textures.contains_key(&allocation_id),
+            state.registry_textures.contains_key(&allocation_id),
+        ));
+        return None;
+    };
     if let Some(texture) = state.textures.get(&registered_id.0) {
-        let info = texture_info(texture.as_raw()).ok()?;
-        return Some((texture.as_raw(), info));
+        match texture_info(texture.as_raw()) {
+            Ok(info) => return Some((texture.as_raw(), info)),
+            Err(error) => {
+                // SAFETY: a live `MTLTexture`; `pixelFormat` is immutable.
+                let mtl = unsafe {
+                    objc::msg_send_usize_0(texture.as_raw(), objc::sel(c"pixelFormat"))
+                };
+                note_attachment_miss(format_args!(
+                    "registered texture has no readable geometry id={allocation_id:#x} mtl_format={mtl} error={error}"
+                ));
+                return None;
+            }
+        }
     }
-    let raw = resolve_registered_texture(state, registered_id.0)?;
-    let info = texture_info(raw).ok()?;
-    Some((raw, info))
+    let Some(raw) = resolve_registered_texture(state, registered_id.0) else {
+        note_attachment_miss(format_args!(
+            "registry handle does not resolve id={allocation_id:#x} generation={generation}"
+        ));
+        return None;
+    };
+    match texture_info(raw) {
+        Ok(info) => Some((raw, info)),
+        Err(error) => {
+            note_attachment_miss(format_args!(
+                "registry texture has no readable geometry id={allocation_id:#x} error={error}"
+            ));
+            None
+        }
+    }
+}
+
+/// Bounded host-stderr diagnostic for an attachment resolution failure.
+///
+/// The host binary does not install a tracing subscriber, so a `tracing` event
+/// would be dropped; this names the failed lookup in `host.log` at most 16
+/// times per process (ADR-054 diagnosis).
+fn note_attachment_miss(message: std::fmt::Arguments<'_>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOTES: AtomicU64 = AtomicU64::new(0);
+    if NOTES.fetch_add(1, Ordering::Relaxed) < 16 {
+        eprintln!("victory-metal-host: attachment {message}");
+    }
 }
 
 /// Resolves a transport texture handle through the ADR-013 texture registry.
@@ -4945,6 +4992,19 @@ fn prepare_compute_segment(
                             | RootParameterKind::UnorderedAccessView
                     ) {
                         transport.count_abi_refusal();
+                        // Bounded stderr: the host installs no subscriber
+                        // (ADR-054/Cycle 16 diagnosis).
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static NOTES: AtomicU64 = AtomicU64::new(0);
+                        if NOTES.fetch_add(1, Ordering::Relaxed) < 16 {
+                            eprintln!(
+                                "victory-metal-host: root view slot={} space={} register={} kind={:?}",
+                                view.slot,
+                                slot.space(),
+                                slot.register(),
+                                slot.kind(),
+                            );
+                        }
                         return Err(MetalError::InvalidArg(
                             "root buffer view names a non-buffer root parameter",
                         )
@@ -5846,6 +5906,19 @@ fn build_render_ops(
                             | RootParameterKind::UnorderedAccessView
                     ) {
                         transport.count_abi_refusal();
+                        // Bounded stderr: the host installs no subscriber
+                        // (ADR-054/Cycle 16 diagnosis).
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static NOTES: AtomicU64 = AtomicU64::new(0);
+                        if NOTES.fetch_add(1, Ordering::Relaxed) < 16 {
+                            eprintln!(
+                                "victory-metal-host: root view slot={} space={} register={} kind={:?}",
+                                view.slot,
+                                slot.space(),
+                                slot.register(),
+                                slot.kind(),
+                            );
+                        }
                         return Err(MetalError::InvalidArg(
                             "root buffer view names a non-buffer root parameter",
                         )
