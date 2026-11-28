@@ -2184,3 +2184,107 @@ used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
 - Worker `target/` directories pruned after every wave; zero orphaned
   processes; GPU lock free. Free SSD 42 GB (APFS snapshots hold the rest;
   `sudo tmutil` is outside authority).
+
+## 19. Cycle 19 — gate determinism restored, descriptor heaps on the wire, real primitive topologies
+
+### 19.1 What changed
+
+- **ADR-063 — gate determinism (test fixture, no weakened assertion).** The
+  pre-boot gate's `depth_test_pixels`/`back_face_cull_pixels` stages were
+  passing *vacuously* before ADR-060: `flush_render_abi` cleared pending
+  bindings after each draw, so the far and cull draws lost their counter UAV
+  and their `InterlockedAdd`s went nowhere. ADR-060 correctly made root
+  arguments persistent, which exposed the real semantics: the coverage shader
+  writes a UAV, so Metal runs **late fragment tests**, and a depth-rejected
+  fragment still increments the counter. With depth forced to `Always` the
+  presented checksum changes while the counters do not, proving the colour was
+  depth-rejected. The fixture now requests `[earlydepthstencil]`, so the probe
+  counts only fragments that pass the depth test. No gate constant, comparison,
+  stage or checksum check was changed.
+- **ADR-064 — `SetDescriptorHeaps` end to end.** Wire v3 opcode 54 carries the
+  active CBV_SRV_UAV and sampler heaps (allocation, generation, offset, GPU
+  base, stride, count, active). The guest tracks the heaps the title binds and
+  enumerates a root descriptor table **from the active heap**: the base handle
+  maps to a descriptor index, `VIEW_TAG` registry records are preferred, and
+  title-written console bytes are classified by their RDNA 2 bits (image,
+  V# buffer range, S# sampler). Lists that never call `SetDescriptorHeaps` keep
+  the registry fallback. Unknown table sizes end at the first unfilled slot and
+  never exceed the 32-entry wire cap; a known size above the cap stays a named
+  refusal. Host side, a mixed buffer+texture table now binds the partition the
+  declared slot can address and counts its residue, and a kind-less declared
+  table (the converter's own 24-byte descriptor array) binds the whole table in
+  wire order with nothing renumbered.
+- **ADR-065 — real primitive topologies.** The wire gained
+  `PrimitiveTopology::RectList`, the guest records a per-value
+  `IASetPrimitiveTopology` census, and the encoder keeps every wire topology
+  distinct (point, line, line strip, triangle, triangle strip) for indexed and
+  non-indexed draws. An Xbox rect list is expanded on the host: three vertices
+  per rect become two triangles with the fourth corner synthesized as
+  `v0 + v2 - v1`, in bounded shared-storage scratch. Unreadable/private ranges
+  and instanced/indexed/indirect combinations are counted under their own names
+  and never silently drawn as triangles.
+
+### 19.2 Windowed boots (probe on, draw trace on, state trace on)
+
+| metric | #33 (Cycle 18) | #34 | #35 | #36 |
+|---|---|---|---|---|
+| submissions / refused | 4227 / 0 | 16770 / 0 | 16770 / 0 | 15937 / 0 |
+| ABI refusals | 0 | 0 | 0 | 0 |
+| draws encoded | 136 | 136 | 145 | 154 |
+| draw indexed | 0 | 0 | 0 | 0 |
+| dispatches | 0 | 0 | 0 | 0 |
+| render passes | 138 | 138 | 147 | 156 |
+| ABI bound / unbound | 181 / 45 | 181 / 45 | 193 / 48 | 205 / 51 |
+| inert table acceptances | 90 | 90 | 96 | 102 |
+| distinct surfaces | 4 | 2 | 2 | 2 |
+| `surface_path_pass_target` | 0 | 2102 | 4198 | 3958 |
+| `surface_path_unrelated` | 2090 | 1 | 1 | 1 |
+| swapchain non-black px | 0 | 0 | 0 | 0 |
+| swapchain luma buckets | 1 | 1 | 1 | 1 |
+| uniform colour | transparent_black | same | same | same |
+| window frames presented | ~4180 | 4211 | 4212 | 4004 |
+| host p50 / p95 ms | 0.012 / 0.030 | 0.004 / 0.013 | 0.004 / 0.013 | 0.004 / 0.013 |
+| D3DMetal fallback | 0 | 0 | 0 | 0 |
+| host D3D12 attempts | 0 | 0 | 0 | 0 |
+
+Boot #34's first attempt refused 16,314 submissions: the new active-heap
+enumerator took the rest of a 446k-descriptor heap as the table run. Bounding an
+unknown-size run by the wire cap removed the refusal, and accepting
+`SetDescriptorHeaps` as a no-work list command (it is resolved guest-side)
+removed the two planner errors that followed.
+
+The topology census names the values the title really sends: `4`
+(`TriangleList`) and `17` (Xbox `RECTLIST`), which decides ADR-065's expansion
+path.
+
+### 19.3 What Boots #34–#36 proved and what they did not
+
+- Proved: every submission is accepted, the presented object is the surface a
+  pass targeted (`surface_path_unrelated` 2090 → 1), the guest encodes more
+  draws each wave (136 → 154) and passes (138 → 156), and the gate's depth and
+  cull stages are honest.
+- Not proved: any non-black pixel or title FPS. The composition fragment's
+  texture source is still unbound in the traced draws
+  (`fragment_texture_sources_declared=1`, `..._bound=0`), 102 of 154 draws bind
+  an inert table, no compute dispatch encodes (`dispatches_encoded=0` —
+  `Dispatch` is refused with "compute threadgroup size not set", and
+  `set_compute_threadgroup_size` still has no production caller), and the
+  presented drawable reads `transparent_black`.
+
+### 19.4 Gate and local tag
+
+`tools/macos/metal-poc/aaa-preboot-gate.sh --runs 2` exits **0 PASS** on both
+runs at this head (`run1_gate: ok=1`, `run2_gate: ok=1`,
+`not_observed=none`, identical presented checksum
+`11527919792119713699`, `d3dmetal_fallback_count=0`). Local annotated tag
+`cycle-19` marks this head.
+
+### 19.5 Counts at the integration head
+
+- `victory-metal` lib **487 passed / 0 failed / 10 ignored**; `victory-gpu`
+  **451 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus **3 / 0 / 1**;
+  `victory` bin **16 / 0 / 0** plus its integration binaries; Win64 `diag`
+  build, three Windows all-targets checks, x86_64 `victory-irconverter` and the
+  ARM64 `victory_metal_host` build all exit 0; `git diff --check` clean.
+- Worker `target/` directories pruned after every wave; zero orphaned
+  processes; GPU lock free.
