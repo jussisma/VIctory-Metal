@@ -21,17 +21,29 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::ffi::c_void;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::ptr::null_mut;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use victory_metal::MetalTransport;
 use victory_metal::VmBufferId;
-use victory_metal::macos::device::DirectMetalTransport;
+use victory_metal::macos::bindings::{
+    DescriptorTableKind, ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
+};
+use victory_metal::macos::device::{DirectMetalTransport, PipelineAbi};
+use victory_metal::macos::registry::{
+    PipelineStage, PipelineState, TextureDesc, TextureDimension, TextureFormat, TextureUsage,
+};
 use victory_metal::macos::render::{GraphicsPipeline, PixelFormat, RenderTarget};
 use victory_metal::macos::trace;
 use victory_metal::wire::ReplyStatus;
 use victory_metal::wire_v3::{
-    BeginRenderPass, ColorAttachment, CommandV3, CullMode, DrawState, FillMode, FrontFaceWinding,
-    LoadOp, PipelineRef, PrimitiveTopology, RasterizerState, ScissorRect, StoreOp, SubmissionV3,
-    Viewport,
+    BeginRenderPass, ColorAttachment, CommandV3, CopyBufferToTexture, CullMode, DescriptorKind,
+    DescriptorTableEntryV3, DescriptorTableV3, DrawState, FillMode, FrontFaceWinding, LoadOp,
+    PipelineRef, PrimitiveTopology, RasterizerState, ScissorRect, StoreOp, SubmissionV3, Viewport,
 };
 
 const EDGE: u32 = 64;
@@ -617,4 +629,365 @@ fn state_trace_names_the_encoder_state_of_a_4k_draw() {
         report.pass_sample_distinct_values
     );
     let _ = target;
+}
+
+// ---------------------------------------------------------------------------
+// ADR-069: the CONTENT of the textures a traced draw binds.
+//
+// Boot #37 bound the fragment table (`declared=1 bound=1 dropped=0`) yet every
+// sampled render target read back uniform zero. This case binds a non-zero
+// RGBA8 texture to the fragment and proves the new `sampled_textures` evidence
+// names its class and exact sampled counts instead of leaving "the texture was
+// black" and "the texture was non-zero" indistinguishable.
+// ---------------------------------------------------------------------------
+
+const SAMPLE_TEXTURE: u64 = 0x7000;
+const SAMPLE_ALLOC_TEXTURE: u64 = 0x7010;
+const SAMPLE_ALLOC_UPLOAD: u64 = 0x7011;
+const SAMPLE_TEXTURE_EDGE: u32 = 4;
+const SAMPLE_ROW_PITCH: usize = 256;
+const SAMPLE_PAGE_BYTES: usize = 16 * 1024;
+const SAMPLE_TARGET: u64 = 0x7001;
+const SAMPLE_ALLOC_TARGET: u64 = 0x7012;
+/// Every byte of every texel is non-zero, so `nonzero_bytes == sampled_bytes`.
+const SAMPLE_COLOR: [u8; 4] = [10, 20, 30, 255];
+
+/// Samples a reflected fragment texture table with an inline sampler, so the
+/// only wire table is the texture table the trace must describe.
+const SAMPLED_TEXTURE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TextureDescriptor {
+    texture2d<float> primary;
+    texture2d<float> duplicate;
+    long reserved;
+};
+
+struct TableAbi {
+    device TextureDescriptor *textures [[id(0)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut sampled_texture_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 sampled_texture_fragment(constant TableAbi &abi [[buffer(2)]]) {
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge, coord::normalized);
+    float4 texel = abi.textures[0].primary.sample(smp, float2(0.5, 0.5));
+    return float4(texel.r, texel.g, texel.b, 1.0);
+}
+"#;
+
+fn sampled_texture_tool(name: &str) -> Option<PathBuf> {
+    let output = Command::new("xcrun").args(["-f", name]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+struct SampledTextureTemp(PathBuf);
+
+impl SampledTextureTemp {
+    fn new(label: &str) -> Self {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path =
+            std::env::temp_dir().join(format!("victory-{label}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SampledTextureTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn sampled_texture_metallib(dir: &Path, source_text: &str) -> Vec<u8> {
+    let metal = sampled_texture_tool("metal").expect("the Metal toolchain (metal) must be installed");
+    let metallib =
+        sampled_texture_tool("metallib").expect("the Metal toolchain (metallib) must be installed");
+    let source = dir.join("sampled_texture.metal");
+    let air = dir.join("sampled_texture.air");
+    let library = dir.join("sampled_texture.metallib");
+    fs::write(&source, source_text).expect("write MSL source");
+    let compiled = Command::new(metal)
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&air)
+        .output()
+        .expect("spawn metal");
+    assert!(
+        compiled.status.success(),
+        "metal -c failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let linked = Command::new(metallib)
+        .arg(&air)
+        .arg("-o")
+        .arg(&library)
+        .output()
+        .expect("spawn metallib");
+    assert!(
+        linked.status.success(),
+        "metallib failed: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    fs::read(&library).expect("read compiled metallib")
+}
+
+/// A page-aligned zero-copy host page.
+struct SampledTextureHostPage {
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl SampledTextureHostPage {
+    fn new(len: usize) -> Self {
+        unsafe extern "C" {
+            fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+        }
+        let mut raw: *mut c_void = null_mut();
+        // SAFETY: `posix_memalign` writes a valid 16 KiB-aligned allocation.
+        let rc = unsafe { posix_memalign(&mut raw, 16 * 1024, len) };
+        assert_eq!(rc, 0, "posix_memalign failed");
+        assert!(!raw.is_null());
+        // SAFETY: `raw` is a fresh allocation of `len` writable bytes.
+        unsafe { std::ptr::write_bytes(raw.cast::<u8>(), 0, len) };
+        Self { ptr: raw, len }
+    }
+
+    fn write(&mut self, offset: usize, bytes: &[u8]) {
+        assert!(
+            offset + bytes.len() <= self.len,
+            "host page write out of bounds"
+        );
+        // SAFETY: `offset + bytes.len() <= self.len` and `self.ptr` is live.
+        unsafe {
+            let destination = self.ptr.cast::<u8>().add(offset);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+        }
+    }
+
+    fn raw(&self) -> *mut u8 {
+        self.ptr.cast()
+    }
+}
+
+impl Drop for SampledTextureHostPage {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn free(ptr: *mut c_void);
+        }
+        // SAFETY: `self.ptr` came from `posix_memalign` and is unregistered
+        // before this guard drops.
+        unsafe { free(self.ptr) };
+    }
+}
+
+fn sampled_texture_desc(width: u32, height: u32, label: &str) -> TextureDesc {
+    TextureDesc {
+        width,
+        height,
+        depth: 1,
+        mip_levels: 1,
+        sample_count: 1,
+        array_layers: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsage::color_attachment(),
+        label: Some(label.to_string()),
+    }
+}
+
+fn sampled_texture_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[RootParameterSpec {
+            kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+            size: 8,
+            register: 0,
+            space: 0,
+        }],
+    )
+    .expect("fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
+}
+
+fn sampled_texture_copy(destination: u64) -> CommandV3 {
+    CommandV3::CopyBufferToTexture(CopyBufferToTexture {
+        allocation_id: SAMPLE_ALLOC_UPLOAD,
+        generation: 1,
+        destination_allocation_id: destination,
+        destination_generation: 1,
+        offset: 0,
+        bytes_per_row: SAMPLE_ROW_PITCH as u32,
+        bytes_per_image: 0,
+        extent: [SAMPLE_TEXTURE_EDGE, SAMPLE_TEXTURE_EDGE, 1],
+        mip_level: 0,
+        slice: 0,
+        origin: [0, 0, 0],
+    })
+}
+
+/// A fragment table bound with a non-zero RGBA8 texture is classified
+/// `non-zero` with the exact bounded-grid byte count.
+#[test]
+#[ignore = "GPU hardware proof; run with --ignored --test-threads=1"]
+fn a_nonzero_bound_texture_is_classified_nonzero_with_exact_counts() {
+    enable_trace();
+    let dir = SampledTextureTemp::new("sampled-texture-trace");
+    let metallib = sampled_texture_metallib(dir.path(), SAMPLED_TEXTURE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+    for (handle, edge, label) in [
+        (SAMPLE_TEXTURE, SAMPLE_TEXTURE_EDGE, "sampled texture"),
+        (SAMPLE_TARGET, EDGE, "sample target"),
+    ] {
+        transport
+            .register_registry_texture(handle, sampled_texture_desc(edge, edge, label))
+            .expect("registry texture must create");
+    }
+
+    let mut upload = SampledTextureHostPage::new(SAMPLE_PAGE_BYTES);
+    upload.write(0, &[0xaau8; SAMPLE_PAGE_BYTES]);
+    for row in 0..SAMPLE_TEXTURE_EDGE as usize {
+        for column in 0..SAMPLE_TEXTURE_EDGE as usize {
+            upload.write(row * SAMPLE_ROW_PITCH + column * 4, &SAMPLE_COLOR);
+        }
+    }
+    // SAFETY: the page is a live, 16 KiB-aligned allocation that outlives the
+    // synchronous submission.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), SAMPLE_PAGE_BYTES) }
+        .expect("upload page must register");
+
+    let mut allocations = HashMap::new();
+    allocations.insert((SAMPLE_ALLOC_TARGET, 1), VmBufferId(SAMPLE_TARGET));
+    allocations.insert((SAMPLE_ALLOC_TEXTURE, 1), VmBufferId(SAMPLE_TEXTURE));
+    allocations.insert((SAMPLE_ALLOC_UPLOAD, 1), upload_id);
+
+    const HANDLE: u64 = 0x7F01;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "sampled_texture_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("sampled_texture_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            sampled_texture_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let submission = SubmissionV3 {
+        sequence: 901,
+        list: None,
+        commands: vec![
+            sampled_texture_copy(SAMPLE_ALLOC_TEXTURE),
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![ColorAttachment {
+                    allocation_id: SAMPLE_ALLOC_TARGET,
+                    generation: 1,
+                    mip_level: 0,
+                    slice: 0,
+                    load: LoadOp::Clear,
+                    store: StoreOp::Store,
+                    clear_color: [0.0, 0.0, 0.0, 1.0],
+                }],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef { pipeline_id: HANDLE }),
+            CommandV3::SetViewport(Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(EDGE),
+                height: f64::from(EDGE),
+                near: 0.0,
+                far: 1.0,
+            }),
+            CommandV3::SetScissor(ScissorRect {
+                x: 0,
+                y: 0,
+                width: EDGE,
+                height: EDGE,
+            }),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorTable(DescriptorTableV3 {
+                set: 0,
+                base_register: 0,
+                kind: DescriptorKind::Srv,
+                bindings: vec![DescriptorTableEntryV3::Texture(SAMPLE_TEXTURE)],
+            }),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, _stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("sampled-texture submission executes");
+    assert_eq!(reply.status, ReplyStatus::Ok, "submission status");
+    transport.wait_for_gpu().expect("GPU completes");
+
+    let record = trace::last_record().expect("the draw was described");
+    assert_eq!(
+        record.texture_bindings.len, 1,
+        "the fragment bound one texture: {}",
+        record.line()
+    );
+    assert!(
+        record.line().contains("textures_bound=1"),
+        "the draw line names the binding: {}",
+        record.line()
+    );
+
+    let evidence = trace::sampled_texture_evidence();
+    assert_eq!(evidence.bindings_traced, 1, "{evidence:?}");
+    assert_eq!(evidence.submissions_sampled, 1, "{evidence:?}");
+    assert_eq!(evidence.textures_sampled, 1, "{evidence:?}");
+    assert_eq!(evidence.class_non_zero, 1, "{evidence:?}");
+    assert_eq!(evidence.class_zero, 0, "{evidence:?}");
+    let entry = evidence.bindings.first().expect("one binding published");
+    assert_eq!(entry.stage, "fragment");
+    assert_eq!(entry.format, "rgba8unorm");
+    assert_eq!((entry.width, entry.height), (4, 4));
+    assert!(!entry.sampled_is_pass_target, "the sample is not an RT");
+    assert_eq!(entry.class, trace::TEXTURE_CLASS_NONZERO);
+    // A 4x4 texture samples a 4x4 grid: 16 texels, every byte non-zero.
+    assert_eq!(entry.nonzero_bytes, 16 * 4);
+    assert_eq!(entry.sampled_bytes, 16 * 4);
+    assert_eq!(entry.distinct_pixels, 1);
+
+    let json = evidence.json_value();
+    assert!(json.contains("\"class\": \"non-zero\""), "{json}");
+    assert!(json.contains("\"nonzero_bytes\": 64"), "{json}");
+    assert!(json.contains("\"format\": \"rgba8unorm\""), "{json}");
+
+    eprintln!("draw_trace_texture_gpu: {}", entry.line());
 }

@@ -56,6 +56,59 @@ pub const MAX_DISTINCT_PIXELS: u32 = 256;
 /// counted as dropped.
 pub const MAX_RT_HISTORY: usize = 32;
 
+/// ADR-069: fragment texture bindings described per traced draw.
+///
+/// The list is bounded so a draw that binds a large descriptor heap cannot grow
+/// the trace. Bindings past the cap are counted in
+/// [`TextureBindingList::dropped`] instead of being published.
+pub const MAX_TEXTURE_BINDINGS: usize = 8;
+
+/// ADR-069: fragment textures read back per submission.
+pub const MAX_TEXTURE_SAMPLES_PER_SUBMISSION: usize = 2;
+
+/// ADR-069: submissions whose bound fragment textures are read back per process.
+pub const MAX_TEXTURE_SAMPLE_SUBMISSIONS: u32 = 4;
+
+/// ADR-069: edge, in texels, of the bounded sampled-texture readback grid.
+pub const TEXTURE_SAMPLE_EDGE: u32 = 8;
+
+/// ADR-069: largest texture (in level-0 bytes) the tracer will read back.
+///
+/// A 3840x2160 RGBA8 target (the composition case) is ~33 MiB and fits. A larger
+/// texture is classified `unreadable` with reason [`TEXTURE_UNREADABLE_TOO_LARGE`]
+/// instead of allocating an unbounded readback buffer.
+pub const MAX_SAMPLED_TEXTURE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// ADR-069 class word: every sampled texel is zero.
+pub const TEXTURE_CLASS_ZERO: &str = "zero";
+
+/// ADR-069 class word: every sampled texel has at least one non-zero channel.
+pub const TEXTURE_CLASS_NONZERO: &str = "non-zero";
+
+/// ADR-069 class word: some sampled texels are non-zero and some are zero.
+pub const TEXTURE_CLASS_PARTIAL: &str = "partial";
+
+/// ADR-069 class word: the texture could not be read back.
+pub const TEXTURE_CLASS_UNREADABLE: &str = "unreadable";
+
+/// ADR-069 class word: the texture is not an RGBA8/BGRA8 colour format.
+pub const TEXTURE_CLASS_NOT_COLOR: &str = "not-a-color-format";
+
+/// ADR-069 class word: the binding was described but never read back.
+pub const TEXTURE_CLASS_UNSAMPLED: &str = "not-sampled";
+
+/// ADR-069 unreadable reason: the texture handle no longer resolves.
+pub const TEXTURE_UNREADABLE_GONE: &str = "gone";
+
+/// ADR-069 unreadable reason: a private-storage texture's readback failed.
+pub const TEXTURE_UNREADABLE_PRIVATE_STORAGE: &str = "private-storage";
+
+/// ADR-069 unreadable reason: the pixel format is not a colour format.
+pub const TEXTURE_UNREADABLE_NON_COLOR_FORMAT: &str = "non-color-format";
+
+/// ADR-069 unreadable reason: the texture exceeds [`MAX_SAMPLED_TEXTURE_BYTES`].
+pub const TEXTURE_UNREADABLE_TOO_LARGE: &str = "too-large";
+
 /// Environment flag that arms the tracer, read once.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -885,6 +938,15 @@ impl TraceReport {
     pub fn rt_evidence(&self) -> RtWriteEvidence {
         rt_write_evidence()
     }
+
+    /// ADR-069: the bounded fragment texture binding/sample evidence.
+    ///
+    /// It is read from the same process-wide log and is empty while the tracer
+    /// is off, so the host folds it beside `rt_evidence` without a second trace
+    /// path.
+    pub fn sampled_textures(&self) -> SampledTextureEvidence {
+        sampled_texture_evidence()
+    }
 }
 
 /// Attachment and pass context shared between [`TraceState::next_pass`] and
@@ -926,6 +988,8 @@ struct TraceLog {
     last_sample: Option<PixelStats>,
     /// ADR-068: bounded per-RT written-after-clear history.
     rts: RtHistory,
+    /// ADR-069: bounded fragment texture binding/sample evidence.
+    sampled_textures: SampledTextureLog,
 }
 
 static TRACE_LOG: OnceLock<Mutex<TraceLog>> = OnceLock::new();
@@ -1427,6 +1491,9 @@ pub struct AbiBindingSummary {
     pub fragment_source_unreachable: u32,
     /// Per-stage declared/encoded shape, indexed by [`abi_stage_name`].
     pub stages: [StageAbiShape; ABI_STAGE_SLOTS],
+    /// ADR-069: fragment texture bindings this draw bound (first
+    /// [`MAX_TEXTURE_BINDINGS`]).
+    pub fragment_textures: TextureBindingList,
 }
 
 impl AbiBindingSummary {
@@ -1448,6 +1515,473 @@ impl AbiBindingSummary {
     /// Bit mask: bit 0 constants, bit 1 view, bit 2 table.
     pub fn kind_bits(&self) -> u8 {
         u8::from(self.constants) | (u8::from(self.view) << 1) | (u8::from(self.table) << 2)
+    }
+}
+
+/// ADR-069: one fragment texture binding a traced draw bound.
+///
+/// `texture` is the opaque host texture handle, used only as a key for the
+/// bounded readback and never published: the telemetry carries the one-based
+/// [`TextureBindingList`] ordinal instead. Every other field is a fixed word or a
+/// dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureBindingInfo {
+    /// Opaque `MTLTexture` handle; never serialized.
+    pub texture: usize,
+    /// Metal pixel-format name (`rgba8unorm`, `bgra8unorm`, ...) or `unknown`.
+    pub format: &'static str,
+    /// Level-0 width in texels.
+    pub width: u32,
+    /// Level-0 height in texels.
+    pub height: u32,
+    /// Stage that bound it (`fragment` for every current caller).
+    pub stage: &'static str,
+    /// Whether the texture is a render target of any pass in this submission.
+    pub sampled_is_pass_target: bool,
+}
+
+impl Default for TextureBindingInfo {
+    fn default() -> Self {
+        Self {
+            texture: 0,
+            format: "none",
+            width: 0,
+            height: 0,
+            stage: "none",
+            sampled_is_pass_target: false,
+        }
+    }
+}
+
+/// ADR-069: the bounded first [`MAX_TEXTURE_BINDINGS`] fragment texture bindings
+/// of one traced draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureBindingList {
+    /// Retained bindings, in wire order.
+    pub bindings: [TextureBindingInfo; MAX_TEXTURE_BINDINGS],
+    /// Number of retained bindings (`<= MAX_TEXTURE_BINDINGS`).
+    pub len: u32,
+    /// Bindings the draw observed before the per-draw cap.
+    pub total: u32,
+}
+
+impl Default for TextureBindingList {
+    fn default() -> Self {
+        Self {
+            bindings: [TextureBindingInfo::default(); MAX_TEXTURE_BINDINGS],
+            len: 0,
+            total: 0,
+        }
+    }
+}
+
+impl TextureBindingList {
+    /// Appends one binding, keeping the first [`MAX_TEXTURE_BINDINGS`].
+    pub fn push(&mut self, binding: TextureBindingInfo) {
+        self.total = self.total.saturating_add(1);
+        let index = self.len as usize;
+        if index < MAX_TEXTURE_BINDINGS {
+            self.bindings[index] = binding;
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    /// Bindings observed past the per-draw cap.
+    pub fn dropped(&self) -> u32 {
+        self.total.saturating_sub(self.len)
+    }
+
+    /// Retained bindings as a slice.
+    pub fn as_slice(&self) -> &[TextureBindingInfo] {
+        &self.bindings[..self.len as usize]
+    }
+}
+
+/// ADR-069: one texture sample the host reads back after its submission commits.
+///
+/// It is an internal queue item, not telemetry: `texture` is the opaque handle
+/// the device retains, and `ordinal` addresses the published evidence entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingTextureSample {
+    /// One-based ordinal of the evidence entry this sample fills.
+    pub ordinal: u32,
+    /// Opaque `MTLTexture` handle to read back.
+    pub texture: usize,
+    /// Format name published with the binding.
+    pub format: &'static str,
+    /// Level-0 width in texels.
+    pub width: u32,
+    /// Level-0 height in texels.
+    pub height: u32,
+    /// Whether the texture is a render target of this submission.
+    pub sampled_is_pass_target: bool,
+}
+
+/// ADR-069: counts and class of one bounded texture grid sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureSampleStats {
+    /// Sampled bytes that are not zero.
+    pub nonzero_bytes: u64,
+    /// Bytes sampled (one grid texel is four bytes).
+    pub sampled_bytes: u64,
+    /// Distinct RGBA texels, saturated at [`MAX_DISTINCT_PIXELS`].
+    pub distinct_pixels: u32,
+    /// Texels sampled.
+    pub sampled_texels: u32,
+    /// Sampled texels with at least one non-zero channel.
+    pub nonzero_texels: u32,
+}
+
+impl Default for TextureSampleStats {
+    fn default() -> Self {
+        Self {
+            nonzero_bytes: 0,
+            sampled_bytes: 0,
+            distinct_pixels: 0,
+            sampled_texels: 0,
+            nonzero_texels: 0,
+        }
+    }
+}
+
+impl TextureSampleStats {
+    /// Derives the fixed class word from the sampled texels.
+    ///
+    /// `zero`: no texel has a non-zero channel. `non-zero`: every sampled texel
+    /// has one. `partial`: the grid mixes both, which is what a mostly black
+    /// composition target with a small lit region reads as.
+    pub fn class(&self) -> &'static str {
+        if self.sampled_texels == 0 || self.sampled_bytes == 0 {
+            TEXTURE_CLASS_ZERO
+        } else if self.nonzero_texels == 0 {
+            TEXTURE_CLASS_ZERO
+        } else if self.nonzero_texels >= self.sampled_texels {
+            TEXTURE_CLASS_NONZERO
+        } else {
+            TEXTURE_CLASS_PARTIAL
+        }
+    }
+}
+
+/// ADR-069: the outcome of one bounded texture readback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureSampleOutcome {
+    /// The texture was read and classified.
+    Sampled(TextureSampleStats),
+    /// The texture could not be read; the word is one of the
+    /// `TEXTURE_UNREADABLE_*` constants.
+    Unreadable(&'static str),
+    /// The texture's pixel format is not RGBA8/BGRA8.
+    NotColor,
+}
+
+impl TextureSampleOutcome {
+    /// The fixed class word this outcome publishes.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Sampled(stats) => stats.class(),
+            Self::Unreadable(_) => TEXTURE_CLASS_UNREADABLE,
+            Self::NotColor => TEXTURE_CLASS_NOT_COLOR,
+        }
+    }
+
+    /// The fixed unreadable reason, or `none`.
+    pub fn unreadable_reason(&self) -> &'static str {
+        match self {
+            Self::Sampled(_) => "none",
+            Self::Unreadable(reason) => reason,
+            Self::NotColor => TEXTURE_UNREADABLE_NON_COLOR_FORMAT,
+        }
+    }
+}
+
+/// ADR-069: one published fragment texture binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampledTextureEntry {
+    /// One-based ordinal of this binding in the process-wide list.
+    pub ordinal: u32,
+    /// Stage that bound it.
+    pub stage: &'static str,
+    /// Metal pixel-format name.
+    pub format: &'static str,
+    /// Level-0 width in texels.
+    pub width: u32,
+    /// Level-0 height in texels.
+    pub height: u32,
+    /// Whether the texture is a render target of the same submission.
+    pub sampled_is_pass_target: bool,
+    /// Whether a readback was attempted and classified.
+    pub sampled: bool,
+    /// Fixed class word (one of the `TEXTURE_CLASS_*` constants).
+    pub class: &'static str,
+    /// Non-zero bytes of the bounded grid sample.
+    pub nonzero_bytes: u64,
+    /// Bytes of the bounded grid sample.
+    pub sampled_bytes: u64,
+    /// Distinct RGBA texels of the bounded grid sample.
+    pub distinct_pixels: u32,
+    /// Fixed unreadable reason, or `none`.
+    pub unreadable_reason: &'static str,
+}
+
+impl Default for SampledTextureEntry {
+    fn default() -> Self {
+        Self {
+            ordinal: 0,
+            stage: "none",
+            format: "none",
+            width: 0,
+            height: 0,
+            sampled_is_pass_target: false,
+            sampled: false,
+            class: TEXTURE_CLASS_UNSAMPLED,
+            nonzero_bytes: 0,
+            sampled_bytes: 0,
+            distinct_pixels: 0,
+            unreadable_reason: "none",
+        }
+    }
+}
+
+impl SampledTextureEntry {
+    /// One log line: counts, class and format/size only.
+    pub fn line(&self) -> String {
+        format!(
+            "draw_trace_texture ordinal={} stage={} format={} size={}x{} \
+             sampled_is_pass_target={} class={} nonzero_bytes={} sampled_bytes={} \
+             distinct_pixels={} unreadable={}",
+            self.ordinal,
+            self.stage,
+            self.format,
+            self.width,
+            self.height,
+            if self.sampled_is_pass_target {
+                "yes"
+            } else {
+                "no"
+            },
+            self.class,
+            self.nonzero_bytes,
+            self.sampled_bytes,
+            self.distinct_pixels,
+            self.unreadable_reason
+        )
+    }
+}
+
+/// ADR-069: the bounded evidence for the fragment textures the traced draws bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SampledTextureEvidence {
+    /// Bindings published (`<= MAX_TEXTURE_BINDINGS`).
+    pub bindings_traced: u64,
+    /// Bindings observed past the caps.
+    pub bindings_dropped: u64,
+    /// Submissions whose first textures were read back.
+    pub submissions_sampled: u64,
+    /// Bindings a readback classified.
+    pub textures_sampled: u64,
+    /// Bindings that are also render targets of the same submission.
+    pub sampled_is_pass_target: u64,
+    /// Bindings classified `zero`.
+    pub class_zero: u64,
+    /// Bindings classified `non-zero`.
+    pub class_non_zero: u64,
+    /// Bindings classified `partial`.
+    pub class_partial: u64,
+    /// Bindings classified `unreadable`.
+    pub class_unreadable: u64,
+    /// Bindings classified `not-a-color-format`.
+    pub class_not_color: u64,
+    /// Unreadable bindings whose handle no longer resolved.
+    pub unreadable_gone: u64,
+    /// Unreadable bindings whose private-storage readback failed.
+    pub unreadable_private_storage: u64,
+    /// Bindings whose format is not a colour format.
+    pub unreadable_non_color_format: u64,
+    /// Bindings too large for a bounded readback.
+    pub unreadable_too_large: u64,
+    /// Per-binding rows in first-seen order.
+    pub bindings: Vec<SampledTextureEntry>,
+}
+
+impl SampledTextureEvidence {
+    /// The evidence as the `sampled_textures` JSON object.
+    ///
+    /// Field names, in emitted order: `bindings_traced`, `bindings_dropped`,
+    /// `submissions_sampled`, `textures_sampled`, `sampled_is_pass_target`,
+    /// `class_zero`, `class_non_zero`, `class_partial`, `class_unreadable`,
+    /// `class_not_color`, `unreadable_gone`, `unreadable_private_storage`,
+    /// `unreadable_non_color_format`, `unreadable_too_large`, `bindings`. Each
+    /// row carries `ordinal`, `stage`, `format`, `width`, `height`,
+    /// `sampled_is_pass_target`, `sampled`, `class`, `nonzero_bytes`,
+    /// `sampled_bytes`, `distinct_pixels` and `unreadable`.
+    pub fn json_members(&self) -> String {
+        let bindings = self
+            .bindings
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"ordinal\": {}, \"stage\": \"{}\", \"format\": \"{}\", \
+                     \"width\": {}, \"height\": {}, \"sampled_is_pass_target\": {}, \
+                     \"sampled\": {}, \"class\": \"{}\", \"nonzero_bytes\": {}, \
+                     \"sampled_bytes\": {}, \"distinct_pixels\": {}, \
+                     \"unreadable\": \"{}\"}}",
+                    entry.ordinal,
+                    entry.stage,
+                    entry.format,
+                    entry.width,
+                    entry.height,
+                    entry.sampled_is_pass_target,
+                    entry.sampled,
+                    entry.class,
+                    entry.nonzero_bytes,
+                    entry.sampled_bytes,
+                    entry.distinct_pixels,
+                    entry.unreadable_reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "\"bindings_traced\": {}, \"bindings_dropped\": {}, \
+             \"submissions_sampled\": {}, \"textures_sampled\": {}, \
+             \"sampled_is_pass_target\": {}, \"class_zero\": {}, \
+             \"class_non_zero\": {}, \"class_partial\": {}, \"class_unreadable\": {}, \
+             \"class_not_color\": {}, \"unreadable_gone\": {}, \
+             \"unreadable_private_storage\": {}, \"unreadable_non_color_format\": {}, \
+             \"unreadable_too_large\": {}, \"bindings\": [{}]",
+            self.bindings_traced,
+            self.bindings_dropped,
+            self.submissions_sampled,
+            self.textures_sampled,
+            self.sampled_is_pass_target,
+            self.class_zero,
+            self.class_non_zero,
+            self.class_partial,
+            self.class_unreadable,
+            self.class_not_color,
+            self.unreadable_gone,
+            self.unreadable_private_storage,
+            self.unreadable_non_color_format,
+            self.unreadable_too_large,
+            bindings
+        )
+    }
+
+    /// The evidence as one JSON object.
+    pub fn json_value(&self) -> String {
+        format!("{{{}}}", self.json_members())
+    }
+}
+
+/// ADR-069: bounded process-wide binding/sample log.
+#[derive(Default)]
+struct SampledTextureLog {
+    bindings: Vec<SampledTextureEntry>,
+    dropped: u64,
+    submissions: u64,
+}
+
+impl SampledTextureLog {
+    /// Publishes one draw's bindings and returns their one-based ordinals.
+    fn note_draw(&mut self, list: &TextureBindingList) -> [u32; MAX_TEXTURE_BINDINGS] {
+        let mut ordinals = [0u32; MAX_TEXTURE_BINDINGS];
+        self.dropped = self.dropped.saturating_add(u64::from(list.dropped()));
+        for (index, binding) in list.as_slice().iter().enumerate() {
+            if self.bindings.len() >= MAX_TEXTURE_BINDINGS {
+                self.dropped = self.dropped.saturating_add(1);
+                continue;
+            }
+            let ordinal = self.bindings.len() as u32 + 1;
+            ordinals[index] = ordinal;
+            self.bindings.push(SampledTextureEntry {
+                ordinal,
+                stage: binding.stage,
+                format: binding.format,
+                width: binding.width,
+                height: binding.height,
+                sampled_is_pass_target: binding.sampled_is_pass_target,
+                ..SampledTextureEntry::default()
+            });
+        }
+        ordinals
+    }
+
+    /// Silently ignores an ordinal that no published binding carries.
+    fn note_sample(&mut self, ordinal: u32, outcome: TextureSampleOutcome) {
+        if ordinal == 0 {
+            return;
+        }
+        let Some(entry) = self
+            .bindings
+            .iter_mut()
+            .find(|entry| entry.ordinal == ordinal)
+        else {
+            return;
+        };
+        entry.sampled = true;
+        entry.class = outcome.class();
+        entry.unreadable_reason = outcome.unreadable_reason();
+        if let TextureSampleOutcome::Sampled(stats) = outcome {
+            entry.nonzero_bytes = stats.nonzero_bytes;
+            entry.sampled_bytes = stats.sampled_bytes;
+            entry.distinct_pixels = stats.distinct_pixels;
+        }
+    }
+
+    /// The whole bounded log as the telemetry value.
+    fn evidence(&self) -> SampledTextureEvidence {
+        let mut evidence = SampledTextureEvidence {
+            bindings_traced: self.bindings.len() as u64,
+            bindings_dropped: self.dropped,
+            submissions_sampled: self.submissions,
+            bindings: self.bindings.clone(),
+            ..SampledTextureEvidence::default()
+        };
+        for entry in &self.bindings {
+            if entry.sampled_is_pass_target {
+                evidence.sampled_is_pass_target =
+                    evidence.sampled_is_pass_target.saturating_add(1);
+            }
+            if !entry.sampled {
+                continue;
+            }
+            evidence.textures_sampled = evidence.textures_sampled.saturating_add(1);
+            match entry.class {
+                TEXTURE_CLASS_ZERO => evidence.class_zero = evidence.class_zero.saturating_add(1),
+                TEXTURE_CLASS_NONZERO => {
+                    evidence.class_non_zero = evidence.class_non_zero.saturating_add(1)
+                }
+                TEXTURE_CLASS_PARTIAL => {
+                    evidence.class_partial = evidence.class_partial.saturating_add(1)
+                }
+                TEXTURE_CLASS_UNREADABLE => {
+                    evidence.class_unreadable = evidence.class_unreadable.saturating_add(1)
+                }
+                TEXTURE_CLASS_NOT_COLOR => {
+                    evidence.class_not_color = evidence.class_not_color.saturating_add(1)
+                }
+                _ => {}
+            }
+            match entry.unreadable_reason {
+                TEXTURE_UNREADABLE_GONE => {
+                    evidence.unreadable_gone = evidence.unreadable_gone.saturating_add(1)
+                }
+                TEXTURE_UNREADABLE_PRIVATE_STORAGE => {
+                    evidence.unreadable_private_storage =
+                        evidence.unreadable_private_storage.saturating_add(1)
+                }
+                TEXTURE_UNREADABLE_NON_COLOR_FORMAT => {
+                    evidence.unreadable_non_color_format =
+                        evidence.unreadable_non_color_format.saturating_add(1)
+                }
+                TEXTURE_UNREADABLE_TOO_LARGE => {
+                    evidence.unreadable_too_large = evidence.unreadable_too_large.saturating_add(1)
+                }
+                _ => {}
+            }
+        }
+        evidence
     }
 }
 
@@ -1512,6 +2046,9 @@ pub struct DrawRecord {
     pub fragment_source_unreachable: u32,
     /// Per-stage declared/encoded ABI shape, indexed by [`abi_stage_name`].
     pub stages: [StageAbiShape; ABI_STAGE_SLOTS],
+    /// ADR-069: fragment texture bindings the draw bound (first
+    /// [`MAX_TEXTURE_BINDINGS`]).
+    pub texture_bindings: TextureBindingList,
     /// Attachment the pass renders into, when known.
     pub target: Option<TraceTarget>,
 }
@@ -1598,6 +2135,28 @@ impl DrawRecord {
             Some(target) => out.push_str(&format!(" rt={}", target_name(&target))),
             None => out.push_str(" rt=none"),
         }
+        // ADR-069: the fragment textures this draw bound, counts and format/size
+        // only. The raw handle is never printed.
+        out.push_str(&format!(
+            " textures_bound={} textures_dropped={}",
+            self.texture_bindings.len,
+            self.texture_bindings.dropped()
+        ));
+        for (index, binding) in self.texture_bindings.as_slice().iter().enumerate() {
+            out.push_str(&format!(
+                " texture[{}]={}x{}:{}:{}:pass_target={}",
+                index + 1,
+                binding.width,
+                binding.height,
+                binding.format,
+                binding.stage,
+                if binding.sampled_is_pass_target {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+        }
         out
     }
 }
@@ -1634,6 +2193,14 @@ pub struct TraceState {
     pub last_pass_draws: u32,
     /// Attachment of the most recent record, published with the pass line.
     pub last_target: Option<TraceTarget>,
+    /// ADR-069: texture handles used as attachments by any pass of the current
+    /// submission, so a bound sample can report `sampled-is-pass-target`.
+    submission_targets: Vec<usize>,
+    /// ADR-069: first fragment textures of the current submission queued for a
+    /// bounded readback after commit (`<= MAX_TEXTURE_SAMPLES_PER_SUBMISSION`).
+    pending_texture_samples: Vec<PendingTextureSample>,
+    /// ADR-069: submissions whose fragment textures were read back.
+    texture_submissions: u32,
 }
 
 impl TraceState {
@@ -1642,16 +2209,51 @@ impl TraceState {
         self.records.len() >= MAX_TRACED_WORK
     }
 
+    /// ADR-069: starts a submission with the attachment handles it renders into.
+    ///
+    /// Called once per prepared submission before any draw is described, so a
+    /// bound fragment texture can be flagged as a render target of the same
+    /// submission. The pending readback queue is cleared here; a submission
+    /// whose encode fails never publishes a stale sample.
+    pub fn begin_submission(&mut self, targets: Vec<usize>) {
+        self.submission_targets = targets;
+        self.pending_texture_samples.clear();
+    }
+
+    /// Whether `texture` is a render target of the current submission.
+    pub fn is_pass_target(&self, texture: usize) -> bool {
+        self.submission_targets.contains(&texture)
+    }
+
+    /// ADR-069: takes the queued texture readbacks, respecting the process cap.
+    ///
+    /// A submission is counted only once its textures are actually about to be
+    /// read. Past [`MAX_TEXTURE_SAMPLE_SUBMISSIONS`] the queue is dropped so a
+    /// long boot never pays an unbounded number of readbacks.
+    pub fn take_texture_samples_for_readback(&mut self) -> Vec<PendingTextureSample> {
+        let mut pending = std::mem::take(&mut self.pending_texture_samples);
+        // Defensive: the queue is filled two-at-a-time, but the cap is enforced
+        // here too so no caller can widen the readback cost.
+        pending.truncate(MAX_TEXTURE_SAMPLES_PER_SUBMISSION);
+        if pending.is_empty() || self.texture_submissions >= MAX_TEXTURE_SAMPLE_SUBMISSIONS {
+            return Vec::new();
+        }
+        self.texture_submissions = self.texture_submissions.saturating_add(1);
+        pending
+    }
+
     /// Appends and formats one record when the process still traces.
     pub fn record(&mut self, record: DrawRecord) -> Option<String> {
         if self.saturated() {
             return None;
         }
         let line = record.line();
+        let bindings = record.texture_bindings;
         self.records.push(record);
         self.pending_draws = self.pending_draws.saturating_add(1);
         self.last_target = record.target;
         if enabled() {
+            let mut ordinals = [0u32; MAX_TEXTURE_BINDINGS];
             with_log(|log| {
                 log.records_described = log.records_described.saturating_add(1);
                 log.last_record = Some(record);
@@ -1660,7 +2262,35 @@ impl TraceState {
                 if let Some(target) = record.target {
                     log.rts.note_draw_target(target);
                 }
+                // ADR-069: publish the draw's fragment texture bindings.
+                ordinals = log.sampled_textures.note_draw(&bindings);
             });
+            // Queue the first distinct textures of this submission for a bounded
+            // readback. The ordinal addresses the entry published above.
+            for (index, binding) in bindings.as_slice().iter().enumerate() {
+                if self.pending_texture_samples.len() >= MAX_TEXTURE_SAMPLES_PER_SUBMISSION {
+                    break;
+                }
+                if self
+                    .pending_texture_samples
+                    .iter()
+                    .any(|sample| sample.texture == binding.texture)
+                {
+                    continue;
+                }
+                let ordinal = ordinals[index];
+                if ordinal == 0 {
+                    continue;
+                }
+                self.pending_texture_samples.push(PendingTextureSample {
+                    ordinal,
+                    texture: binding.texture,
+                    format: binding.format,
+                    width: binding.width,
+                    height: binding.height,
+                    sampled_is_pass_target: binding.sampled_is_pass_target,
+                });
+            }
         }
         Some(line)
     }
@@ -1926,6 +2556,119 @@ pub fn pixel_stats(bytes: &[u8]) -> PixelStats {
         distinct_pixels_after_draws: pixels.len() as u32,
         ..PixelStats::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-069: bounded fragment texture binding samples.
+//
+// Boot #37 made the fragment table bind (`declared=1 bound=1 dropped=0`) yet
+// every sampled render target read back uniform zero. The remaining question is
+// the CONTENT of the textures the fragment binds, not just whether a table
+// bound. The functions below describe the first eight bindings of the traced
+// draws and read back the first two textures of a submission through the same
+// bounded grid sample the render-target trace uses (8x8 texels, at most).
+// ---------------------------------------------------------------------------
+
+/// Counts one bounded texture grid sample without copying it.
+///
+/// `bytes` is a tightly packed grid of RGBA8/BGRA8 texels. A texel is non-zero
+/// when any of its four channels is non-zero; `distinct_pixels` saturates at
+/// [`MAX_DISTINCT_PIXELS`] like [`pixel_stats`].
+pub fn texture_sample_stats(bytes: &[u8]) -> TextureSampleStats {
+    let mut nonzero_bytes = 0u64;
+    let mut nonzero_texels = 0u32;
+    let mut sampled_texels = 0u32;
+    let mut pixels: Vec<[u8; 4]> = Vec::new();
+    for texel in bytes.chunks_exact(4) {
+        sampled_texels = sampled_texels.saturating_add(1);
+        let pixel = [texel[0], texel[1], texel[2], texel[3]];
+        if pixel.iter().any(|channel| *channel != 0) {
+            nonzero_texels = nonzero_texels.saturating_add(1);
+        }
+        for &byte in &pixel {
+            if byte != 0 {
+                nonzero_bytes += 1;
+            }
+        }
+        if pixels.len() as u32 >= MAX_DISTINCT_PIXELS {
+            continue;
+        }
+        if !pixels.contains(&pixel) {
+            pixels.push(pixel);
+        }
+    }
+    TextureSampleStats {
+        nonzero_bytes,
+        sampled_bytes: bytes.len() as u64,
+        distinct_pixels: pixels.len() as u32,
+        sampled_texels,
+        nonzero_texels,
+    }
+}
+
+/// Samples a bounded [`TEXTURE_SAMPLE_EDGE`]-square grid from a whole
+/// `RGBA8`/`BGRA8` texture image.
+///
+/// Unlike [`sample_grid`] this never touches the render-target sample context:
+/// it is the fragment-texture readback path. It returns an all-zero summary when
+/// the buffer is shorter than the declared extent, which the caller classifies
+/// as `zero` rather than inferring content that was never read.
+pub fn sample_texture_grid(bytes: &[u8], width: u32, height: u32) -> TextureSampleStats {
+    if width == 0 || height == 0 {
+        return TextureSampleStats::default();
+    }
+    let row_bytes = width as usize * 4;
+    if bytes.len() < row_bytes * height as usize {
+        return TextureSampleStats::default();
+    }
+    let edge = TEXTURE_SAMPLE_EDGE.min(width).min(height);
+    let step_x = (width / edge).max(1) as usize;
+    let step_y = (height / edge).max(1) as usize;
+    let mut sample = Vec::with_capacity((edge * edge * 4) as usize);
+    for row in 0..edge as usize {
+        let y = (row * step_y).min(height as usize - 1);
+        for column in 0..edge as usize {
+            let x = (column * step_x).min(width as usize - 1);
+            let at = y * row_bytes + x * 4;
+            sample.extend_from_slice(&bytes[at..at + 4]);
+        }
+    }
+    texture_sample_stats(&sample)
+}
+
+/// Records one bounded texture readback against its published binding.
+///
+/// The ordinal was assigned when the binding was published; an unknown ordinal
+/// is ignored so a late sample can never create a row.
+pub fn note_texture_sample(ordinal: u32, outcome: TextureSampleOutcome) {
+    with_log(|log| {
+        log.sampled_textures.note_sample(ordinal, outcome);
+        if let Some(entry) = log
+            .sampled_textures
+            .bindings
+            .iter()
+            .find(|entry| entry.ordinal == ordinal)
+        {
+            eprintln!("{}", entry.line());
+        }
+    });
+}
+
+/// Records that one submission's bound fragment textures are being read back.
+pub fn note_texture_submission() {
+    with_log(|log| {
+        log.sampled_textures.submissions = log.sampled_textures.submissions.saturating_add(1);
+    });
+}
+
+/// The process-wide bounded fragment texture evidence.
+///
+/// It is empty while the tracer is off: reading it never arms the tracer.
+pub fn sampled_texture_evidence() -> SampledTextureEvidence {
+    if !enabled() {
+        return SampledTextureEvidence::default();
+    }
+    with_log(|log| log.sampled_textures.evidence())
 }
 
 // ---------------------------------------------------------------------------
@@ -2418,6 +3161,7 @@ mod tests {
                 ps_tables_dropped_inert: 0,
                 fragment_source_unreachable: 0,
                 stages: [StageAbiShape::default(); ABI_STAGE_SLOTS],
+                texture_bindings: TextureBindingList::default(),
                 target: None,
             };
             assert!(state.record(record).is_some());
@@ -2453,6 +3197,7 @@ mod tests {
                     ps_tables_dropped_inert: 0,
                     fragment_source_unreachable: 0,
                     stages: [StageAbiShape::default(); ABI_STAGE_SLOTS],
+                    texture_bindings: TextureBindingList::default(),
                     target: None,
                 })
                 .is_none()
@@ -2588,6 +3333,7 @@ mod tests {
                 };
                 stages
             },
+            texture_bindings: TextureBindingList::default(),
             target: Some(TraceTarget {
                 texture: 0,
                 width: 1920,
@@ -3172,5 +3918,187 @@ mod tests {
         let stats = pixel_stats(&mixed);
         assert_eq!(stats.distinct_pixels_after_draws, 2);
         assert_eq!(stats.distinct_values, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-069: fragment texture binding sample. Every case is pure: no GPU,
+    // no environment flag, no process-wide state.
+    // -----------------------------------------------------------------------
+
+    fn texture_binding(texture: usize) -> TextureBindingInfo {
+        TextureBindingInfo {
+            texture,
+            format: "rgba8unorm",
+            width: 64,
+            height: 64,
+            stage: "fragment",
+            sampled_is_pass_target: false,
+        }
+    }
+
+    /// The class derivation separates an all-zero grid, a fully non-zero grid
+    /// and a mixed one, and counts bytes and texels independently.
+    #[test]
+    fn texture_class_derivation_names_zero_nonzero_and_partial() {
+        let zero = texture_sample_stats(&[0u8; 64]);
+        assert_eq!(zero.class(), TEXTURE_CLASS_ZERO);
+        assert_eq!(zero.nonzero_bytes, 0);
+        assert_eq!(zero.sampled_texels, 16);
+
+        let nonzero = texture_sample_stats(&[1u8, 2, 3, 255].repeat(16));
+        assert_eq!(nonzero.class(), TEXTURE_CLASS_NONZERO);
+        assert_eq!(nonzero.nonzero_bytes, 64);
+        assert_eq!(nonzero.sampled_bytes, 64);
+        assert_eq!(nonzero.distinct_pixels, 1);
+
+        // 15 non-zero texels and one zero texel: mixed content.
+        let mut mixed = [1u8, 2, 3, 255].repeat(16);
+        mixed[60..64].fill(0);
+        let partial = texture_sample_stats(&mixed);
+        assert_eq!(partial.class(), TEXTURE_CLASS_PARTIAL);
+        assert_eq!(partial.nonzero_texels, 15);
+        assert_eq!(partial.sampled_texels, 16);
+        assert_eq!(partial.distinct_pixels, 2);
+    }
+
+    /// The per-draw binding list keeps the first eight and counts the rest.
+    #[test]
+    fn the_texture_binding_list_is_capped_at_eight() {
+        let mut list = TextureBindingList::default();
+        for index in 0..MAX_TEXTURE_BINDINGS + 3 {
+            list.push(texture_binding(0x1000 + index));
+        }
+        assert_eq!(list.len as usize, MAX_TEXTURE_BINDINGS);
+        assert_eq!(list.total as usize, MAX_TEXTURE_BINDINGS + 3);
+        assert_eq!(list.dropped(), 3);
+        assert_eq!(list.as_slice().len(), MAX_TEXTURE_BINDINGS);
+        assert_eq!(list.as_slice()[0].texture, 0x1000);
+        assert_eq!(
+            list.as_slice()[MAX_TEXTURE_BINDINGS - 1].texture,
+            0x1000 + MAX_TEXTURE_BINDINGS - 1
+        );
+    }
+
+    /// The readback queue respects two textures per submission and four
+    /// submissions per process.
+    #[test]
+    fn texture_samples_are_capped_per_submission_and_process() {
+        let mut state = TraceState::default();
+        for submission in 0..MAX_TEXTURE_SAMPLE_SUBMISSIONS {
+            state.begin_submission(vec![0x1000]);
+            assert!(state.is_pass_target(0x1000));
+            for index in 0..MAX_TEXTURE_SAMPLES_PER_SUBMISSION + 2 {
+                state.pending_texture_samples.push(PendingTextureSample {
+                    ordinal: submission * 4 + index as u32 + 1,
+                    texture: 0x1000 + index,
+                    format: "rgba8unorm",
+                    width: 64,
+                    height: 64,
+                    sampled_is_pass_target: false,
+                });
+            }
+            let taken = state.take_texture_samples_for_readback();
+            assert_eq!(taken.len(), MAX_TEXTURE_SAMPLES_PER_SUBMISSION);
+        }
+        assert_eq!(state.texture_submissions, MAX_TEXTURE_SAMPLE_SUBMISSIONS);
+        state.begin_submission(vec![]);
+        state.pending_texture_samples.push(PendingTextureSample {
+            ordinal: 99,
+            texture: 0x2000,
+            format: "rgba8unorm",
+            width: 64,
+            height: 64,
+            sampled_is_pass_target: false,
+        });
+        assert!(
+            state.take_texture_samples_for_readback().is_empty(),
+            "the process cap holds"
+        );
+    }
+
+    /// The evidence JSON carries every class/reason key and the bound row shape.
+    #[test]
+    fn sampled_texture_evidence_json_names_the_classes() {
+        let mut log = SampledTextureLog::default();
+        let mut bindings = TextureBindingList::default();
+        bindings.push(TextureBindingInfo {
+            sampled_is_pass_target: true,
+            ..texture_binding(0x3000)
+        });
+        let ordinals = log.note_draw(&bindings);
+        assert_eq!(ordinals[0], 1);
+        log.note_sample(
+            ordinals[0],
+            TextureSampleOutcome::Sampled(texture_sample_stats(
+                &[0xff_u8, 0x10, 0x20, 0xff].repeat(8),
+            )),
+        );
+        let mut second = TextureBindingList::default();
+        second.push(texture_binding(0x3001));
+        let ordinals = log.note_draw(&second);
+        log.note_sample(
+            ordinals[0],
+            TextureSampleOutcome::Unreadable(TEXTURE_UNREADABLE_GONE),
+        );
+        let mut third = TextureBindingList::default();
+        third.push(texture_binding(0x3002));
+        let ordinals = log.note_draw(&third);
+        log.note_sample(ordinals[0], TextureSampleOutcome::NotColor);
+
+        log.submissions = 1;
+        let evidence = log.evidence();
+        assert_eq!(evidence.bindings_traced, 3);
+        assert_eq!(evidence.textures_sampled, 3);
+        assert_eq!(evidence.sampled_is_pass_target, 1);
+        assert_eq!(evidence.class_non_zero, 1);
+        assert_eq!(evidence.class_unreadable, 1);
+        assert_eq!(evidence.class_not_color, 1);
+        assert_eq!(evidence.unreadable_gone, 1);
+        assert_eq!(evidence.unreadable_non_color_format, 1);
+        let json = evidence.json_value();
+        for expected in [
+            "\"bindings_traced\": 3",
+            "\"bindings_dropped\": 0",
+            "\"submissions_sampled\": 1",
+            "\"textures_sampled\": 3",
+            "\"sampled_is_pass_target\": 1",
+            "\"class_zero\": 0",
+            "\"class_non_zero\": 1",
+            "\"class_unreadable\": 1",
+            "\"class_not_color\": 1",
+            "\"unreadable_gone\": 1",
+            "\"unreadable_non_color_format\": 1",
+            "\"ordinal\": 1",
+            "\"stage\": \"fragment\"",
+            "\"format\": \"rgba8unorm\"",
+            "\"width\": 64",
+            "\"height\": 64",
+            "\"sampled_is_pass_target\": true",
+            "\"sampled\": true",
+            "\"class\": \"non-zero\"",
+            "\"nonzero_bytes\": 32",
+            "\"unreadable\": \"gone\"",
+            "\"unreadable\": \"non-color-format\"",
+        ] {
+            assert!(json.contains(expected), "{expected} missing from {json}");
+        }
+        assert_eq!(
+            json.matches('{').count(),
+            json.matches('}').count(),
+            "balanced braces: {json}"
+        );
+    }
+
+    /// A bounded 8x8 grid reads only 64 texels from a larger texture.
+    #[test]
+    fn the_texture_grid_is_bounded_to_eight_squared() {
+        let mut image = vec![0u8; 64 * 64 * 4];
+        // A single lit texel at the origin; the 8x8 grid includes it.
+        image[0..4].copy_from_slice(&[1, 2, 3, 255]);
+        let stats = sample_texture_grid(&image, 64, 64);
+        assert_eq!(stats.sampled_texels, TEXTURE_SAMPLE_EDGE * TEXTURE_SAMPLE_EDGE);
+        assert_eq!(stats.sampled_bytes, 8 * 8 * 4);
+        assert_eq!(stats.nonzero_bytes, 4);
+        assert_eq!(stats.class(), TEXTURE_CLASS_PARTIAL);
     }
 }
