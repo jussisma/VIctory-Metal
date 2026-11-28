@@ -530,6 +530,9 @@ struct Stats {
     host_pipeline_translations_refused: u64,
     /// Stages answered from the host pool's disk cache.
     host_pipeline_cache_hits: u64,
+    /// ADR-067 diag: compute translation/registration/dispatch counters,
+    /// accumulated across sessions (Boot #38).
+    compute: victory_metal::ipc_host::ComputeTelemetry,
     /// Graphics pipelines whose descriptor came from the guest's `VMVD` v2
     /// layout (ADR-061).
     vertex_layout_guest: u64,
@@ -605,6 +608,7 @@ impl Default for Stats {
             host_pipeline_translations_ok: 0,
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
+            compute: victory_metal::ipc_host::ComputeTelemetry::default(),
             vertex_layout_guest: 0,
             vertex_layout_signature: 0,
             vertex_layout_ia_stride_unknown: 0,
@@ -1077,6 +1081,41 @@ fn publish_session_stats(stats: &Arc<Mutex<Stats>>, session: &SessionStats) {
     stats.host_pipeline_cache_hits = stats
         .host_pipeline_cache_hits
         .saturating_add(session.host_pipeline_cache_hits);
+    {
+        let compute = &mut stats.compute;
+        let incoming = &session.compute;
+        compute.stages_translated = compute
+            .stages_translated
+            .saturating_add(incoming.stages_translated);
+        compute.pipelines_registered = compute
+            .pipelines_registered
+            .saturating_add(incoming.pipelines_registered);
+        compute.threadgroup_parsed = compute
+            .threadgroup_parsed
+            .saturating_add(incoming.threadgroup_parsed);
+        compute.threadgroup_missing = compute
+            .threadgroup_missing
+            .saturating_add(incoming.threadgroup_missing);
+        compute.threadgroup_invalid = compute
+            .threadgroup_invalid
+            .saturating_add(incoming.threadgroup_invalid);
+        compute.dispatch_attempted = compute
+            .dispatch_attempted
+            .saturating_add(incoming.dispatch_attempted);
+        compute.dispatch_encoded = compute
+            .dispatch_encoded
+            .saturating_add(incoming.dispatch_encoded);
+        compute.dispatch_refused = compute
+            .dispatch_refused
+            .saturating_add(incoming.dispatch_refused);
+        for (class, count) in &incoming.refusal_classes {
+            let slot = compute.refusal_classes.entry(class).or_insert(0);
+            *slot = slot.saturating_add(*count);
+        }
+        if let Some(reason) = &incoming.last_refusal_reason {
+            compute.last_refusal_reason = Some(reason.clone());
+        }
+    }
     stats.vertex_layout_guest = stats
         .vertex_layout_guest
         .saturating_add(session.vertex_layout_guest);
@@ -1413,6 +1452,7 @@ fn write_telemetry(
             || "null".to_string(),
             |message| format!("\"{}\"", json_escape(message)),
         );
+    let compute_fields = stats.compute.json_fields();
     let host_translated_total: u64 = stats.host_translated_stages.iter().sum();
     let frame_probe = frame_probe_json();
     let draw_trace = draw_trace_json();
@@ -1463,6 +1503,7 @@ fn write_telemetry(
             "  \"host_pipeline_translations_ok\": {host_ok},\n",
             "  \"host_pipeline_translations_refused\": {host_refused},\n",
             "  \"host_pipeline_cache_hits\": {host_cache_hits},\n",
+            "  {compute_fields},\n",
             "  \"vertex_layout_guest\": {vertex_layout_guest},\n",
             "  \"vertex_layout_signature\": {vertex_layout_signature},\n",
             "  \"vertex_layout_ia_stride_unknown\": {vertex_layout_ia_stride_unknown},\n",
@@ -1547,6 +1588,7 @@ fn write_telemetry(
         host_ok = stats.host_pipeline_translations_ok,
         host_refused = stats.host_pipeline_translations_refused,
         host_cache_hits = stats.host_pipeline_cache_hits,
+        compute_fields = compute_fields,
         vertex_layout_guest = stats.vertex_layout_guest,
         vertex_layout_signature = stats.vertex_layout_signature,
         vertex_layout_ia_stride_unknown = stats.vertex_layout_ia_stride_unknown,
@@ -1865,6 +1907,7 @@ impl Clone for Stats {
             present_status: self.present_status,
             present_texture_id: self.present_texture_id,
             present_checksum: self.present_checksum,
+            compute: self.compute.clone(),
             window_presented: self.window_presented,
             window_drawables: self.window_drawables,
             window_error: self.window_error.clone(),
@@ -2222,6 +2265,16 @@ mod draw_trace_json_tests {
             "host_pipeline_translations_ok",
             "host_pipeline_translations_refused",
             "host_pipeline_cache_hits",
+            "compute_stages_translated",
+            "compute_pipelines_registered",
+            "compute_threadgroup_parsed",
+            "compute_threadgroup_missing",
+            "compute_threadgroup_invalid",
+            "compute_dispatches_attempted",
+            "compute_dispatches_encoded",
+            "compute_dispatches_refused",
+            "compute_refusal_classes",
+            "compute_last_refusal_reason",
             "vertex_layout_guest",
             "vertex_layout_signature",
             "vertex_layout_ia_stride_unknown",
