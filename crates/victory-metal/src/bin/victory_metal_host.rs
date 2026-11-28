@@ -1366,6 +1366,7 @@ fn write_telemetry(
     let descriptor_table_census =
         victory_metal::macos::trace::descriptor_table_refusal_census().json_value();
     let present_trace = victory_metal::macos::present::present_trace_report().json_value();
+    let memory_space = victory_metal::macos::memory_space_bind::telemetry();
 
     let json = format!(
         concat!(
@@ -1422,6 +1423,11 @@ fn write_telemetry(
             "  \"unknown_handle_id\": {unknown_handle_id},\n",
             "  \"memory_space_bound\": {memory_space_bound},\n",
             "  \"memory_space_bytes\": {memory_space_bytes},\n",
+            "  \"memory_space_updates\": {memory_space_updates},\n",
+            "  \"memory_space_pages\": {memory_space_pages},\n",
+            "  \"memory_space_invalidations\": {memory_space_invalidations},\n",
+            "  \"memory_space_bindings\": {memory_space_bindings},\n",
+            "  \"memory_space_misses\": {memory_space_misses},\n",
             "  \"abi_refusals\": {abi_refusals},\n",
             "  \"descriptor_table_refusal_census\": {descriptor_table_census},\n",
             "  \"present_trace\": {present_trace},\n",
@@ -1488,6 +1494,11 @@ fn write_telemetry(
         unknown_handle_id = stats.unknown_handle_id,
         memory_space_bound = stats.memory_space_bound,
         memory_space_bytes = stats.memory_space_bytes,
+        memory_space_updates = memory_space.updates,
+        memory_space_pages = memory_space.pages,
+        memory_space_invalidations = memory_space.invalidations,
+        memory_space_bindings = memory_space.bindings,
+        memory_space_misses = memory_space.misses,
         abi_refusals = stats.abi_refusals,
         descriptor_table_census = descriptor_table_census,
         present_trace = present_trace,
