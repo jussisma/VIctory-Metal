@@ -16,6 +16,7 @@ pub mod pagetable;
 pub mod present;
 pub mod registry;
 pub mod render;
+pub(crate) mod root_arguments;
 pub mod residency;
 pub mod retire;
 pub mod state;

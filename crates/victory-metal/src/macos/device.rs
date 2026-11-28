@@ -4584,37 +4584,13 @@ fn abi_parameter_index(
     binding: &PendingAbiBinding,
 ) -> Option<usize> {
     let slot = binding.slot();
-    let index = binding.wire_slot();
-    // Converter reflection reports a descriptor table's Slot/Space as
-    // `u32::MAX`, so every table's reflected triple is identical: a triple
-    // lookup would bind the first table twice. The wire index is that path's
-    // only identity, and it is checked first whenever the layout agrees with it
-    // (an unknown `u32::MAX` field, or the exact declared pair).
-    if let Some(parameter) = layout.parameters().get(index)
-        && abi_kinds_compatible(parameter.kind(), slot.kind())
-        && (parameter.space() == slot.space() || parameter.space() == u32::MAX)
-        && (parameter.register() == slot.register() || parameter.register() == u32::MAX)
-    {
-        return Some(index);
-    }
-    if let Ok(Some(found)) = layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
-        return Some(found);
-    }
-    None
-}
-
-/// Whether a wire argument kind can address a reflected parameter kind.
-///
-/// A table is a table; converter reflection cannot distinguish its range kinds
-/// (`Table` is stored as `Unspecified`), so those match any table.
-fn abi_kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -> bool {
-    match (declared, named) {
-        (
-            RootParameterKind::DescriptorTable(_),
-            RootParameterKind::DescriptorTable(_),
-        ) => true,
-        (left, right) => left == right,
-    }
+    crate::macos::root_arguments::parameter_index(
+        layout,
+        binding.wire_slot(),
+        slot.space(),
+        slot.register(),
+        slot.kind(),
+    )
 }
 
 /// Whether one translated declaration binds the `(space, register)` a root
