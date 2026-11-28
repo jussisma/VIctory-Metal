@@ -5157,7 +5157,6 @@ fn flush_abi(
     // anything. A wire slot no layout declares is refused by name, never
     // silently dropped.
     for binding in &pending.bindings {
-        let slot = binding.slot();
         let mut declared = false;
         for (_stage, layout) in stages {
             if abi_parameter_index(layout, binding).is_some() {
@@ -5179,7 +5178,6 @@ fn flush_abi(
     for (_stage, layout) in stages {
         let mut bound = vec![false; layout.parameters().len()];
         for binding in &pending.bindings {
-            let slot = binding.slot();
             if let Some(index) = abi_parameter_index(layout, binding) {
                 bound[index] = true;
             }
@@ -5215,7 +5213,6 @@ fn flush_abi(
         let mut tables: Vec<ObjcObject> = Vec::new();
         let mut stage_bytes: Option<(usize, Vec<u8>)> = None;
         for binding in &pending.bindings {
-            let slot = binding.slot();
             let Some(index) = abi_parameter_index(layout, binding) else {
                 // The parameter belongs to another stage (root signatures are
                 // per-stage visible); it is not this stage's argument buffer.

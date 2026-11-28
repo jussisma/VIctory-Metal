@@ -246,7 +246,7 @@ use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
     TextureDimension, TextureFormat, TextureUsage,
 };
-use crate::macos::vertex_layout::{VertexLayout, VertexStepFunction};
+use crate::macos::vertex_layout::VertexLayout;
 use crate::root_arguments::{RootParameterPlan, decode_root_plan};
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
@@ -3050,21 +3050,7 @@ impl<E: BatchExecutor> IpcHost<E> {
                     // stats are the only place a per-slot stride fallback is
                     // visible to telemetry.
                     match VertexLayout::decode_with_stats(&state[at..]) {
-                        Ok((layout, stats)) => {
-                            // The registry's descriptor apply is per-vertex
-                            // only (its file is outside this task's scope).
-                            // Refuse a per-instance slot by name instead of
-                            // silently stepping it per vertex.
-                            if let Some(slot) = layout
-                                .slots()
-                                .iter()
-                                .find(|slot| slot.step_function == VertexStepFunction::PerInstance)
-                            {
-                                return self.reject_host_translation(format!(
-                                    "vertex buffer {} is per-instance; this host's descriptor apply is per-vertex only",
-                                    slot.buffer_index
-                                ));
-                            }
+                        Ok((_layout, stats)) => {
                             self.vertex_layout_guest = self.vertex_layout_guest.saturating_add(1);
                             self.vertex_layout_ia_stride_unknown = self
                                 .vertex_layout_ia_stride_unknown
