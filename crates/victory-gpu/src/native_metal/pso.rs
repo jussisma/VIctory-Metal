@@ -66,9 +66,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 #[cfg(not(test))]
 use std::sync::OnceLock;
+use std::sync::{Condvar, LazyLock, Mutex};
 
 #[cfg(windows)]
 use victory_metal::compiler_pool::PoolConfig;
@@ -254,6 +254,210 @@ impl std::fmt::Display for PipelineError {
 }
 
 impl std::error::Error for PipelineError {}
+
+/// The monotonic registration epoch and the in-flight counter behind it.
+///
+/// A native pipeline registration and a render submission travel on
+/// independent sockets (ADR-041), so the render socket has no ordering
+/// guarantee of its own: a submission that selects a pipeline must not be
+/// handed to the host while that pipeline's registration is still in flight.
+/// Every registration settles the epoch exactly once, success or failure, and
+/// a submission that names a pipeline waits on the epoch it observed after
+/// enqueue. A successful registration also advances the separate
+/// [`successful_registrations`] counter, so the boot can tell a settled failure
+/// (which still has to release a waiter) from a hosted pipeline.
+///
+/// The guest is synchronous today: `pipeline::native_pipeline` holds the
+/// pipeline's cell across the registration exchange and only installs a host id
+/// after the reply, so no list can name a pipeline before its registration
+/// returns. The barrier is therefore an invariant guard and a regression test,
+/// not a change to the observed host ordering.
+#[derive(Debug)]
+struct RegistrationBarrier {
+    inner: Mutex<RegistrationState>,
+    settled: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct RegistrationState {
+    epoch: u64,
+    successful: u64,
+    in_flight: u64,
+    #[cfg(any(windows, test))]
+    poisoned: BTreeMap<[u8; 32], String>,
+}
+
+impl RegistrationBarrier {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(RegistrationState::default()),
+            settled: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistrationState> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn snapshot(&self) -> RegistrationSnapshot {
+        let state = self.lock();
+        RegistrationSnapshot {
+            epoch: state.epoch,
+            successful: state.successful,
+            in_flight: usize::try_from(state.in_flight).unwrap_or(usize::MAX),
+        }
+    }
+
+    fn begin(&self) -> PipelineRegistration {
+        let mut state = self.lock();
+        state.in_flight = state.in_flight.saturating_add(1);
+        drop(state);
+        PipelineRegistration { successful: false }
+    }
+
+    fn settle(&self, successful: bool) {
+        let mut state = self.lock();
+        state.epoch = state.epoch.saturating_add(1);
+        if successful {
+            state.successful = state.successful.saturating_add(1);
+        }
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.settled.notify_all();
+    }
+
+    fn wait_for_epoch(&self, required: u64) {
+        let mut state = self.lock();
+        while state.epoch < required {
+            state = self
+                .settled
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn poisoned(&self, key: &[u8; 32]) -> Option<String> {
+        self.lock().poisoned.get(key).cloned()
+    }
+
+    #[cfg(any(windows, test))]
+    fn poison(&self, key: [u8; 32], reason: &str) {
+        self.lock().poisoned.insert(key, reason.to_string());
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        let mut state = self.lock();
+        *state = RegistrationState::default();
+    }
+}
+
+static REGISTRATION_BARRIER: LazyLock<RegistrationBarrier> =
+    LazyLock::new(RegistrationBarrier::new);
+
+/// The registration state a submission observes at enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationSnapshot {
+    /// Settled registrations (successes and failures) so far.
+    pub epoch: u64,
+    /// Registrations that completed successfully.
+    pub successful: u64,
+    /// Registrations in flight when the snapshot was taken.
+    pub in_flight: usize,
+}
+
+/// A guard for one in-flight native pipeline registration.
+///
+/// Dropping the guard settles the registration. [`Self::succeeded`] marks it a
+/// success before the drop; every other path settles it as a failure, so a
+/// refused registration releases a waiting submission instead of leaving it
+/// blocked on an epoch that will never arrive.
+#[derive(Debug)]
+#[must_use = "a registration guard settles the epoch when it is dropped"]
+pub struct PipelineRegistration {
+    successful: bool,
+}
+
+impl PipelineRegistration {
+    /// Marks this registration as successful (settled on drop).
+    pub fn succeeded(mut self) {
+        self.successful = true;
+    }
+}
+
+impl Drop for PipelineRegistration {
+    fn drop(&mut self) {
+        REGISTRATION_BARRIER.settle(self.successful);
+    }
+}
+
+/// The current registration snapshot.
+pub fn registration_snapshot() -> RegistrationSnapshot {
+    REGISTRATION_BARRIER.snapshot()
+}
+
+/// The monotonic registration epoch: settled registrations so far.
+pub fn registration_epoch() -> u64 {
+    REGISTRATION_BARRIER.snapshot().epoch
+}
+
+/// Native pipeline registrations that completed successfully.
+pub fn successful_registrations() -> u64 {
+    REGISTRATION_BARRIER.snapshot().successful
+}
+
+/// Native pipeline registrations in flight right now.
+pub fn registrations_in_flight() -> usize {
+    REGISTRATION_BARRIER.snapshot().in_flight
+}
+
+/// Announces one native pipeline registration that is about to reach the host.
+///
+/// The returned guard must be marked [`PipelineRegistration::succeeded`] on a
+/// successful registration; its drop settles the epoch either way.
+pub fn begin_pipeline_registration() -> PipelineRegistration {
+    REGISTRATION_BARRIER.begin()
+}
+
+/// Waits until `required` registrations have settled.
+///
+/// A submission that observed `epoch + in_flight` at enqueue calls this before
+/// its frame reaches the render socket: it cannot overtake a registration that
+/// was already in flight. The wait is a condition variable, never a spin or a
+/// sleep loop; a failed registration settles the epoch, so the wait cannot
+/// outlive the registration's own socket timeout.
+pub fn wait_for_registration_epoch(required: u64) {
+    REGISTRATION_BARRIER.wait_for_epoch(required);
+}
+
+/// The cached refusal of a pipeline registration content key, if any.
+#[cfg(any(windows, test))]
+fn poisoned_pipeline(key: &[u8; 32]) -> Option<String> {
+    REGISTRATION_BARRIER.poisoned(key)
+}
+
+/// Marks a pipeline registration content key as permanently refused.
+#[cfg(any(windows, test))]
+fn poison_pipeline(key: [u8; 32], reason: &str) {
+    REGISTRATION_BARRIER.poison(key, reason);
+}
+
+/// Empties the registration barrier: tests start each case from a known state.
+#[cfg(test)]
+pub(crate) fn reset_registration_barrier() {
+    REGISTRATION_BARRIER.reset();
+}
+
+/// Serialises the tests that drive the process-global registration barrier.
+///
+/// The barrier is one instance per process by design; a test that holds a
+/// registration open must not race another test's reset or registration.
+#[cfg(test)]
+pub(crate) fn registration_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 /// Most bytes of one refusal reason retained in telemetry and logged.
 ///
@@ -2476,6 +2680,22 @@ fn register_with_host_translation(
         Some(upload_host_stage(&share, details.root_signature)?)
     };
     let state = host_pipeline_state(programs, details, kind)?;
+    // The content key is every input the host hashes into a pipeline; it is
+    // computed before the host call so a refused registration can be cached and
+    // a repeat of the same content refused locally.
+    let libraries: Vec<(PipelineStage, &[u8], &str)> = programs
+        .iter()
+        .map(|program| (program.stage, program.dxil.as_slice(), program.entry.as_str()))
+        .collect();
+    let details_key = PipelineDetails {
+        state: &state,
+        abi: &[],
+        root_signature: &[],
+    };
+    let key = registration_key(&stage_codes, &libraries, Some(&details_key));
+    if let Some(reason) = poisoned_pipeline(&key) {
+        return Err(PipelineError::Refused(reason));
+    }
     let kind_code = match kind {
         PipelineKind::Graphics => crate::native_metal::client::PIPELINE_KIND_GRAPHICS,
         PipelineKind::Mesh => crate::native_metal::client::PIPELINE_KIND_MESH,
@@ -2502,23 +2722,16 @@ fn register_with_host_translation(
     ) {
         Ok(id) => id,
         Err(crate::native_metal::queue::NativeQueueError::Refused(reason)) => {
-            return Err(PipelineError::HostTranslation(bounded_refusal_reason(&reason)));
+            let error = PipelineError::HostTranslation(bounded_refusal_reason(&reason));
+            poison_pipeline(key, &error.to_string());
+            return Err(error);
         }
         Err(error) => return Err(PipelineError::Transport(error.to_string())),
     };
 
     // The census memory only records that this content is hosted; a later
     // reconnect must still ask the (new) host session again.
-    let libraries: Vec<(PipelineStage, &[u8], &str)> = programs
-        .iter()
-        .map(|program| (program.stage, program.dxil.as_slice(), program.entry.as_str()))
-        .collect();
-    let details_key = PipelineDetails {
-        state: &state,
-        abi: &[],
-        root_signature: &[],
-    };
-    let _ = remember(registration_key(&stage_codes, &libraries, Some(&details_key)), id);
+    let _ = remember(key, id);
     Ok((id, PoolServing { warm: false }, AttemptOutcome::HostTranslated))
 }
 
@@ -2677,12 +2890,20 @@ fn register_translated_inner(
         stages,
         if v1_compute { None } else { Some(details) },
     );
+    if let Some(reason) = poisoned_pipeline(&key) {
+        // A content key the host already refused is never sent again: the
+        // registration error is cached, so a repeated list bind is refused
+        // locally instead of re-translating and re-sending it forever.
+        return Err(PipelineError::Refused(reason));
+    }
     if v1_compute {
         // No reflection was available: keep the original v1 frame. The host
         // binds nothing for this pipeline, which is exactly the old behaviour.
         let (_, metallib, entry) = stages[0];
-        let id = crate::native_metal::queue::register_pipeline(metallib, entry)
-            .map_err(map_queue_error)?;
+        let id = register_and_cache_refusal(
+            key,
+            crate::native_metal::queue::register_pipeline(metallib, entry).map_err(map_queue_error),
+        )?;
         return Ok((id, remember_outcome(key, id)));
     }
     for (stage, metallib, _) in stages {
@@ -2725,15 +2946,44 @@ fn register_translated_inner(
         };
         &state_storage
     };
-    let id = crate::native_metal::queue::register_pipeline_v2(
-        kind_code,
-        &wire,
-        state,
-        details.abi,
-        details.root_signature,
-    )
-    .map_err(map_queue_error)?;
+    let id = register_and_cache_refusal(
+        key,
+        crate::native_metal::queue::register_pipeline_v2(
+            kind_code,
+            &wire,
+            state,
+            details.abi,
+            details.root_signature,
+        )
+        .map_err(map_queue_error),
+    )?;
     Ok((id, remember_outcome(key, id)))
+}
+
+/// Runs one pipeline registration and caches a permanent refusal by content key.
+///
+/// A transport fault and a missing converter are environmental and deliberately
+/// not cached: the next attempt may reach a live host or a working pool. Every
+/// other failure is the host's or the shader's answer to these exact bytes, so a
+/// repeat registration of the same content is refused locally with the cached
+/// text instead of a second host round trip.
+#[cfg(any(windows, test))]
+fn register_and_cache_refusal(
+    key: [u8; 32],
+    result: Result<u64, PipelineError>,
+) -> Result<u64, PipelineError> {
+    match result {
+        Ok(id) => Ok(id),
+        Err(error) => {
+            if !matches!(
+                error,
+                PipelineError::Transport(_) | PipelineError::ConverterUnavailable(_)
+            ) {
+                poison_pipeline(key, &error.to_string());
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Maps a queue failure onto the PSO path's explicit error vocabulary.
@@ -2819,6 +3069,109 @@ fn pipeline_kind(stages: &[PipelineStage]) -> Result<PipelineKind, PipelineError
 mod tests {
     use super::*;
     use victory_metal::wire_v3::{BlendFactor, BlendOperation};
+
+    /// A compute stage set and details whose key a poison test can name exactly.
+    fn poisoned_key_fixture() -> (
+        [(PipelineStage, &'static [u8], &'static str); 1],
+        PipelineDetails<'static>,
+        [u8; 32],
+    ) {
+        let stages = [(PipelineStage::Compute, b"MTLB compute".as_slice(), "main")];
+        let details = PipelineDetails {
+            state: &[],
+            abi: b"VAB1",
+            root_signature: b"root",
+        };
+        let key = registration_key(&[PipelineStage::Compute], &stages, Some(&details));
+        (stages, details, key)
+    }
+
+    /// The registration epoch advances once per settled registration; the
+    /// success counter only moves for a success.
+    #[test]
+    fn the_registration_epoch_advances_on_every_settled_registration() {
+        let _serial = registration_test_lock();
+        reset_registration_barrier();
+        let before = registration_snapshot();
+        assert_eq!(before.epoch, 0);
+        assert_eq!(before.successful, 0);
+
+        let registration = begin_pipeline_registration();
+        assert_eq!(registrations_in_flight(), 1);
+        registration.succeeded();
+
+        let after_success = registration_snapshot();
+        assert_eq!(after_success.epoch, before.epoch + 1);
+        assert_eq!(after_success.successful, before.successful + 1);
+        assert_eq!(after_success.in_flight, 0);
+
+        // A failed registration must also settle the epoch, or a submission
+        // waiting on it would block forever even though the pipeline will
+        // never exist.
+        drop(begin_pipeline_registration());
+        let after_failure = registration_snapshot();
+        assert_eq!(after_failure.epoch, after_success.epoch + 1);
+        assert_eq!(
+            after_failure.successful, after_success.successful,
+            "a failure is not a successful registration"
+        );
+        assert_eq!(after_failure.in_flight, 0);
+    }
+
+    /// A waiter on the observed epoch does not return until the in-flight
+    /// registration settles, and a refused registration releases it too.
+    #[test]
+    fn a_waiter_on_the_registration_epoch_blocks_until_it_settles() {
+        let _serial = registration_test_lock();
+        reset_registration_barrier();
+        let registration = begin_pipeline_registration();
+        let snapshot = registration_snapshot();
+        let required = snapshot.epoch + snapshot.in_flight as u64;
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            wait_for_registration_epoch(required);
+            sender.send(()).expect("report the wake");
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "the waiter must not pass an unsettled registration"
+        );
+        drop(registration); // settles as a failure, never a success
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a settled registration releases the waiter");
+        waiter.join().expect("waiter thread");
+        assert_eq!(successful_registrations(), 0);
+    }
+
+    /// A refused registration content key is refused locally with the cached
+    /// text: the same bytes are never translated or sent to the host again.
+    #[test]
+    fn a_poisoned_pipeline_is_refused_locally_with_the_registration_error() {
+        let _serial = registration_test_lock();
+        reset_registration_barrier();
+        let (stages, details, key) = poisoned_key_fixture();
+        let cached = "the host refused the pipeline: pixel stage could not be translated";
+        poison_pipeline(key, cached);
+
+        let error = register_translated(&stages, &details)
+            .expect_err("a poisoned content key is refused before any host call");
+        assert_eq!(error, PipelineError::Refused(cached.to_string()));
+        assert!(
+            error.to_string().contains("pixel stage could not be translated"),
+            "{error}"
+        );
+
+        // The cache is keyed by content: different entry points do not inherit
+        // the refusal.
+        let other = [(PipelineStage::Compute, b"MTLB compute".as_slice(), "other")];
+        let other_error = register_translated(&other, &details)
+            .expect_err("no live host is configured in this test");
+        assert_ne!(other_error, PipelineError::Refused(cached.to_string()));
+    }
 
     #[test]
     fn stage_codes_match_the_converter() {

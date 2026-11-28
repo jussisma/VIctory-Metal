@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use victory_metal::wire::{ListIdentity, ReplyStatus, WireError};
-use victory_metal::wire_v3::{SubmissionV3, encode_submission_v3};
+use victory_metal::wire_v3::{CommandV3, SubmissionV3, encode_submission_v3};
 
 use crate::backend::GpuBackend;
 #[cfg(any(windows, test, target_os = "macos"))]
@@ -141,6 +141,87 @@ pub struct OutboundFrame {
     pub list: Option<ListIdentity>,
     /// Canonical v3 encoded bytes, handed to the sink unchanged.
     pub bytes: Vec<u8>,
+    /// The first work/handle-bearing command, for a refusal diagnostic.
+    pub(crate) probe: Option<RefusalProbe>,
+    /// The registration epoch this frame must not overtake, when it selects a
+    /// pipeline (see [`crate::native_metal::pso::wait_for_registration_epoch`]).
+    pub(crate) required_epoch: Option<u64>,
+}
+
+/// The first command of a submission that names what the list was doing.
+///
+/// This is guest-side attribution only: the Wire v3 `UnknownHandle` reply
+/// carries no per-handle site, so the queue records the first draw, dispatch,
+/// pipeline selection, binding, copy or present command and its exact index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusalProbe {
+    /// Zero-based index of the command in the submission.
+    pub index: u32,
+    /// Its wire opcode.
+    pub opcode: u16,
+    /// Its command class, one of `telemetry::refusal_sites`.
+    pub class: &'static str,
+}
+
+/// The command class of one command, if it is a work/handle-bearing command.
+fn command_class(command: &CommandV3) -> Option<&'static str> {
+    use crate::native_metal::telemetry::refusal_sites as sites;
+    match command {
+        CommandV3::Draw(_)
+        | CommandV3::DrawIndexed(_)
+        | CommandV3::DrawInstanced(_)
+        | CommandV3::DrawIndexedInstanced(_) => Some(sites::DRAW),
+        CommandV3::Dispatch1d(_) | CommandV3::Dispatch3d(_) => Some(sites::DISPATCH),
+        CommandV3::ExecuteIndirectDraw(_)
+        | CommandV3::ExecuteIndirectDrawIndexed(_)
+        | CommandV3::ExecuteIndirectDispatch(_)
+        | CommandV3::ExecuteIndirectDispatchMesh(_) => Some(sites::INDIRECT),
+        CommandV3::SetGraphicsPipeline(_) | CommandV3::SetPipeline(_) => {
+            Some(sites::PIPELINE_GRAPHICS)
+        }
+        CommandV3::SetMeshPipeline(_) => Some(sites::PIPELINE_MESH),
+        CommandV3::SetComputePipeline(_) => Some(sites::PIPELINE_COMPUTE),
+        CommandV3::SetVertexBuffers(_)
+        | CommandV3::SetIndexBuffer(_)
+        | CommandV3::SetRootBufferView(_)
+        | CommandV3::SetRootConstants(_)
+        | CommandV3::SetDescriptorTable(_)
+        | CommandV3::BeginRenderPass(_) => Some(sites::BINDING),
+        CommandV3::CopyBuffer(_)
+        | CommandV3::CopyTexture(_)
+        | CommandV3::CopyTextureRegion(_)
+        | CommandV3::CopyBufferToTexture(_)
+        | CommandV3::ResolveSubresource(_) => Some(sites::COPY),
+        CommandV3::Present(_) => Some(sites::PRESENT),
+        _ => None,
+    }
+}
+
+/// The first work/handle-bearing command of `commands`, in stream order.
+fn first_refusal_probe(commands: &[CommandV3]) -> Option<RefusalProbe> {
+    commands
+        .iter()
+        .enumerate()
+        .find_map(|(index, command)| {
+            command_class(command).map(|class| RefusalProbe {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                opcode: command.opcode(),
+                class,
+            })
+        })
+}
+
+/// Whether any command selects a host pipeline.
+fn selects_a_pipeline(commands: &[CommandV3]) -> bool {
+    commands.iter().any(|command| {
+        matches!(
+            command,
+            CommandV3::SetGraphicsPipeline(_)
+                | CommandV3::SetMeshPipeline(_)
+                | CommandV3::SetComputePipeline(_)
+                | CommandV3::SetPipeline(_)
+        )
+    })
 }
 
 /// Where the outbound submissions go.
@@ -325,11 +406,22 @@ impl<S: V3Sink> NativeQueue<S> {
             };
             let submission = assigned.as_ref().unwrap_or(submission);
             let bytes = encode_submission_v3(submission).map_err(NativeQueueError::Encode)?;
+            // A frame that selects a pipeline may not overtake a registration
+            // that was already in flight when it was enqueued. The requirement
+            // is the epoch every such registration settles at.
+            let required_epoch = selects_a_pipeline(&submission.commands).then(|| {
+                let registration = crate::native_metal::pso::registration_snapshot();
+                registration
+                    .epoch
+                    .saturating_add(u64::try_from(registration.in_flight).unwrap_or(u64::MAX))
+            });
             self.highest_sequence = self.highest_sequence.max(submission.sequence);
             encoded.push(OutboundFrame {
                 sequence: submission.sequence,
                 list: submission.list,
                 bytes,
+                probe: first_refusal_probe(&submission.commands),
+                required_epoch,
             });
         }
         let count = encoded.len();
@@ -354,22 +446,42 @@ impl<S: V3Sink> NativeQueue<S> {
         let mut statuses = Vec::with_capacity(self.outbound.len());
         let mut refusal = None;
         while let Some(frame) = self.outbound.pop_front() {
+            // A frame that selects a pipeline waits on the registration epoch
+            // it observed at enqueue: it never reaches the render socket ahead
+            // of a registration that was already in flight. The guest is
+            // synchronous today (no list can name an id before the kind 129
+            // reply), so this is the invariant guard, not a reordering.
+            if let Some(required) = frame.required_epoch {
+                #[cfg(test)]
+                flush_reached_pipeline_wait();
+                crate::native_metal::pso::wait_for_registration_epoch(required);
+            }
             match self.sink.send(&frame.bytes) {
+                Ok(ReplyStatus::UnknownHandle) => {
+                    self.sent += 1;
+                    note_refused_site(&frame, None);
+                    statuses.push(ReplyStatus::UnknownHandle);
+                }
                 Ok(status) => {
                     self.sent += 1;
                     statuses.push(status);
                 }
-                Err(error @ NativeQueueError::Refused(_)) => {
-                    // The host consumed the sequence and wrote a reply. The
-                    // frame is spent: keeping it would re-send an already
-                    // consumed sequence and poison the session.
-                    self.sent += 1;
-                    refusal.get_or_insert(error);
-                }
-                Err(error) => {
-                    self.outbound.push_front(frame);
-                    return Err(error);
-                }
+                Err(error) => match &error {
+                    NativeQueueError::Refused(reason) => {
+                        // The host consumed the sequence and wrote a reply. The
+                        // frame is spent: keeping it would re-send an already
+                        // consumed sequence and poison the session.
+                        self.sent += 1;
+                        if is_unknown_handle_refusal(reason) {
+                            note_refused_site(&frame, Some(reason.as_str()));
+                        }
+                        refusal.get_or_insert(error);
+                    }
+                    _ => {
+                        self.outbound.push_front(frame);
+                        return Err(error);
+                    }
+                },
             }
         }
         match refusal {
@@ -439,6 +551,65 @@ impl<S: V3Sink> NativeQueue<S> {
         self.outbound.clear();
         self.sent = 0;
     }
+}
+
+/// A test hook: a sender notified when a flush reaches a pipeline-epoch wait.
+///
+/// The barrier is observed, not guessed at: a test registers a channel and
+/// waits for the notification before completing the in-flight registration, so
+/// the ordering proof does not depend on thread scheduling.
+#[cfg(test)]
+static PIPELINE_WAIT_NOTIFY: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Installs (or clears) the pipeline-wait notification channel.
+#[cfg(test)]
+pub(crate) fn notify_on_pipeline_wait(sender: Option<std::sync::mpsc::Sender<()>>) {
+    *PIPELINE_WAIT_NOTIFY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = sender;
+}
+
+#[cfg(test)]
+fn flush_reached_pipeline_wait() {
+    if let Some(sender) = PIPELINE_WAIT_NOTIFY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        let _ = sender.send(());
+    }
+}
+
+/// Whether a host refusal text names `UnknownHandle`.
+///
+/// The Wire v3 reply status is not carried on [`NativeQueueError::Refused`]
+/// (only the formatted reason is), so the client's stable `Debug` spelling is
+/// the signal. `ExecutionFailed` refusals are not recorded as site details.
+fn is_unknown_handle_refusal(reason: &str) -> bool {
+    reason.contains("answered UnknownHandle")
+}
+
+/// Records one refused frame's guest-side site and logs its stable line.
+///
+/// `reason` is the host text when the transport carried it; an `UnknownHandle`
+/// reply has no trailer, so the record says that by keeping the reason empty.
+fn note_refused_site(frame: &OutboundFrame, reason: Option<&str>) {
+    use crate::native_metal::telemetry::{self, SubmitRefusalSite, refusal_sites};
+
+    let probe = frame.probe;
+    let site = SubmitRefusalSite {
+        sequence: frame.sequence,
+        list_id: frame.list.map_or(0, |list| list.list_id),
+        list_generation: frame.list.map_or(0, |list| list.list_generation),
+        command_index: probe.map(|probe| probe.index),
+        opcode: probe.map(|probe| probe.opcode),
+        class: probe.map_or(refusal_sites::UNCLASSIFIED, |probe| probe.class),
+        reason: reason.unwrap_or_default().to_string(),
+        registration_epoch: crate::native_metal::pso::registration_epoch(),
+    };
+    let record = telemetry::note_submit_refusal_site(site);
+    tracing::warn!("{}", telemetry::refusal_site_line(&record));
 }
 
 /// Where one submission batch spent its guest-side time.
@@ -1467,7 +1638,12 @@ pub fn register_pipeline(metallib: &[u8], entry: &str) -> Result<u64, NativeQueu
     })?;
     crate::native_metal::pso::write_metallib(&path, metallib)
         .map_err(NativeQueueError::Transport)?;
-    client.register_pipeline(ticket, entry)
+    let registration = crate::native_metal::pso::begin_pipeline_registration();
+    let result = client.register_pipeline(ticket, entry);
+    if result.is_ok() {
+        registration.succeeded();
+    }
+    result
 }
 
 /// One pre-translated stage of a version 2 pipeline registration.
@@ -1535,7 +1711,12 @@ pub fn register_pipeline_v2(
             .map_err(NativeQueueError::Transport)?;
         wire.push((stage.stage, ticket, stage.entry));
     }
-    client.register_pipeline_v2(kind, &wire, state, abi, root_signature)
+    let registration = crate::native_metal::pso::begin_pipeline_registration();
+    let result = client.register_pipeline_v2(kind, &wire, state, abi, root_signature);
+    if result.is_ok() {
+        registration.succeeded();
+    }
+    result
 }
 
 /// Connects the session queue from the environment exactly once per process.
@@ -2193,7 +2374,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
-    use victory_metal::wire_v3::{CommandV3, Present, decode_submission_v3};
+    use victory_metal::wire::Dispatch1d;
+    use victory_metal::wire_v3::{CommandV3, PipelineRef, Present, decode_submission_v3};
 
     use crate::object::S_OK;
     use crate::native_metal::bindings::{self, GuestRange, GuestRangeResolver, ResolveError};
@@ -2244,6 +2426,173 @@ mod tests {
                 sync_interval: 0,
             })],
         }
+    }
+
+    /// One compute pipeline selection followed by its dispatch.
+    fn compute_pipeline_submission(
+        sequence: u32,
+        list_id: u64,
+        pipeline_id: u64,
+    ) -> SubmissionV3 {
+        SubmissionV3 {
+            sequence,
+            list: Some(ListIdentity {
+                list_id,
+                list_generation: 1,
+            }),
+            commands: vec![
+                CommandV3::SetComputePipeline(PipelineRef { pipeline_id }),
+                CommandV3::Dispatch1d(Dispatch1d {
+                    pipeline_id,
+                    threads: 1,
+                    threads_per_group: 1,
+                    bindings: Vec::new(),
+                }),
+            ],
+        }
+    }
+
+    /// A sink that records the order in which sends arrive.
+    #[derive(Debug, Clone)]
+    struct OrderedSink {
+        order: Arc<(Mutex<Vec<&'static str>>, std::sync::Condvar)>,
+    }
+
+    impl V3Sink for OrderedSink {
+        fn send(&mut self, _bytes: &[u8]) -> Result<ReplyStatus, NativeQueueError> {
+            let (order, wake) = &*self.order;
+            order
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push("submission");
+            wake.notify_all();
+            Ok(ReplyStatus::Ok)
+        }
+    }
+
+    /// A submission that selects a pipeline cannot reach the render socket
+    /// before an in-flight registration settles: the flush waits on the epoch
+    /// it observed at enqueue. This is the ordering invariant behind the
+    /// pipeline-class `UnknownHandle` guard; the guest is synchronous today, so
+    /// the test drives the barrier directly.
+    #[test]
+    fn a_pipeline_submission_cannot_overtake_an_inflight_registration() {
+        use crate::native_metal::pso;
+
+        let _serial = pso::registration_test_lock();
+        pso::reset_registration_barrier();
+        let (ready, reached) = mpsc::channel();
+        notify_on_pipeline_wait(Some(ready));
+
+        let order = Arc::new((Mutex::new(Vec::<&'static str>::new()), std::sync::Condvar::new()));
+        let mut queue = NativeQueue::new(OrderedSink {
+            order: Arc::clone(&order),
+        });
+        let registration = pso::begin_pipeline_registration();
+        let handle = std::thread::spawn(move || {
+            let result = queue.submit(&[compute_pipeline_submission(1, 10, 7)]);
+            (queue, result)
+        });
+
+        reached
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the flush reached the pipeline epoch wait");
+        assert!(
+            order
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "the submission reached the host before the registration settled"
+        );
+
+        // The registration is ordered before the submission by completion, not
+        // by the test's thread scheduling.
+        order
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push("registration");
+        registration.succeeded();
+        let (_queue, result) = handle.join().expect("submission thread");
+        assert_eq!(result, Ok(ReplyStatus::Ok));
+        assert_eq!(
+            *order
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec!["registration", "submission"],
+            "registration completes before the submission is carried"
+        );
+        notify_on_pipeline_wait(None);
+    }
+
+    /// A submission that names no pipeline does not wait on a registration:
+    /// the barrier is scoped to the frames that can actually name a pipeline.
+    #[test]
+    fn a_submission_without_a_pipeline_does_not_wait_for_registration() {
+        use crate::native_metal::pso;
+
+        let _serial = pso::registration_test_lock();
+        pso::reset_registration_barrier();
+        let (ready, reached) = mpsc::channel();
+        notify_on_pipeline_wait(Some(ready));
+        let registration = pso::begin_pipeline_registration();
+        let mut queue = NativeQueue::new(RecordingSink::default());
+
+        assert_eq!(
+            queue.submit(&[submission(1, 10, 1)]),
+            Ok(ReplyStatus::Ok),
+            "a present-only frame is carried while a registration is in flight"
+        );
+        assert!(
+            reached.try_recv().is_err(),
+            "the present path never waits on a pipeline epoch"
+        );
+        drop(registration);
+        notify_on_pipeline_wait(None);
+    }
+
+    /// A pipeline-class `UnknownHandle` names the first work command, the list
+    /// and the sequence, and the histogram counts the class exactly.
+    #[test]
+    fn an_unknown_handle_refusal_names_the_first_work_command() {
+        let _serial = serialized();
+        reset_sequences(1);
+        telemetry::global().reset_submit_refusal_sites_for_test();
+        let mut queue = NativeQueue::new(HostStatusSink::default());
+
+        let error = queue
+            .submit(&[compute_pipeline_submission(0, 21, 5)])
+            .expect_err("an odd list id is refused UnknownHandle");
+        assert!(matches!(error, NativeQueueError::Refused(_)), "{error:?}");
+
+        assert_eq!(
+            telemetry::global().refusal_site_histogram(),
+            std::collections::BTreeMap::from([(
+                telemetry::refusal_sites::PIPELINE_COMPUTE,
+                1
+            )])
+        );
+        assert_eq!(telemetry::global().unknown_handle_sites(), 1);
+        let sites = telemetry::global().submit_refusal_sites();
+        assert_eq!(sites.len(), 1, "the detail is retained and bounded");
+        let site = &sites[0];
+        assert_eq!(site.sequence, 1);
+        assert_eq!((site.list_id, site.list_generation), (21, 1));
+        assert_eq!(site.command_index, Some(0));
+        assert_eq!(
+            site.opcode,
+            Some(victory_metal::wire_v3::OP_SET_COMPUTE_PIPELINE)
+        );
+        assert_eq!(site.class, telemetry::refusal_sites::PIPELINE_COMPUTE);
+        assert!(
+            site.reason.contains("UnknownHandle"),
+            "the host reason is retained: {site:?}"
+        );
+        let line = telemetry::global().snapshot().to_string();
+        assert!(line.contains("refusal_sites=[pipeline:compute=1]"), "{line}");
+        assert!(line.contains("sequence=1 list=21 generation=1 index=0"), "{line}");
     }
 
     /// Two closed title lists submitted one after the other reach the sink in
@@ -3476,6 +3825,12 @@ mod tests {
         let _serial = serialized();
         reset_sequences(1);
         let mut queue = NativeQueue::new(HostStatusSink::default());
+        let sites_before = telemetry::global().unknown_handle_sites();
+        let present_before = telemetry::global()
+            .refusal_site_histogram()
+            .get(telemetry::refusal_sites::PRESENT)
+            .copied()
+            .unwrap_or(0);
 
         for index in 0..100u64 {
             let refused = queue.submit(&[submission(0, index * 2 + 1, 1)]);
@@ -3502,6 +3857,28 @@ mod tests {
         let mut distinct = queue.sink().sequences.clone();
         distinct.dedup();
         assert_eq!(distinct.len(), 200, "no sequence is sent twice");
+
+        // Every refusal is named exactly, and the retained detail stays at the
+        // fixed cap: a hundred interleaved refusals never grow the snapshot.
+        assert_eq!(
+            telemetry::global().unknown_handle_sites() - sites_before,
+            100,
+            "one site per refused submission, no more and no less"
+        );
+        assert_eq!(
+            telemetry::global()
+                .refusal_site_histogram()
+                .get(telemetry::refusal_sites::PRESENT)
+                .copied()
+                .unwrap_or(0)
+                - present_before,
+            100
+        );
+        assert!(
+            telemetry::global().submit_refusal_sites().len()
+                <= telemetry::MAX_SUBMIT_REFUSAL_SITES,
+            "the retained detail is bounded"
+        );
     }
 
     /// A retry after a refusal is a new submission with a new sequence: it

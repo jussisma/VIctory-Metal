@@ -769,6 +769,109 @@ pub const SUBMIT_REFUSAL_NAMES: &[&str] = &[
     submit_refusals::UNKNOWN,
 ];
 
+/// The fixed command classes a refused submission is attributed to.
+///
+/// The class is derived guest-side from the refused submission's own command
+/// stream: the first draw, dispatch, pipeline-select, binding, copy or present
+/// command names what the list was doing when the host answered an
+/// `UnknownHandle`. The Wire v3 reply carries no per-refusal site, so this is
+/// the guest's own attribution and never invents a host reason.
+///
+/// The table is fixed, exactly like [`submit_refusals`]: a class outside it is
+/// counted under [`UNCLASSIFIED`], so the histogram never grows and every
+/// retained detail has a name.
+pub mod refusal_sites {
+    /// A graphics (or legacy opcode 7) pipeline selection.
+    pub const PIPELINE_GRAPHICS: &str = "pipeline:graphics";
+    /// A mesh pipeline selection.
+    pub const PIPELINE_MESH: &str = "pipeline:mesh";
+    /// A compute pipeline selection.
+    pub const PIPELINE_COMPUTE: &str = "pipeline:compute";
+    /// A vertex/index/root/descriptor-table binding.
+    pub const BINDING: &str = "binding";
+    /// A draw call.
+    pub const DRAW: &str = "draw";
+    /// A compute dispatch.
+    pub const DISPATCH: &str = "dispatch";
+    /// A GPU-driven indirect draw or dispatch.
+    pub const INDIRECT: &str = "indirect";
+    /// A buffer/texture copy or resolve.
+    pub const COPY: &str = "copy";
+    /// A present.
+    pub const PRESENT: &str = "present";
+    /// A refusal whose command class is not in this table.
+    pub const UNCLASSIFIED: &str = "unclassified";
+}
+
+/// The fixed set of refusal-site names, in a stable order.
+pub const REFUSAL_SITE_NAMES: &[&str] = &[
+    refusal_sites::PIPELINE_GRAPHICS,
+    refusal_sites::PIPELINE_MESH,
+    refusal_sites::PIPELINE_COMPUTE,
+    refusal_sites::BINDING,
+    refusal_sites::DRAW,
+    refusal_sites::DISPATCH,
+    refusal_sites::INDIRECT,
+    refusal_sites::COPY,
+    refusal_sites::PRESENT,
+    refusal_sites::UNCLASSIFIED,
+];
+
+/// How many individual `UnknownHandle` refusals are retained with full detail.
+///
+/// The histogram counts every refusal exactly; only this many records are kept,
+/// so a boot with thousands of early refusals reports the same bounded snapshot
+/// as a boot with one. The first refusals are kept deliberately: the early
+/// low-sequence refusals are the ones a boot has to explain.
+pub const MAX_SUBMIT_REFUSAL_SITES: usize = 32;
+
+/// Maximum bytes of the host reason retained per refusal site.
+pub const MAX_REFUSAL_SITE_REASON_BYTES: usize = 96;
+
+/// One bounded guest-side record of a submission the host answered
+/// `UnknownHandle`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitRefusalSite {
+    /// Session sequence of the refused submission.
+    pub sequence: u32,
+    /// Command-list id the submission named (0 when it named none).
+    pub list_id: u64,
+    /// Command-list generation (0 when the submission named no list).
+    pub list_generation: u32,
+    /// Index of the first work/handle-bearing command in the submission.
+    pub command_index: Option<u32>,
+    /// Wire opcode of that command (`None` when the stream had no such command).
+    pub opcode: Option<u16>,
+    /// Static command class, from [`REFUSAL_SITE_NAMES`].
+    pub class: &'static str,
+    /// Bounded host reason trailer, empty when the reply carried none.
+    pub reason: String,
+    /// The pipeline registration epoch the frame was built against.
+    pub registration_epoch: u64,
+}
+
+impl SubmitRefusalSite {
+    /// The one compact field list the frame line and the boot log share.
+    pub fn fields(&self) -> String {
+        format!(
+            "sequence={} list={} generation={} index={} opcode={} class={} reason={}",
+            self.sequence,
+            self.list_id,
+            self.list_generation,
+            self.command_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string()),
+            self.opcode
+                .map_or_else(|| "none".to_string(), |opcode| opcode.to_string()),
+            self.class,
+            if self.reason.is_empty() {
+                "-"
+            } else {
+                self.reason.as_str()
+            }
+        )
+    }
+}
+
 /// The histogram slot for `reason`, if it is one of [`SUBMIT_REFUSAL_NAMES`].
 pub(crate) fn submit_refusal_index(reason: &str) -> Option<usize> {
     SUBMIT_REFUSAL_NAMES.iter().position(|&known| known == reason)
@@ -792,6 +895,18 @@ fn submit_refusal_name(reason: &'static str) -> &'static str {
             });
             submit_refusals::UNKNOWN
         }
+    }
+}
+
+/// The table name a refusal-site class is counted under.
+///
+/// An unregistered class is a caller bug, not a new bucket: it is counted under
+/// [`refusal_sites::UNCLASSIFIED`] so the histogram is a fixed set and its
+/// total always equals the retention counter.
+fn refusal_site_name(class: &'static str) -> &'static str {
+    match REFUSAL_SITE_NAMES.iter().find(|&&known| known == class) {
+        Some(&known) => known,
+        None => refusal_sites::UNCLASSIFIED,
     }
 }
 
@@ -819,6 +934,15 @@ pub struct FrameTelemetry {
     /// the same call, so a boot can never report a bare refusal count. Session
     /// totals: like the submit counters, they survive a window reset.
     named_submit_refusals: Mutex<BTreeMap<&'static str, u64>>,
+    /// `UnknownHandle` submissions by the guest-side command class that was in
+    /// flight (session totals, fixed key set).
+    refusal_sites: Mutex<BTreeMap<&'static str, u64>>,
+    /// Exact count of `UnknownHandle` submissions attributed to a site.
+    unknown_handle_sites: AtomicU64,
+    /// The first [`MAX_SUBMIT_REFUSAL_SITES`] refusal records, with detail.
+    submit_refusal_sites: Mutex<Vec<SubmitRefusalSite>>,
+    /// Refusals whose detail was not retained after the cap.
+    submit_refusal_site_overflow: AtomicU64,
     /// Frames the installed native presenter accepted.
     presents_ok: AtomicU64,
     /// Frames the native presenter (or its absence) refused.
@@ -1059,6 +1183,87 @@ impl FrameTelemetry {
             .clone()
     }
 
+    /// Records one submission the host answered `UnknownHandle`.
+    ///
+    /// The class histogram, the exact total and the bounded retention all move
+    /// together: the histogram names the command class the guest saw, the total
+    /// stays exact past [`MAX_SUBMIT_REFUSAL_SITES`], and only the first
+    /// records keep their full detail. The reason is sanitised to one line and
+    /// bounded to [`MAX_REFUSAL_SITE_REASON_BYTES`]. Returns the stored record
+    /// for the one log line the caller prints.
+    pub fn note_submit_refusal_site(&self, site: SubmitRefusalSite) -> SubmitRefusalSite {
+        let class = refusal_site_name(site.class);
+        let site = SubmitRefusalSite {
+            class,
+            reason: sanitize_refusal_site_reason(&site.reason),
+            ..site
+        };
+        self.unknown_handle_sites.fetch_add(1, Ordering::Relaxed);
+        *self
+            .refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(class)
+            .or_insert(0) += 1;
+        let mut retained = self
+            .submit_refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if retained.len() < MAX_SUBMIT_REFUSAL_SITES {
+            retained.push(site.clone());
+        } else {
+            self.submit_refusal_site_overflow
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        site
+    }
+
+    /// `UnknownHandle` submissions by guest-side command class.
+    pub fn refusal_site_histogram(&self) -> BTreeMap<&'static str, u64> {
+        self.refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Exact count of `UnknownHandle` submissions attributed to a site.
+    pub fn unknown_handle_sites(&self) -> u64 {
+        self.unknown_handle_sites.load(Ordering::Relaxed)
+    }
+
+    /// The retained refusal records, oldest first (at most the cap).
+    pub fn submit_refusal_sites(&self) -> Vec<SubmitRefusalSite> {
+        self.submit_refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Refusals whose detail was counted but not retained past the cap.
+    pub fn submit_refusal_site_overflow(&self) -> u64 {
+        self.submit_refusal_site_overflow.load(Ordering::Relaxed)
+    }
+
+    /// Empties the refusal-site totals, histogram and detail (tests only).
+    ///
+    /// The session totals are deliberately not reset in production; this hook
+    /// lets a test that asserts exact detail start from a known state without
+    /// touching the unrelated submit counters.
+    #[cfg(test)]
+    pub fn reset_submit_refusal_sites_for_test(&self) {
+        self.unknown_handle_sites.store(0, Ordering::Relaxed);
+        self.submit_refusal_site_overflow
+            .store(0, Ordering::Relaxed);
+        self.refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.submit_refusal_sites
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
     /// A frame the installed native presenter accepted.
     pub fn note_present_ok(&self) {
         self.presents_ok.fetch_add(1, Ordering::Relaxed);
@@ -1271,6 +1476,13 @@ impl FrameTelemetry {
             first_call_failure: self.call_failures.first(),
             heaps: self.heap_bindings(),
             named_submit_refusals: self.named_submit_refusal_histogram(),
+            refusal_sites: self.refusal_site_histogram(),
+            unknown_handle_sites: self.unknown_handle_sites(),
+            submit_refusal_sites: self.submit_refusal_sites(),
+            submit_refusal_site_overflow: self.submit_refusal_site_overflow(),
+            pipeline_registration_epoch: crate::native_metal::pso::registration_epoch(),
+            pipeline_registrations_successful: crate::native_metal::pso::successful_registrations(),
+            pipeline_registrations_in_flight: crate::native_metal::pso::registrations_in_flight(),
         }
     }
 
@@ -1386,6 +1598,20 @@ pub struct TelemetrySnapshot {
     /// in an early window stays counted, so the reason of the boot's one
     /// refusal is never lost to a later reset).
     pub named_submit_refusals: BTreeMap<&'static str, u64>,
+    /// `UnknownHandle` submissions by guest-side command class (session totals).
+    pub refusal_sites: BTreeMap<&'static str, u64>,
+    /// Exact count of `UnknownHandle` submissions attributed to a site.
+    pub unknown_handle_sites: u64,
+    /// The first [`MAX_SUBMIT_REFUSAL_SITES`] refusal records, oldest first.
+    pub submit_refusal_sites: Vec<SubmitRefusalSite>,
+    /// Refusals counted but not retained past the cap.
+    pub submit_refusal_site_overflow: u64,
+    /// Monotonic native pipeline registration epoch (settled registrations).
+    pub pipeline_registration_epoch: u64,
+    /// Native pipeline registrations that completed successfully.
+    pub pipeline_registrations_successful: u64,
+    /// Native pipeline registrations in flight when the snapshot was taken.
+    pub pipeline_registrations_in_flight: usize,
 }
 
 impl std::fmt::Display for TelemetrySnapshot {
@@ -1451,6 +1677,29 @@ impl std::fmt::Display for TelemetrySnapshot {
             )?,
             None => write!(f, " first_call_failure=none hr=0x0")?,
         }
+        write!(f, "{}", name_count_list(&self.refusal_sites, "refusal_sites"))?;
+        write!(
+            f,
+            ", unknown_handle_sites={} retained={}/{} overflow={}, registration_epoch={} \
+             successful={} in_flight={}",
+            self.unknown_handle_sites,
+            self.submit_refusal_sites.len(),
+            MAX_SUBMIT_REFUSAL_SITES,
+            self.submit_refusal_site_overflow,
+            self.pipeline_registration_epoch,
+            self.pipeline_registrations_successful,
+            self.pipeline_registrations_in_flight
+        )?;
+        if !self.submit_refusal_sites.is_empty() {
+            write!(f, ", refusal_site_detail=[")?;
+            for (index, site) in self.submit_refusal_sites.iter().enumerate() {
+                if index > 0 {
+                    write!(f, "; ")?;
+                }
+                write!(f, "{}", site.fields())?;
+            }
+            write!(f, "]")?;
+        }
         write!(
             f,
             "{}",
@@ -1498,6 +1747,38 @@ fn opcode_list(opcodes: &BTreeMap<u16, u64>, name: &str) -> String {
     }
     text.push(']');
     text
+}
+
+/// Sanitises a refusal-site reason into one bounded UTF-8 line.
+///
+/// Unlike [`sanitize_host_error`] an empty reason stays empty: an
+/// `UnknownHandle` reply carries no trailer, and the record must say that
+/// rather than invent a placeholder.
+fn sanitize_refusal_site_reason(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len().min(MAX_REFUSAL_SITE_REASON_BYTES));
+    for character in text.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if cleaned.len() + character.len_utf8() > MAX_REFUSAL_SITE_REASON_BYTES {
+            break;
+        }
+        if character == ' ' && (cleaned.is_empty() || cleaned.ends_with(' ')) {
+            continue;
+        }
+        cleaned.push(character);
+    }
+    cleaned.trim().to_string()
+}
+
+/// The stable single guest log line for one refused submission site.
+///
+/// The format is fixed so an operator can grep a boot log for
+/// `METAL_REFUSAL_SITE ` and read the sequence, list and command class.
+pub fn refusal_site_line(site: &SubmitRefusalSite) -> String {
+    format!("METAL_REFUSAL_SITE {}", site.fields())
 }
 
 /// Sanitises a host diagnostic into one bounded UTF-8 line.
@@ -1727,6 +2008,26 @@ pub fn note_submit_ok() {
 /// Records one refused native submission batch under its static reason.
 pub fn note_submit_refused(reason: &'static str) {
     global().note_submit_refused(reason);
+}
+
+/// Records one `UnknownHandle` submission in the process-wide telemetry.
+pub fn note_submit_refusal_site(site: SubmitRefusalSite) -> SubmitRefusalSite {
+    global().note_submit_refusal_site(site)
+}
+
+/// The process-wide `UnknownHandle` command-class histogram.
+pub fn refusal_site_histogram() -> BTreeMap<&'static str, u64> {
+    global().refusal_site_histogram()
+}
+
+/// The process-wide exact `UnknownHandle` site count.
+pub fn unknown_handle_sites() -> u64 {
+    global().unknown_handle_sites()
+}
+
+/// The process-wide retained `UnknownHandle` records.
+pub fn submit_refusal_sites() -> Vec<SubmitRefusalSite> {
+    global().submit_refusal_sites()
 }
 
 /// Records one accepted native present.
@@ -2648,5 +2949,133 @@ mod tests {
             from += found;
         }
         assert!(line.ends_with("named_submit_refusals=[]"), "{line}");
+    }
+
+    /// One refusal-site record with every field set.
+    fn site(sequence: u32, class: &'static str) -> SubmitRefusalSite {
+        SubmitRefusalSite {
+            sequence,
+            list_id: u64::from(sequence) + 100,
+            list_generation: 3,
+            command_index: Some(4),
+            opcode: Some(22),
+            class,
+            reason: "the host answered UnknownHandle for sequence".to_string(),
+            registration_epoch: 7,
+        }
+    }
+
+    /// Every refusal is counted exactly under its class, past the retention cap,
+    /// and the retained detail stays at the cap with the overflow counted.
+    #[test]
+    fn refusal_sites_are_exact_and_bounded() {
+        let telemetry = telemetry();
+        let overflow = 8;
+        for sequence in 1..=(MAX_SUBMIT_REFUSAL_SITES as u32 + overflow) {
+            let class = if sequence % 2 == 0 {
+                refusal_sites::PIPELINE_COMPUTE
+            } else {
+                refusal_sites::PRESENT
+            };
+            telemetry.note_submit_refusal_site(site(sequence, class));
+        }
+
+        let total = (MAX_SUBMIT_REFUSAL_SITES as u64) + u64::from(overflow);
+        assert_eq!(telemetry.unknown_handle_sites(), total);
+        let histogram = telemetry.refusal_site_histogram();
+        assert_eq!(
+            histogram,
+            BTreeMap::from([
+                (refusal_sites::PIPELINE_COMPUTE, total / 2),
+                (refusal_sites::PRESENT, total / 2),
+            ]),
+            "the histogram is exact past the cap"
+        );
+        assert_eq!(
+            histogram.values().sum::<u64>(),
+            telemetry.unknown_handle_sites(),
+            "the total equals the sum of the named classes"
+        );
+        assert_eq!(telemetry.submit_refusal_sites().len(), MAX_SUBMIT_REFUSAL_SITES);
+        assert_eq!(
+            telemetry.submit_refusal_site_overflow(),
+            u64::from(overflow),
+            "counted, not retained"
+        );
+        let line = telemetry.snapshot().to_string();
+        assert!(
+            line.contains(&format!(
+                "unknown_handle_sites={total} retained={MAX_SUBMIT_REFUSAL_SITES}/\
+                 {MAX_SUBMIT_REFUSAL_SITES} overflow={overflow}"
+            )),
+            "{line}"
+        );
+        assert!(line.contains("refusal_sites=[pipeline:compute="), "{line}");
+    }
+
+    /// A class outside the fixed table is not a new bucket: it is counted under
+    /// the fixed fallback, so the histogram can never grow.
+    #[test]
+    fn a_class_outside_the_table_uses_the_fixed_fallback() {
+        let telemetry = telemetry();
+        telemetry.note_submit_refusal_site(site(1, "not_a_refusal_class"));
+
+        assert_eq!(
+            telemetry.refusal_site_histogram(),
+            BTreeMap::from([(refusal_sites::UNCLASSIFIED, 1)])
+        );
+        assert!(telemetry.submit_refusal_sites()[0]
+            .class
+            .eq(refusal_sites::UNCLASSIFIED));
+    }
+
+    /// The reason is flattened to one line and bounded, and an empty reason
+    /// (the `UnknownHandle` reply has no trailer) stays empty.
+    #[test]
+    fn a_refusal_site_reason_is_bounded_and_an_absent_one_stays_empty() {
+        let telemetry = telemetry();
+        let mut long = site(1, refusal_sites::DRAW);
+        long.reason = "x".repeat(MAX_REFUSAL_SITE_REASON_BYTES * 4);
+        let stored = telemetry.note_submit_refusal_site(long);
+        assert_eq!(stored.reason.len(), MAX_REFUSAL_SITE_REASON_BYTES);
+        assert!(!stored.reason.contains('\n'));
+
+        let mut absent = site(2, refusal_sites::PIPELINE_GRAPHICS);
+        absent.reason.clear();
+        let stored = telemetry.note_submit_refusal_site(absent);
+        assert!(stored.reason.is_empty());
+        assert!(refusal_site_line(&stored).contains("reason=-"));
+    }
+
+    /// Refusal sites are session totals: a window reset keeps both the counts
+    /// and the retained detail so an early low-sequence refusal stays named.
+    #[test]
+    fn refusal_sites_survive_a_window_reset() {
+        let telemetry = telemetry();
+        telemetry.note_submit_refusal_site(site(3, refusal_sites::PIPELINE_COMPUTE));
+        telemetry.record_frame_at(0, 10, 0, 0, 0, None);
+
+        telemetry.snapshot_and_reset();
+        telemetry.reset();
+        let after = telemetry.snapshot();
+        assert_eq!(after.unknown_handle_sites, 1);
+        assert_eq!(
+            after.refusal_sites,
+            BTreeMap::from([(refusal_sites::PIPELINE_COMPUTE, 1)])
+        );
+        assert_eq!(after.submit_refusal_sites.len(), 1);
+        assert_eq!(after.submit_refusal_sites[0].sequence, 3);
+    }
+
+    /// The site line is stable and names everything an operator needs.
+    #[test]
+    fn the_refusal_site_line_names_sequence_list_and_class() {
+        let line = refusal_site_line(&site(9, refusal_sites::PIPELINE_MESH));
+        assert!(
+            line.starts_with("METAL_REFUSAL_SITE sequence=9 list=109 generation=3"),
+            "{line}"
+        );
+        assert!(line.contains("index=4 opcode=22 class=pipeline:mesh"), "{line}");
+        assert!(!line.contains('\n'));
     }
 }
