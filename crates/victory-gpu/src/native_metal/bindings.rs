@@ -106,6 +106,32 @@ pub trait GuestRangeResolver: Send + Sync {
 
     /// Releases the pin `token` names. A second retirement is an error.
     fn retire(&self, token: u64) -> Result<(), ResolveError>;
+
+    /// Every guest VA range currently backed by a host-visible share file
+    /// (ADR-055).
+    ///
+    /// This is the source of the title-memory page table's address relation:
+    /// only ranges the guest actually maps appear, and a provider that cannot
+    /// enumerate returns nothing (the default), so a translated shader reads
+    /// the zero fallback instead of a guessed page.
+    fn mappings(&self) -> Vec<GuestMapping> {
+        Vec::new()
+    }
+}
+
+/// One guest VA range backed by a share allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GuestMapping {
+    /// First guest GPU virtual address of the range; 64 KiB aligned.
+    pub guest_address: u64,
+    /// Share allocation id; never zero.
+    pub allocation_id: u64,
+    /// Allocation generation; never zero.
+    pub generation: u32,
+    /// First byte of the range in the share file; 64 KiB aligned.
+    pub byte_offset: u64,
+    /// Range length; a non-zero multiple of 64 KiB.
+    pub length: u64,
 }
 
 static RESOLVER: LazyLock<RwLock<Option<Arc<dyn GuestRangeResolver>>>> =

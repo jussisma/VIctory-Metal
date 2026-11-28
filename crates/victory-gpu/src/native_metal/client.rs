@@ -109,6 +109,8 @@ pub const KIND_AUTH: u8 = 1;
 pub const KIND_SUBMISSION_V3: u8 = 5;
 /// Frame kind of a host allocation registration (`ipc_host::KIND_REGISTER`).
 pub const KIND_REGISTER: u8 = 2;
+/// Frame kind of one title-memory map chunk (`ipc_host::KIND_TITLE_MAP`).
+pub const KIND_TITLE_MAP: u8 = victory_metal::title_map::KIND_TITLE_MAP;
 /// Frame kind of an opt-in precompiled pipeline registration
 /// (`ipc_host::KIND_PIPELINE`).
 pub const KIND_PIPELINE: u8 = 4;
@@ -981,6 +983,11 @@ pub struct WireV3Client {
     /// Cleared by a later accepted registration. `None` for an older host that
     /// answers with the classic one-byte status.
     last_texture_refusal: Option<String>,
+    /// Digest and generation of the title-memory map this session sent.
+    ///
+    /// `None` until the first map; reset by a reconnect (a new host session
+    /// starts with no map, even though the transport's generation persists).
+    title_map_sent: Option<(u64, u32)>,
 }
 
 impl WireV3Client {
@@ -1066,6 +1073,7 @@ impl WireV3Client {
             last_pipeline_ticket: 0,
             pipelines: std::collections::BTreeMap::new(),
             last_texture_refusal: None,
+            title_map_sent: None,
         };
         let mut stream = client.handshake()?;
         client.register_fence_page(&mut stream, client.fence_page_path.clone());
@@ -1196,6 +1204,7 @@ impl WireV3Client {
         self.samplers.clear();
         self.surfaces.clear();
         self.last_texture_refusal = None;
+        self.title_map_sent = None;
         self.allocations.clear();
         self.last_allocation = 0;
         self.last_pipeline_ticket = 0;
@@ -1436,6 +1445,38 @@ impl WireV3Client {
     /// The highest allocation id registered in this session (0: none).
     pub fn last_allocation(&self) -> u64 {
         self.last_allocation
+    }
+
+    /// Sends the guest's VA → share-allocation map (transport kind 11).
+    ///
+    /// The map is chunked to the transport's payload bound and sent only when
+    /// its content changed since the last send in this session (or after a
+    /// reconnect). Entries are the exact ranges the guest mapped; nothing is
+    /// invented. A host refusal (status 1) leaves the session open and is
+    /// returned as [`NativeQueueError::Refused`]; an older host that does not
+    /// know the kind closes the session with an explicit unexpected-kind
+    /// error, never a misread frame.
+    pub fn send_title_memory_map(
+        &mut self,
+        generation: u32,
+        ranges: &[victory_metal::title_map::Range],
+    ) -> Result<bool, NativeQueueError> {
+        let digest = title_map_digest(ranges);
+        if self.title_map_sent.is_some_and(|(sent, _)| sent == digest) {
+            return Ok(false);
+        }
+        let chunks = victory_metal::title_map::chunks(generation, ranges)
+            .map_err(|error| NativeQueueError::Refused(error.to_string()))?;
+        for chunk in chunks {
+            let status = self.registration(KIND_TITLE_MAP, &chunk, "title map")?;
+            if status != REGISTRATION_ACCEPTED {
+                return Err(NativeQueueError::Refused(format!(
+                    "the host refused a title-memory map chunk with status {status}"
+                )));
+            }
+        }
+        self.title_map_sent = Some((digest, generation));
+        Ok(true)
     }
 
     /// Registers one precompiled library as a pipeline (transport kind 4).
@@ -2362,6 +2403,26 @@ fn decode_registration_reason(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(reason).into_owned())
+}
+
+/// FNV-1a digest of a title-memory map's content, so a re-send only happens
+/// when the map changed. Not a security hash.
+fn title_map_digest(ranges: &[victory_metal::title_map::Range]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(&(ranges.len() as u64).to_le_bytes());
+    for range in ranges {
+        feed(&range.guest_address.to_le_bytes());
+        feed(&range.allocation_id.to_le_bytes());
+        feed(&range.byte_offset.to_le_bytes());
+        feed(&range.length.to_le_bytes());
+    }
+    hash
 }
 
 #[cfg(test)]

@@ -279,6 +279,8 @@ pub(crate) struct DeviceState {
     depth_states: DepthStencilCache,
     /// ADR-053: opt-in draw trace, armed on the first traced encode.
     trace: Option<crate::macos::trace::TraceState>,
+    /// ADR-055: the live title-memory map and its built page table.
+    pub(crate) title: crate::macos::title_memory::TitleMemory,
 }
 
 impl DeviceState {
@@ -1240,6 +1242,7 @@ impl DirectMetalTransport {
                 executed_list_order: VecDeque::new(),
                 depth_states: DepthStencilCache::new(),
                 trace: None,
+                title: crate::macos::title_memory::TitleMemory::new(),
             }),
             async_submit,
             encode_counters: crate::macos::trace::EncodeCounters::default(),
@@ -3280,6 +3283,11 @@ struct PreparedArgumentBuffer {
     stage: ShaderStage,
     index: usize,
     buffer: ObjcObject,
+    /// The converter's implicit resource descriptor heap argument buffer.
+    ///
+    /// Bound at [`crate::macos::bindings::RESOURCE_DESCRIPTOR_HEAP_BUFFER_INDEX`]
+    /// when a title-memory page table names heap indices.
+    heap: Option<ObjcObject>,
     /// Converted descriptor tables this argument buffer points at.
     ///
     /// Each table is its own `MTLBuffer`, and `AbiPending` is cleared as soon as
@@ -3288,6 +3296,10 @@ struct PreparedArgumentBuffer {
     /// `encode_v3_segments` pins the objects in the retire queue; without it the
     /// GPU (and `useResource:`) reads a released buffer.
     tables: Vec<ObjcObject>,
+    /// ADR-055 title-memory buffers this argument buffer references: the page
+    /// table, write bitmap, heap argument buffer and every allocation it
+    /// names, retained until any in-flight command buffer is done.
+    title: Vec<ObjcObject>,
     /// Resources the argument buffer references, declared with `useResource:`.
     resources: Vec<objc::Id>,
 }
@@ -4124,6 +4136,7 @@ fn abi_kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -
 
 fn flush_abi(
     transport: &DirectMetalTransport,
+    state: &mut DeviceState,
     stages: &[(ShaderStage, RootSignatureLayout)],
     pending: &mut AbiPending,
 ) -> Result<
@@ -4136,9 +4149,32 @@ fn flush_abi(
     let device = transport.device_raw();
     let mut buffers = Vec::new();
     let mut bytes_ops = Vec::new();
-    if pending.is_empty() {
+    if pending.is_empty()
+        && !stages.iter().any(|(_, layout)| {
+            layout
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.space() == victory_shader::emit::MEMORY_SPACE)
+        })
+    {
         return Ok((buffers, bytes_ops));
     }
+
+    // ADR-055: build the live page table once for this flush. A stage that
+    // declares MEMORY_SPACE t0/u0 gets the real buffers; no map (or a map
+    // naming an unregistered allocation) leaves the previous zero fallback.
+    let needs_title = stages.iter().any(|(_, layout)| {
+        layout
+            .parameters()
+            .iter()
+            .any(|parameter| parameter.space() == victory_shader::emit::MEMORY_SPACE)
+    });
+    let title = if needs_title {
+        let DeviceState { title, buffers: registered, .. } = state;
+        title.binding(device, registered)?
+    } else {
+        None
+    };
 
     // Resolve every pending argument against every stage before allocating
     // anything. A wire slot no layout declares is refused by name, never
@@ -4290,18 +4326,43 @@ fn flush_abi(
             }
         }
 
-        // MEMORY_SPACE fallback: one zero-filled shared buffer per stage layout,
-        // carved into one aligned sub-range per unbound parameter.
+        // MEMORY_SPACE: the live page table `t0` and write bitmap `u0` when a
+        // map is installed, and one zero-filled shared buffer carved into one
+        // aligned sub-range per remaining unbound parameter.
         let bound = &bound_per_stage[stage_index];
-        let unbound: Vec<usize> = layout
-            .parameters()
-            .iter()
-            .enumerate()
-            .filter(|(index, parameter)| {
-                parameter.space() == victory_shader::emit::MEMORY_SPACE && !bound[*index]
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let mut unbound: Vec<usize> = Vec::new();
+        let mut title_parameters = 0u64;
+        let mut title_bytes = 0u64;
+        for (index, parameter) in layout.parameters().iter().enumerate() {
+            if parameter.space() != victory_shader::emit::MEMORY_SPACE || bound[index] {
+                continue;
+            }
+            if let Some(binding) = &title {
+                let view = matches!(
+                    parameter.kind(),
+                    RootParameterKind::ShaderResourceView
+                        | RootParameterKind::UnorderedAccessView
+                );
+                if view && parameter.register() == 0 {
+                    let (address, bytes) = match parameter.kind() {
+                        RootParameterKind::ShaderResourceView => {
+                            (buffer_gpu_address(binding.table), binding.table_bytes)
+                        }
+                        _ => (buffer_gpu_address(binding.bitmap), binding.bitmap_bytes),
+                    };
+                    builder.set_buffer_address(index, address)?;
+                    title_parameters += 1;
+                    title_bytes = title_bytes
+                        .saturating_add(bytes)
+                        .saturating_add(binding.heap_bytes);
+                    continue;
+                }
+            }
+            unbound.push(index);
+        }
+        if title_parameters > 0 {
+            transport.count_memory_space(title_parameters, title_bytes);
+        }
         if !unbound.is_empty() {
             let mut total = 0usize;
             for &index in &unbound {
@@ -4347,6 +4408,18 @@ fn flush_abi(
         if let Some((index, bytes)) = stage_bytes {
             bytes_ops.push((*stage, index, bytes));
         }
+        let mut heap = None;
+        let mut title_owned = Vec::new();
+        if title_parameters > 0 {
+            let binding = title.as_ref().expect("counted title parameters");
+            for raw in &binding.resources {
+                resources.push((*raw, MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE));
+                if let Some(object) = retain_object(*raw) {
+                    title_owned.push(object);
+                }
+            }
+            heap = retain_object(binding.heap);
+        }
         if builder.encoded_parameters() == 0 {
             continue;
         }
@@ -4355,7 +4428,9 @@ fn flush_abi(
             stage: *stage,
             index: layout.argument_buffer_index(),
             buffer,
+            heap,
             tables,
+            title: title_owned,
             resources: resources.into_iter().map(|(resource, _)| resource).collect(),
         });
     }
@@ -4445,6 +4520,7 @@ fn abi_render_stages(
 /// Flushes collected root-signature bindings for a render-family pipeline.
 fn flush_render_abi(
     transport: &DirectMetalTransport,
+    state: &mut DeviceState,
     abi: Option<&PipelineAbi>,
     mesh_family: bool,
     pending: &mut AbiPending,
@@ -4458,7 +4534,7 @@ fn flush_render_abi(
         return Ok(());
     }
     let stages = abi_render_stages(abi, mesh_family);
-    let (buffers, bytes_ops) = flush_abi(transport, &stages, pending)?;
+    let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
     }
@@ -4472,6 +4548,7 @@ fn flush_render_abi(
 /// Flushes collected root-signature bindings for a compute pipeline.
 fn flush_compute_abi(
     transport: &DirectMetalTransport,
+    state: &mut DeviceState,
     abi: Option<&PipelineAbi>,
     pending: &mut AbiPending,
     ops: &mut Vec<PreparedComputeOp>,
@@ -4488,7 +4565,7 @@ fn flush_compute_abi(
         .into_iter()
         .map(|(stage, layout)| (stage, layout.clone()))
         .collect();
-    let (buffers, bytes_ops) = flush_abi(transport, &stages, pending)?;
+    let (buffers, bytes_ops) = flush_abi(transport, state, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedComputeOp::ArgumentBuffer(buffer));
     }
@@ -4693,7 +4770,7 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 trace_encoded_work(
                     state,
@@ -4735,7 +4812,7 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 trace_encoded_work(
                     state,
@@ -4806,7 +4883,7 @@ fn prepare_compute_segment(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, state, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_indirect();
                 trace_encoded_work(
                     state,
@@ -5903,6 +5980,7 @@ fn build_render_ops(
                 }
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5947,6 +6025,7 @@ fn build_render_ops(
                 }
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5988,6 +6067,7 @@ fn build_render_ops(
                 }
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6030,6 +6110,7 @@ fn build_render_ops(
                 }
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6078,6 +6159,7 @@ fn build_render_ops(
                 }
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6123,6 +6205,7 @@ fn build_render_ops(
                 indirect::validate(&arguments)?;
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6164,6 +6247,7 @@ fn build_render_ops(
                 indirect::validate(&arguments)?;
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6207,6 +6291,7 @@ fn build_render_ops(
                 indirect::validate(&arguments)?;
                 flush_render_abi(
                     transport,
+                    state,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -6243,6 +6328,7 @@ fn build_render_ops(
     // same state the pass had reached.
     flush_render_abi(
         transport,
+        state,
         abi.as_ref(),
         mesh_pipeline.is_some(),
         &mut pending,
@@ -7622,6 +7708,14 @@ impl DirectMetalTransport {
                                         0,
                                         argument_buffer.index,
                                     );
+                                    if let Some(heap) = &argument_buffer.heap {
+                                        objc::msg_send_set_buffer(
+                                            enc,
+                                            heap.as_raw(),
+                                            0,
+                                            crate::macos::bindings::RESOURCE_DESCRIPTOR_HEAP_BUFFER_INDEX,
+                                        );
+                                    }
                                     for resource in &argument_buffer.resources {
                                         objc::msg_send_use_resource(
                                             enc,
@@ -7713,7 +7807,9 @@ impl DirectMetalTransport {
                     // Staging: the GPU reads it after `commit` returns.
                     for op in ops {
                         if let PreparedComputeOp::ArgumentBuffer(argument_buffer) = op {
+                            staged.extend(argument_buffer.title);
                             staged.push(argument_buffer.buffer);
+                            staged.extend(argument_buffer.heap);
                             staged.extend(argument_buffer.tables);
                         }
                     }
@@ -7737,7 +7833,9 @@ impl DirectMetalTransport {
                             )?;
                             for op in ops {
                                 if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
+                                    staged.extend(argument_buffer.title);
                                     staged.push(argument_buffer.buffer);
+                                    staged.extend(argument_buffer.heap);
                                     staged.extend(argument_buffer.tables);
                                 }
                             }
@@ -7798,6 +7896,13 @@ impl DirectMetalTransport {
                                     argument_buffer.buffer.as_raw(),
                                     argument_buffer.index,
                                 )?;
+                                if let Some(heap) = &argument_buffer.heap {
+                                    encoder.bind_argument_buffer(
+                                        argument_buffer.stage,
+                                        heap.as_raw(),
+                                        crate::macos::bindings::RESOURCE_DESCRIPTOR_HEAP_BUFFER_INDEX,
+                                    )?;
+                                }
                                 for resource in &argument_buffer.resources {
                                     // SAFETY: the resource is a live Metal object
                                     // named by the argument buffer.
@@ -7892,7 +7997,9 @@ impl DirectMetalTransport {
                     // Staging: the GPU reads it after `commit` returns.
                     for op in ops {
                         if let PreparedRenderOp::ArgumentBuffer(argument_buffer) = op {
+                            staged.extend(argument_buffer.title);
                             staged.push(argument_buffer.buffer);
+                            staged.extend(argument_buffer.heap);
                             staged.extend(argument_buffer.tables);
                         }
                     }
