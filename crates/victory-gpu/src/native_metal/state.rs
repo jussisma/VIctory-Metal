@@ -301,6 +301,9 @@ pub struct RasterizerDesc {
 }
 
 impl Default for RasterizerDesc {
+    /// `D3D12_RASTERIZER_DESC`'s defaults: solid fill, cull `BACK`, clockwise
+    /// front faces and depth clip on. This is the value the converter bakes
+    /// into a `VPS2` pipeline when the title supplies no rasterizer desc.
     fn default() -> Self {
         Self {
             fill_mode: D3D12_FILL_MODE_SOLID,
@@ -1115,6 +1118,59 @@ mod tests {
         assert_eq!(cull_mode(3), Ok(CullMode::Back));
         assert_eq!(winding(false), FrontFaceWinding::Clockwise);
         assert_eq!(winding(true), FrontFaceWinding::CounterClockwise);
+    }
+
+    /// `D3D12_RASTERIZER_DESC`'s zero/default desc is cull `BACK` with
+    /// `FrontCounterClockwise = FALSE` (clockwise front faces) and solid fill.
+    /// A host that applies no rasterizer state does *not* reproduce this: Metal's
+    /// encoder defaults to cull `None`, which leaves every triangle unculled.
+    #[test]
+    fn d3d12_default_rasterizer_is_cull_back_clockwise_solid() {
+        let desc = RasterizerDesc::default();
+        assert_eq!(desc.fill_mode, D3D12_FILL_MODE_SOLID);
+        assert_eq!(desc.cull_mode, D3D12_CULL_MODE_BACK);
+        assert!(!desc.front_counter_clockwise);
+        assert!(desc.depth_clip_enable);
+
+        let wire = rasterizer_state(&desc).expect("the default desc converts");
+        assert_eq!(wire.fill, FillMode::Solid);
+        assert_eq!(wire.cull, CullMode::Back);
+        assert_eq!(
+            wire.front_face,
+            FrontFaceWinding::Clockwise,
+            "FrontCounterClockwise=false must stay clockwise"
+        );
+        assert_eq!(wire.depth_bias, 0);
+    }
+
+    /// `FrontCounterClockwise` flips only the front-face winding; it never
+    /// swaps which face is culled.
+    #[test]
+    fn front_counter_clockwise_changes_winding_only() {
+        for (flag, expected) in [
+            (false, FrontFaceWinding::Clockwise),
+            (true, FrontFaceWinding::CounterClockwise),
+        ] {
+            let wire = rasterizer_state(&RasterizerDesc {
+                front_counter_clockwise: flag,
+                ..RasterizerDesc::default()
+            })
+            .expect("rasterizer converts");
+            assert_eq!(wire.front_face, expected, "flag {flag}");
+            assert_eq!(wire.cull, CullMode::Back, "cull face is independent");
+        }
+    }
+
+    /// Cycle 06 precedent: the Metal fill-mode constants were inverted once and
+    /// a solid fill behaved like wireframe. The D3D12 fill codes must map
+    /// straight through (`SOLID=3 -> FillMode::Solid`, `WIREFRAME=2 ->
+    /// FillMode::Wireframe`) with no inversion.
+    #[test]
+    fn cycle_06_fill_modes_are_not_inverted() {
+        assert_eq!(fill_mode(3), Ok(FillMode::Solid));
+        assert_eq!(fill_mode(2), Ok(FillMode::Wireframe));
+        assert_eq!(FillMode::Solid.code(), D3D12_FILL_MODE_SOLID as u16);
+        assert_eq!(FillMode::Wireframe.code(), D3D12_FILL_MODE_WIREFRAME as u16);
     }
 
     #[test]

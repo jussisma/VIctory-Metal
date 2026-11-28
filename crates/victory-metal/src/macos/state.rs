@@ -128,6 +128,55 @@ const MTL_WINDING_CLOCKWISE: usize = 0;
 /// `MTLWindingCounterClockwise`.
 const MTL_WINDING_COUNTER_CLOCKWISE: usize = 1;
 
+/// Where an encoder's rasterizer state came from.
+///
+/// The state trace used to publish `cull=unset` whenever no wire
+/// `SetRasterizerState` had run, which conflated two very different cases: a
+/// title that culls nothing and a host that applies nothing. Recording the
+/// source separates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RasterizerSource {
+    /// Neither a wire `SetRasterizerState` nor a pipeline's carried state set
+    /// it, so Metal's encoder default is in force.
+    #[default]
+    Default,
+    /// A wire `SetRasterizerState` (`RSSetState`).
+    Wire,
+    /// The rasterizer carried in a content-hashed pipeline's `PipelineState`.
+    Pipeline,
+}
+
+impl RasterizerSource {
+    /// Stable name used by the pass line.
+    #[allow(dead_code)] // the labels are fixed strings; this names the enum for callers/tests.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Wire => "wire",
+            Self::Pipeline => "pipeline",
+        }
+    }
+}
+
+/// Metal's `MTLRenderCommandEncoder` rasterizer defaults.
+///
+/// Every encoder starts with cull `None`, front-facing `Clockwise`, solid fill
+/// and zero depth bias. This is deliberately *not* the D3D12 default: a
+/// `D3D12_RASTERIZER_DESC` created with the header defaults (and the guest
+/// converter's `RasterizerDesc::default`) is `CullMode BACK`,
+/// `FrontCounterClockwise FALSE` (clockwise). A host that applies no rasterizer
+/// state therefore disables culling instead of reproducing the D3D12 default;
+/// the state trace records this as the `default` source rather than `unset`.
+pub(crate) const METAL_DEFAULT_RASTERIZER: RasterizerState = RasterizerState {
+    fill: FillMode::Solid,
+    cull: CullMode::None,
+    front_face: FrontFaceWinding::Clockwise,
+    depth_bias: 0,
+    slope_scaled_depth_bias: 0.0,
+    depth_bias_clamp: 0.0,
+    depth_clip: true,
+};
+
 /// Maps a D3D12 blend factor onto `MTLBlendFactor`.
 pub(crate) const fn mtl_blend_factor(factor: BlendFactor) -> usize {
     match factor {
@@ -422,6 +471,37 @@ pub(crate) unsafe fn apply_rasterizer(
     enc: objc::Id,
     state: &RasterizerState,
 ) -> Result<(), MetalError> {
+    // SAFETY: the caller guarantees a live render encoder.
+    unsafe { apply_rasterizer_from(enc, state, RasterizerSource::Wire) }
+}
+
+/// Applies a content-hashed pipeline's carried rasterizer state.
+///
+/// The selector bodies are identical to [`apply_rasterizer`]; only the recorded
+/// source differs, so the state trace can name `pipeline` instead of `wire`.
+///
+/// # Safety
+///
+/// `enc` must be a live `MTLRenderCommandEncoder`.
+#[allow(dead_code)] // wired into the device render path separately from this module.
+pub(crate) unsafe fn apply_pipeline_rasterizer(
+    enc: objc::Id,
+    state: &RasterizerState,
+) -> Result<(), MetalError> {
+    // SAFETY: the caller guarantees a live render encoder.
+    unsafe { apply_rasterizer_from(enc, state, RasterizerSource::Pipeline) }
+}
+
+/// Shared body of the wire and pipeline rasterizer application paths.
+///
+/// # Safety
+///
+/// `enc` must be a live `MTLRenderCommandEncoder`.
+unsafe fn apply_rasterizer_from(
+    enc: objc::Id,
+    state: &RasterizerState,
+    source: RasterizerSource,
+) -> Result<(), MetalError> {
     if enc.is_null() {
         return Err(MetalError::InternalError(
             "render encoder is nil".to_string(),
@@ -450,7 +530,7 @@ pub(crate) unsafe fn apply_rasterizer(
     }
     // Recorded here rather than at the caller so both render executors (the
     // `RenderEncoder` path and the device's indirect path) are counted.
-    crate::macos::render::state_trace::note_rasterizer(state);
+    crate::macos::render::state_trace::note_rasterizer_source(state, source);
     Ok(())
 }
 
@@ -663,6 +743,50 @@ mod tests {
         assert_eq!(mtl_cull_mode(CullMode::Back), 2);
         assert_eq!(mtl_winding(FrontFaceWinding::Clockwise), 0);
         assert_eq!(mtl_winding(FrontFaceWinding::CounterClockwise), 1);
+    }
+
+    /// Cycle 06 root cause 1: `MTLTriangleFillMode` was inverted, so a solid
+    /// fill called `setTriangleFillMode:` with line fill and almost no fragment
+    /// landed. The D3D12 -> Metal value for `FillMode::Solid` must stay 0.
+    #[test]
+    fn cycle_06_solid_fill_stays_metal_fill_not_lines() {
+        assert_eq!(mtl_fill_mode(FillMode::Solid), MTL_TRIANGLE_FILL_MODE_FILL);
+        assert_eq!(
+            mtl_fill_mode(FillMode::Wireframe),
+            MTL_TRIANGLE_FILL_MODE_LINES
+        );
+        assert_ne!(MTL_TRIANGLE_FILL_MODE_FILL, MTL_TRIANGLE_FILL_MODE_LINES);
+    }
+
+    /// The default an encoder actually carries is Metal's, not D3D12's:
+    /// cull `None`, clockwise front faces, solid fill. D3D12's default raster
+    /// state is cull `BACK` and clockwise, which is why "applied nothing" is
+    /// recorded as a *default* decision instead of `unset`.
+    #[test]
+    fn metal_encoder_default_is_no_cull_clockwise_solid() {
+        assert_eq!(METAL_DEFAULT_RASTERIZER.cull, CullMode::None);
+        assert_eq!(
+            METAL_DEFAULT_RASTERIZER.front_face,
+            FrontFaceWinding::Clockwise
+        );
+        assert_eq!(METAL_DEFAULT_RASTERIZER.fill, FillMode::Solid);
+        assert_eq!(
+            mtl_cull_mode(METAL_DEFAULT_RASTERIZER.cull),
+            MTL_CULL_MODE_NONE
+        );
+        assert_eq!(
+            mtl_winding(METAL_DEFAULT_RASTERIZER.front_face),
+            MTL_WINDING_CLOCKWISE
+        );
+        assert_eq!(
+            mtl_fill_mode(METAL_DEFAULT_RASTERIZER.fill),
+            MTL_TRIANGLE_FILL_MODE_FILL
+        );
+        // The source names are the ones the pass line publishes.
+        assert_eq!(RasterizerSource::Wire.name(), "wire");
+        assert_eq!(RasterizerSource::Pipeline.name(), "pipeline");
+        assert_eq!(RasterizerSource::Default.name(), "default");
+        assert_eq!(RasterizerSource::default(), RasterizerSource::Default);
     }
 
     #[test]

@@ -1504,6 +1504,29 @@ impl<'a> RenderEncoder<'a> {
         Ok(())
     }
 
+    /// Applies cull, winding, fill and depth bias carried by a content-hashed
+    /// pipeline's `PipelineState`.
+    ///
+    /// The contact point for the device render path: a pipeline-selected draw
+    /// that carries [`crate::macos::registry::PipelineState::rasterizer`] should
+    /// call this once per pass that runs with it. Until it does, the encoder
+    /// keeps Metal's default (cull `None`), which the state trace now labels
+    /// `default` rather than `unset`.
+    #[allow(dead_code)] // the device render path calls it in a follow-up change.
+    pub(crate) fn apply_pipeline_rasterizer_state(
+        &mut self,
+        state: &crate::wire_v3::RasterizerState,
+    ) -> Result<(), MetalError> {
+        self.ensure_encoder()?;
+        // SAFETY: `self.enc` is a live render encoder created by
+        // `ensure_encoder`.
+        unsafe { crate::macos::state::apply_pipeline_rasterizer(self.enc, state) }?;
+        if let Some(pass) = self.state_trace.as_mut() {
+            pass.note_pipeline_rasterizer(state);
+        }
+        Ok(())
+    }
+
     /// Applies the wire stencil reference value.
     pub(crate) fn apply_stencil_ref(&mut self, value: u8) -> Result<(), MetalError> {
         self.ensure_encoder()?;
@@ -3721,6 +3744,7 @@ pub mod state_trace {
 
     use crate::macos::objc;
     use crate::macos::render::{PixelFormat, PrimitiveType};
+    use crate::macos::state::{RasterizerSource, METAL_DEFAULT_RASTERIZER};
     use crate::wire_v3::{BlendAttachment, CullMode, FrontFaceWinding, RasterizerState};
 
     /// Environment flag that arms the encoder-state trace. Off when unset.
@@ -3846,6 +3870,9 @@ pub mod state_trace {
         depth: DepthBind,
         cull: Option<CullMode>,
         winding: Option<FrontFaceWinding>,
+        /// Source of the encoder's current rasterizer state. [`RasterizerSource::Default`]
+        /// until a wire or pipeline state is applied.
+        raster_source: RasterizerSource,
     }
 
     /// A retained pass attachment sample that has not completed yet.
@@ -3967,11 +3994,16 @@ pub mod state_trace {
         pub blend_write_mask_full: u64,
         /// Baked attachments with a partial write mask.
         pub blend_write_mask_partial: u64,
-        /// `SetRasterizerState` applications.
+        /// Non-default rasterizer applications (wire or pipeline).
         pub rasterizer_applied: u64,
-        /// Applied cull modes (none, front, back).
+        /// Cull mode in force for each encoded draw (none, front, back).
+        ///
+        /// This is per draw, so `cull_none == draws` says the title's draws ran
+        /// with culling disabled — including Metal's default when nothing was
+        /// applied. The pass line names which source decided it.
         pub cull: [u64; 3],
-        /// Applied windings (clockwise, counter-clockwise).
+        /// Front-face winding in force for each encoded draw (clockwise,
+        /// counter-clockwise).
         pub winding: [u64; 2],
         /// Pass attachments sampled after their encoder.
         pub pass_sampled_passes: u64,
@@ -4213,15 +4245,17 @@ pub mod state_trace {
         });
     }
 
-    /// Records one `SetRasterizerState` applied to a render encoder.
-    pub(crate) fn note_rasterizer(state: &RasterizerState) {
+    /// Records one rasterizer application and the source it came from.
+    ///
+    /// Only the application count is recorded here. The cull/winding counters
+    /// are per encoded *draw* (`PassState::note_draw`), so a state that is set
+    /// and never drawn cannot inflate them.
+    pub(crate) fn note_rasterizer_source(_state: &RasterizerState, _source: RasterizerSource) {
         if !enabled() {
             return;
         }
         with_global(|global| {
             global.rasterizer_applied += 1;
-            global.cull[cull_index(state.cull)] += 1;
-            global.winding[winding_index(state.front_face)] += 1;
         });
     }
 
@@ -4240,20 +4274,47 @@ pub mod state_trace {
         }
     }
 
-    const fn cull_name(index: Option<usize>) -> &'static str {
-        match index {
-            Some(0) => "none",
-            Some(1) => "front",
-            Some(2) => "back",
-            _ => "unset",
+    /// Names a cull mode and the source that decided it, e.g. `back/pipeline`.
+    ///
+    /// A pass with no encoded draw has no applied decision and stays `unset`.
+    fn cull_label(cull: Option<CullMode>, source: RasterizerSource) -> &'static str {
+        match cull {
+            Some(CullMode::None) => match source {
+                RasterizerSource::Default => "none/default",
+                RasterizerSource::Wire => "none/wire",
+                RasterizerSource::Pipeline => "none/pipeline",
+            },
+            Some(CullMode::Front) => match source {
+                RasterizerSource::Default => "front/default",
+                RasterizerSource::Wire => "front/wire",
+                RasterizerSource::Pipeline => "front/pipeline",
+            },
+            Some(CullMode::Back) => match source {
+                RasterizerSource::Default => "back/default",
+                RasterizerSource::Wire => "back/wire",
+                RasterizerSource::Pipeline => "back/pipeline",
+            },
+            None => "unset",
         }
     }
 
-    const fn winding_name(index: Option<usize>) -> &'static str {
-        match index {
-            Some(0) => "clockwise",
-            Some(1) => "counter_clockwise",
-            _ => "unset",
+    /// Names a winding and the source that decided it.
+    fn winding_label(
+        winding: Option<FrontFaceWinding>,
+        source: RasterizerSource,
+    ) -> &'static str {
+        match winding {
+            Some(FrontFaceWinding::Clockwise) => match source {
+                RasterizerSource::Default => "clockwise/default",
+                RasterizerSource::Wire => "clockwise/wire",
+                RasterizerSource::Pipeline => "clockwise/pipeline",
+            },
+            Some(FrontFaceWinding::CounterClockwise) => match source {
+                RasterizerSource::Default => "counter_clockwise/default",
+                RasterizerSource::Wire => "counter_clockwise/wire",
+                RasterizerSource::Pipeline => "counter_clockwise/pipeline",
+            },
+            None => "unset",
         }
     }
 
@@ -4320,17 +4381,38 @@ pub mod state_trace {
             depth: DepthBind::None,
             cull: None,
             winding: None,
+            raster_source: RasterizerSource::Default,
         })
     }
 
     impl PassState {
         /// Records one encoded draw and its topology.
+        ///
+        /// Also counts the rasterizer state that is *in force* for this draw.
+        /// Before any wire or pipeline state is applied that is Metal's encoder
+        /// default (cull `None`, clockwise front faces), recorded with the
+        /// `default` source. This is why a drawn pass never says `cull=unset`
+        /// again: `cull_none == draws` means no culling was active, which is a
+        /// fact about the draw rather than a missing record.
         pub(crate) fn note_draw(&mut self, primitive: PrimitiveType) {
             self.draws += 1;
             let index = primitive.mtl_value();
             if let Some(slot) = self.topology.get_mut(index) {
                 *slot += 1;
             }
+            let cull = self
+                .cull
+                .unwrap_or(METAL_DEFAULT_RASTERIZER.cull);
+            let winding = self
+                .winding
+                .unwrap_or(METAL_DEFAULT_RASTERIZER.front_face);
+            // Publish the effective decision so `finish` can name its source.
+            self.cull = Some(cull);
+            self.winding = Some(winding);
+            with_global(|global| {
+                global.cull[cull_index(cull)] += 1;
+                global.winding[winding_index(winding)] += 1;
+            });
         }
 
         /// Draws encoded in this pass so far.
@@ -4348,10 +4430,21 @@ pub mod state_trace {
             self.depth = bind;
         }
 
-        /// Records the rasterizer state applied to the encoder.
+        /// Records the wire rasterizer state applied to the encoder.
         pub(crate) fn note_rasterizer(&mut self, state: &RasterizerState) {
+            self.note_rasterizer_source(state, RasterizerSource::Wire);
+        }
+
+        /// Records the rasterizer state a content-hashed pipeline carries.
+        #[allow(dead_code)] // the device render path does not call it yet; see apply_pipeline_rasterizer_state.
+        pub(crate) fn note_pipeline_rasterizer(&mut self, state: &RasterizerState) {
+            self.note_rasterizer_source(state, RasterizerSource::Pipeline);
+        }
+
+        fn note_rasterizer_source(&mut self, state: &RasterizerState, source: RasterizerSource) {
             self.cull = Some(state.cull);
             self.winding = Some(state.front_face);
+            self.raster_source = source;
         }
     }
 
@@ -4493,8 +4586,8 @@ pub mod state_trace {
             depth_load: load_name(pass.info.depth_load),
             depth_format: depth_format_name(pass.info.depth_format),
             depth_bind: depth_bind_name(pass.depth),
-            cull: cull_name(pass.cull.map(cull_index)),
-            winding: winding_name(pass.winding.map(winding_index)),
+            cull: cull_label(pass.cull, pass.raster_source),
+            winding: winding_label(pass.winding, pass.raster_source),
             topology: dominant,
         };
         let log_line = with_global(|global| {
@@ -4606,6 +4699,142 @@ pub mod state_trace {
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The process-wide counters are shared, so these tests run one at a
+        /// time even if the harness uses more than one thread.
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+        fn info() -> PassInfo {
+            PassInfo {
+                color_attachments: 1,
+                color_format: Some(PixelFormat::Rgba8Unorm),
+                color_load: 2,
+                color_store: 1,
+                depth_attachment: false,
+                depth_load: 0,
+                depth_format: 0,
+                sample: None,
+            }
+        }
+
+        fn raster(cull: CullMode, front_face: FrontFaceWinding) -> RasterizerState {
+            RasterizerState {
+                fill: crate::wire_v3::FillMode::Solid,
+                cull,
+                front_face,
+                depth_bias: 0,
+                slope_scaled_depth_bias: 0.0,
+                depth_bias_clamp: 0.0,
+                depth_clip: true,
+            }
+        }
+
+        fn arm() {
+            reset();
+            // Bypass the environment read: `enabled()` caches, and the tests
+            // want a deterministic armed state regardless of other tests.
+            ENABLED.store(2, Ordering::Relaxed);
+        }
+
+        /// One draw with no rasterizer state is counted as Metal's default
+        /// (cull `None`, clockwise) and the pass line names `default`.
+        #[test]
+        fn a_draw_without_rasterizer_state_is_recorded_as_default() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            arm();
+            let mut pass = begin(info()).expect("the trace is armed");
+            pass.note_draw(PrimitiveType::Triangle);
+            finish(pass, None);
+
+            let report = report();
+            assert_eq!(report.draws, 1);
+            assert_eq!(report.cull, [1, 0, 0], "cull none was in force");
+            assert_eq!(report.winding, [1, 0], "clockwise was in force");
+            assert_eq!(
+                report.rasterizer_applied, 0,
+                "no non-default rasterizer application"
+            );
+            let line = report.last_pass.expect("the pass summary").line();
+            assert!(line.contains("cull=none/default"), "{line}");
+            assert!(line.contains("winding=clockwise/default"), "{line}");
+            reset();
+        }
+
+        /// A wire and a pipeline state with the same values are counted per
+        /// draw identically, but the pass line names the different sources.
+        #[test]
+        fn counters_and_pass_line_distinguish_wire_pipeline_and_default() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
+            // Wire: cull back, counter-clockwise.
+            arm();
+            let wire = raster(CullMode::Back, FrontFaceWinding::CounterClockwise);
+            let mut pass = begin(info()).expect("the trace is armed");
+            pass.note_rasterizer(&wire);
+            note_rasterizer_source(&wire, RasterizerSource::Wire);
+            pass.note_draw(PrimitiveType::Triangle);
+            finish(pass, None);
+            let report_wire = report();
+            assert_eq!(report_wire.cull, [0, 0, 1], "one back-culled draw");
+            assert_eq!(report_wire.winding, [0, 1], "one counter-clockwise draw");
+            assert_eq!(report_wire.rasterizer_applied, 1);
+            let line = report_wire.last_pass.expect("the pass summary").line();
+            assert!(line.contains("cull=back/wire"), "{line}");
+            assert!(line.contains("winding=counter_clockwise/wire"), "{line}");
+
+            // Pipeline: cull front, clockwise. Same counting, different source.
+            arm();
+            let pipeline = raster(CullMode::Front, FrontFaceWinding::Clockwise);
+            let mut pass = begin(info()).expect("the trace is armed");
+            pass.note_pipeline_rasterizer(&pipeline);
+            note_rasterizer_source(&pipeline, RasterizerSource::Pipeline);
+            pass.note_draw(PrimitiveType::Triangle);
+            finish(pass, None);
+            let report_pipeline = report();
+            assert_eq!(report_pipeline.cull, [0, 1, 0], "one front-culled draw");
+            assert_eq!(report_pipeline.winding, [1, 0], "one clockwise draw");
+            assert_eq!(report_pipeline.rasterizer_applied, 1);
+            let line = report_pipeline.last_pass.expect("the pass summary").line();
+            assert!(line.contains("cull=front/pipeline"), "{line}");
+            assert!(line.contains("winding=clockwise/pipeline"), "{line}");
+
+            // A default-only pass must not be mistaken for either source.
+            arm();
+            let mut pass = begin(info()).expect("the trace is armed");
+            pass.note_draw(PrimitiveType::Triangle);
+            finish(pass, None);
+            let line = report().last_pass.expect("the pass summary").line();
+            assert!(line.contains("cull=none/default"), "{line}");
+            assert!(!line.contains("/wire"), "{line}");
+            assert!(!line.contains("/pipeline"), "{line}");
+            reset();
+        }
+
+        /// The cull/winding counters are per draw: setting a state in a pass
+        /// with no draw does not inflate them.
+        #[test]
+        fn rasterizer_counters_are_per_draw_not_per_application() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            arm();
+            let state = raster(CullMode::Back, FrontFaceWinding::Clockwise);
+            let mut pass = begin(info()).expect("the trace is armed");
+            pass.note_rasterizer(&state);
+            note_rasterizer_source(&state, RasterizerSource::Wire);
+            // Two applications from two executors, one draw.
+            note_rasterizer_source(&state, RasterizerSource::Wire);
+            pass.note_draw(PrimitiveType::Triangle);
+            finish(pass, None);
+            let report = report();
+            assert_eq!(report.cull[2], 1, "one draw, not two applications");
+            assert_eq!(report.winding[0], 1);
+            assert_eq!(report.rasterizer_applied, 2);
+            reset();
+        }
     }
 }
 
