@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
 use crate::fence_page::{FencePage, FencePageMapping};
 use crate::macos::bindings::{
-    ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind,
-    ReflectedStage, RootParameterKind, RootSignatureLayout,
+    ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind, ReflectedStage,
+    RootParameterKind, RootParameterMap, RootParameterSlot, RootSignatureLayout,
 };
 use crate::macos::irconverter;
 use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
@@ -1173,6 +1173,13 @@ pub struct DirectMetalTransport {
     async_submit: Arc<Mutex<AsyncSubmitState>>,
     /// ADR-053: exact encoded-work counters for the whole process.
     encode_counters: crate::macos::trace::EncodeCounters,
+    /// Root-signature arguments refused because the translated layout does not
+    /// declare them or declares a different `(space, register, kind)`.
+    abi_refusals: std::sync::atomic::AtomicU64,
+    /// MEMORY_SPACE parameters bound to a default zero-filled buffer.
+    memory_space_bound: std::sync::atomic::AtomicU64,
+    /// Bytes allocated for those default MEMORY_SPACE buffers.
+    memory_space_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl DirectMetalTransport {
@@ -1236,12 +1243,43 @@ impl DirectMetalTransport {
             }),
             async_submit,
             encode_counters: crate::macos::trace::EncodeCounters::default(),
+            abi_refusals: std::sync::atomic::AtomicU64::new(0),
+            memory_space_bound: std::sync::atomic::AtomicU64::new(0),
+            memory_space_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// ADR-053: a snapshot of the exact encoded-work counters.
     pub fn encode_counters(&self) -> crate::macos::trace::CounterSnapshot {
         self.encode_counters.snapshot()
+    }
+
+    /// `(parameters, bytes)` bound by the default MEMORY_SPACE fallback.
+    pub fn memory_space_counters(&self) -> (u64, u64) {
+        (
+            self.memory_space_bound
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.memory_space_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Root-signature arguments refused by the ABI resolvers.
+    pub fn abi_refusal_count(&self) -> u64 {
+        self.abi_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_abi_refusal(&self) {
+        self.abi_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn count_memory_space(&self, parameters: u64, bytes: u64) {
+        self.memory_space_bound
+            .fetch_add(parameters, std::sync::atomic::Ordering::Relaxed);
+        self.memory_space_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Raw retained `MTLDevice` handle for sibling modules that allocate GPU objects.
@@ -2981,6 +3019,14 @@ pub struct PipelineAbi {
     pub object: Option<RootSignatureLayout>,
     /// Compute-stage layout (compute pipelines).
     pub compute: Option<RootSignatureLayout>,
+    /// Authoritative root-parameter slot map of the translated root signature.
+    ///
+    /// When present, every wire `SetRootConstants`/`SetRootBufferView`/
+    /// `SetDescriptorTable` is resolved through it. When absent (a pipeline
+    /// registered without translated signature bytes, as the legacy tests and
+    /// pre-v3 paths do), the map is derived from the stage layouts' flattened
+    /// order, which is exactly what those callers address.
+    pub root_parameters: Option<RootParameterMap>,
 }
 
 impl PipelineAbi {
@@ -3016,6 +3062,52 @@ impl PipelineAbi {
             compute: Some(layout),
             ..Self::default()
         }
+    }
+
+    /// Attaches the authoritative slot -> `(space, register, kind)` map parsed
+    /// from the translated root signature.
+    pub fn with_root_parameters(mut self, map: RootParameterMap) -> Self {
+        self.root_parameters = Some(map);
+        self
+    }
+
+    /// The declaration of wire root-parameter `slot`.
+    ///
+    /// Prefers the authoritative map. A pipeline registered without one (the
+    /// legacy constructors) is resolved from the stage layouts' flattened
+    /// order; if two stages declare different parameters at the same flattened
+    /// index, that slot is ambiguous and resolves to `None` rather than one of
+    /// them.
+    pub fn root_parameter(&self, slot: usize) -> Option<RootParameterSlot> {
+        if let Some(map) = self.root_parameters.as_ref() {
+            return map.slot(slot).copied();
+        }
+        let mut found: Option<RootParameterSlot> = None;
+        for layout in self.layouts() {
+            if let Some(parameter) = layout.parameters().get(slot) {
+                let candidate = RootParameterSlot::new(
+                    parameter.space(),
+                    parameter.register(),
+                    parameter.kind(),
+                    parameter.size(),
+                );
+                match found {
+                    Some(previous) if previous != candidate => return None,
+                    _ => found = Some(candidate),
+                }
+            }
+        }
+        found
+    }
+
+    /// Every stage layout this ABI carries, in registration order.
+    fn layouts(&self) -> impl Iterator<Item = &RootSignatureLayout> {
+        self.vertex
+            .iter()
+            .chain(self.fragment.iter())
+            .chain(self.mesh.iter())
+            .chain(self.object.iter())
+            .chain(self.compute.iter())
     }
 
     /// Whether no stage declares a root signature.
@@ -3568,19 +3660,21 @@ fn prepare_indirect_indexed_draw(
 /// One validated root-signature binding collected before its argument buffer
 /// is uploaded.
 enum PendingAbiBinding {
-    /// Inline root constants for one reflected parameter.
-    Constants { parameter: usize, bytes: Vec<u8> },
+    /// Inline root constants for one declared root parameter.
+    Constants {
+        slot: RootParameterSlot,
+        bytes: Vec<u8>,
+    },
     /// One root CBV/SRV/UAV device address and the resource it names.
     RootView {
-        parameter: usize,
+        slot: RootParameterSlot,
         address: u64,
         resource: objc::Id,
         usage: usize,
     },
     /// One converted descriptor array in GPU-visible shared memory.
     Table {
-        parameter: usize,
-        kind: DescriptorTableKind,
+        slot: RootParameterSlot,
         buffer: ObjcObject,
         address: u64,
         length: u64,
@@ -3768,10 +3862,16 @@ fn build_descriptor_table(
     state: &DeviceState,
     allocations: &HashMap<(u64, u32), VmBufferId>,
     table: &crate::wire_v3::DescriptorTableV3,
-    kind: DescriptorTableKind,
+    slot: RootParameterSlot,
 ) -> Result<PendingAbiBinding, PrepareAbort> {
     use crate::wire_v3::DescriptorTableEntryV3;
 
+    let RootParameterKind::DescriptorTable(kind) = slot.kind() else {
+        return Err(MetalError::InvalidArg(
+            "descriptor table names a non-table root parameter",
+        )
+        .into());
+    };
     if !table_kind_accepts_wire(kind, table.kind) {
         return Err(MetalError::InvalidArg(
             "descriptor table kind does not match the reflected range kind",
@@ -3845,8 +3945,7 @@ fn build_descriptor_table(
     let address = buffer_gpu_address(buffer.as_raw());
     let table_binding = builder.binding(address)?;
     Ok(PendingAbiBinding::Table {
-        parameter: usize::from(table.set),
-        kind,
+        slot,
         buffer,
         address,
         length: table_binding.length,
@@ -3856,51 +3955,37 @@ fn build_descriptor_table(
     })
 }
 
-/// Reflected kind of the descriptor table a `set` ordinal names.
-///
-/// Reflection does not carry range kinds, so the registered layout supplies
-/// them in root-signature order ([`RootSignatureLayout::with_descriptor_table_kinds`]).
-/// A `set` ordinal that names different kinds across stages is an explicit
-/// error instead of a silently chosen table.
-fn abi_table_kind(
-    stages: &[(ShaderStage, RootSignatureLayout)],
-    set: usize,
-) -> Result<DescriptorTableKind, PrepareAbort> {
-    let mut found: Option<DescriptorTableKind> = None;
-    for (_stage, layout) in stages {
-        let mut ordinal = 0usize;
-        for parameter in layout.parameters() {
-            if let RootParameterKind::DescriptorTable(kind) = parameter.kind()
-                && ordinal == set
-            {
-                match found {
-                    Some(existing) if existing != kind => {
-                        return Err(MetalError::InvalidArg(
-                            "descriptor table set ordinal names different range kinds",
-                        )
-                        .into());
-                    }
-                    _ => found = Some(kind),
-                }
-            }
-            if matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
-                ordinal += 1;
-            }
+impl PendingAbiBinding {
+    /// The root-parameter declaration this wire argument resolved to.
+    fn slot(&self) -> RootParameterSlot {
+        match self {
+            Self::Constants { slot, .. }
+            | Self::RootView { slot, .. }
+            | Self::Table { slot, .. } => *slot,
         }
     }
-    found.ok_or_else(|| {
-        MetalError::InvalidArg("descriptor table set ordinal has no reflected root parameter").into()
-    })
 }
 
+/// Upper bound on bytes the default MEMORY_SPACE fallback may allocate for one
+/// submission. A stage declares a handful of 8-byte descriptors; a signature
+/// that needs more than this is refused instead of sized.
+const MEMORY_SPACE_DEFAULT_BUDGET: usize = 1 << 20;
+
 /// Uploads one argument buffer per stage and appends the bind ops.
+///
+/// Every pending wire argument is resolved by `(space, register, kind)` through
+/// [`RootSignatureLayout::parameter_by`], never by its wire slot. A pending
+/// argument no stage declares is a counted refusal. After the title bindings,
+/// every MEMORY_SPACE parameter of the stage that received no binding is
+/// pointed at a zero-filled shared buffer (one allocation per stage layout, at
+/// most [`MEMORY_SPACE_DEFAULT_BUDGET`] bytes per submission).
 ///
 /// The builders write only checked 64-bit device addresses, `gpuResourceID`s
 /// and inline root constants. Stage layouts without any encoded parameter are
 /// skipped, so a fragment stage that does not read the root signature keeps its
 /// own `buffer(2)` untouched.
 fn flush_abi(
-    device: objc::Id,
+    transport: &DirectMetalTransport,
     stages: &[(ShaderStage, RootSignatureLayout)],
     pending: &mut AbiPending,
 ) -> Result<
@@ -3910,72 +3995,142 @@ fn flush_abi(
     ),
     PrepareAbort,
 > {
+    let device = transport.device_raw();
     let mut buffers = Vec::new();
     let mut bytes_ops = Vec::new();
     if pending.is_empty() {
         return Ok((buffers, bytes_ops));
     }
-    for (stage, layout) in stages {
+
+    // Resolve every pending argument against every stage before allocating
+    // anything. A wire slot no layout declares is refused by name, never
+    // silently dropped.
+    for binding in &pending.bindings {
+        let slot = binding.slot();
+        let mut declared = false;
+        for (_stage, layout) in stages {
+            match layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
+                Ok(Some(_)) => {
+                    declared = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    transport.count_abi_refusal();
+                    return Err(error.into());
+                }
+            }
+        }
+        if !declared {
+            transport.count_abi_refusal();
+            return Err(MetalError::InvalidArg(
+                "a wire root argument is not declared by the converted layout",
+            )
+            .into());
+        }
+    }
+
+    // Flattened indices each stage received a title binding for.
+    let mut bound_per_stage: Vec<Vec<bool>> = Vec::with_capacity(stages.len());
+    for (_stage, layout) in stages {
+        let mut bound = vec![false; layout.parameters().len()];
+        for binding in &pending.bindings {
+            let slot = binding.slot();
+            if let Ok(Some(index)) =
+                layout.parameter_by(slot.space(), slot.register(), slot.kind())
+            {
+                bound[index] = true;
+            }
+        }
+        bound_per_stage.push(bound);
+    }
+
+    // Size the default MEMORY_SPACE buffers first, so an over-budget layout is
+    // refused before any Metal allocation exists.
+    let mut default_bytes = 0usize;
+    for ((_stage, layout), bound) in stages.iter().zip(&bound_per_stage) {
+        for (index, parameter) in layout.parameters().iter().enumerate() {
+            if parameter.space() == victory_shader::emit::MEMORY_SPACE && !bound[index] {
+                default_bytes = default_bytes
+                    .checked_add(parameter.size().max(crate::macos::bindings::DEVICE_ADDRESS_BYTES))
+                    .ok_or(MetalError::InvalidArg(
+                        "memory-space default binding size overflows",
+                    ))?;
+            }
+        }
+    }
+    if default_bytes > MEMORY_SPACE_DEFAULT_BUDGET {
+        transport.count_abi_refusal();
+        return Err(MetalError::InvalidArg(
+            "memory-space default bindings exceed the 1 MiB budget",
+        )
+        .into());
+    }
+
+    for (stage_index, (stage, layout)) in stages.iter().enumerate() {
         let mut builder = ArgumentBufferBuilder::new(layout);
         let mut resources: Vec<(objc::Id, usize)> = Vec::new();
         let mut tables: Vec<ObjcObject> = Vec::new();
         let mut stage_bytes: Option<(usize, Vec<u8>)> = None;
         for binding in &pending.bindings {
+            let slot = binding.slot();
+            let Some(index) = layout.parameter_by(slot.space(), slot.register(), slot.kind())?
+            else {
+                // The parameter belongs to another stage (root signatures are
+                // per-stage visible); it is not this stage's argument buffer.
+                continue;
+            };
             match binding {
-                PendingAbiBinding::Constants { parameter, bytes } => {
-                    let Some(root) = layout.parameters().get(*parameter) else {
-                        continue;
-                    };
-                    if root.kind() != RootParameterKind::Constants {
+                PendingAbiBinding::Constants { bytes, .. } => {
+                    if layout.parameters()[index].kind() != RootParameterKind::Constants {
+                        transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
-                            "root constants name a non-constant root parameter",
+                            "root constants do not name a constant root parameter",
                         )
                         .into());
                     }
                     match layout.root_constants_metal_index() {
-                        Some(index) => stage_bytes = Some((index, bytes.clone())),
-                        None => builder.set_root_constants(*parameter, bytes)?,
+                        Some(metal_index) => stage_bytes = Some((metal_index, bytes.clone())),
+                        None => builder.set_root_constants(index, bytes)?,
                     }
                 }
                 PendingAbiBinding::RootView {
-                    parameter,
                     address,
                     resource,
                     usage,
+                    ..
                 } => {
-                    let Some(root) = layout.parameters().get(*parameter) else {
-                        continue;
-                    };
-                    match root.kind() {
+                    match layout.parameters()[index].kind() {
                         RootParameterKind::ConstantBufferView
                         | RootParameterKind::ShaderResourceView
                         | RootParameterKind::UnorderedAccessView => {}
                         _ => {
+                            transport.count_abi_refusal();
                             return Err(MetalError::InvalidArg(
-                                "root buffer view names a non-buffer root parameter",
+                                "root buffer view does not name a buffer root parameter",
                             )
                             .into());
                         }
                     }
-                    builder.set_buffer_address(*parameter, *address)?;
+                    builder.set_buffer_address(index, *address)?;
                     resources.push((*resource, *usage));
                 }
                 PendingAbiBinding::Table {
-                    parameter,
-                    kind,
                     buffer,
                     address,
                     length,
                     count,
                     stride,
                     resources: table_resources,
+                    ..
                 } => {
-                    let Some(root) = layout.parameters().get(*parameter) else {
-                        continue;
-                    };
-                    if root.kind() != RootParameterKind::DescriptorTable(*kind) {
+                    if !matches!(
+                        layout.parameters()[index].kind(),
+                        RootParameterKind::DescriptorTable(_)
+                    ) {
+                        transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
-                            "descriptor table names a non-table root parameter",
+                            "descriptor table does not name a table root parameter",
                         )
                         .into());
                     }
@@ -3992,7 +4147,7 @@ fn flush_abi(
                         )
                         .into());
                     }
-                    builder.set_table_address(*parameter, *address)?;
+                    builder.set_table_address(index, *address)?;
                     resources.push((buffer.as_raw(), MTL_RESOURCE_USAGE_READ));
                     resources.extend(table_resources.iter().copied());
                     // `pending` is cleared by the caller as soon as this
@@ -4006,6 +4161,61 @@ fn flush_abi(
                 }
             }
         }
+
+        // MEMORY_SPACE fallback: one zero-filled shared buffer per stage layout,
+        // carved into one aligned sub-range per unbound parameter.
+        let bound = &bound_per_stage[stage_index];
+        let unbound: Vec<usize> = layout
+            .parameters()
+            .iter()
+            .enumerate()
+            .filter(|(index, parameter)| {
+                parameter.space() == victory_shader::emit::MEMORY_SPACE && !bound[*index]
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if !unbound.is_empty() {
+            let mut total = 0usize;
+            for &index in &unbound {
+                total = total
+                    .checked_add(
+                        layout.parameters()[index]
+                            .size()
+                            .max(crate::macos::bindings::DEVICE_ADDRESS_BYTES),
+                    )
+                    .ok_or(MetalError::InvalidArg(
+                        "memory-space default binding size overflows",
+                    ))?;
+            }
+            let zero = vec![0u8; total.max(8)];
+            let buffer = new_argument_buffer(device, &zero)?;
+            let base = buffer_gpu_address(buffer.as_raw());
+            let mut offset = 0usize;
+            for &index in &unbound {
+                let parameter = &layout.parameters()[index];
+                if !matches!(
+                    parameter.kind(),
+                    RootParameterKind::ConstantBufferView
+                        | RootParameterKind::ShaderResourceView
+                        | RootParameterKind::UnorderedAccessView
+                ) {
+                    transport.count_abi_refusal();
+                    return Err(MetalError::InvalidArg(
+                        "a memory-space parameter is not a buffer view",
+                    )
+                    .into());
+                }
+                let address = base.checked_add(offset as u64).ok_or(
+                    MetalError::InvalidArg("memory-space default address overflows"),
+                )?;
+                builder.set_buffer_address(index, address)?;
+                offset += parameter.size().max(crate::macos::bindings::DEVICE_ADDRESS_BYTES);
+            }
+            resources.push((buffer.as_raw(), MTL_RESOURCE_USAGE_READ));
+            tables.push(buffer);
+            transport.count_memory_space(unbound.len() as u64, zero.len() as u64);
+        }
+
         if let Some((index, bytes)) = stage_bytes {
             bytes_ops.push((*stage, index, bytes));
         }
@@ -4106,7 +4316,7 @@ fn abi_render_stages(
 
 /// Flushes collected root-signature bindings for a render-family pipeline.
 fn flush_render_abi(
-    device: objc::Id,
+    transport: &DirectMetalTransport,
     abi: Option<&PipelineAbi>,
     mesh_family: bool,
     pending: &mut AbiPending,
@@ -4120,7 +4330,7 @@ fn flush_render_abi(
         return Ok(());
     }
     let stages = abi_render_stages(abi, mesh_family);
-    let (buffers, bytes_ops) = flush_abi(device, &stages, pending)?;
+    let (buffers, bytes_ops) = flush_abi(transport, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedRenderOp::ArgumentBuffer(buffer));
     }
@@ -4133,7 +4343,7 @@ fn flush_render_abi(
 
 /// Flushes collected root-signature bindings for a compute pipeline.
 fn flush_compute_abi(
-    device: objc::Id,
+    transport: &DirectMetalTransport,
     abi: Option<&PipelineAbi>,
     pending: &mut AbiPending,
     ops: &mut Vec<PreparedComputeOp>,
@@ -4150,7 +4360,7 @@ fn flush_compute_abi(
         .into_iter()
         .map(|(stage, layout)| (stage, layout.clone()))
         .collect();
-    let (buffers, bytes_ops) = flush_abi(device, &stages, pending)?;
+    let (buffers, bytes_ops) = flush_abi(transport, &stages, pending)?;
     for buffer in buffers {
         ops.push(PreparedComputeOp::ArgumentBuffer(buffer));
     }
@@ -4352,7 +4562,7 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
@@ -4382,7 +4592,7 @@ fn prepare_compute_segment(
                     )
                     .into());
                 }
-                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_dispatch();
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
@@ -4441,7 +4651,7 @@ fn prepare_compute_segment(
                     indirect::DISPATCH_ARGUMENT_STRIDE,
                 )?;
                 indirect::validate(&arguments)?;
-                flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                flush_compute_abi(transport, abi.as_ref(), &mut pending, &mut ops)?;
                 transport.encode_counters.bump_indirect();
                 ops.push(PreparedComputeOp::DispatchIndirect {
                     pipeline: pso.raw,
@@ -4461,9 +4671,23 @@ fn prepare_compute_segment(
                         MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
                     );
                 }
-                if abi.is_some() {
+                if let Some(active) = abi.as_ref() {
+                    let Some(slot) = active.root_parameter(usize::from(constants.slot)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root constants name no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if slot.kind() != RootParameterKind::Constants {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root constants name a non-constant root parameter",
+                        )
+                        .into());
+                    }
                     pending.bindings.push(PendingAbiBinding::Constants {
-                        parameter: usize::from(constants.slot),
+                        slot,
                         bytes: constants.bytes.clone(),
                     });
                 } else {
@@ -4483,18 +4707,26 @@ fn prepare_compute_segment(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    let stages: Vec<(ShaderStage, RootSignatureLayout)> = active
-                        .stages_for(ReflectedStage::Compute)
-                        .into_iter()
-                        .map(|(stage, layout)| (stage, layout.clone()))
-                        .collect();
-                    let kind = abi_table_kind(&stages, usize::from(table.set))?;
+                    let Some(slot) = active.root_parameter(usize::from(table.set)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table names no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table names a non-table root parameter",
+                        )
+                        .into());
+                    }
                     pending.bindings.push(build_descriptor_table(
                         device,
                         state,
                         allocations,
                         table,
-                        kind,
+                        slot,
                     )?);
                 } else {
                     if table.kind == DescriptorKind::Sampler {
@@ -4521,14 +4753,33 @@ fn prepare_compute_segment(
                     view.length,
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
-                if abi.is_some() {
+                if let Some(active) = abi.as_ref() {
+                    let Some(slot) = active.root_parameter(usize::from(view.slot)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root buffer view names no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if !matches!(
+                        slot.kind(),
+                        RootParameterKind::ConstantBufferView
+                            | RootParameterKind::ShaderResourceView
+                            | RootParameterKind::UnorderedAccessView
+                    ) {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root buffer view names a non-buffer root parameter",
+                        )
+                        .into());
+                    }
                     let address = buffer_gpu_address(buffer)
                         .checked_add(offset as u64)
                         .ok_or(MetalError::InvalidArg(
                             "root buffer view address overflows u64",
                         ))?;
                     pending.bindings.push(PendingAbiBinding::RootView {
-                        parameter: usize::from(view.slot),
+                        slot,
                         address,
                         resource: buffer,
                         usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
@@ -5292,16 +5543,29 @@ fn build_render_ops(
                         MetalError::InvalidArg("root constants must be 1..=256 bytes").into(),
                     );
                 }
-                if abi.is_some() {
-                    // Converted ABI: the bytes land at the reflected constant
-                    // slot (inline in the top-level argument buffer, or a
-                    // dedicated setBytes index).
-                    pending
-                        .bindings
-                        .push(PendingAbiBinding::Constants {
-                            parameter: usize::from(constants.slot),
-                            bytes: constants.bytes.clone(),
-                        });
+                if let Some(active) = abi.as_ref() {
+                    // Converted ABI: resolve the wire slot through the
+                    // translated root signature, then write the bytes at the
+                    // reflected constant slot (inline in the top-level argument
+                    // buffer, or a dedicated setBytes index).
+                    let Some(slot) = active.root_parameter(usize::from(constants.slot)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root constants name no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if slot.kind() != RootParameterKind::Constants {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root constants name a non-constant root parameter",
+                        )
+                        .into());
+                    }
+                    pending.bindings.push(PendingAbiBinding::Constants {
+                        slot,
+                        bytes: constants.bytes.clone(),
+                    });
                 } else {
                     ops.push(PreparedRenderOp::VertexBytes {
                         slot: usize::from(constants.slot),
@@ -5319,16 +5583,26 @@ fn build_render_ops(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    // A mesh pipeline's tables live on its mesh/object stages;
-                    // a vertex/fragment lookup would not find them.
-                    let stages = abi_render_stages(active, mesh_pipeline.is_some());
-                    let kind = abi_table_kind(&stages, usize::from(table.set))?;
+                    let Some(slot) = active.root_parameter(usize::from(table.set)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table names no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if !matches!(slot.kind(), RootParameterKind::DescriptorTable(_)) {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "descriptor table names a non-table root parameter",
+                        )
+                        .into());
+                    }
                     pending.bindings.push(build_descriptor_table(
                         device,
                         state,
                         allocations,
                         table,
-                        kind,
+                        slot,
                     )?);
                 } else {
                     if table.kind == DescriptorKind::Sampler {
@@ -5355,14 +5629,33 @@ fn build_render_ops(
                     view.length,
                 )
                 .ok_or(PrepareAbort::UnknownHandle)?;
-                if abi.is_some() {
+                if let Some(active) = abi.as_ref() {
+                    let Some(slot) = active.root_parameter(usize::from(view.slot)) else {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root buffer view names no declared root parameter",
+                        )
+                        .into());
+                    };
+                    if !matches!(
+                        slot.kind(),
+                        RootParameterKind::ConstantBufferView
+                            | RootParameterKind::ShaderResourceView
+                            | RootParameterKind::UnorderedAccessView
+                    ) {
+                        transport.count_abi_refusal();
+                        return Err(MetalError::InvalidArg(
+                            "root buffer view names a non-buffer root parameter",
+                        )
+                        .into());
+                    }
                     let address = buffer_gpu_address(buffer)
                         .checked_add(offset as u64)
                         .ok_or(MetalError::InvalidArg(
                             "root buffer view address overflows u64",
                         ))?;
                     pending.bindings.push(PendingAbiBinding::RootView {
-                        parameter: usize::from(view.slot),
+                        slot,
                         address,
                         resource: buffer,
                         usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
@@ -5406,7 +5699,7 @@ fn build_render_ops(
                     .into());
                 }
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5450,7 +5743,7 @@ fn build_render_ops(
                     .into());
                 }
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5491,7 +5784,7 @@ fn build_render_ops(
                     .into());
                 }
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5533,7 +5826,7 @@ fn build_render_ops(
                     );
                 }
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5581,7 +5874,7 @@ fn build_render_ops(
                     );
                 }
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5626,7 +5919,7 @@ fn build_render_ops(
                 )?;
                 indirect::validate(&arguments)?;
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5667,7 +5960,7 @@ fn build_render_ops(
                 )?;
                 indirect::validate(&arguments)?;
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5710,7 +6003,7 @@ fn build_render_ops(
                 )?;
                 indirect::validate(&arguments)?;
                 flush_render_abi(
-                    device,
+                    transport,
                     abi.as_ref(),
                     mesh_pipeline.is_some(),
                     &mut pending,
@@ -5746,7 +6039,7 @@ fn build_render_ops(
     // before an explicit clear). Emit those bindings so the encoder is in the
     // same state the pass had reached.
     flush_render_abi(
-        device,
+        transport,
         abi.as_ref(),
         mesh_pipeline.is_some(),
         &mut pending,

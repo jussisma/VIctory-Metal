@@ -228,7 +228,7 @@ use crate::cmdlist::{ListLedger, RingError};
 use crate::compiler_pool::{CompileJob, CompilerPool, PoolError, PoolStats};
 use crate::fence_page::{FencePage, FencePageMapping, Wake};
 use crate::guest_ipc::{MAX_PIPELINE_ENTRY_LEN, valid_pipeline_entry};
-use crate::macos::bindings::RootSignatureLayout;
+use crate::macos::bindings::{RootParameterMap, RootSignatureLayout};
 use crate::macos::device::{DirectMetalTransport, PipelineAbi, SamplerDesc, bounded_gpu_reason};
 use crate::macos::objc::{self, ObjcObject};
 use crate::macos::registry::{
@@ -2341,12 +2341,20 @@ impl<E: BatchExecutor> IpcHost<E> {
         if let Err(reason) = validate_pipeline_v3(request) {
             return self.reject_host_translation(reason);
         }
-        if let Some(name) = request.root_signature_file.as_deref()
-            && read_stage_file(&self.share_dir, name).is_err()
-        {
-            return self
-                .reject_host_translation("the root-signature file is missing or unreadable");
-        }
+        // The translated root signature is the authoritative slot ->
+        // `(space, register, kind)` map. Read it now so a missing or unreadable
+        // file is a named refusal before any translation work.
+        let translated_root_signature = match request.root_signature_file.as_deref() {
+            Some(name) => match read_stage_file(&self.share_dir, name) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => {
+                    return self.reject_host_translation(
+                        "the root-signature file is missing or unreadable",
+                    );
+                }
+            },
+            None => None,
+        };
         let mut dxil = Vec::with_capacity(request.stages.len());
         for stage in &request.stages {
             match read_stage_file(&self.share_dir, &stage.file) {
@@ -2418,6 +2426,17 @@ impl<E: BatchExecutor> IpcHost<E> {
         let abi = match abi_from_converter_reflections(request, &reflections) {
             Ok(abi) => abi,
             Err(reason) => return self.reject_host_translation(reason),
+        };
+        let abi = match translated_root_signature {
+            Some(bytes) => match RootParameterMap::from_versioned_blob(&bytes) {
+                Ok(map) => abi.with_root_parameters(map),
+                Err(_) => {
+                    return self.reject_host_translation(
+                        "the translated root signature is not a usable versioned signature",
+                    );
+                }
+            },
+            None => abi,
         };
 
         // A graphics vertex function with `[[attribute(n)]]` inputs needs a

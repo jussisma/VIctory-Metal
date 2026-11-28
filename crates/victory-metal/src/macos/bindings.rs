@@ -797,6 +797,47 @@ impl RootSignatureLayout {
         ))
     }
 
+    /// Flattened index of the parameter the translated root signature names by
+    /// `(space, register, kind)`.
+    ///
+    /// The wire protocol addresses a root argument by its root-parameter slot,
+    /// while the converter flattens parameters into the argument buffer in its
+    /// own order. This lookup is the bridge: it is deterministic, requires an
+    /// exact `space`/`register` match, and refuses a layout that declares the
+    /// same `(space, register, kind)` twice instead of silently picking one.
+    ///
+    /// `Ok(None)` means the layout does not declare the argument. A table kind
+    /// of [`DescriptorTableKind::Unspecified`] matches any concrete table kind,
+    /// because converter reflection reports every table as `"Table"` and the
+    /// root signature is the only source of the range kind.
+    pub fn parameter_by(
+        &self,
+        space: u32,
+        register: u32,
+        kind: RootParameterKind,
+    ) -> Result<Option<usize>, MetalError> {
+        let mut found = None;
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            // Converter reflection reports `Slot`/`Space` as `u32::MAX` for a
+            // descriptor table; the root signature is the only source of that
+            // table's register and space, so an unspecified reflected field
+            // still matches.
+            let table = matches!(parameter.kind, RootParameterKind::DescriptorTable(_));
+            let space_matches = parameter.space == space || (table && parameter.space == u32::MAX);
+            let register_matches =
+                parameter.register == register || (table && parameter.register == u32::MAX);
+            if space_matches && register_matches && root_kind_matches(parameter.kind, kind) {
+                if found.is_some() {
+                    return Err(MetalError::InvalidArg(
+                        "root signature declares duplicate space, register and kind parameters",
+                    ));
+                }
+                found = Some(index);
+            }
+        }
+        Ok(found)
+    }
+
     /// Metal buffer index used by `setBytes` root constants, when opted in.
     pub fn root_constants_metal_index(&self) -> Option<usize> {
         self.root_constants_metal_index
@@ -810,6 +851,254 @@ impl RootSignatureLayout {
             (_, ReflectedStage::Other) => true,
             _ => false,
         }
+    }
+}
+
+/// Whether a reflected parameter kind satisfies a requested kind.
+///
+/// Only a descriptor table's range kind may be unspecified: converter
+/// reflection reports `"Table"` for every table, so the root signature alone
+/// supplies the concrete range kind. Every other kind must match exactly.
+fn root_kind_matches(declared: RootParameterKind, requested: RootParameterKind) -> bool {
+    match (declared, requested) {
+        (
+            RootParameterKind::DescriptorTable(declared),
+            RootParameterKind::DescriptorTable(requested),
+        ) => {
+            declared == requested
+                || declared == DescriptorTableKind::Unspecified
+                || requested == DescriptorTableKind::Unspecified
+        }
+        _ => declared == requested,
+    }
+}
+
+/// One root-parameter slot of the translated root signature.
+///
+/// The slot is the root-parameter index the wire protocol names on
+/// `SetRootConstants`, `SetRootBufferView` and `SetDescriptorTable`; `space`,
+/// `register`, `kind` and `size` are what the translated signature declares
+/// there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootParameterSlot {
+    space: u32,
+    register: u32,
+    kind: RootParameterKind,
+    size: usize,
+}
+
+impl RootParameterSlot {
+    /// Builds one slot declaration.
+    pub fn new(space: u32, register: u32, kind: RootParameterKind, size: usize) -> Self {
+        Self {
+            space,
+            register,
+            kind,
+            size,
+        }
+    }
+
+    /// HLSL register space.
+    pub fn space(&self) -> u32 {
+        self.space
+    }
+
+    /// HLSL register index.
+    pub fn register(&self) -> u32 {
+        self.register
+    }
+
+    /// Parameter kind.
+    pub fn kind(&self) -> RootParameterKind {
+        self.kind
+    }
+
+    /// Declared byte size (root constants: the serialized value count times
+    /// four; descriptors and tables: eight).
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+/// D3D12's limit on root parameters.
+const ROOT_SIGNATURE_PARAMETER_LIMIT: usize = 64;
+/// Header of a serialized versioned root signature.
+const ROOT_SIGNATURE_HEADER_BYTES: usize = 24;
+/// One parameter-array entry.
+const ROOT_SIGNATURE_PARAMETER_BYTES: usize = 12;
+/// One descriptor-table range.
+const ROOT_SIGNATURE_RANGE_BYTES: usize = 24;
+
+/// Authoritative slot -> `(space, register, kind)` map of a translated root
+/// signature.
+///
+/// This is the host's resolution table for wire root arguments. It is built
+/// from `PipelineRequestV3`'s translated root-signature bytes, never from a
+/// guest claim about the layout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RootParameterMap {
+    slots: Vec<RootParameterSlot>,
+}
+
+impl RootParameterMap {
+    /// Builds a map from declarations in root-parameter slot order.
+    pub fn from_slots(slots: Vec<RootParameterSlot>) -> Self {
+        Self { slots }
+    }
+
+    /// The declaration at root-parameter `slot`.
+    pub fn slot(&self, slot: usize) -> Option<&RootParameterSlot> {
+        self.slots.get(slot)
+    }
+
+    /// Number of declared slots.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the signature declares no root parameter.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Declarations in slot order.
+    pub fn slots(&self) -> &[RootParameterSlot] {
+        &self.slots
+    }
+
+    /// Parses the `D3D12SerializeVersionedRootSignature` bytes of a translated
+    /// root signature into a slot map.
+    ///
+    /// Accepts the documented version 1.0/1.1 layout: a 24-byte header, a
+    /// 12-byte parameter array, then each parameter's 12-byte record and, for a
+    /// descriptor table, its 24-byte ranges. Static samplers follow and are not
+    /// needed here. A truncated, misaligned or unknown declaration is
+    /// `InvalidArg` with a fixed reason; no bytes of the signature are
+    /// reproduced.
+    pub fn from_versioned_blob(blob: &[u8]) -> Result<Self, MetalError> {
+        let word = |at: usize| -> Result<u32, MetalError> {
+            let bytes = blob
+                .get(at..at + 4)
+                .ok_or(MetalError::InvalidArg(
+                    "translated root signature is truncated",
+                ))?;
+            Ok(u32::from_le_bytes(
+                bytes.try_into().expect("a four-byte slice"),
+            ))
+        };
+        if blob.len() < ROOT_SIGNATURE_HEADER_BYTES {
+            return Err(MetalError::InvalidArg(
+                "translated root signature is shorter than its header",
+            ));
+        }
+        let version = word(0)?;
+        if version != 1 && version != 2 {
+            return Err(MetalError::InvalidArg(
+                "translated root signature has an unknown version",
+            ));
+        }
+        let count = word(4)? as usize;
+        if count > ROOT_SIGNATURE_PARAMETER_LIMIT {
+            return Err(MetalError::InvalidArg(
+                "translated root signature has too many parameters",
+            ));
+        }
+        let array = word(8)? as usize;
+        let array_end = array
+            .checked_add(count * ROOT_SIGNATURE_PARAMETER_BYTES)
+            .ok_or(MetalError::InvalidArg(
+                "translated root signature parameter array overflows",
+            ))?;
+        if array < ROOT_SIGNATURE_HEADER_BYTES || array_end > blob.len() {
+            return Err(MetalError::InvalidArg(
+                "translated root signature parameter array is out of bounds",
+            ));
+        }
+
+        let mut slots = Vec::with_capacity(count);
+        for index in 0..count {
+            let at = array + index * ROOT_SIGNATURE_PARAMETER_BYTES;
+            let parameter_type = word(at)?;
+            let record = word(at + 8)? as usize;
+            if record + 12 > blob.len() {
+                return Err(MetalError::InvalidArg(
+                    "translated root signature parameter record is out of bounds",
+                ));
+            }
+            let (kind, size) = match parameter_type {
+                1 => {
+                    let values = word(record + 8)? as usize;
+                    let size = values
+                        .checked_mul(4)
+                        .ok_or(MetalError::InvalidArg(
+                            "translated root signature constant size overflows",
+                        ))?;
+                    (RootParameterKind::Constants, size)
+                }
+                2 => (RootParameterKind::ConstantBufferView, DEVICE_ADDRESS_BYTES),
+                3 => (RootParameterKind::ShaderResourceView, DEVICE_ADDRESS_BYTES),
+                4 => (RootParameterKind::UnorderedAccessView, DEVICE_ADDRESS_BYTES),
+                0 => {
+                    let ranges = word(record)? as usize;
+                    if ranges == 0 {
+                        return Err(MetalError::InvalidArg(
+                            "translated root signature table has no ranges",
+                        ));
+                    }
+                    let ranges_at = word(record + 4)? as usize;
+                    let ranges_end = ranges_at
+                        .checked_add(ranges * ROOT_SIGNATURE_RANGE_BYTES)
+                        .ok_or(MetalError::InvalidArg(
+                            "translated root signature ranges overflow",
+                        ))?;
+                    if ranges_at < ROOT_SIGNATURE_HEADER_BYTES || ranges_end > blob.len() {
+                        return Err(MetalError::InvalidArg(
+                            "translated root signature ranges are out of bounds",
+                        ));
+                    }
+                    let range_kind = |kind| match kind {
+                        0 => Some(DescriptorTableKind::ShaderResourceView),
+                        1 => Some(DescriptorTableKind::UnorderedAccessView),
+                        2 => Some(DescriptorTableKind::ConstantBufferView),
+                        3 => Some(DescriptorTableKind::Sampler),
+                        _ => None,
+                    };
+                    let mut table_kind = None;
+                    for range in 0..ranges {
+                        let at = ranges_at + range * ROOT_SIGNATURE_RANGE_BYTES;
+                        let declared = range_kind(word(at)?).ok_or(MetalError::InvalidArg(
+                            "translated root signature table range has an unknown kind",
+                        ))?;
+                        table_kind = match table_kind {
+                            None => Some(declared),
+                            Some(previous) if previous == declared => Some(previous),
+                            Some(_) => Some(DescriptorTableKind::Unspecified),
+                        };
+                    }
+                    // A table's register/space is its first range's.
+                    let register = word(ranges_at + 8)?;
+                    let space = word(ranges_at + 12)?;
+                    slots.push(RootParameterSlot::new(
+                        space,
+                        register,
+                        RootParameterKind::DescriptorTable(
+                            table_kind.unwrap_or(DescriptorTableKind::Unspecified),
+                        ),
+                        DEVICE_ADDRESS_BYTES,
+                    ));
+                    continue;
+                }
+                _ => {
+                    return Err(MetalError::InvalidArg(
+                        "translated root signature has an unknown parameter type",
+                    ));
+                }
+            };
+            let register = word(record)?;
+            let space = word(record + 4)?;
+            slots.push(RootParameterSlot::new(space, register, kind, size));
+        }
+        Ok(Self { slots })
     }
 }
 
@@ -2718,6 +3007,246 @@ mod tests {
         let builder = ArgumentBufferBuilder::new(&layout);
         assert_eq!(builder.bytes().len(), 8);
         assert_eq!(builder.encoded_parameters(), 0);
+    }
+
+    /// A root signature layout whose parameters are distinct in `(space,
+    /// register, kind)`: user-data constants, a root CBV, a root UAV and the
+    /// two table kinds a title memory/table signature declares.
+    fn lookup_layout() -> RootSignatureLayout {
+        RootSignatureLayout::from_parameters(
+            ReflectedStage::Compute,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::ConstantBufferView,
+                    size: 8,
+                    register: 0,
+                    space: 1,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::UnorderedAccessView,
+                    size: 8,
+                    register: 0,
+                    space: 2,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                    size: 8,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("lookup layout")
+    }
+
+    #[test]
+    fn parameter_by_resolves_exact_space_register_and_kind() {
+        let layout = lookup_layout();
+        assert_eq!(
+            layout
+                .parameter_by(0, 0, RootParameterKind::Constants)
+                .expect("unique constants"),
+            Some(0)
+        );
+        assert_eq!(
+            layout
+                .parameter_by(1, 0, RootParameterKind::ConstantBufferView)
+                .expect("unique CBV"),
+            Some(1)
+        );
+        assert_eq!(
+            layout
+                .parameter_by(2, 0, RootParameterKind::UnorderedAccessView)
+                .expect("unique UAV"),
+            Some(2)
+        );
+        assert_eq!(
+            layout
+                .parameter_by(
+                    0,
+                    0,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+                )
+                .expect("texture table"),
+            Some(3)
+        );
+        assert_eq!(
+            layout
+                .parameter_by(
+                    0,
+                    0,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler)
+                )
+                .expect("sampler table"),
+            Some(4)
+        );
+        // Converter reflection cannot report a table's range kind: with one
+        // table of that space/register the unspecified kind resolves it.
+        let one_table = RootSignatureLayout::from_parameters(
+            ReflectedStage::Compute,
+            &[RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                size: 8,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("one table");
+        assert_eq!(
+            one_table
+                .parameter_by(
+                    0,
+                    0,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
+                )
+                .expect("unspecified table kind"),
+            Some(0)
+        );
+        // Two tables at the same space/register with different kinds make an
+        // unspecified lookup ambiguous, which must refuse rather than pick one.
+        assert!(layout
+            .parameter_by(
+                0,
+                0,
+                RootParameterKind::DescriptorTable(DescriptorTableKind::Unspecified)
+            )
+            .is_err());
+        // Converter reflection gives a table `u32::MAX` slot/space; the root
+        // signature supplies the concrete pair, so the lookup must still match.
+        let reflected_tables = compute_layout();
+        assert_eq!(
+            reflected_tables
+                .parameter_by(
+                    3,
+                    7,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+                )
+                .expect("reflected texture table"),
+            Some(4)
+        );
+        assert_eq!(
+            reflected_tables
+                .parameter_by(
+                    3,
+                    9,
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler)
+                )
+                .expect("reflected sampler table"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn parameter_by_reports_a_missing_argument() {
+        let layout = lookup_layout();
+        assert_eq!(
+            layout
+                .parameter_by(3, 0, RootParameterKind::Constants)
+                .expect("no space 3 parameter"),
+            None
+        );
+        assert_eq!(
+            layout
+                .parameter_by(0, 7, RootParameterKind::Constants)
+                .expect("no b7 constant"),
+            None
+        );
+        assert_eq!(
+            layout
+                .parameter_by(0, 0, RootParameterKind::ShaderResourceView)
+                .expect("no SRV at b0"),
+            None
+        );
+    }
+
+    #[test]
+    fn parameter_by_refuses_a_duplicate_declaration() {
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Compute,
+            &[
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 4,
+                    register: 0,
+                    space: 0,
+                },
+                RootParameterSpec {
+                    kind: RootParameterKind::Constants,
+                    size: 4,
+                    register: 0,
+                    space: 0,
+                },
+            ],
+        )
+        .expect("the flattening layer allows repeated declarations");
+        assert!(matches!(
+            layout.parameter_by(0, 0, RootParameterKind::Constants),
+            Err(MetalError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn root_parameter_map_parses_a_versioned_blob() {
+        // A minimal version 1.1 blob: header, one parameter array entry, one
+        // constants record at `b0, space 2` with two dwords.
+        let mut blob = vec![0u8; 24 + 12 + 12];
+        let put = |blob: &mut Vec<u8>, at: usize, value: u32| {
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut blob, 0, 2); // version 1.1
+        put(&mut blob, 4, 1); // one parameter
+        put(&mut blob, 8, 24); // array offset
+        put(&mut blob, 12, 0); // no static samplers
+        put(&mut blob, 16, 36); // sampler offset (unused)
+        put(&mut blob, 20, 0); // flags
+        put(&mut blob, 24, 1); // root constants
+        put(&mut blob, 28, 0); // visibility all
+        put(&mut blob, 32, 36); // record offset
+        put(&mut blob, 36, 0); // register b0
+        put(&mut blob, 40, 2); // space 2
+        put(&mut blob, 44, 2); // two 32-bit values
+        let map = super::RootParameterMap::from_versioned_blob(&blob).expect("parse");
+        assert_eq!(map.len(), 1);
+        let slot = map.slot(0).expect("slot 0");
+        assert_eq!(slot.space(), 2);
+        assert_eq!(slot.register(), 0);
+        assert_eq!(slot.kind(), RootParameterKind::Constants);
+        assert_eq!(slot.size(), 8);
+        assert!(map.slot(1).is_none());
+    }
+
+    #[test]
+    fn root_parameter_map_refuses_truncated_and_unknown_blobs() {
+        assert!(matches!(
+            super::RootParameterMap::from_versioned_blob(&[]),
+            Err(MetalError::InvalidArg(_))
+        ));
+        let mut blob = vec![0u8; 24];
+        blob[0..4].copy_from_slice(&9u32.to_le_bytes());
+        assert!(matches!(
+            super::RootParameterMap::from_versioned_blob(&blob),
+            Err(MetalError::InvalidArg(_))
+        ));
+        let mut blob = vec![0u8; 24];
+        blob[0..4].copy_from_slice(&2u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&1u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&24u32.to_le_bytes());
+        assert!(matches!(
+            super::RootParameterMap::from_versioned_blob(&blob),
+            Err(MetalError::InvalidArg(_))
+        ));
     }
     // ------------------------------------------------------------------
     // Hardware proof: IRConverter -> Metal argument buffer -> GPU results
