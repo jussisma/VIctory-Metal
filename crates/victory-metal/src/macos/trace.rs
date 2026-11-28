@@ -224,12 +224,18 @@ pub const OUTCOME_INERT: &str = "inert";
 /// requires.
 pub const OUTCOME_KIND_MISMATCH: &str = "kind-mismatch";
 
+/// Outcome word: a mixed resource table was split by entry shape and bound to
+/// its declared consecutive table parameters.
+pub const OUTCOME_SPLIT: &str = "split";
+
 /// One bounded key of the descriptor-table *kind mismatch* census.
 ///
 /// It names only fixed kind words and counts: the reflected table kind from the
-/// resolved root parameter, the wire `DescriptorTableV3.kind`, and the entry
-/// variant shape (`buffer`, `texture`, `sampler`, `mixed` or `empty`). No
-/// handles, register values, shader bytes or resource contents appear here.
+/// resolved root parameter, the wire `DescriptorTableV3.kind`, the entry
+/// variant shape (`buffer`, `texture`, `sampler`, `mixed` or `empty`), and the
+/// exact entry combination class (`single`, `buffer+texture`,
+/// `buffer+sampler`, `texture+sampler`, `all`, `empty`). No handles, register
+/// values, shader bytes or resource contents appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DescriptorTableKindMismatchKey {
     /// Host pipeline id the refused table was selected with.
@@ -244,6 +250,41 @@ pub struct DescriptorTableKindMismatchKey {
     pub wire_kind: &'static str,
     /// Entry variant shape (`buffer`/`texture`/`sampler`/`mixed`/`empty`).
     pub entry_shape: &'static str,
+    /// Entry combination class, finer than `entry_shape`: `single`,
+    /// `buffer+texture`, `buffer+sampler`, `texture+sampler`, `all` or `empty`.
+    pub mix_class: &'static str,
+}
+
+/// One bounded key of the descriptor-table *mix* census.
+///
+/// A D3D12 table may name several ranges in one resource heap, and the
+/// converter flattens each range as its own table parameter. `mix_class` names
+/// the entry-variant combination and `outcome` says how the host encoded it:
+/// [`OUTCOME_SPLIT`] (bound as per-shape sub-tables), [`OUTCOME_INERT`] (the
+/// declared layout has no consecutive slots for it; the submission still
+/// encodes) or [`OUTCOME_REFUSED`] (an illegal sampler/resource mix). Counts
+/// only; no handles or payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DescriptorTableMixKey {
+    /// Host pipeline id the table was selected with.
+    pub pipeline_id: u64,
+    /// Wire `DescriptorTableV3.set` the submission carried.
+    pub wire_set: u16,
+    /// Entry combination class (`single`, `buffer+texture`, `buffer+sampler`,
+    /// `texture+sampler`, `all` or `empty`).
+    pub mix_class: &'static str,
+    /// Outcome word: [`OUTCOME_SPLIT`], [`OUTCOME_INERT`] or
+    /// [`OUTCOME_REFUSED`].
+    pub outcome: &'static str,
+}
+
+/// One counted descriptor-table mix key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorTableMixCount {
+    /// The bounded key.
+    pub key: DescriptorTableMixKey,
+    /// How many tables the key describes in this process.
+    pub count: u64,
 }
 
 /// One counted kind-mismatch key.
@@ -281,12 +322,14 @@ pub struct DescriptorTableRefusalCensus {
     pub entries: Vec<DescriptorTableRefusalCount>,
     /// Retained kind-mismatch keys in first-observed order.
     pub kind_mismatches: Vec<DescriptorTableKindMismatchCount>,
+    /// Retained mixed-table keys in first-observed order.
+    pub mix_keys: Vec<DescriptorTableMixCount>,
 }
 
 impl DescriptorTableRefusalCensus {
     /// Whether no descriptor table was refused or accepted as inert.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.kind_mismatches.is_empty()
+        self.entries.is_empty() && self.kind_mismatches.is_empty() && self.mix_keys.is_empty()
     }
 
     /// The census as the `descriptor_table_refusal_census` telemetry member.
@@ -303,11 +346,13 @@ impl DescriptorTableRefusalCensus {
     /// The census as the `descriptor_table_refusal_census` telemetry object.
     ///
     /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`,
-    /// `kind_mismatch_keys`; each resolution key carries `pipeline_id`,
-    /// `wire_set`, `declared_tables`, `reflected_tables`, `stage_mask`,
-    /// `map_tables`, `had_plan`, `plan_kind`, `outcome` and `count`. Each
-    /// kind-mismatch key carries `pipeline_id`, `wire_set`, `reflected_kind`,
-    /// `wire_kind`, `entry_shape`, `outcome` (`"kind-mismatch"`) and `count`.
+    /// `kind_mismatch_keys`, `mix_keys`; each resolution key carries
+    /// `pipeline_id`, `wire_set`, `declared_tables`, `reflected_tables`,
+    /// `stage_mask`, `map_tables`, `had_plan`, `plan_kind`, `outcome` and
+    /// `count`. Each kind-mismatch key carries `pipeline_id`, `wire_set`,
+    /// `reflected_kind`, `wire_kind`, `entry_shape`, `mix_class`, `outcome`
+    /// (`"kind-mismatch"`) and `count`. Each mix key carries `pipeline_id`,
+    /// `wire_set`, `mix_class`, `outcome` and `count`.
     pub fn json_value(&self) -> String {
         let keys = self
             .entries
@@ -338,14 +383,31 @@ impl DescriptorTableRefusalCensus {
             .map(|entry| {
                 format!(
                     "{{\"pipeline_id\": {}, \"wire_set\": {}, \"reflected_kind\": \"{}\", \
-                     \"wire_kind\": \"{}\", \"entry_shape\": \"{}\", \"outcome\": \"{}\", \
-                     \"count\": {}}}",
+                     \"wire_kind\": \"{}\", \"entry_shape\": \"{}\", \"mix_class\": \"{}\", \
+                     \"outcome\": \"{}\", \"count\": {}}}",
                     entry.key.pipeline_id,
                     entry.key.wire_set,
                     entry.key.reflected_kind,
                     entry.key.wire_kind,
                     entry.key.entry_shape,
+                    entry.key.mix_class,
                     OUTCOME_KIND_MISMATCH,
+                    entry.count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mix_keys = self
+            .mix_keys
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"pipeline_id\": {}, \"wire_set\": {}, \"mix_class\": \"{}\", \
+                     \"outcome\": \"{}\", \"count\": {}}}",
+                    entry.key.pipeline_id,
+                    entry.key.wire_set,
+                    entry.key.mix_class,
+                    entry.key.outcome,
                     entry.count
                 )
             })
@@ -353,8 +415,8 @@ impl DescriptorTableRefusalCensus {
             .join(", ");
         format!(
             "{{\"distinct_keys\": {}, \"omitted\": {}, \"keys\": [{}], \
-             \"kind_mismatch_keys\": [{}]}}",
-            self.distinct_keys, self.omitted, keys, kind_mismatches
+             \"kind_mismatch_keys\": [{}], \"mix_keys\": [{}]}}",
+            self.distinct_keys, self.omitted, keys, kind_mismatches, mix_keys
         )
     }
 }
@@ -363,12 +425,13 @@ impl DescriptorTableRefusalCensus {
 struct DescriptorTableRefusalLog {
     entries: Vec<(DescriptorTableRefusalKey, u64)>,
     kind_mismatches: Vec<(DescriptorTableKindMismatchKey, u64)>,
+    mix: Vec<(DescriptorTableMixKey, u64)>,
     omitted: u64,
 }
 
 impl DescriptorTableRefusalLog {
     fn retained(&self) -> usize {
-        self.entries.len() + self.kind_mismatches.len()
+        self.entries.len() + self.kind_mismatches.len() + self.mix.len()
     }
 }
 
@@ -425,6 +488,28 @@ pub fn note_descriptor_table_kind_mismatch(key: DescriptorTableKindMismatchKey) 
     log.kind_mismatches.push((key, 1));
 }
 
+/// Counts one mixed descriptor-table event under its bounded key.
+///
+/// It records every mixed table the host sees, whatever its outcome
+/// ([`OUTCOME_SPLIT`], [`OUTCOME_INERT`] or [`OUTCOME_REFUSED`]), so one boot
+/// names the exact entry combination without any payload. It shares the one
+/// [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`] cap; keys past the cap only bump
+/// `omitted`.
+pub fn note_descriptor_table_mix(key: DescriptorTableMixKey) {
+    let mut log = descriptor_table_refusals()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, count)) = log.mix.iter_mut().find(|(known, _)| *known == key) {
+        *count = count.saturating_add(1);
+        return;
+    }
+    if log.retained() >= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS {
+        log.omitted = log.omitted.saturating_add(1);
+        return;
+    }
+    log.mix.push((key, 1));
+}
+
 /// A copy of the process-wide descriptor-table refusal census.
 pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
     let log = descriptor_table_refusals()
@@ -445,6 +530,14 @@ pub fn descriptor_table_refusal_census() -> DescriptorTableRefusalCensus {
             .kind_mismatches
             .iter()
             .map(|(key, count)| DescriptorTableKindMismatchCount {
+                key: *key,
+                count: *count,
+            })
+            .collect(),
+        mix_keys: log
+            .mix
+            .iter()
+            .map(|(key, count)| DescriptorTableMixCount {
                 key: *key,
                 count: *count,
             })
@@ -1283,7 +1376,64 @@ mod tests {
             reflected_kind: "ShaderResourceView",
             wire_kind: "Cbv",
             entry_shape: "buffer",
+            mix_class: "single",
         }
+    }
+
+    fn mix_key(
+        wire_set: u16,
+        mix_class: &'static str,
+        outcome: &'static str,
+    ) -> DescriptorTableMixKey {
+        DescriptorTableMixKey {
+            pipeline_id: 3,
+            wire_set,
+            mix_class,
+            outcome,
+        }
+    }
+
+    /// The mix census names the exact entry combination and how the host
+    /// encoded it, counting repeats once per key.
+    #[test]
+    fn the_mix_census_counts_by_class_and_outcome() {
+        reset_descriptor_table_refusal_census();
+        note_descriptor_table_mix(mix_key(0, "buffer+texture", OUTCOME_SPLIT));
+        note_descriptor_table_mix(mix_key(0, "buffer+texture", OUTCOME_SPLIT));
+        note_descriptor_table_mix(mix_key(0, "buffer+texture", OUTCOME_INERT));
+        note_descriptor_table_mix(mix_key(0, "texture+sampler", OUTCOME_REFUSED));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, 3);
+        assert!(census.entries.is_empty());
+        assert!(census.kind_mismatches.is_empty());
+        assert_eq!(census.mix_keys.len(), 3);
+        assert_eq!(census.mix_keys[0].count, 2);
+        assert_eq!(census.mix_keys[0].key.mix_class, "buffer+texture");
+        assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_SPLIT);
+        assert_eq!(census.mix_keys[1].key.outcome, OUTCOME_INERT);
+        assert_eq!(census.mix_keys[2].key.mix_class, "texture+sampler");
+        assert_eq!(census.mix_keys[2].key.outcome, OUTCOME_REFUSED);
+        let json = census.json_value();
+        assert!(json.contains("\"mix_keys\""));
+        assert!(json.contains("\"mix_class\": \"buffer+texture\""));
+        assert!(json.contains("\"outcome\": \"split\""));
+        assert!(json.contains("\"outcome\": \"inert\""));
+        reset_descriptor_table_refusal_census();
+        assert!(descriptor_table_refusal_census().is_empty());
+    }
+
+    #[test]
+    fn mix_keys_share_the_resolution_cap() {
+        reset_descriptor_table_refusal_census();
+        for set in 0..MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u16 {
+            note_descriptor_table_refusal(key(set));
+        }
+        note_descriptor_table_mix(mix_key(0, "buffer+texture", OUTCOME_SPLIT));
+        let census = descriptor_table_refusal_census();
+        assert_eq!(census.distinct_keys, MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS as u64);
+        assert!(census.mix_keys.is_empty(), "the cap is shared");
+        assert_eq!(census.omitted, 1);
+        reset_descriptor_table_refusal_census();
     }
 
     #[test]

@@ -571,3 +571,268 @@ fn srv_texture_table_samples_both_entries_exactly() {
         allocations_in_set
     );
 }
+
+// ----- Cycle 18B: mixed resource tables -------------------------------------
+
+/// A fragment that reads a texture table partition at `[[id(0)]]` and a buffer
+/// view table partition at `[[id(1)]]`. The converter flattens a D3D12 table
+/// naming two ranges as two consecutive table parameters, so each partition
+/// must land on its own declared slot; a cross-bound partition reads the wrong
+/// shape and cannot produce the expected pixel.
+const MIXED_RESOURCE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct TextureDescriptor {
+    texture2d<float> primary;
+    texture2d<float> duplicate;
+    long reserved;
+};
+
+struct BufferEntry {
+    device const float4 *data;
+    long reserved0;
+    long reserved1;
+};
+
+struct SplitAbi {
+    device TextureDescriptor *textures [[id(0)]];
+    device BufferEntry *buffers [[id(1)]];
+};
+
+struct VOut {
+    float4 position [[position]];
+};
+
+vertex VOut split_vertex(uint vid [[vertex_id]]) {
+    float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VOut out;
+    out.position = float4(corners[vid], 0.0, 1.0);
+    return out;
+}
+
+fragment float4 split_fragment(constant SplitAbi &abi [[buffer(2)]]) {
+    constexpr sampler smp(filter::nearest, address::clamp_to_edge, coord::normalized);
+    float4 tex = abi.textures[0].primary.sample(smp, float2(0.5, 0.5));
+    float4 buf = abi.buffers[0].data[0];
+    return float4(tex.r, buf.g, tex.b + buf.r, 1.0);
+}
+"#;
+
+/// The converted layout a two-range D3D12 table produces: a `Texture` table
+/// parameter followed by a buffer view table parameter.
+fn mixed_resource_abi() -> PipelineAbi {
+    let layout = RootSignatureLayout::from_parameters(
+        ReflectedStage::Fragment,
+        &[
+            RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Texture),
+                size: 8,
+                register: 0,
+                space: 0,
+            },
+            RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(
+                    DescriptorTableKind::ShaderResourceView,
+                ),
+                size: 8,
+                register: 1,
+                space: 0,
+            },
+        ],
+    )
+    .expect("mixed-resource fragment root signature must build");
+    PipelineAbi::graphics(None, Some(layout))
+}
+
+/// One mixed wire table binds both partitions at their declared consecutive
+/// slots: the draw samples a texture entry and reads a buffer range entry and
+/// writes an exact pixel derived from both, and the pass encodes.
+#[test]
+fn a_mixed_resource_table_binds_both_partitions_exactly() {
+    use victory_metal::macos::trace::{
+        OUTCOME_SPLIT, descriptor_table_refusal_census, reset_descriptor_table_refusal_census,
+    };
+    use victory_metal::wire::BufferBinding;
+
+    reset_descriptor_table_refusal_census();
+    // The GPU lock is taken by the sibling test in this binary; the two run
+    // serially under `--test-threads=1`.
+    let dir = TempDir::new("mixed-resource-table");
+    let metallib = compile_metallib(dir.path(), "mixed_resource", MIXED_RESOURCE_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    for (handle, label) in [(TEXTURE0, "texture0"), (TARGET, "target")] {
+        transport
+            .register_registry_texture(
+                handle,
+                rgba8_desc(
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    if handle == TARGET { EDGE } else { TEXTURE_EDGE },
+                    TextureUsage::color_attachment(),
+                    label,
+                ),
+            )
+            .expect("registry texture must create");
+    }
+
+    // A 4x4 image of COLOR0 at pitch `ROW_PITCH` and a `float4` buffer range.
+    let mut upload = HostPage::new(PAGE_BYTES);
+    let poison = [0xaau8; PAGE_BYTES];
+    upload.write(0, &poison);
+    for row in 0..TEXTURE_EDGE as usize {
+        for column in 0..TEXTURE_EDGE as usize {
+            upload.write(row * ROW_PITCH + column * 4, &COLOR0);
+        }
+    }
+    let mut buffer_page = HostPage::new(PAGE_BYTES);
+    let buffer_values: Vec<u8> = [40.0f32 / 255.0, 50.0 / 255.0, 60.0 / 255.0, 1.0]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    buffer_page.write(0, &buffer_values);
+
+    // SAFETY: both pages are live, 16 KiB-aligned allocations that outlive the
+    // synchronous submission and are unregistered before they drop.
+    let upload_id = unsafe { transport.register_zerocopy(upload.raw(), PAGE_BYTES) }
+        .expect("upload page must register");
+    // SAFETY: same zero-copy contract as the upload page.
+    let buffer_id = unsafe { transport.register_zerocopy(buffer_page.raw(), PAGE_BYTES) }
+        .expect("buffer page must register");
+
+    const ALLOC_BUFFER: u64 = 0x42;
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_TEXTURE0, 1), VmBufferId(TEXTURE0));
+    allocations.insert((ALLOC_UPLOAD, 1), upload_id);
+    allocations.insert((ALLOC_BUFFER, 1), buffer_id);
+
+    const HANDLE: u64 = 0x5100;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "split_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("split_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            mixed_resource_abi(),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    // Texture entries first, then the buffer range: the two ranges of one
+    // D3D12 descriptor table, flattened as two table parameters.
+    let mixed_table = DescriptorTableV3 {
+        set: 0,
+        base_register: 0,
+        kind: DescriptorKind::Srv,
+        bindings: vec![
+            DescriptorTableEntryV3::Texture(TEXTURE0),
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: ALLOC_BUFFER,
+                generation: 1,
+                offset: 0,
+                length: 16,
+            }),
+        ],
+    };
+
+    let submission = SubmissionV3 {
+        sequence: 401,
+        list: None,
+        commands: vec![
+            copy_to_texture(ALLOC_UPLOAD, ALLOC_TEXTURE0, 0),
+            CommandV3::BeginRenderPass(BeginRenderPass {
+                colors: vec![color_attachment(ALLOC_TARGET, [0.0, 0.0, 0.0, 1.0])],
+                depth_stencil: None,
+            }),
+            CommandV3::SetGraphicsPipeline(PipelineRef {
+                pipeline_id: HANDLE,
+            }),
+            CommandV3::SetViewport(full_viewport()),
+            CommandV3::SetScissor(full_scissor()),
+            CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
+            CommandV3::SetDescriptorTable(mixed_table),
+            CommandV3::Draw(DrawState {
+                vertex_count: 3,
+                instance_count: 1,
+                start_vertex: 0,
+                start_instance: 0,
+            }),
+            CommandV3::EndRenderPass,
+        ],
+    };
+    let (reply, stats) = transport
+        .submit_v3_with_stats(&submission, &allocations)
+        .expect("a legal mixed resource table must encode");
+    assert_eq!(reply.status, ReplyStatus::Ok, "mixed-table status");
+    assert_eq!(
+        stats,
+        EncoderStats {
+            command_buffers: 1,
+            compute_encoders: 0,
+            render_encoders: 1,
+            blit_encoders: 1,
+            barriers: 0,
+        },
+        "one blit uploads the image and one render encoder draws"
+    );
+    assert_eq!(transport.encode_counters().draws, 1, "the draw encodes");
+    assert_eq!(
+        transport.abi_refusal_count(),
+        0,
+        "a representable mixed table is not an ABI refusal"
+    );
+    assert_eq!(
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        0,
+        "two declared slots represent both partitions"
+    );
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        0,
+        "the table is bound, not inert"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "both partitions fit their declared kinds: {}",
+        census.json_value()
+    );
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    assert_eq!(census.mix_keys[0].key.mix_class, "buffer+texture");
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_SPLIT);
+
+    transport
+        .wait_for_gpu()
+        .expect("the mixed-table pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    // tex.r = COLOR0.r, buf.g = 50, tex.b + buf.r = 30 + 40.
+    assert_uniform(&pixels, [COLOR0[0], 50, COLOR0[2] + 40, 255], "mixed table target");
+    assert_eq!(
+        pixels[0],
+        [10, 50, 70, 255],
+        "texture partition supplies R/B, buffer partition supplies G and the B addend"
+    );
+
+    transport
+        .unregister_buffer(upload_id)
+        .expect("unregister the upload page");
+    transport
+        .unregister_buffer(buffer_id)
+        .expect("unregister the buffer page");
+    eprintln!(
+        "mixed resource table proof on {}: target={:?}, draws=1, abi_refusals=0, census={}",
+        info.name_str(),
+        pixels[0],
+        census.json_value()
+    );
+    reset_descriptor_table_refusal_census();
+}

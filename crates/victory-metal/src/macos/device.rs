@@ -13,7 +13,7 @@ use crate::abi::{VmBufferId, VmDeviceInfo, VmDxilCompileOutput, VmPipelineId};
 use crate::fence_page::{FencePage, FencePageMapping};
 use crate::macos::bindings::{
     ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind, ReflectedStage,
-    RootParameterKind, RootParameterMap, RootParameterSlot, RootSignatureLayout,
+    RootParameter, RootParameterKind, RootParameterMap, RootParameterSlot, RootSignatureLayout,
 };
 use crate::macos::irconverter;
 use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
@@ -1199,6 +1199,12 @@ pub struct DirectMetalTransport {
     /// Descriptor-table sets a plan named as tables that the bound pipeline
     /// declares none of (a genuinely stale/correlated set).
     descriptor_table_stale_refusals: std::sync::atomic::AtomicU64,
+    /// Mixed resource descriptor tables (buffer and texture entries) whose
+    /// declared layout has no consecutive per-shape table slots at the resolved
+    /// ordinal. They are accepted inertly — the submission still encodes — so
+    /// this counter (and the mix census) keeps the class visible instead of
+    /// aborting the batch.
+    descriptor_table_mixed_unrepresentables: std::sync::atomic::AtomicU64,
     /// Persisted root arguments dropped when a pipeline change produced a
     /// layout that does not declare their `(space, register, kind)`.
     abi_stale_parameters_dropped: std::sync::atomic::AtomicU64,
@@ -1272,6 +1278,7 @@ impl DirectMetalTransport {
             memory_space_bytes: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_inert_acceptances: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_stale_refusals: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_mixed_unrepresentables: std::sync::atomic::AtomicU64::new(0),
             abi_stale_parameters_dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1327,6 +1334,21 @@ impl DirectMetalTransport {
 
     fn count_descriptor_table_stale_refusal(&self) {
         self.descriptor_table_stale_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mixed resource descriptor tables accepted inertly because the declared
+    /// layout has no consecutive per-shape table slots for their partitions.
+    ///
+    /// These are not refusals: the submission encodes, and the mix census
+    /// records `outcome: "inert"` with the exact entry combination.
+    pub fn descriptor_table_mixed_unrepresentable_count(&self) -> u64 {
+        self.descriptor_table_mixed_unrepresentables
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_descriptor_table_mixed_unrepresentable(&self) {
+        self.descriptor_table_mixed_unrepresentables
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -4233,6 +4255,12 @@ enum PendingAbiBinding {
         slot: RootParameterSlot,
         /// Wire descriptor-set index the command named.
         wire_slot: usize,
+        /// Partition ordinal of a split mixed table (`0` for a single table).
+        partition: u8,
+        /// Flattened parameter index of the declared slot, when the partition
+        /// was mapped from a layout. A mixed table maps each partition
+        /// explicitly; a single table keeps the wire-ordinal rule.
+        parameter_index: Option<usize>,
         buffer: ObjcObject,
         address: u64,
         length: u64,
@@ -4363,6 +4391,36 @@ fn descriptor_table_entry_shape(table: &crate::wire_v3::DescriptorTableV3) -> &'
     shape.unwrap_or("empty")
 }
 
+/// Exact entry combination class of one wire table, for the mix census.
+///
+/// A D3D12 descriptor table may name several ranges in one resource heap, and
+/// the converter flattens each range as its own table parameter. The class is
+/// computed from entry variants alone (no handles, no payloads) so a boot can
+/// name which combinations the title actually sends: `single`,
+/// `buffer+texture`, `buffer+sampler`, `texture+sampler`, `all` or `empty`.
+fn descriptor_table_mix_class(table: &crate::wire_v3::DescriptorTableV3) -> &'static str {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    let mut buffer = false;
+    let mut texture = false;
+    let mut sampler = false;
+    for entry in &table.bindings {
+        match entry {
+            DescriptorTableEntryV3::Buffer(_) => buffer = true,
+            DescriptorTableEntryV3::Texture(_) => texture = true,
+            DescriptorTableEntryV3::Sampler(_) => sampler = true,
+        }
+    }
+    match (buffer, texture, sampler) {
+        (false, false, false) => "empty",
+        (true, true, true) => "all",
+        (true, true, false) => "buffer+texture",
+        (true, false, true) => "buffer+sampler",
+        (false, true, true) => "texture+sampler",
+        _ => "single",
+    }
+}
+
 /// Records one kind-mismatch in the bounded descriptor-table census.
 fn note_descriptor_table_kind_mismatch(
     pipeline_id: u64,
@@ -4376,8 +4434,24 @@ fn note_descriptor_table_kind_mismatch(
             reflected_kind: reflected_kind.name(),
             wire_kind: descriptor_kind_name(table.kind),
             entry_shape: descriptor_table_entry_shape(table),
+            mix_class: descriptor_table_mix_class(table),
         },
     );
+}
+
+/// Records one mixed-table event in the bounded mix census.
+fn note_descriptor_table_mix(
+    pipeline_id: u64,
+    wire_set: u16,
+    mix_class: &'static str,
+    outcome: &'static str,
+) {
+    crate::macos::trace::note_descriptor_table_mix(crate::macos::trace::DescriptorTableMixKey {
+        pipeline_id,
+        wire_set,
+        mix_class,
+        outcome,
+    });
 }
 
 /// Static, pair-named refusal for a wire kind that cannot fill a range kind.
@@ -4548,8 +4622,6 @@ fn build_descriptor_table(
     slot: RootParameterSlot,
     pipeline_id: u64,
 ) -> Result<PendingAbiBinding, PrepareAbort> {
-    use crate::wire_v3::DescriptorTableEntryV3;
-
     let RootParameterKind::DescriptorTable(kind) = slot.kind() else {
         return Err(MetalError::InvalidArg(
             "descriptor table names a non-table root parameter",
@@ -4572,13 +4644,49 @@ fn build_descriptor_table(
             return Err(error.into());
         }
     };
+    build_descriptor_table_entries(
+        device,
+        state,
+        allocations,
+        table,
+        &table.bindings,
+        shape,
+        slot,
+        table.set,
+        0,
+        None,
+    )
+}
+
+/// Converts one shape partition of a wire table into its own argument buffer.
+///
+/// `entries` are the partition's entries in wire order and `shape` is the
+/// converter descriptor shape they encode (the declared range kind for an
+/// address partition, [`DescriptorTableKind::Texture`] for a texture
+/// partition). A mixed resource table calls this once per partition, each
+/// binding at its own declared parameter.
+#[allow(clippy::too_many_arguments)]
+fn build_descriptor_table_entries(
+    device: objc::Id,
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    table: &crate::wire_v3::DescriptorTableV3,
+    entries: &[crate::wire_v3::DescriptorTableEntryV3],
+    shape: DescriptorTableKind,
+    slot: RootParameterSlot,
+    wire_slot: u16,
+    partition: u8,
+    parameter_index: Option<usize>,
+) -> Result<PendingAbiBinding, PrepareAbort> {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
     let usage = match table.kind {
         DescriptorKind::Uav => MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
         _ => MTL_RESOURCE_USAGE_READ,
     };
     let mut builder = DescriptorTableBuilder::new(shape);
-    let mut resources = Vec::with_capacity(table.bindings.len());
-    for entry in &table.bindings {
+    let mut resources = Vec::with_capacity(entries.len());
+    for entry in entries {
         match entry {
             DescriptorTableEntryV3::Texture(handle)
                 if shape == DescriptorTableKind::Texture =>
@@ -4639,7 +4747,9 @@ fn build_descriptor_table(
     let table_binding = builder.binding(address)?;
     Ok(PendingAbiBinding::Table {
         slot,
-        wire_slot: usize::from(table.set),
+        wire_slot: usize::from(wire_slot),
+        partition,
+        parameter_index,
         buffer,
         address,
         length: table_binding.length,
@@ -4647,6 +4757,275 @@ fn build_descriptor_table(
         stride: table_binding.stride,
         resources,
     })
+}
+
+/// Descriptor shape of one entry variant, before any handle resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireEntryShape {
+    /// A buffer range: the converter's 24-byte `{device_address, 0, 0}`.
+    Buffer,
+    /// A registered texture: `{gpuResourceID, gpuResourceID, 0}`.
+    Texture,
+    /// A registered sampler state: `{gpuResourceID, 0, 0}`.
+    Sampler,
+}
+
+/// The shape of one wire table entry.
+fn wire_entry_shape(entry: &crate::wire_v3::DescriptorTableEntryV3) -> WireEntryShape {
+    use crate::wire_v3::DescriptorTableEntryV3;
+
+    match entry {
+        DescriptorTableEntryV3::Buffer(_) => WireEntryShape::Buffer,
+        DescriptorTableEntryV3::Texture(_) => WireEntryShape::Texture,
+        DescriptorTableEntryV3::Sampler(_) => WireEntryShape::Sampler,
+    }
+}
+
+/// Splits a wire table into per-shape entry partitions, in first-entry order.
+///
+/// D3D12 range descriptors are contiguous and each range is one descriptor
+/// shape, so a legal mixed table is a sequence of shape runs. Grouping by shape
+/// keeps the range order. Returns `None` for an empty table and for the
+/// genuinely illegal mix of sampler entries with buffer/texture entries: a
+/// sampler can never share a resource heap table with views, and a view can
+/// never appear in a sampler table.
+fn descriptor_table_partitions(
+    table: &crate::wire_v3::DescriptorTableV3,
+) -> Option<Vec<(WireEntryShape, Vec<crate::wire_v3::DescriptorTableEntryV3>)>> {
+    let mut partitions: Vec<(WireEntryShape, Vec<crate::wire_v3::DescriptorTableEntryV3>)> =
+        Vec::new();
+    let mut has_sampler = false;
+    let mut has_resource = false;
+    for entry in &table.bindings {
+        let shape = wire_entry_shape(entry);
+        match shape {
+            WireEntryShape::Sampler => has_sampler = true,
+            WireEntryShape::Buffer | WireEntryShape::Texture => has_resource = true,
+        }
+        match partitions.iter_mut().find(|(known, _)| *known == shape) {
+            Some((_, entries)) => entries.push(*entry),
+            None => partitions.push((shape, vec![*entry])),
+        }
+    }
+    if partitions.is_empty() || (has_sampler && has_resource) {
+        return None;
+    }
+    Some(partitions)
+}
+
+/// Whether a declared range kind can carry one entry-shape partition at the
+/// wire table's kind.
+///
+/// The address families are shape-identical (one 24-byte address descriptor),
+/// a texture partition needs a declared `Texture` range, and a sampler
+/// partition a declared `Sampler` range. `Unspecified` is deliberately not
+/// accepted for a mix: the converter reports no range kind there, so the
+/// partition order cannot be proven and the table is treated as
+/// unrepresentable rather than guessed.
+fn mixed_partition_fits(
+    shape: WireEntryShape,
+    declared: DescriptorTableKind,
+    wire: DescriptorKind,
+) -> bool {
+    match shape {
+        WireEntryShape::Buffer => {
+            matches!(
+                declared,
+                DescriptorTableKind::ConstantBufferView
+                    | DescriptorTableKind::ShaderResourceView
+                    | DescriptorTableKind::UnorderedAccessView
+            ) && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
+        }
+        WireEntryShape::Texture => {
+            declared == DescriptorTableKind::Texture
+                && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
+        }
+        WireEntryShape::Sampler => {
+            declared == DescriptorTableKind::Sampler
+                && crate::macos::root_arguments::wire_kind_fills_table(declared, wire)
+        }
+    }
+}
+
+/// The declared table parameter a layout stores at `index`.
+fn parameter_slot(parameter: &RootParameter) -> RootParameterSlot {
+    RootParameterSlot::new(
+        parameter.space(),
+        parameter.register(),
+        parameter.kind(),
+        parameter.size(),
+    )
+}
+
+/// Maps the shape partitions of a mixed resource table onto the declared table
+/// parameters at the resolved ordinal and its consecutive successors.
+///
+/// The converter flattens each D3D12 range as one table parameter in range
+/// order, so partition `i` must land on the `i`-th parameter after the resolved
+/// slot: a missing parameter, a non-table parameter, or a declared kind that
+/// cannot carry the partition's shape means the layout cannot represent the
+/// wire table. That returns `None` so the caller accepts the table inertly —
+/// never binds a partition to a slot of another kind.
+fn plan_mixed_table_partition_slots(
+    abi: &PipelineAbi,
+    wire_set: usize,
+    resolved: RootParameterSlot,
+    shapes: &[WireEntryShape],
+    wire_kind: DescriptorKind,
+) -> Option<Vec<(RootParameterSlot, usize)>> {
+    for layout in abi.layouts() {
+        let parameters = layout.parameters();
+        // Prefer the parameter whose table ordinal is the wire set; a reflected
+        // `u32::MAX` field is a wildcard, so the ordinal is the only identity
+        // when several tables look alike.
+        let mut start: Option<usize> = None;
+        let mut ordinal = 0usize;
+        for (index, parameter) in parameters.iter().enumerate() {
+            if !matches!(parameter.kind(), RootParameterKind::DescriptorTable(_)) {
+                continue;
+            }
+            if same_descriptor_table(&parameter_slot(parameter), &resolved) {
+                if ordinal == wire_set {
+                    start = Some(index);
+                    break;
+                }
+                if start.is_none() {
+                    start = Some(index);
+                }
+            }
+            ordinal += 1;
+        }
+        let Some(start) = start else {
+            continue;
+        };
+        let mut plan = Vec::with_capacity(shapes.len());
+        for (offset, shape) in shapes.iter().enumerate() {
+            let parameter = parameters.get(start + offset)?;
+            let RootParameterKind::DescriptorTable(kind) = parameter.kind() else {
+                return None;
+            };
+            if !mixed_partition_fits(*shape, kind, wire_kind) {
+                return None;
+            }
+            plan.push((parameter_slot(parameter), start + offset));
+        }
+        return Some(plan);
+    }
+    None
+}
+
+/// Prepares the converted bindings for one wire `SetDescriptorTable`.
+///
+/// A single-shape table keeps the ADR-062 path unchanged. A mixed *resource*
+/// table (buffer and texture entries, no sampler) is split by entry shape and
+/// bound to the resolved declared table parameter and its consecutive
+/// successors in converter flattening order, each partition with its own
+/// argument buffer and slot. A layout that has no matching consecutive slots is
+/// accepted inertly: the submission still encodes, the
+/// `mixed_table_unrepresentable` counter and the mix census (`outcome:
+/// "inert"`) keep the class visible, and `abi_refusals` does not move.
+///
+/// A sampler entry inside a resource table (or a buffer/texture entry inside a
+/// sampler table) is illegal in D3D12: that case alone keeps the named,
+/// counted kind-mismatch refusal.
+#[allow(clippy::too_many_arguments)]
+fn prepare_descriptor_table_bindings(
+    transport: &DirectMetalTransport,
+    device: objc::Id,
+    state: &DeviceState,
+    allocations: &HashMap<(u64, u32), VmBufferId>,
+    abi: &PipelineAbi,
+    table: &crate::wire_v3::DescriptorTableV3,
+    slot: RootParameterSlot,
+    pipeline_id: u64,
+) -> Result<Vec<PendingAbiBinding>, PrepareAbort> {
+    let mix_class = descriptor_table_mix_class(table);
+    if mix_class == "single" || mix_class == "empty" {
+        return build_descriptor_table(device, state, allocations, table, slot, pipeline_id)
+            .map(|binding| vec![binding]);
+    }
+
+    let RootParameterKind::DescriptorTable(declared) = slot.kind() else {
+        return Err(MetalError::InvalidArg(
+            "descriptor table names a non-table root parameter",
+        )
+        .into());
+    };
+    let Some(partitions) = descriptor_table_partitions(table) else {
+        // Illegal: sampler entries sharing a table with views. Keep the named
+        // refusal, counted in the bounded kind-mismatch census and in the mix
+        // census as `refused`.
+        note_descriptor_table_kind_mismatch(pipeline_id, table, declared);
+        note_descriptor_table_mix(
+            pipeline_id,
+            table.set,
+            mix_class,
+            crate::macos::trace::OUTCOME_REFUSED,
+        );
+        return match descriptor_table_shape(table, declared) {
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(MetalError::InvalidArg(
+                "descriptor table mixes sampler and resource entries",
+            )
+            .into()),
+        };
+    };
+
+    let shapes: Vec<WireEntryShape> = partitions.iter().map(|(shape, _)| *shape).collect();
+    let Some(plan) = plan_mixed_table_partition_slots(
+        abi,
+        usize::from(table.set),
+        slot,
+        &shapes,
+        table.kind,
+    ) else {
+        // The declared layout cannot represent this mix at consecutive slots.
+        // Accept inertly so the submission encodes; count both the class and
+        // the inert acceptance (the mix key says which).
+        note_descriptor_table_mix(
+            pipeline_id,
+            table.set,
+            mix_class,
+            crate::macos::trace::OUTCOME_INERT,
+        );
+        transport.count_descriptor_table_mixed_unrepresentable();
+        transport.count_descriptor_table_inert_acceptance();
+        return Ok(Vec::new());
+    };
+
+    note_descriptor_table_mix(
+        pipeline_id,
+        table.set,
+        mix_class,
+        crate::macos::trace::OUTCOME_SPLIT,
+    );
+    let mut bindings = Vec::with_capacity(partitions.len());
+    for (partition, ((shape, entries), (partition_slot, parameter_index))) in partitions
+        .into_iter()
+        .zip(plan)
+        .enumerate()
+    {
+        let RootParameterKind::DescriptorTable(declared_kind) = partition_slot.kind() else {
+            return Err(MetalError::InvalidArg(
+                "descriptor table names a non-table root parameter",
+            )
+            .into());
+        };
+        debug_assert!(mixed_partition_fits(shape, declared_kind, table.kind));
+        bindings.push(build_descriptor_table_entries(
+            device,
+            state,
+            allocations,
+            table,
+            &entries,
+            declared_kind,
+            partition_slot,
+            table.set,
+            u8::try_from(partition).unwrap_or(u8::MAX),
+            Some(parameter_index),
+        )?);
+    }
+    Ok(bindings)
 }
 
 impl PendingAbiBinding {
@@ -4677,9 +5056,20 @@ impl PendingAbiBinding {
         }
     }
 
-    /// `(kind, wire_slot)`: one title root-argument slot.
-    fn key(&self) -> (PendingAbiKind, usize) {
-        (self.kind(), self.wire_slot())
+    /// `(kind, wire_slot, partition)`: one title root-argument slot.
+    ///
+    /// A split mixed table carries every partition at the same wire set, so the
+    /// partition ordinal is part of the identity; a single table keeps
+    /// partition `0`.
+    fn key(&self) -> (PendingAbiKind, usize, u8) {
+        match self {
+            Self::Table {
+                wire_slot,
+                partition,
+                ..
+            } => (PendingAbiKind::Table, *wire_slot, *partition),
+            _ => (self.kind(), self.wire_slot(), 0),
+        }
     }
 }
 
@@ -4726,6 +5116,25 @@ fn abi_parameter_index(
     binding: &PendingAbiBinding,
 ) -> Option<usize> {
     let slot = binding.slot();
+    // A split mixed table names its flattened parameter index explicitly: the
+    // partition sits at the declared table parameter consecutive to the
+    // resolved one, which need not equal the wire set ordinal in this layout.
+    // The layout's parameter there must still carry the same `(space, register,
+    // kind)`, so another stage's different parameter is never overwritten.
+    if let PendingAbiBinding::Table {
+        parameter_index: Some(index),
+        ..
+    } = binding
+        && let Some(parameter) = layout.parameters().get(*index)
+    {
+        let compatible =
+            crate::macos::root_arguments::kinds_compatible(parameter.kind(), slot.kind())
+                && (parameter.space() == slot.space() || parameter.space() == u32::MAX)
+                && (parameter.register() == slot.register() || parameter.register() == u32::MAX);
+        if compatible {
+            return Some(*index);
+        }
+    }
     crate::macos::root_arguments::parameter_index(
         layout,
         binding.wire_slot(),
@@ -6098,14 +6507,18 @@ fn prepare_compute_segment(
                         )
                         .into());
                     }
-                    pending.set(build_descriptor_table(
+                    for binding in prepare_descriptor_table_bindings(
+                        transport,
                         device,
                         state,
                         allocations,
+                        active,
                         table,
                         slot,
                         current_pipeline_id,
-                    )?);
+                    )? {
+                        pending.set(binding);
+                    }
                 } else {
                     if table.kind == DescriptorKind::Sampler {
                         return Err(MetalError::NotSupported(
@@ -7020,14 +7433,18 @@ fn build_render_ops(
                         )
                         .into());
                     }
-                    pending.set(build_descriptor_table(
+                    for binding in prepare_descriptor_table_bindings(
+                        transport,
                         device,
                         state,
                         allocations,
+                        active,
                         table,
                         slot,
                         current_pipeline_id,
-                    )?);
+                    )? {
+                        pending.set(binding);
+                    }
                 } else {
                     if table.kind == DescriptorKind::Sampler {
                         return Err(MetalError::NotSupported(
@@ -12418,8 +12835,12 @@ mod async_pipeline_tests {
 #[cfg(test)]
 mod descriptor_table_kind_tests {
     use super::{
-        DescriptorTableKind, check_table_kind, descriptor_table_entry_shape,
-        descriptor_table_shape,
+        DescriptorTableKind, DescriptorTableSet, PipelineAbi, WireEntryShape, check_table_kind,
+        descriptor_table_entry_shape, descriptor_table_mix_class, descriptor_table_partitions,
+        descriptor_table_shape, plan_mixed_table_partition_slots,
+    };
+    use crate::macos::bindings::{
+        ReflectedStage, RootParameterKind, RootParameterSpec, RootSignatureLayout,
     };
     use crate::macos::root_arguments::wire_kind_fills_table;
     use crate::wire::BufferBinding;
@@ -12433,6 +12854,10 @@ mod descriptor_table_kind_tests {
         offset: 0,
         length: 16,
     });
+
+    const TEXTURE_ENTRY: DescriptorTableEntryV3 = DescriptorTableEntryV3::Texture(0x1000);
+
+    const SAMPLER_ENTRY: DescriptorTableEntryV3 = DescriptorTableEntryV3::Sampler(0x2000);
 
     fn table(kind: DescriptorKind, entries: Vec<DescriptorTableEntryV3>) -> DescriptorTableV3 {
         DescriptorTableV3 {
@@ -12624,5 +13049,172 @@ mod descriptor_table_kind_tests {
             descriptor_table_entry_shape(&table(DescriptorKind::Cbv, Vec::new())),
             "empty"
         );
+    }
+
+    // ----- Cycle 18B: mixed resource tables -------------------------------
+
+    /// A fragment layout with one table parameter per declared kind, flattened
+    /// in declaration order and given distinct registers.
+    fn table_layout_abi(kinds: &[DescriptorTableKind]) -> (PipelineAbi, super::RootParameterSlot) {
+        let specs: Vec<RootParameterSpec> = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(*kind),
+                size: 8,
+                register: index as u32,
+                space: 0,
+            })
+            .collect();
+        let layout = RootSignatureLayout::from_parameters(ReflectedStage::Fragment, &specs)
+            .expect("a mixed-table fragment root signature must build");
+        let abi = PipelineAbi::graphics(None, Some(layout));
+        let slot = match abi.descriptor_table_for_set_kind(0, DescriptorKind::Srv) {
+            DescriptorTableSet::Declared(slot) => slot,
+            other => panic!("the first table must resolve, got {other:?}"),
+        };
+        (abi, slot)
+    }
+
+    fn partition_shapes(table: &DescriptorTableV3) -> Vec<WireEntryShape> {
+        descriptor_table_partitions(table)
+            .expect("a resource mix partitions")
+            .iter()
+            .map(|(shape, _)| *shape)
+            .collect()
+    }
+
+    /// The census class names every entry combination exactly, without
+    /// handles or payloads.
+    #[test]
+    fn the_mix_class_names_the_exact_combination() {
+        assert_eq!(descriptor_table_mix_class(&table(DescriptorKind::Cbv, Vec::new())), "empty");
+        assert_eq!(descriptor_table_mix_class(&buffer_table(DescriptorKind::Cbv)), "single");
+        assert_eq!(descriptor_table_mix_class(&texture_table(DescriptorKind::Srv)), "single");
+        assert_eq!(descriptor_table_mix_class(&sampler_table()), "single");
+        assert_eq!(
+            descriptor_table_mix_class(&table(
+                DescriptorKind::Srv,
+                vec![TEXTURE_ENTRY, BUFFER_ENTRY],
+            )),
+            "buffer+texture"
+        );
+        assert_eq!(
+            descriptor_table_mix_class(&table(
+                DescriptorKind::Srv,
+                vec![BUFFER_ENTRY, SAMPLER_ENTRY],
+            )),
+            "buffer+sampler"
+        );
+        assert_eq!(
+            descriptor_table_mix_class(&table(
+                DescriptorKind::Srv,
+                vec![TEXTURE_ENTRY, SAMPLER_ENTRY],
+            )),
+            "texture+sampler"
+        );
+        assert_eq!(
+            descriptor_table_mix_class(&table(
+                DescriptorKind::Srv,
+                vec![BUFFER_ENTRY, TEXTURE_ENTRY, SAMPLER_ENTRY],
+            )),
+            "all"
+        );
+    }
+
+    /// A texture-then-buffer mix maps its partitions onto the two declared
+    /// consecutive table parameters, in entry order.
+    #[test]
+    fn a_mixed_resource_table_partitions_texture_then_buffer() {
+        let (abi, resolved) = table_layout_abi(&[
+            DescriptorTableKind::Texture,
+            DescriptorTableKind::ShaderResourceView,
+        ]);
+        let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
+        assert_eq!(partition_shapes(&wire), vec![
+            WireEntryShape::Texture,
+            WireEntryShape::Buffer,
+        ]);
+        let plan =
+            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
+                .expect("two consecutive declared slots represent the mix");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].1, 0);
+        assert_eq!(plan[1].1, 1);
+        assert_eq!(
+            plan[0].0.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Texture)
+        );
+        assert_eq!(
+            plan[1].0.kind(),
+            RootParameterKind::DescriptorTable(DescriptorTableKind::ShaderResourceView)
+        );
+        // The reverse mix (buffer entries first) maps to the reverse plan.
+        let reversed = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
+        assert!(
+            plan_mixed_table_partition_slots(
+                &abi,
+                0,
+                resolved,
+                &partition_shapes(&reversed),
+                reversed.kind,
+            )
+            .is_none(),
+            "declared range order is authoritative; buffer-first does not fit [Texture, SRV]"
+        );
+    }
+
+    /// One declared table slot cannot represent two partitions; the table is
+    /// inert, never bound to the wrong kind.
+    #[test]
+    fn a_mixed_resource_table_with_one_declared_slot_is_unrepresentable() {
+        let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Texture]);
+        let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
+        assert!(
+            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
+                .is_none(),
+            "a second partition has no declared consecutive slot"
+        );
+    }
+
+    /// A declared order that disagrees with the wire entry order is
+    /// unrepresentable rather than cross-bound.
+    #[test]
+    fn a_mixed_resource_table_whose_declared_order_disagrees_is_unrepresentable() {
+        let (abi, resolved) = table_layout_abi(&[
+            DescriptorTableKind::ShaderResourceView,
+            DescriptorTableKind::Texture,
+        ]);
+        let wire = table(DescriptorKind::Srv, vec![TEXTURE_ENTRY, BUFFER_ENTRY]);
+        assert!(
+            plan_mixed_table_partition_slots(&abi, 0, resolved, &partition_shapes(&wire), wire.kind)
+                .is_none(),
+            "a buffer partition must never fill a Texture slot"
+        );
+    }
+
+    /// Sampler entries mixed with resource entries are illegal in D3D12 and
+    /// stay a named refusal; they are not split and not treated as inert.
+    #[test]
+    fn a_sampler_entry_mixed_with_a_resource_is_illegal() {
+        for entries in [
+            vec![TEXTURE_ENTRY, SAMPLER_ENTRY],
+            vec![BUFFER_ENTRY, SAMPLER_ENTRY],
+            vec![SAMPLER_ENTRY, TEXTURE_ENTRY],
+        ] {
+            let wire = table(DescriptorKind::Srv, entries);
+            assert!(
+                descriptor_table_partitions(&wire).is_none(),
+                "a sampler never shares a resource table"
+            );
+            let error = descriptor_table_shape(&wire, DescriptorTableKind::Texture)
+                .expect_err("the illegal sampler mix is a named refusal");
+            assert!(
+                error.to_string().contains("sampler")
+                    || error.to_string().contains("texture")
+                    || error.to_string().contains("buffer"),
+                "the refusal names the offending entry: {error}"
+            );
+        }
     }
 }

@@ -240,6 +240,11 @@ fn full_scissor() -> ScissorRect {
 /// One mixed-kind draw: a declared table of `reflected` kind fed by a wire
 /// table of `wire` kind.
 fn submission(sequence: u32, pipeline: u64, wire: DescriptorKind) -> SubmissionV3 {
+    table_submission(sequence, pipeline, buffer_table(wire))
+}
+
+/// One draw that binds exactly `table` at set 0.
+fn table_submission(sequence: u32, pipeline: u64, table: DescriptorTableV3) -> SubmissionV3 {
     SubmissionV3 {
         sequence,
         list: None,
@@ -254,7 +259,7 @@ fn submission(sequence: u32, pipeline: u64, wire: DescriptorKind) -> SubmissionV
             CommandV3::SetViewport(full_viewport()),
             CommandV3::SetScissor(full_scissor()),
             CommandV3::SetPrimitiveTopology(PrimitiveTopology::TriangleList),
-            CommandV3::SetDescriptorTable(buffer_table(wire)),
+            CommandV3::SetDescriptorTable(table),
             CommandV3::Draw(DrawState {
                 vertex_count: 3,
                 instance_count: 1,
@@ -262,6 +267,25 @@ fn submission(sequence: u32, pipeline: u64, wire: DescriptorKind) -> SubmissionV
                 start_instance: 0,
             }),
             CommandV3::EndRenderPass,
+        ],
+    }
+}
+
+/// A wire table naming a texture range and a buffer range in one resource
+/// heap: legal D3D12, and the converter flattens it as two table parameters.
+fn mixed_resource_table(overrides: DescriptorKind) -> DescriptorTableV3 {
+    DescriptorTableV3 {
+        set: 0,
+        base_register: 0,
+        kind: overrides,
+        bindings: vec![
+            DescriptorTableEntryV3::Texture(0x3000),
+            DescriptorTableEntryV3::Buffer(BufferBinding {
+                allocation_id: ALLOC_SIDE,
+                generation: 1,
+                offset: 0,
+                length: 16,
+            }),
         ],
     }
 }
@@ -930,5 +954,221 @@ fn an_srv_table_skips_a_sampler_at_the_wire_ordinal_without_a_map() {
         info.name_str(),
         census.json_value()
     );
+    reset_descriptor_table_refusal_census();
+}
+
+// ----- Cycle 18B: mixed resource tables -------------------------------------
+
+/// A mixed resource table (texture range then buffer range) is legal D3D12.
+/// When the declared layout has no consecutive per-shape table slots, the host
+/// accepts it inertly: the submission encodes, the draw still runs, the
+/// `mixed_table_unrepresentable` counter advances, `abi_refusals` stays 0, and
+/// the mix census records `buffer+texture` / `inert`.
+#[test]
+fn an_unrepresentable_mixed_table_is_inert_and_encodes() {
+    use victory_metal::macos::trace::{OUTCOME_INERT, descriptor_table_refusal_census};
+
+    let Some(_lock) = GpuLock::acquire() else {
+        eprintln!("PARTIAL: another GPU run holds /tmp/victory-gpu.lock; proof skipped");
+        return;
+    };
+    reset_descriptor_table_refusal_census();
+
+    let dir = TempDir::new("descriptor-table-mixed-inert");
+    let metallib = compile_metallib(dir.path(), "mixedinert", CONSTANT_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+    let info = transport.device_info().expect("device info");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), "target"),
+        )
+        .expect("registry texture must create");
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live, 16 KiB-aligned allocation that outlives the
+    // synchronous submissions and is unregistered before it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_SIDE, 1), side_id);
+
+    const HANDLE: u64 = 0x7101;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "constant_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("constant_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            // One declared texture table: there is no consecutive buffer slot
+            // for the mixed table's second partition.
+            one_table_abi(DescriptorTableKind::Texture),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let (reply, stats) = transport
+        .submit_v3_with_stats(
+            &table_submission(701, HANDLE, mixed_resource_table(DescriptorKind::Srv)),
+            &allocations,
+        )
+        .expect("an unrepresentable mixed table must not refuse the submission");
+    assert_eq!(
+        reply.status,
+        victory_metal::wire::ReplyStatus::Ok,
+        "the submission is accepted, not refused"
+    );
+    assert_eq!(stats.render_encoders, 1, "the pass encodes");
+    assert_eq!(transport.encode_counters().draws, 1, "the draw encodes");
+    assert_eq!(
+        transport.abi_refusal_count(),
+        0,
+        "an inert mixed table is not an ABI refusal"
+    );
+    assert_eq!(
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        1,
+        "the unrepresentable mix is counted"
+    );
+    assert_eq!(
+        transport.descriptor_table_inert_acceptance_count(),
+        1,
+        "the inert acceptance counter accounts for it too"
+    );
+    let census = descriptor_table_refusal_census();
+    assert!(
+        census.kind_mismatches.is_empty(),
+        "an unrepresentable resource mix is not a kind mismatch: {}",
+        census.json_value()
+    );
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    let entry = &census.mix_keys[0];
+    assert_eq!(entry.count, 1);
+    assert_eq!(entry.key.pipeline_id, HANDLE);
+    assert_eq!(entry.key.wire_set, 0);
+    assert_eq!(entry.key.mix_class, "buffer+texture");
+    assert_eq!(entry.key.outcome, OUTCOME_INERT);
+
+    transport
+        .wait_for_gpu()
+        .expect("the constant pass should complete");
+    let pixels = transport
+        .read_registered_texture_rgba8(TARGET)
+        .expect("target readback");
+    assert_eq!(pixels.len(), PIXELS, "target pixel count");
+    for (index, pixel) in pixels.iter().enumerate() {
+        assert_eq!(*pixel, DRAWN_RGBA, "target pixel {index}");
+    }
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
+    eprintln!(
+        "mixed inert proof on {}: draws=1, mixed_unrepresentable={}, inert={}, census={}",
+        info.name_str(),
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        transport.descriptor_table_inert_acceptance_count(),
+        census.json_value()
+    );
+    reset_descriptor_table_refusal_census();
+}
+
+/// A sampler entry inside a resource table is illegal in D3D12: the named
+/// kind-mismatch refusal is kept, counted in both censuses, and `abi_refusals`
+/// stays 0 (the table already named a declared parameter).
+#[test]
+fn an_illegal_sampler_mix_stays_a_named_counted_refusal() {
+    use victory_metal::macos::trace::{
+        OUTCOME_REFUSED, descriptor_table_refusal_census,
+    };
+
+    let Some(_lock) = GpuLock::acquire() else {
+        eprintln!("PARTIAL: another GPU run holds /tmp/victory-gpu.lock; proof skipped");
+        return;
+    };
+    reset_descriptor_table_refusal_census();
+
+    let dir = TempDir::new("descriptor-table-mixed-illegal");
+    let metallib = compile_metallib(dir.path(), "mixedillegal", CONSTANT_MSL);
+    let transport = DirectMetalTransport::new().expect("Metal device should open");
+
+    transport
+        .register_registry_texture(
+            TARGET,
+            rgba8_desc(EDGE, EDGE, TextureUsage::color_attachment(), "target"),
+        )
+        .expect("registry texture must create");
+    let side = HostPage::new(PAGE_BYTES);
+    // SAFETY: the page is a live, 16 KiB-aligned allocation unregistered before
+    // it drops.
+    let side_id = unsafe { transport.register_zerocopy(side.raw(), PAGE_BYTES) }
+        .expect("side page must register");
+    let mut allocations = HashMap::new();
+    allocations.insert((ALLOC_TARGET, 1), VmBufferId(TARGET));
+    allocations.insert((ALLOC_SIDE, 1), side_id);
+
+    const HANDLE: u64 = 0x7102;
+    transport
+        .register_content_hashed_graphics_pipeline(
+            HANDLE,
+            &metallib,
+            "constant_vertex",
+            &PipelineState {
+                color_formats: vec![TextureFormat::Rgba8Unorm],
+                depth_format: None,
+                fragment_entry: Some("constant_fragment".to_string()),
+                ..Default::default()
+            }
+            .encode(PipelineStage::Graphics),
+            one_table_abi(DescriptorTableKind::ShaderResourceView),
+        )
+        .expect("content-hashed graphics pipeline must register");
+
+    let illegal = DescriptorTableV3 {
+        set: 0,
+        base_register: 0,
+        kind: DescriptorKind::Srv,
+        bindings: vec![
+            DescriptorTableEntryV3::Texture(0x3000),
+            DescriptorTableEntryV3::Sampler(0x4000),
+        ],
+    };
+    let error = transport
+        .submit_v3_with_stats(&table_submission(702, HANDLE, illegal), &allocations)
+        .expect_err("a sampler entry inside a resource table is illegal");
+    assert!(
+        error.to_string().contains("sampler entry"),
+        "the refusal names the offending entry: {error}"
+    );
+    assert_eq!(
+        transport.abi_refusal_count(),
+        0,
+        "the kind refusal is not a root-argument ABI refusal"
+    );
+    assert_eq!(
+        transport.descriptor_table_mixed_unrepresentable_count(),
+        0,
+        "an illegal mix is refused, never accepted inertly"
+    );
+    let census = descriptor_table_refusal_census();
+    assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
+    assert_eq!(census.mix_keys[0].key.mix_class, "texture+sampler");
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_REFUSED);
+    assert_eq!(census.kind_mismatches.len(), 1, "{}", census.json_value());
+    let mismatch = &census.kind_mismatches[0];
+    assert_eq!(mismatch.key.reflected_kind, "ShaderResourceView");
+    assert_eq!(mismatch.key.wire_kind, "Srv");
+    assert_eq!(mismatch.key.entry_shape, "mixed");
+    assert_eq!(mismatch.key.mix_class, "texture+sampler");
+
+    transport
+        .unregister_buffer(side_id)
+        .expect("unregister the side page");
     reset_descriptor_table_refusal_census();
 }
