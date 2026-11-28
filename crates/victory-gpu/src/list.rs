@@ -2131,6 +2131,57 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Expands a whole-resource `CopyResource` into one wire texture-region copy
+/// per subresource.
+///
+/// D3D12 `CopyResource` copies every mip/slice of an identically described
+/// resource. The wire has no whole-texture command, so each subresource is
+/// copied with its exact texel extent: no implicit format conversion, no
+/// implicit resize and no silent skip. A descriptor mismatch or a multisample
+/// source is refused by name.
+#[cfg(windows)]
+fn copy_texture_resource(
+    producer: &mut crate::native_metal::producer::MetalProducer,
+    dst: This,
+    src: This,
+) -> Result<(), crate::native_metal::producer::ProducerError> {
+    use crate::native_metal::producer::ProducerError;
+    let refuse = |why: &'static str| {
+        ProducerError::unsupported_opcode(why, victory_metal::wire_v3::OP_COPY_TEXTURE)
+    };
+    let destination = crate::resource::texture_copy_layout(dst)
+        .ok_or(refuse("CopyResource: destination is not a texture"))?;
+    let source = crate::resource::texture_copy_layout(src)
+        .ok_or(refuse("CopyResource: source is not a texture"))?;
+    if destination.sample_count != 1 || source.sample_count != 1 {
+        return Err(refuse(
+            "CopyResource: a multisample resource must use ResolveSubresource",
+        ));
+    }
+    if destination != source {
+        return Err(refuse("CopyResource: source and destination descriptions differ"));
+    }
+    let subresources = destination.subresources;
+    tracing::debug!(
+        copy_kind = "copy_resource",
+        subresources,
+        "present_copy_trace=copy_kind=copy_resource"
+    );
+    for index in 0..subresources {
+        let (_, _, _, to_extent) = crate::resource::texture_subresource(dst, index)
+            .ok_or(refuse("CopyResource: destination subresource"))?;
+        let (_, _, _, from_extent) = crate::resource::texture_subresource(src, index)
+            .ok_or(refuse("CopyResource: source subresource"))?;
+        if to_extent != from_extent {
+            return Err(refuse("CopyResource: subresource extents differ"));
+        }
+        let to = metal_subresource(dst, index)?;
+        let from = metal_subresource(src, index)?;
+        producer.copy_texture_region(from, to, [0, 0, 0], [0, 0, 0], to_extent)?;
+    }
+    Ok(())
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     if crate::backend::GpuBackend::from_env() == crate::backend::GpuBackend::Metal {
@@ -2164,9 +2215,14 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 let from = crate::native_metal::producer::ResourceId::from_range(&source)?;
                 return producer.copy_buffer(from, 0, to, 0, length);
             }
+            if crate::resource::texture_memory(dst).is_some()
+                && crate::resource::texture_memory(src).is_some()
+            {
+                return copy_texture_resource(producer, dst, src);
+            }
             producer.refuse(
-                "CopyResource of a texture (subresource lowering not wired)",
-                None,
+                "CopyResource: a resource is neither a buffer nor a texture",
+                Some(victory_metal::wire_v3::OP_COPY_TEXTURE),
             )
         });
         return;

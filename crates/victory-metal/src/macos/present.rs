@@ -38,6 +38,7 @@ use std::mem;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::macos::blit;
 use crate::macos::device::DirectMetalTransport;
 use crate::macos::objc::{self, AutoreleasePool, ObjcObject};
 
@@ -63,6 +64,8 @@ const MTL_STORE_ACTION_STORE: usize = 1;
 const MTL_COMMAND_BUFFER_STATUS_COMPLETED: usize = 4;
 /// `'BGRA'` four-character code in the big-endian layout IOSurface expects.
 const IOSURFACE_PIXEL_FORMAT_BGRA: i32 = 0x4247_5241;
+/// `'RGBA'` four-character code, matching `MTLPixelFormatRGBA8Unorm` (70).
+const IOSURFACE_PIXEL_FORMAT_RGBA: i32 = 0x5247_4241;
 /// `kIOSurfaceLockReadOnly`. Test-only: production never locks a surface.
 #[cfg(test)]
 const IOSURFACE_LOCK_READ_ONLY: u32 = 1;
@@ -254,6 +257,283 @@ impl PresentSink for RecordingSink {
         self.frames.push(frame);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded present trace
+// ---------------------------------------------------------------------------
+//
+// One line per process proves which identity `Present` actually showed and
+// whether anything wrote that texture before it was shown. The trace is
+// counts only: no pixel payload, no title asset, no dump. It is bounded to
+// [`PRESENT_TRACE_MAX_KEYS`] distinct keys so a long boot cannot grow memory.
+
+/// Largest number of distinct present keys the trace remembers.
+pub const PRESENT_TRACE_MAX_KEYS: usize = 16;
+
+/// What wrote the presented source texture before this frame was shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentCopyKind {
+    /// No host copy into the source was observed.
+    None,
+    /// A texture-region copy (guest `CopyResource` lowers to this).
+    CopyTextureRegion,
+    /// A multisample resolve.
+    ResolveSubresource,
+}
+
+impl PresentCopyKind {
+    /// The stable telemetry name of this kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CopyTextureRegion => "copy_texture_region",
+            Self::ResolveSubresource => "resolve_subresource",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PresentTraceKey {
+    copy_kind: PresentCopyKind,
+    source_is_presented: bool,
+    probe_sampled_presented: bool,
+    fallback_clear: bool,
+}
+
+#[derive(Debug, Default)]
+struct PresentTrace {
+    frames: u64,
+    copied_into_source: u64,
+    probe_source_mismatch: u64,
+    fallback_clear: u64,
+    keys: Vec<(PresentTraceKey, u64)>,
+    dropped_keys: u64,
+    /// Copy count observed at the previous present of each source texture, so
+    /// a copy from an earlier frame is not counted again.
+    source_copies: Vec<(usize, u64)>,
+    dropped_sources: u64,
+}
+
+static PRESENT_TRACE: OnceLock<Mutex<PresentTrace>> = OnceLock::new();
+
+fn present_trace() -> &'static Mutex<PresentTrace> {
+    PRESENT_TRACE.get_or_init(|| Mutex::new(PresentTrace::default()))
+}
+
+/// Records one presented frame.
+///
+/// `source` is the texture `Present` was asked to show, `presented` is the
+/// texture the window server actually shows, and `probe_sampled` is the
+/// texture the probe read (`None` when it did not sample this frame). The
+/// source and presented tokens are object identity, not pixel payload.
+fn record_present_trace(
+    source: objc::Id,
+    presented: objc::Id,
+    probe_sampled: Option<objc::Id>,
+    fallback_clear: bool,
+) {
+    let copy_total = if source.is_null() {
+        0
+    } else {
+        blit::copy_count_for(source)
+    };
+    let Ok(mut trace) = present_trace().lock() else {
+        return;
+    };
+    let previous_copies = if source.is_null() {
+        0
+    } else {
+        let key = source as usize;
+        match trace.source_copies.iter().position(|(seen, _)| *seen == key) {
+            Some(index) => {
+                let previous = trace.source_copies[index].1;
+                trace.source_copies[index].1 = copy_total;
+                previous
+            }
+            None => {
+                if trace.source_copies.len() < PRESENT_TRACE_MAX_KEYS {
+                    trace.source_copies.push((key, copy_total));
+                } else {
+                    trace.dropped_sources = trace.dropped_sources.saturating_add(1);
+                }
+                0
+            }
+        }
+    };
+    // A copy that happened before this frame's previous present is not part of
+    // this frame; only a new copy makes the source "written for this frame".
+    let copied_since_last_present = copy_total > previous_copies;
+    let copy_kind = if copied_since_last_present {
+        if source.is_null() {
+            PresentCopyKind::None
+        } else {
+            match blit::copy_kind_for(source) {
+                Some(blit::BlitCopyKind::CopyTextureRegion) => PresentCopyKind::CopyTextureRegion,
+                Some(blit::BlitCopyKind::ResolveSubresource) => {
+                    PresentCopyKind::ResolveSubresource
+                }
+                None => PresentCopyKind::None,
+            }
+        }
+    } else {
+        PresentCopyKind::None
+    };
+    let key = PresentTraceKey {
+        copy_kind,
+        source_is_presented: !source.is_null() && source == presented,
+        probe_sampled_presented: probe_sampled.is_some_and(|sampled| sampled == presented),
+        fallback_clear,
+    };
+    trace.frames = trace.frames.saturating_add(1);
+    if copied_since_last_present {
+        trace.copied_into_source = trace.copied_into_source.saturating_add(1);
+    }
+    if probe_sampled.is_some() && !key.probe_sampled_presented {
+        trace.probe_source_mismatch = trace.probe_source_mismatch.saturating_add(1);
+    }
+    if fallback_clear {
+        trace.fallback_clear = trace.fallback_clear.saturating_add(1);
+    }
+    match trace.keys.iter_mut().find(|(seen, _)| *seen == key) {
+        Some((_, count)) => *count = count.saturating_add(1),
+        None => {
+            if trace.keys.len() < PRESENT_TRACE_MAX_KEYS {
+                trace.keys.push((key, 1));
+            } else {
+                trace.dropped_keys = trace.dropped_keys.saturating_add(1);
+            }
+        }
+    }
+    let frames = trace.frames;
+    drop(trace);
+    // A stable line in the host log without any host-binary edit. One line per
+    // 60 presented frames is bounded and enough for a boot digest.
+    if frames.is_multiple_of(60) {
+        eprintln!("{}", present_trace_report().log_line());
+    }
+}
+
+/// Snapshot of the bounded present trace, for telemetry and tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PresentTraceReport {
+    /// Frames recorded by this process.
+    pub frames: u64,
+    /// Frames whose source texture received a host copy before it was shown.
+    pub copied_into_source: u64,
+    /// Times the probe sampled a texture other than the one presented.
+    pub probe_source_mismatch: u64,
+    /// Frames whose drawable was the diagnostic fallback clear.
+    pub fallback_clear: u64,
+    /// Per-key counts, at most [`PRESENT_TRACE_MAX_KEYS`] entries.
+    pub keys: Vec<PresentTraceEntry>,
+    /// Keys dropped after the bound was reached.
+    pub dropped_keys: u64,
+    /// Source textures whose previous-copy state was not retained after the
+    /// bound was reached.
+    pub dropped_sources: u64,
+}
+
+/// One counted present key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentTraceEntry {
+    /// Copy kind that wrote the source before this frame.
+    pub copy_kind: PresentCopyKind,
+    /// The source texture and the presented texture are the same object.
+    pub source_is_presented: bool,
+    /// The probe sampled the presented texture (not a different one).
+    pub probe_sampled_presented: bool,
+    /// The presented drawable was the diagnostic fallback clear.
+    pub fallback_clear: bool,
+    /// Frames with this key.
+    pub count: u64,
+}
+
+/// Clears the present trace (tests).
+#[cfg(test)]
+fn reset_present_trace() {
+    if let Ok(mut trace) = present_trace().lock() {
+        *trace = PresentTrace::default();
+    }
+}
+
+/// The present trace accumulated so far.
+pub fn present_trace_report() -> PresentTraceReport {
+    let Ok(trace) = present_trace().lock() else {
+        return PresentTraceReport::default();
+    };
+    PresentTraceReport {
+        frames: trace.frames,
+        copied_into_source: trace.copied_into_source,
+        probe_source_mismatch: trace.probe_source_mismatch,
+        fallback_clear: trace.fallback_clear,
+        keys: trace
+            .keys
+            .iter()
+            .map(|(key, count)| PresentTraceEntry {
+                copy_kind: key.copy_kind,
+                source_is_presented: key.source_is_presented,
+                probe_sampled_presented: key.probe_sampled_presented,
+                fallback_clear: key.fallback_clear,
+                count: *count,
+            })
+            .collect(),
+        dropped_keys: trace.dropped_keys,
+        dropped_sources: trace.dropped_sources,
+    }
+}
+
+impl PresentTraceReport {
+    /// One stable `present_trace=...` line for the host log.
+    ///
+    /// Every field is a count or a stable name; no texture payload appears.
+    pub fn log_line(&self) -> String {
+        let count_for = |kind: PresentCopyKind| {
+            self.keys
+                .iter()
+                .filter(|entry| entry.copy_kind == kind)
+                .map(|entry| entry.count)
+                .fold(0u64, u64::saturating_add)
+        };
+        let source_is_presented: u64 = self
+            .keys
+            .iter()
+            .filter(|entry| entry.source_is_presented)
+            .map(|entry| entry.count)
+            .fold(0u64, u64::saturating_add);
+        let probe_sampled_presented: u64 = self
+            .keys
+            .iter()
+            .filter(|entry| entry.probe_sampled_presented)
+            .map(|entry| entry.count)
+            .fold(0u64, u64::saturating_add);
+        format!(
+            "present_trace=frames={} copied_into_source={} copy_kind_copy_texture_region={} \
+             copy_kind_resolve_subresource={} copy_kind_none={} source_is_presented={} \
+             probe_sampled_presented={} probe_source_mismatch={} fallback_clear={} \
+             distinct_keys={} dropped_keys={} dropped_sources={}",
+            self.frames,
+            self.copied_into_source,
+            count_for(PresentCopyKind::CopyTextureRegion),
+            count_for(PresentCopyKind::ResolveSubresource),
+            count_for(PresentCopyKind::None),
+            source_is_presented,
+            probe_sampled_presented,
+            self.probe_source_mismatch,
+            self.fallback_clear,
+            self.keys.len(),
+            self.dropped_keys,
+            self.dropped_sources,
+        )
+    }
+}
+
+/// Whether `sampled` is the same texture `presented` shows.
+///
+/// A probe that reads a different texture is a false negative; the caller must
+/// name and count it rather than count its pixels as success.
+pub fn probe_samples_presented(sampled: objc::Id, presented: objc::Id) -> bool {
+    !sampled.is_null() && sampled == presented
 }
 
 /// A `CAMetalLayer` drawable pool driven by the native window presenter.
@@ -514,11 +794,24 @@ impl NativeSwapchain {
         // after `waitUntilCompleted` is the only point where "presented" and
         // "readable" coincide. With the probe off, `probe` is `None` and this
         // block does nothing.
+        let mut probe_sampled = None;
         if let Some(probe) = self.probe.as_mut() {
             // `filled == false` means the drawable was cleared to the known
             // diagnostic colour, so the probe can use that as its clear value.
-            probe.observe(self.queue.as_raw(), target, self.presented, !filled);
+            // Both the presented and the sampled texture are this same
+            // drawable; handing the two explicitly makes a mismatch named and
+            // counted instead of silently reported as pixels.
+            if probe.observe(self.queue.as_raw(), target, target, self.presented, !filled) {
+                probe_sampled = Some(target);
+            }
         }
+
+        record_present_trace(
+            source_info.map_or(std::ptr::null_mut(), |(source, ..)| source),
+            target,
+            probe_sampled,
+            !filled,
+        );
 
         self.presented = self.presented.wrapping_add(1);
         Ok(())
@@ -929,6 +1222,9 @@ pub struct FrameProbeReport {
     pub dropped_samples: u64,
     /// True when the last sample came from the diagnostic fallback clear.
     pub fallback_clear: bool,
+    /// True when the probe was asked to sample a texture other than the one
+    /// `Present` showed. A set flag is a named failure, never a pixel success.
+    pub probe_source_mismatch: bool,
     /// Sampling interval in presented frames.
     pub probe_every: u64,
     /// First named failure, if any. A set failure stops further sampling.
@@ -1000,6 +1296,7 @@ impl Default for FrameProbeReport {
             frame_crc: 0,
             dropped_samples: 0,
             fallback_clear: false,
+            probe_source_mismatch: false,
             probe_every: FRAME_PROBE_DEFAULT_EVERY,
             failure: None,
             min_rgba: [0; 4],
@@ -1051,7 +1348,8 @@ impl FrameProbeReport {
              pixel_format={} pixel_format_name={} sampled_width={} sampled_height={} \
              source_row_bytes={} source_bytes={} \
              first_sample={},{} first_sample_byte={} last_sample={},{} last_sample_byte={} \
-             source_last_byte={} staging_row_bytes={} probe_bytes={} nonzero_bytes={}",
+             source_last_byte={} staging_row_bytes={} probe_bytes={} nonzero_bytes={} \
+             probe_source_mismatch={}",
             self.non_black_pixels,
             self.unique_luma_buckets,
             self.frame_crc,
@@ -1093,6 +1391,7 @@ impl FrameProbeReport {
             self.staging_row_bytes,
             self.probe_bytes,
             self.nonzero_bytes,
+            u8::from(self.probe_source_mismatch),
         )
     }
 }
@@ -1514,17 +1813,29 @@ impl FrameProbe {
         })
     }
 
-    /// Called once per successful present. Never returns an error and never
-    /// blocks for longer than [`FRAME_PROBE_WAIT`].
+    /// Called once per successful present. Returns whether this frame was
+    /// sampled. Never returns an error and never blocks for longer than
+    /// [`FRAME_PROBE_WAIT`].
+    ///
+    /// `presented` is the texture the window server shows and `sampled` is the
+    /// texture the probe would read. They must be the same object: a probe
+    /// reading a different image is a false negative, so it is named and
+    /// counted (`probe_source_mismatch`) and produces no pixel sample.
     fn observe(
         &mut self,
         queue: objc::Id,
-        target: objc::Id,
+        presented: objc::Id,
+        sampled: objc::Id,
         frame_index: u64,
         fallback_clear: bool,
-    ) {
+    ) -> bool {
+        if !probe_samples_presented(sampled, presented) {
+            self.report.probe_source_mismatch = true;
+            self.fail("probe_source_mismatch");
+            return false;
+        }
         if self.abandoned {
-            return;
+            return false;
         }
         self.harvest_if_complete();
         let due = probe_due(frame_index, self.every);
@@ -1536,14 +1847,20 @@ impl FrameProbe {
                 // of queuing another command buffer.
                 self.report.dropped_samples = self.report.dropped_samples.saturating_add(1);
             }
-            return;
+            return false;
         }
         if !due {
-            return;
+            return false;
         }
-        match self.encode(queue, target, frame_index, fallback_clear) {
-            Ok(()) => self.wait_for(FRAME_PROBE_WAIT),
-            Err(reason) => self.fail(&reason),
+        match self.encode(queue, sampled, frame_index, fallback_clear) {
+            Ok(()) => {
+                self.wait_for(FRAME_PROBE_WAIT);
+                true
+            }
+            Err(reason) => {
+                self.fail(&reason);
+                false
+            }
         }
     }
 
@@ -2049,6 +2366,8 @@ pub struct SurfaceImage {
     width: u32,
     height: u32,
     bytes_per_row: usize,
+    /// `MTLPixelFormat` of the wrapped texture (`BGRA8Unorm` or `RGBA8Unorm`).
+    format: usize,
     frame_index: Option<u64>,
 }
 
@@ -2066,6 +2385,43 @@ impl SurfaceImage {
         width: u32,
         height: u32,
     ) -> Result<Self, PresentError> {
+        Self::create_with_format(
+            transport,
+            width,
+            height,
+            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            IOSURFACE_PIXEL_FORMAT_BGRA,
+        )
+    }
+
+    /// Creates an `rgba8unorm` IOSurface-backed render target.
+    ///
+    /// The title's AAA offscreen target is `RGBA8Unorm`; a same-format present
+    /// surface lets the offscreen->swapchain copy stay a GPU blit instead of a
+    /// swizzle or an implicit conversion. The surface uses the `'RGBA'`
+    /// four-character code so the IOSurface and the `MTLTexture` agree.
+    pub fn create_rgba8(
+        transport: &DirectMetalTransport,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, PresentError> {
+        Self::create_with_format(
+            transport,
+            width,
+            height,
+            MTL_PIXEL_FORMAT_RGBA8_UNORM,
+            IOSURFACE_PIXEL_FORMAT_RGBA,
+        )
+    }
+
+    /// Shared constructor for a 4-byte-per-pixel IOSurface and its texture.
+    fn create_with_format(
+        transport: &DirectMetalTransport,
+        width: u32,
+        height: u32,
+        format: usize,
+        fourcc: i32,
+    ) -> Result<Self, PresentError> {
         if width == 0 || height == 0 {
             return Err(PresentError::ZeroExtent { width, height });
         }
@@ -2079,7 +2435,7 @@ impl SurfaceImage {
         let bytes_per_row = min_row.next_multiple_of(SURFACE_ROW_ALIGNMENT);
 
         let _pool = AutoreleasePool::new();
-        let surface = create_bgra8_iosurface(width, height, bytes_per_row)?;
+        let surface = create_iosurface(width, height, bytes_per_row, fourcc)?;
 
         // SAFETY: `surface` is a live IOSurface within this pool, and the
         // geometry accessors only read immutable surface properties.
@@ -2103,6 +2459,7 @@ impl SurfaceImage {
             surface.as_ptr(),
             width,
             height,
+            format,
         )?;
 
         Ok(Self {
@@ -2113,8 +2470,14 @@ impl SurfaceImage {
             width,
             height,
             bytes_per_row: actual_row,
+            format,
             frame_index: None,
         })
+    }
+
+    /// `MTLPixelFormat` of the wrapped texture (70 or 80).
+    pub fn pixel_format(&self) -> usize {
+        self.format
     }
 
     /// Width in pixels.
@@ -2368,6 +2731,12 @@ impl<'a> PresentPath<'a> {
             timestamp_ns,
             sync_interval,
         };
+        // The headless path presents the drawn image itself, so the source and
+        // the presented texture are the same object by construction. The host
+        // copy trace names whatever wrote it last (for the title path this is
+        // the offscreen->swapchain copy/resolve).
+        let texture = image.texture_raw();
+        record_present_trace(texture, texture, None, false);
         self.in_flight = Some(frame);
         if let Err(error) = sink.present(frame) {
             // The sink did not take ownership: nothing is in flight.
@@ -2408,10 +2777,11 @@ impl Drop for CfOwned {
 }
 
 /// Builds the `CFDictionary` of documented property keys and creates the surface.
-fn create_bgra8_iosurface(
+fn create_iosurface(
     width: u32,
     height: u32,
     bytes_per_row: usize,
+    pixel_format: i32,
 ) -> Result<CfOwned, PresentError> {
     let dict_class = objc::class(c"NSMutableDictionary");
     if dict_class.is_null() {
@@ -2446,7 +2816,7 @@ fn create_bgra8_iosurface(
         ("IOSurfaceBytesPerRow", PropertyValue::Int(row_prop)),
         (
             "IOSurfacePixelFormat",
-            PropertyValue::Int(IOSURFACE_PIXEL_FORMAT_BGRA),
+            PropertyValue::Int(pixel_format),
         ),
         ("IOSurfaceAllocSize", PropertyValue::Long(alloc_size as i64)),
     ];
@@ -2487,20 +2857,21 @@ fn create_iosurface_texture(
     surface: *mut c_void,
     width: u32,
     height: u32,
+    format: usize,
 ) -> Result<ObjcObject, PresentError> {
     let class = objc::class(c"MTLTextureDescriptor");
     if class.is_null() {
         return Err(PresentError::TextureCreationFailed);
     }
     // SAFETY: `class` is `MTLTextureDescriptor`, the selector is the documented
-    // 2D factory (BGRA8, one mip level) and the receiver is the class object.
+    // 2D factory (one mip level) and the receiver is the class object.
     let descriptor = unsafe {
         type Fn = unsafe extern "C" fn(objc::Id, objc::Sel, usize, usize, usize, u8) -> objc::Id;
         let f: Fn = mem::transmute(objc_msgSend as unsafe extern "C" fn());
         f(
             class,
             objc::sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-            MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            format,
             width as usize,
             height as usize,
             0,
@@ -3405,6 +3776,7 @@ mod tests {
             staging_row_bytes: 256,
             probe_bytes: 16_384,
             nonzero_bytes: 16_384,
+            probe_source_mismatch: false,
         };
         let line = report.log_line();
         assert!(line.starts_with("frame_probe="), "{line}");
@@ -4148,5 +4520,104 @@ mod tests {
         assert!(sample.nonzero_bytes > 0);
         assert!(sample.non_black_pixels > 0);
         assert!(sample.unique_luma_buckets >= 2);
+    }
+
+    fn token(value: usize) -> objc::Id {
+        value as *mut c_void
+    }
+
+    #[test]
+    fn probe_samples_presented_requires_the_same_texture() {
+        let presented = token(0x1000);
+        assert!(probe_samples_presented(presented, presented));
+        assert!(!probe_samples_presented(token(0x2000), presented));
+        assert!(!probe_samples_presented(std::ptr::null_mut(), presented));
+    }
+
+    #[test]
+    fn present_trace_names_the_copy_kind_and_probe_identity() {
+        reset_present_trace();
+        blit::reset_copy_trace();
+        let source = token(0x3000);
+        let presented = token(0x4000);
+        blit::note_copy_destination(blit::BlitCopyKind::CopyTextureRegion, source);
+        record_present_trace(source, presented, Some(presented), false);
+        let report = present_trace_report();
+        assert_eq!(report.frames, 1);
+        assert_eq!(report.copied_into_source, 1);
+        assert_eq!(report.probe_source_mismatch, 0);
+        let entry = report.keys.first().copied().expect("one key");
+        assert_eq!(entry.copy_kind, PresentCopyKind::CopyTextureRegion);
+        assert!(entry.probe_sampled_presented);
+        assert!(!entry.source_is_presented);
+        let line = report.log_line();
+        assert!(line.contains("copy_kind_copy_texture_region=1"), "{line}");
+        assert!(line.contains("probe_source_mismatch=0"), "{line}");
+
+        record_present_trace(source, presented, Some(token(0x5000)), false);
+        let report = present_trace_report();
+        assert_eq!(report.frames, 2);
+        assert_eq!(report.probe_source_mismatch, 1);
+        assert!(
+            report.keys.iter().any(|entry| !entry.probe_sampled_presented),
+            "a different sampled texture is a distinct key"
+        );
+    }
+
+    #[test]
+    fn present_trace_is_bounded_to_sixteen_keys() {
+        reset_present_trace();
+        blit::reset_copy_trace();
+        let mut recorded = 0u64;
+        for kind in 0..3usize {
+            for source_is_presented in [false, true] {
+                for probe_presented in [false, true] {
+                    for fallback in [false, true] {
+                        let index = recorded as usize;
+                        let source = token(0x6000 + index);
+                        let presented = if source_is_presented {
+                            source
+                        } else {
+                            token(0x7000 + index)
+                        };
+                        match kind {
+                            1 => blit::note_copy_destination(
+                                blit::BlitCopyKind::CopyTextureRegion,
+                                source,
+                            ),
+                            2 => blit::note_copy_destination(
+                                blit::BlitCopyKind::ResolveSubresource,
+                                source,
+                            ),
+                            _ => {}
+                        }
+                        let probe = probe_presented.then_some(presented);
+                        record_present_trace(source, presented, probe, fallback);
+                        recorded += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(recorded, 24);
+        let report = present_trace_report();
+        assert_eq!(report.frames, 24);
+        assert_eq!(report.keys.len(), PRESENT_TRACE_MAX_KEYS);
+        assert_eq!(report.dropped_keys, 24 - PRESENT_TRACE_MAX_KEYS as u64);
+    }
+
+    #[test]
+    fn a_probe_mismatch_is_a_named_failure_not_a_pixel_success() {
+        // The guard the present path uses: a sampler handed a different
+        // texture must not publish `non_black_pixels` as success.
+        let presented = token(0x8000);
+        let sampled = token(0x9000);
+        assert!(!probe_samples_presented(sampled, presented));
+        let report = FrameProbeReport {
+            probe_source_mismatch: true,
+            failure: Some("probe_source_mismatch".to_string()),
+            ..FrameProbeReport::default()
+        };
+        assert_eq!(report.non_black_pixels, 0);
+        assert!(report.log_line().contains("probe_source_mismatch=1"));
     }
 }
