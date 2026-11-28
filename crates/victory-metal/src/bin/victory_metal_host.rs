@@ -536,6 +536,14 @@ struct Stats {
     pool_status: &'static str,
     /// Shared translator-pool counters.
     pool: victory_metal::compiler_pool::PoolStats,
+    /// ADR-053: exact encoded-work counters (process-wide, monotonic).
+    draws_encoded: u64,
+    draws_indexed_encoded: u64,
+    dispatches_encoded: u64,
+    mesh_dispatches_encoded: u64,
+    indirect_encoded: u64,
+    render_passes_encoded: u64,
+    clear_ops_encoded: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -566,6 +574,13 @@ impl Default for Stats {
             host_translation_reason: None,
             pool_status: "skipped",
             pool: victory_metal::compiler_pool::PoolStats::default(),
+            draws_encoded: 0,
+            draws_indexed_encoded: 0,
+            dispatches_encoded: 0,
+            mesh_dispatches_encoded: 0,
+            indirect_encoded: 0,
+            render_passes_encoded: 0,
+            clear_ops_encoded: 0,
         }
     }
 }
@@ -829,6 +844,17 @@ impl BatchExecutor for DaemonExecutor {
             DirectMetalTransport::submit_v3(self.transport.as_ref(), submission, allocations);
         self.record_v3(started, submission, &result);
         self.present_window_frame(submission, &result);
+        // ADR-053: publish the process-wide exact encode counters.
+        let counters = self.transport.encode_counters();
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.draws_encoded = counters.draws;
+            stats.draws_indexed_encoded = counters.draws_indexed;
+            stats.dispatches_encoded = counters.dispatches;
+            stats.mesh_dispatches_encoded = counters.mesh_dispatches;
+            stats.indirect_encoded = counters.indirect;
+            stats.render_passes_encoded = counters.render_passes;
+            stats.clear_ops_encoded = counters.clear_ops;
+        }
         result
     }
 
@@ -1297,6 +1323,13 @@ fn write_telemetry(
             "  \"host_pipeline_translations_refused\": {host_refused},\n",
             "  \"host_pipeline_cache_hits\": {host_cache_hits},\n",
             "  \"host_translation_reason\": {host_translation_reason},\n",
+            "  \"draws_encoded\": {draws_encoded},\n",
+            "  \"draw_indexed_encoded\": {draw_indexed_encoded},\n",
+            "  \"dispatches_encoded\": {dispatches_encoded},\n",
+            "  \"mesh_dispatches_encoded\": {mesh_dispatches_encoded},\n",
+            "  \"indirect_encoded\": {indirect_encoded},\n",
+            "  \"render_passes_encoded\": {render_passes_encoded},\n",
+            "  \"clear_ops_encoded\": {clear_ops_encoded},\n",
             "  \"d3dmetal_loaded\": {loaded},\n",
             "  \"d3dmetal_images\": [{images}],\n",
             "  \"d3dmetal_fallback_count\": 0,\n",
@@ -1343,6 +1376,13 @@ fn write_telemetry(
         host_refused = stats.host_pipeline_translations_refused,
         host_cache_hits = stats.host_pipeline_cache_hits,
         host_translation_reason = host_translation_reason,
+        draws_encoded = stats.draws_encoded,
+        draw_indexed_encoded = stats.draws_indexed_encoded,
+        dispatches_encoded = stats.dispatches_encoded,
+        mesh_dispatches_encoded = stats.mesh_dispatches_encoded,
+        indirect_encoded = stats.indirect_encoded,
+        render_passes_encoded = stats.render_passes_encoded,
+        clear_ops_encoded = stats.clear_ops_encoded,
         images = images,
         loaded = !d3dmetal.is_empty(),
         frame_probe = frame_probe,
@@ -1630,6 +1670,13 @@ impl Clone for Stats {
             host_translation_reason: self.host_translation_reason.clone(),
             pool_status: self.pool_status,
             pool: self.pool,
+            draws_encoded: self.draws_encoded,
+            draws_indexed_encoded: self.draws_indexed_encoded,
+            dispatches_encoded: self.dispatches_encoded,
+            mesh_dispatches_encoded: self.mesh_dispatches_encoded,
+            indirect_encoded: self.indirect_encoded,
+            render_passes_encoded: self.render_passes_encoded,
+            clear_ops_encoded: self.clear_ops_encoded,
         }
     }
 }

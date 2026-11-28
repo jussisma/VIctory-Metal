@@ -277,6 +277,8 @@ pub(crate) struct DeviceState {
     executed_list_order: VecDeque<(u64, u32)>,
     /// `MTLDepthStencilState` objects built from wire depth/stencil commands.
     depth_states: DepthStencilCache,
+    /// ADR-053: opt-in draw trace, armed on the first traced encode.
+    trace: Option<crate::macos::trace::TraceState>,
 }
 
 impl DeviceState {
@@ -1169,6 +1171,8 @@ pub struct DirectMetalTransport {
     info: VmDeviceInfo,
     state: Mutex<DeviceState>,
     async_submit: Arc<Mutex<AsyncSubmitState>>,
+    /// ADR-053: exact encoded-work counters for the whole process.
+    encode_counters: crate::macos::trace::EncodeCounters,
 }
 
 impl DirectMetalTransport {
@@ -1228,9 +1232,16 @@ impl DirectMetalTransport {
                 executed_lists: HashSet::new(),
                 executed_list_order: VecDeque::new(),
                 depth_states: DepthStencilCache::new(),
+                trace: None,
             }),
             async_submit,
+            encode_counters: crate::macos::trace::EncodeCounters::default(),
         })
+    }
+
+    /// ADR-053: a snapshot of the exact encoded-work counters.
+    pub fn encode_counters(&self) -> crate::macos::trace::CounterSnapshot {
+        self.encode_counters.snapshot()
     }
 
     /// Raw retained `MTLDevice` handle for sibling modules that allocate GPU objects.
@@ -1655,6 +1666,7 @@ impl DirectMetalTransport {
         encoded: EncodedSubmission,
         sequence: u32,
         site: (&'static str, usize),
+        trace_wait: bool,
     ) -> Result<(), MetalError> {
         self.await_slot()?;
         let state_ptr = Arc::as_ptr(&self.async_submit);
@@ -1707,7 +1719,33 @@ impl DirectMetalTransport {
             );
             objc::msg_send_void_0(command_buffer_raw, objc::sel(c"commit"));
         }
+        if trace_wait {
+            // ADR-053, opt-in only: the first rendered pass of a traced
+            // submission is read back, so its command buffer must complete
+            // first. At most MAX_TRACED_PASSES submissions pay this cost.
+            unsafe { objc::msg_send_void_0(command_buffer_raw, objc::sel(c"waitUntilCompleted")) };
+        }
         Ok(())
+    }
+
+    /// ADR-053: samples the first colour attachment of a traced pass.
+    fn trace_sample_target(&self, target: &crate::macos::trace::TraceTarget) {
+        let Some(texture) = retain_object(target.texture as objc::Id) else {
+            eprintln!("draw_trace_rt failure=texture-gone");
+            return;
+        };
+        let Ok(render_target) = RenderTarget::from_objc(texture) else {
+            eprintln!("draw_trace_rt failure=texture-unsupported");
+            return;
+        };
+        match read_back_render_target(self, &render_target) {
+            Ok(bytes) => {
+                let stats =
+                    crate::macos::trace::sample_grid(&bytes, target.width, target.height);
+                eprintln!("{}", stats.line());
+            }
+            Err(error) => eprintln!("draw_trace_rt failure=readback {error}"),
+        }
     }
 
     /// Records one submission that returned before any commit.
@@ -3290,6 +3328,8 @@ struct PreparedRenderPass {
     /// Replayed commands, including the state prefix when the sub-pass follows
     /// an explicit clear.
     ops: Vec<PreparedRenderOp>,
+    /// ADR-053: first colour attachment, for the opt-in offscreen-RT sample.
+    trace_target: Option<crate::macos::trace::TraceTarget>,
 }
 
 fn to_usize(value: u64) -> Result<usize, MetalError> {
@@ -3953,6 +3993,63 @@ fn flush_abi(
 /// A mesh-family pipeline (mesh/object/fragment) binds its mesh stages; the
 /// converter never emits a vertex stage for a mesh PSO, so looking only at
 /// vertex/fragment would miss every mesh-stage root parameter.
+/// ADR-053: records one encoded draw/dispatch in the opt-in tracer.
+///
+/// A no-op unless `VICTORY_METAL_DRAW_TRACE` armed the trace and fewer than
+/// [`crate::macos::trace::MAX_TRACED_WORK`] calls were described. The line is
+/// written to stderr the host log already carries; it contains counts, shapes
+/// and the attachment's geometry and format, never resource contents.
+#[allow(clippy::too_many_arguments)]
+fn trace_encoded_work(
+    state: &mut DeviceState,
+    kind: &'static str,
+    pipeline_id: u64,
+    count: u32,
+    instances: u32,
+    viewport: Option<[u32; 4]>,
+    scissor: Option<[u32; 4]>,
+    abi: Option<&PipelineAbi>,
+    mesh_family: bool,
+    target: Option<crate::macos::trace::TraceTarget>,
+) {
+    let Some(trace) = state.trace.as_mut() else {
+        return;
+    };
+    if trace.saturated() {
+        return;
+    }
+    let (parameters, bytes) = abi_argument_summary(abi, mesh_family);
+    let record = crate::macos::trace::DrawRecord {
+        ordinal: trace.records.len() + 1,
+        kind,
+        pipeline_id,
+        count,
+        instances,
+        viewport,
+        scissor,
+        abi_parameters: parameters,
+        abi_bytes: bytes,
+        target,
+    };
+    if let Some(line) = trace.record(record) {
+        eprintln!("{line}");
+    }
+}
+
+/// Counts a pipeline's reflected parameters and argument-buffer bytes.
+fn abi_argument_summary(abi: Option<&PipelineAbi>, mesh_family: bool) -> (u32, u32) {
+    let Some(abi) = abi else {
+        return (0, 0);
+    };
+    let mut parameters = 0u32;
+    let mut bytes = 0u32;
+    for (_, layout) in abi_render_stages(abi, mesh_family) {
+        parameters = parameters.saturating_add(layout.parameters().len() as u32);
+        bytes = bytes.saturating_add(layout.argument_buffer_len() as u32);
+    }
+    (parameters, bytes)
+}
+
 fn abi_render_stages(
     abi: &PipelineAbi,
     mesh_family: bool,
@@ -4219,6 +4316,7 @@ fn prepare_compute_segment(
                     .into());
                 }
                 flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                transport.encode_counters.bump_dispatch();
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
                     grid: PreparedGrid::OneD {
@@ -4248,6 +4346,7 @@ fn prepare_compute_segment(
                     .into());
                 }
                 flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                transport.encode_counters.bump_dispatch();
                 ops.push(PreparedComputeOp::Dispatch(PreparedV3Dispatch {
                     pipeline: pso.raw,
                     grid: PreparedGrid::ThreeD {
@@ -4306,6 +4405,7 @@ fn prepare_compute_segment(
                 )?;
                 indirect::validate(&arguments)?;
                 flush_compute_abi(device, abi.as_ref(), &mut pending, &mut ops)?;
+                transport.encode_counters.bump_indirect();
                 ops.push(PreparedComputeOp::DispatchIndirect {
                     pipeline: pso.raw,
                     threads_per_group: MTLSize {
@@ -4457,6 +4557,8 @@ fn prepare_render_segment(
     let mut colors = Vec::with_capacity(pass.colors.len());
     let mut color_formats = Vec::with_capacity(pass.colors.len());
     let mut extent: Option<(u32, u32)> = None;
+    // ADR-053: the pass's first colour attachment is what the tracer samples.
+    let mut trace_target: Option<crate::macos::trace::TraceTarget> = None;
     for color in &pass.colors {
         let (texture, info) =
             resolve_texture(state, allocations, color.allocation_id, color.generation)
@@ -4484,6 +4586,19 @@ fn prepare_render_segment(
             None => extent = Some((info.width, info.height)),
         }
         color_formats.push(info.format);
+        if trace_target.is_none() {
+            trace_target = Some(crate::macos::trace::TraceTarget {
+                texture: texture as usize,
+                width: info.width,
+                height: info.height,
+                format: match info.format {
+                    PixelFormat::Bgra8Unorm => "bgra8unorm",
+                    PixelFormat::Rgba8Unorm => "rgba8unorm",
+                    _ => "non_colour",
+                },
+                swapchain: state.surfaces.values().any(|surface| surface.as_raw() == texture),
+            });
+        }
         colors.push(RawColorAttachment {
             texture,
             load: map_load_op(color.load),
@@ -4598,6 +4713,10 @@ fn prepare_render_segment(
     // group after a run of non-clear commands; adjacent groups are merged by
     // `push_clear_group`.
     let groups = merge_clear_groups(commands, range.clone(), groups);
+    let folded_clears: u64 = groups.iter().map(|(_, specs)| specs.len() as u64).sum();
+    for _ in 0..folded_clears {
+        transport.encode_counters.bump_clear();
+    }
 
     let mut passes = Vec::with_capacity(groups.len() + 1);
     let mut cursor = range.start;
@@ -4616,6 +4735,7 @@ fn prepare_render_segment(
             depth_format,
             width,
             height,
+            trace_target,
         )?;
         let (descriptor_colors, descriptor_depth) = if first {
             (colors.clone(), depth)
@@ -4629,7 +4749,11 @@ fn prepare_render_segment(
             &descriptor_colors,
             descriptor_depth.as_ref(),
         )?;
-        passes.push(PreparedRenderPass { descriptor, ops });
+        passes.push(PreparedRenderPass {
+            descriptor,
+            ops,
+            trace_target,
+        });
         cursor = *clear_at;
         previous_clears = clears;
         first = false;
@@ -4646,6 +4770,7 @@ fn prepare_render_segment(
         depth_format,
         width,
         height,
+        trace_target,
     )?;
     let (final_colors, final_depth) = if first {
         (colors, depth)
@@ -4660,7 +4785,11 @@ fn prepare_render_segment(
     passes.push(PreparedRenderPass {
         descriptor: final_descriptor,
         ops: final_ops,
+        trace_target,
     });
+    for _ in &passes {
+        transport.encode_counters.bump_render_pass();
+    }
     Ok((passes, width, height))
 }
 
@@ -4826,12 +4955,21 @@ fn build_render_ops(
     depth_format: Option<PixelFormat>,
     width: u32,
     height: u32,
+    trace_target: Option<crate::macos::trace::TraceTarget>,
 ) -> Result<Vec<PreparedRenderOp>, PrepareAbort> {
     let mut ops = Vec::new();
     let mut mesh_pipeline: Option<u64> = None;
     let mut current_pipeline = false;
+    // ADR-053: the id of the selected pipeline, for the trace line.
+    let mut current_pipeline_id: u64 = 0;
     let mut index_binding: Option<(objc::Id, usize, IndexType, u64)> = None;
     let mut topology = PrimitiveType::Triangle;
+    // ADR-053: the viewport/scissor a traced draw ran with.
+    let mut viewport_rect: Option<[u32; 4]> = None;
+    let mut scissor_rect: Option<[u32; 4]> = None;
+    if state.trace.is_none() && crate::macos::trace::enabled() {
+        state.trace = Some(crate::macos::trace::TraceState::default());
+    }
     // Root-signature state of the selected pipeline and its collected bindings.
     let mut abi: Option<PipelineAbi> = None;
     let mut pending = AbiPending::default();
@@ -4901,6 +5039,7 @@ fn build_render_ops(
                 });
                 current_pipeline = true;
                 mesh_pipeline = None;
+                current_pipeline_id = pipeline.pipeline_id;
             }
             CommandV3::SetPipeline(pipeline) => {
                 let mut depth_state = None;
@@ -4948,6 +5087,7 @@ fn build_render_ops(
                 });
                 current_pipeline = true;
                 mesh_pipeline = None;
+                current_pipeline_id = pipeline.pipeline_id;
             }
             CommandV3::SetMeshPipeline(pipeline) => {
                 let mut depth_state = None;
@@ -4990,6 +5130,7 @@ fn build_render_ops(
                 });
                 current_pipeline = true;
                 mesh_pipeline = Some(pipeline.pipeline_id);
+                current_pipeline_id = pipeline.pipeline_id;
             }
             CommandV3::SetBlendState(blend) => {
                 current_blend = Some(blend.clone());
@@ -5027,14 +5168,24 @@ fn build_render_ops(
                 }
             }
             CommandV3::SetViewport(viewport) => {
-                ops.push(PreparedRenderOp::Viewport(validate_viewport(
-                    viewport, width, height,
-                )?));
+                let validated = validate_viewport(viewport, width, height)?;
+                viewport_rect = Some([
+                    validated.origin_x as u32,
+                    validated.origin_y as u32,
+                    validated.width as u32,
+                    validated.height as u32,
+                ]);
+                ops.push(PreparedRenderOp::Viewport(validated));
             }
             CommandV3::SetScissor(scissor) => {
-                ops.push(PreparedRenderOp::Scissor(validate_scissor(
-                    scissor, width, height,
-                )?));
+                let validated = validate_scissor(scissor, width, height)?;
+                scissor_rect = Some([
+                    validated.x as u32,
+                    validated.y as u32,
+                    validated.width as u32,
+                    validated.height as u32,
+                ]);
+                ops.push(PreparedRenderOp::Scissor(validated));
             }
             CommandV3::SetPrimitiveTopology(wire_topology) => {
                 topology = map_topology(*wire_topology);
@@ -5224,6 +5375,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_mesh_dispatch();
+                trace_encoded_work(
+                    state,
+                    "mesh_dispatch",
+                    current_pipeline_id,
+                    dispatch.group_counts[0],
+                    1,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DispatchMesh {
                     group_counts: MTLSize {
                         width: dispatch.group_counts[0] as usize,
@@ -5255,6 +5419,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_draw();
+                trace_encoded_work(
+                    state,
+                    "draw",
+                    current_pipeline_id,
+                    draw.vertex_count,
+                    draw.instance_count,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::Draw {
                     primitive: topology,
                     vertex_start: draw.start_vertex as usize,
@@ -5283,6 +5460,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_draw();
+                trace_encoded_work(
+                    state,
+                    "draw",
+                    current_pipeline_id,
+                    draw.vertex_count_per_instance,
+                    draw.instance_count,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::Draw {
                     primitive: topology,
                     vertex_start: draw.start_vertex as usize,
@@ -5312,6 +5502,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_draw_indexed();
+                trace_encoded_work(
+                    state,
+                    "draw_indexed",
+                    current_pipeline_id,
+                    draw.index_count,
+                    draw.instance_count,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DrawIndexed {
                     primitive: topology,
                     index_count,
@@ -5347,6 +5550,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_draw_indexed();
+                trace_encoded_work(
+                    state,
+                    "draw_indexed",
+                    current_pipeline_id,
+                    draw.index_count_per_instance,
+                    draw.instance_count,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DrawIndexed {
                     primitive: topology,
                     index_count,
@@ -5379,6 +5595,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_indirect();
+                trace_encoded_work(
+                    state,
+                    "draw_indirect",
+                    current_pipeline_id,
+                    0,
+                    1,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DrawIndirect {
                     primitive: topology,
                     arguments,
@@ -5407,6 +5636,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_indirect();
+                trace_encoded_work(
+                    state,
+                    "draw_indexed_indirect",
+                    current_pipeline_id,
+                    0,
+                    1,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DrawIndexedIndirect {
                     primitive: topology,
                     index_type,
@@ -5437,6 +5679,19 @@ fn build_render_ops(
                     &mut pending,
                     &mut ops,
                 )?;
+                transport.encode_counters.bump_indirect();
+                trace_encoded_work(
+                    state,
+                    "mesh_dispatch_indirect",
+                    current_pipeline_id,
+                    0,
+                    1,
+                    viewport_rect,
+                    scissor_rect,
+                    abi.as_ref(),
+                    mesh_pipeline.is_some(),
+                    trace_target,
+                );
                 ops.push(PreparedRenderOp::DispatchMeshIndirect {
                     threads_per_object_threadgroup: mesh.threads_per_object_threadgroup,
                     threads_per_mesh_threadgroup: mesh.threads_per_mesh_threadgroup,
@@ -6673,6 +6928,28 @@ impl DirectMetalTransport {
             return Ok((reply(ReplyStatus::Ok), stats));
         }
 
+        // ADR-053: the first pass of a traced submission is sampled after its
+        // command buffer completes; at most MAX_TRACED_PASSES per process.
+        let trace_sample = if crate::macos::trace::enabled() {
+            let first = prepared.iter().find_map(|segment| match segment {
+                PreparedSegment::Render { passes, .. } => {
+                    passes.first().and_then(|pass| pass.trace_target)
+                }
+                _ => None,
+            });
+            match (first, state.trace.as_mut()) {
+                (Some(target), Some(trace)) => {
+                    if trace.next_pass() {
+                        Some(target)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         // Attach every live buffer and registered texture to the persistent
         // residency set and publish the additions before the queues run.
         self.sync_residency(&mut state)?;
@@ -6699,7 +6976,10 @@ impl DirectMetalTransport {
             .first()
             .map(segment_failure_site)
             .unwrap_or(("command buffer", 0));
-        self.commit_async(encoded, submission.sequence, site)?;
+        self.commit_async(encoded, submission.sequence, site, trace_sample.is_some())?;
+        if let Some(target) = trace_sample {
+            self.trace_sample_target(&target);
+        }
         if let Some((list_id, generation)) = list_key {
             state.mark_list_executed(list_id, generation);
         }
@@ -6885,7 +7165,7 @@ impl DirectMetalTransport {
                     height,
                 } => {
                     for pass in passes {
-                        let PreparedRenderPass { descriptor, ops } = pass;
+                        let PreparedRenderPass { descriptor, ops, .. } = pass;
                         if ops.iter().any(PreparedRenderOp::is_indirect) {
                             encode_indirect_render_segment(
                                 cb,
