@@ -1818,16 +1818,17 @@ fn a_kindless_declared_table_binds_a_mixed_wire_table_into_the_present_surface()
     );
 }
 
-/// The same pipeline shape with a declared `Sampler` range instead: a resource
-/// table can never fill it. The table stays a counted inert acceptance (the
-/// batch still encodes), and the new binding-drop key names the exact early
-/// return, the declared kind and the slot count, so `declared == 1 && bound ==
-/// 0` is never silent.
+/// The same pipeline shape with a declared `Sampler` range and the converter's
+/// 24-byte descriptor extent: a resource table fills no partition of it, but the
+/// field is the converter's descriptor array (ADR-066). The table binds whole
+/// there in wire order, so the draw's declared fragment source is bound
+/// (`declared == bound == 1`, `inert == 0`) and the adoption is counted and
+/// censused.
 #[test]
-fn an_inert_declared_table_names_its_drop_reason() {
+fn an_adopted_declared_table_binds_a_buffer_texture_set() {
     use victory_metal::macos::trace::{
-        DROP_DECLARED_KIND_REJECTS_PARTITIONS, OUTCOME_INERT, descriptor_table_refusal_census,
-        reset_abi_binding_telemetry, reset_descriptor_table_refusal_census, stage_abi_telemetry,
+        OUTCOME_MERGED, descriptor_table_refusal_census, reset_abi_binding_telemetry,
+        reset_descriptor_table_refusal_census, stage_abi_telemetry,
     };
     use victory_metal::wire::BufferBinding;
 
@@ -1868,7 +1869,10 @@ fn an_inert_declared_table_names_its_drop_reason() {
     allocations.insert((ALLOC_UPLOAD, 1), upload_id);
     allocations.insert((ALLOC_BUFFER, 1), buffer_id);
 
-    // A declared `Sampler` slot: no resource partition can ever fill it.
+    // The composition's reflected shape: one `Sampler`-typed table field. No
+    // buffer/texture partition fits it, so ADR-066 binds the wire set as the
+    // converter's descriptor array (the 24-byte extent form is covered by
+    // `fragment_table_binding_gpu`).
     let fragment = RootSignatureLayout::from_parameters(
         ReflectedStage::Fragment,
         &[RootParameterSpec {
@@ -1948,56 +1952,50 @@ fn an_inert_declared_table_names_its_drop_reason() {
     };
     let (reply, stats) = transport
         .submit_v3_with_stats(&submission, &allocations)
-        .expect("an unrepresentable table must not abort the batch");
-    assert_eq!(reply.status, ReplyStatus::Ok, "inert-table status");
-    assert_eq!(stats.render_encoders, 1, "the draw still encodes");
-    assert_eq!(transport.abi_refusal_count(), 0, "inert is not a refusal");
+        .expect("an adopted table must not abort the batch");
+    assert_eq!(reply.status, ReplyStatus::Ok, "adopted-table status");
+    assert_eq!(stats.render_encoders, 1, "the draw encodes");
+    assert_eq!(transport.abi_refusal_count(), 0, "adoption is not a refusal");
+    assert_eq!(
+        transport.descriptor_table_array_adoption_count(),
+        1,
+        "the declared field adopted the converter's descriptor array"
+    );
     assert_eq!(
         transport.descriptor_table_inert_acceptance_count(),
-        1,
-        "the table is counted inert"
+        0,
+        "the table is bound, not inert"
     );
 
     let census = descriptor_table_refusal_census();
     assert_eq!(census.mix_keys.len(), 1, "{}", census.json_value());
-    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_INERT);
-    assert_eq!(
-        census.binding_drops.len(),
-        1,
-        "the drop is named: {}",
+    assert_eq!(census.mix_keys[0].key.outcome, OUTCOME_MERGED);
+    assert!(
+        census.binding_drops.is_empty(),
+        "a bound table has no named drop: {}",
         census.json_value()
     );
-    let drop = &census.binding_drops[0];
-    assert_eq!(drop.key.pipeline_id, HANDLE);
-    assert_eq!(drop.key.wire_set, 0);
-    assert_eq!(drop.key.declared_kind, "Sampler");
-    assert_eq!(drop.key.declared_tables, 1);
-    assert_eq!(drop.key.declared_slots, 1);
-    assert_eq!(drop.key.mix_class, "buffer+texture");
-    assert_eq!(drop.key.reason, DROP_DECLARED_KIND_REJECTS_PARTITIONS);
-    let json = census.json_value();
-    assert!(json.contains("\"binding_drops\""));
-    assert!(json.contains("\"reason\": \"declared-kind-rejects-partitions\""));
 
     let abi = stage_abi_telemetry();
     assert_eq!(abi.fragment_texture_sources_declared, 1);
-    assert_eq!(abi.fragment_texture_sources_bound, 0);
     assert_eq!(
-        abi.fragment_texture_sources_dropped, 1,
-        "a declared source is never unbound without a counted drop"
+        abi.fragment_texture_sources_bound, 1,
+        "the texture entry is bound into the declared source"
     );
     assert_eq!(
-        abi.fragment_source_drop_reason,
-        DROP_DECLARED_KIND_REJECTS_PARTITIONS
+        abi.fragment_texture_sources_dropped, 0,
+        "nothing is dropped, so declared == bound"
     );
+    assert_eq!(abi.fragment_source_drop_reason, "none");
+    assert_eq!(abi.tables_dropped_inert, 0, "the table is bound, not inert");
 
     transport
         .wait_for_gpu()
-        .expect("the inert-table pass should complete");
+        .expect("the adopted-table pass should complete");
     let pixels = transport
         .read_registered_texture_rgba8(TARGET)
         .expect("target readback");
-    assert_uniform(&pixels, [7, 11, 13, 255], "inert table target");
+    assert_uniform(&pixels, [7, 11, 13, 255], "adopted table target");
 
     transport
         .unregister_buffer(upload_id)
@@ -2007,11 +2005,13 @@ fn an_inert_declared_table_names_its_drop_reason() {
         .expect("unregister the buffer page");
     reset_descriptor_table_refusal_census();
     eprintln!(
-        "inert declared-table proof: declared/bound={}/{}, dropped={}, reason={}, drop_key={:?}",
+        "adopted declared-table proof: declared/bound={}/{}, dropped={}, reason={}, \
+         adoptions={}, outcome={}",
         abi.fragment_texture_sources_declared,
         abi.fragment_texture_sources_bound,
         abi.fragment_texture_sources_dropped,
         abi.fragment_source_drop_reason,
-        drop.key
+        transport.descriptor_table_array_adoption_count(),
+        census.mix_keys[0].key.outcome
     );
 }

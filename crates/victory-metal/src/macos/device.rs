@@ -14,6 +14,7 @@ use crate::fence_page::{FencePage, FencePageMapping};
 use crate::macos::bindings::{
     ArgumentBufferBuilder, DescriptorTableBuilder, DescriptorTableKind, ReflectedStage,
     RootParameter, RootParameterKind, RootParameterMap, RootParameterSlot, RootSignatureLayout,
+    DEVICE_ADDRESS_BYTES, TEXTURE_DESCRIPTOR_BYTES,
 };
 use crate::macos::irconverter;
 use crate::macos::mesh::{MeshPipeline, MeshPipelineSpec};
@@ -1213,6 +1214,14 @@ pub struct DirectMetalTransport {
     descriptor_table_partial_bindings: std::sync::atomic::AtomicU64,
     /// Entries dropped as the residue of a partially bound mixed table.
     descriptor_table_partition_residue_entries: std::sync::atomic::AtomicU64,
+    /// Mixed resource tables bound at a declared table whose reflected range
+    /// kind could carry none of their partitions (ADR-066).
+    ///
+    /// Converter reflection types a table field by the range kind it guessed,
+    /// not by the descriptor array's real element shape. Such a table now binds
+    /// whole in wire order at that field instead of being accepted inert; this
+    /// counter keeps the adoption visible to telemetry and tests.
+    descriptor_table_array_adoptions: std::sync::atomic::AtomicU64,
     /// Persisted root arguments dropped when a pipeline change produced a
     /// layout that does not declare their `(space, register, kind)`.
     abi_stale_parameters_dropped: std::sync::atomic::AtomicU64,
@@ -1289,6 +1298,7 @@ impl DirectMetalTransport {
             descriptor_table_mixed_unrepresentables: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_partial_bindings: std::sync::atomic::AtomicU64::new(0),
             descriptor_table_partition_residue_entries: std::sync::atomic::AtomicU64::new(0),
+            descriptor_table_array_adoptions: std::sync::atomic::AtomicU64::new(0),
             abi_stale_parameters_dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1368,6 +1378,25 @@ impl DirectMetalTransport {
     pub fn descriptor_table_partial_binding_count(&self) -> u64 {
         self.descriptor_table_partial_bindings
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mixed resource tables bound at a declared table whose reflected range
+    /// kind could carry none of their partitions (ADR-066).
+    ///
+    /// The table is the converter's 24-byte descriptor array: its reflected
+    /// `Sampler`/`Texture` type names the range kind the converter guessed, and
+    /// the wire entry variants are the authoritative element shapes. The table
+    /// binds whole at that field in wire order (the mix census records
+    /// `outcome: "merged"`); this counter keeps the adoption visible, and every
+    /// entry still resolves fail-closed.
+    pub fn descriptor_table_array_adoption_count(&self) -> u64 {
+        self.descriptor_table_array_adoptions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_descriptor_table_array_adoption(&self) {
+        self.descriptor_table_array_adoptions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Entries dropped as the residue of a partially bound mixed table.
@@ -3448,6 +3477,34 @@ impl PipelineAbi {
         tables
     }
 
+    /// Descriptor tables one stage declares, in flattened parameter order, with
+    /// the reflected range kind and descriptor slot count registration recorded
+    /// (ADR-066).
+    ///
+    /// The binding path uses this instead of re-deriving a table's kind from the
+    /// wire set: a converter-typed field (`Sampler`, `Texture`, a view family or
+    /// the kind-less `Table`) is carried here exactly as registration saw it,
+    /// and an empty vector means the stage declares no table at all.
+    pub fn stage_declared_tables(
+        &self,
+        stage: ShaderStage,
+    ) -> Vec<crate::macos::bindings::DeclaredTable> {
+        self.stage_layout(stage)
+            .map(RootSignatureLayout::declared_tables)
+            .unwrap_or_default()
+    }
+
+    /// The stage layout the ABI carries, when the pipeline declares that stage.
+    fn stage_layout(&self, stage: ShaderStage) -> Option<&RootSignatureLayout> {
+        match stage {
+            ShaderStage::Vertex => self.vertex.as_ref(),
+            ShaderStage::Fragment => self.fragment.as_ref(),
+            ShaderStage::Mesh => self.mesh.as_ref(),
+            ShaderStage::Object => self.object.as_ref(),
+            ShaderStage::Compute => self.compute.as_ref(),
+        }
+    }
+
     /// Fragment table parameters whose range kind can carry a texture or
     /// sampler source.
     ///
@@ -5374,6 +5431,19 @@ enum MixedTablePlan {
         /// Flattened parameter index of that slot.
         parameter_index: usize,
     },
+    /// The declared slot's reflected range kind carries no partition, but the
+    /// field is the converter's descriptor array (ADR-066): the wire entries are
+    /// authoritative and bind whole there in wire order.
+    ///
+    /// Named apart from [`Self::Merged`] so the caller can count the adoption:
+    /// reflection typed the field by the range kind it guessed, not by the
+    /// array's real element shape.
+    Adopted {
+        /// The declared slot the array binds.
+        slot: RootParameterSlot,
+        /// Flattened parameter index of that slot.
+        parameter_index: usize,
+    },
     /// No declared slot can carry any partition.
     Unbound(MixedTablePlanMiss),
 }
@@ -5396,6 +5466,15 @@ enum MixedTablePlan {
 /// partitions in, and the entries are the authoritative shape, so such a table
 /// binds whole at that slot ([`MixedTablePlan::Merged`]) with every entry at the
 /// index the title gave it. Nothing is dropped and no index is renumbered.
+///
+/// ADR-066: a declared slot with a *concrete* reflected range kind that cannot
+/// carry any partition of a buffer/texture mix is the same converter descriptor
+/// array. Reflection names the range kind the converter guessed, not the array's
+/// real element shape, so the wire entries bind whole there
+/// ([`MixedTablePlan::Adopted`]) instead of the table being accepted inert. The
+/// kind and slot count that justified it are the registration-carried
+/// [`crate::macos::bindings::DeclaredTable`] of that field. A sampler wire kind
+/// stays out: a sampler never shares an array with resource entries.
 fn plan_mixed_table_partition_slots(
     abi: &PipelineAbi,
     wire_set: usize,
@@ -5444,6 +5523,10 @@ fn plan_mixed_table_partition_slots(
                 RootParameterKind::DescriptorTable(kind) => kind,
                 _ => resolved_kind,
             };
+            // ADR-066: the count is the stage layout's own registration-carried
+            // table count, not the widest stage's: the census must attribute
+            // the miss to the stage that declares it.
+            miss.declared_slots = layout.declared_tables().len();
         }
 
         // Positional mapping first: it is the exact converter flattening order.
@@ -5488,6 +5571,49 @@ fn plan_mixed_table_partition_slots(
                 slot: parameter_slot(&parameters[start]),
                 parameter_index: start,
             };
+        }
+
+        // The declared slot's reflected range kind carries none of the
+        // partitions. ADR-066: converter reflection types a descriptor-table
+        // field by the range kind it guessed, not by the descriptor array's
+        // real element shape. The field is still the converter's array (the
+        // registration-carried `DeclaredTable` records that kind and its slot
+        // count), so a resource mix binds whole there in wire order: entry `i`
+        // stays descriptor `i`, nothing is renumbered and nothing is dropped.
+        //
+        // Only a resource mix qualifies. A sampler never shares a descriptor
+        // array with buffer/texture entries, so a sampler wire kind, or any
+        // partition that is not a buffer/texture run, keeps the named inert
+        // drop below.
+        if wire_kind != DescriptorKind::Sampler
+            && partitions.iter().all(|(shape, _entries)| {
+                matches!(shape, WireEntryShape::Buffer | WireEntryShape::Texture)
+            })
+            && partitions.iter().all(|(shape, _entries)| {
+                !mixed_partition_fits(
+                    *shape,
+                    match parameters[start].kind() {
+                        RootParameterKind::DescriptorTable(kind) => kind,
+                        _ => DescriptorTableKind::Unspecified,
+                    },
+                    wire_kind,
+                )
+            })
+        {
+            let declared = layout
+                .declared_tables()
+                .into_iter()
+                .find(|table| table.parameter == start);
+            if let Some(declared) = declared
+                && declared.slots >= 1
+                && (declared.field_bytes == DEVICE_ADDRESS_BYTES
+                    || declared.field_bytes % TEXTURE_DESCRIPTOR_BYTES == 0)
+            {
+                return MixedTablePlan::Adopted {
+                    slot: parameter_slot(&parameters[start]),
+                    parameter_index: start,
+                };
+            }
         }
 
         // Fallback: bind the longest remaining partition each declared slot can
@@ -5566,9 +5692,19 @@ fn plan_mixed_table_partition_slots(
 ///    ([`DirectMetalTransport::descriptor_table_partition_residue_entry_count`]
 ///    and the census `partition_residues`).
 ///
-/// A layout where no partition fits any declared slot is accepted inertly: the
-/// submission still encodes, `abi_refusals` does not move, and the exact early
-/// return is named by the bounded `binding_drops` census key
+/// 4. **Adopted (ADR-066).** The resolved declared slot's reflected range kind
+///    carries none of the partitions, but the field is the converter's
+///    descriptor array and the entries are a buffer/texture mix: the table binds
+///    whole there in wire order. Converter reflection types a table field by the
+///    range kind it guessed, so a declared `Sampler`/`Texture` field still
+///    receives the resource array the wire set names. The census records
+///    `outcome: "merged"` and [`DirectMetalTransport::descriptor_table_array_adoption_count`]
+///    counts it.
+///
+/// A layout where no partition fits any declared slot and the entries are not a
+/// resource mix is accepted inertly: the submission still encodes,
+/// `abi_refusals` does not move, and the exact early return is named by the
+/// bounded `binding_drops` census key
 /// ([`crate::macos::trace::DescriptorTableBindingDropKey`]) instead of only the
 /// coarse mix `outcome: "inert"`.
 ///
@@ -5671,6 +5807,33 @@ fn prepare_descriptor_table_bindings(
                 allocations,
                 table,
                 merged_slot,
+                Some(parameter_index),
+            )?]);
+        }
+        MixedTablePlan::Adopted {
+            slot: adopted_slot,
+            parameter_index,
+        } => {
+            // ADR-066: the declared slot's reflected range kind carries none of
+            // this resource mix's partitions, but the field is the converter's
+            // descriptor array and the wire entry variants are the
+            // authoritative element shapes. Bind the table whole there in wire
+            // order (entry `i` stays descriptor `i`). Loud: the adoption is
+            // counted and censused, and every entry still resolves
+            // fail-closed.
+            note_descriptor_table_mix(
+                pipeline_id,
+                table.set,
+                mix_class,
+                crate::macos::trace::OUTCOME_MERGED,
+            );
+            transport.count_descriptor_table_array_adoption();
+            return Ok(vec![build_merged_descriptor_table(
+                device,
+                state,
+                allocations,
+                table,
+                adopted_slot,
                 Some(parameter_index),
             )?]);
         }
@@ -14466,10 +14629,16 @@ mod descriptor_table_kind_tests {
         assert_eq!(plan.bound[1].partition, 1);
     }
 
-    /// When no declared slot can carry a partition, the planner names which
-    /// early return dropped it: the declared kind and the slot it resolved to.
+    /// A declared `Sampler`/`Texture` slot carries none of a resource mix's
+    /// partitions. ADR-066: the field is still the converter's descriptor array,
+    /// so the wire entries bind whole there in wire order instead of the table
+    /// being accepted inert. The registration-carried declared kind and slot
+    /// count are what the plan consults.
     #[test]
-    fn a_table_no_declared_slot_can_carry_names_its_drop_reason() {
+    fn a_resource_mix_under_a_concrete_declared_table_adopts_the_descriptor_array() {
+        // A `Sampler` declared slot carries no buffer and no texture partition,
+        // so the field is the converter's descriptor array and the wire entries
+        // bind whole there.
         let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Sampler]);
         let wire = table(DescriptorKind::Srv, vec![BUFFER_ENTRY, TEXTURE_ENTRY]);
         match plan_mixed_table_partition_slots(
@@ -14479,12 +14648,92 @@ mod descriptor_table_kind_tests {
             &partition_sizes(&wire),
             wire.kind,
         ) {
-            MixedTablePlan::Unbound(miss) => {
-                assert_eq!(miss.slot_index, Some(0), "one declared slot resolved");
-                assert_eq!(miss.declared_kind, DescriptorTableKind::Sampler);
-                assert_eq!(miss.declared_slots, 1);
+            MixedTablePlan::Adopted {
+                parameter_index,
+                slot,
+            } => {
+                assert_eq!(parameter_index, 0, "the declared field binds");
+                assert_eq!(
+                    slot.kind(),
+                    RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler)
+                );
             }
-            other => panic!("a sampler slot cannot carry resource views, got {other:?}"),
+            other => panic!("expected the array adoption, got {other:?}"),
+        }
+
+        // A `Texture` declared slot legitimately carries the texture partition
+        // and names the buffer as residue: that is the partial rule, not the
+        // adoption. Nothing is weakened for a range that can carry an entry.
+        let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Texture]);
+        let plan = partitioned(plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        ));
+        assert_eq!(plan.bound.len(), 1);
+        assert_eq!(plan.residue.len(), 1, "the buffer partition is residue");
+    }
+
+    /// A sampler wire kind is never adopted into a resource array: sampler
+    /// entries and view entries cannot share one descriptor array.
+    #[test]
+    fn a_sampler_wire_kind_is_never_adopted() {
+        let (abi, resolved) = table_layout_abi(&[DescriptorTableKind::Texture]);
+        let wire = sampler_table();
+        let plan = plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        );
+        // A sampler table is not a mix at all, so it takes the homogeneous
+        // path; the planner must not invent an adoption for it.
+        assert!(matches!(
+            plan,
+            MixedTablePlan::Unbound(_) | MixedTablePlan::Partitioned(_)
+        ));
+    }
+
+    /// When no declared slot can carry a partition and the entries are not a
+    /// resource mix, the planner still names which early return dropped it: the
+    /// declared kind and the slot it resolved to.
+    #[test]
+    fn a_table_no_declared_slot_can_carry_names_its_drop_reason() {
+        // An unregistered-only declared table: the wire set names no table of
+        // this stage at all, so the miss has no slot index.
+        let layout = RootSignatureLayout::from_parameters(
+            ReflectedStage::Fragment,
+            &[RootParameterSpec {
+                kind: RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+                size: 8,
+                register: 0,
+                space: 0,
+            }],
+        )
+        .expect("one sampler table");
+        let abi = PipelineAbi::graphics(None, Some(layout));
+        let resolved = crate::macos::bindings::RootParameterSlot::new(
+            1,
+            3,
+            RootParameterKind::DescriptorTable(DescriptorTableKind::Sampler),
+            8,
+        );
+        let wire = table(DescriptorKind::Sampler, vec![SAMPLER_ENTRY]);
+        match plan_mixed_table_partition_slots(
+            &abi,
+            0,
+            resolved,
+            &partition_sizes(&wire),
+            wire.kind,
+        ) {
+            MixedTablePlan::Unbound(miss) => {
+                assert_eq!(miss.slot_index, None, "no declared slot names the set");
+                assert_eq!(miss.declared_kind, DescriptorTableKind::Sampler);
+            }
+            other => panic!("a set naming no declared slot is unbound, got {other:?}"),
         }
     }
 
