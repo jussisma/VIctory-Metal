@@ -438,9 +438,53 @@ impl GraphicsState {
                     offset,
                     format,
                     per_instance: e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    step_rate: e.InstanceDataStepRate,
                 }
             })
             .collect()
+    }
+
+    /// The title's `D3D12_INPUT_LAYOUT_DESC` in VMVD v2 form, using the most
+    /// recent `IASetVertexBuffers` stride per slot when one is known.
+    ///
+    /// Element order is preserved and the Metal attribute index is
+    /// `11 + order` (the converter's measured numbering). A stride the title
+    /// has not set yet is left unknown: the encode marks that slot zero and
+    /// counts it, and the host derives the packed stride for that slot only.
+    pub(crate) fn guest_input_layout(
+        &self,
+    ) -> Result<
+        Option<crate::native_metal::state::GuestInputLayout>,
+        crate::native_metal::state::GuestLayoutError,
+    > {
+        use crate::native_metal::state::{
+            self, GuestInputElement, GuestInputLayout, GuestLayoutError,
+        };
+        if self.inputs.is_empty() {
+            return Ok(None);
+        }
+        let strides = state::vertex_strides();
+        let elements = self.elements();
+        let mut guest = Vec::with_capacity(elements.len());
+        for (order, input) in elements.iter().enumerate() {
+            let format = state::vertex_format_code(input.format).ok_or(
+                GuestLayoutError::UnsupportedFormat {
+                    element: order,
+                    format: input.format,
+                },
+            )?;
+            let order_u8 = u8::try_from(order)
+                .map_err(|_| GuestLayoutError::TooManyElements(elements.len()))?;
+            guest.push(GuestInputElement {
+                index: state::FIRST_VERTEX_ATTRIBUTE.saturating_add(order_u8),
+                format,
+                offset: input.offset,
+                slot: u8::try_from(input.slot).unwrap_or(u8::MAX),
+                per_instance: input.per_instance,
+                step_rate: input.step_rate,
+            });
+        }
+        GuestInputLayout::from_elements(guest, &strides).map(Some)
     }
 }
 
@@ -451,6 +495,8 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+    /// D3D12 `InstanceDataStepRate`.
+    pub(crate) step_rate: u32,
 }
 
 /// The console's own primitive topology types.

@@ -770,7 +770,25 @@ pub(crate) fn native_pipeline(this: This) -> Result<u64, String> {
         .any(|program| program.stage == PipelineStage::Mesh);
     let state_blob = match p.host.graphics.as_deref() {
         Some(graphics) => match graphics.pipeline_state(pixel_entry, object_entry, mesh) {
-            Ok(state) => Some(state),
+            Ok(mut state) => {
+                // ADR-061: carry the guest's own input layout (slots,
+                // offsets, strides and step rates) after the versioned
+                // state. A layout that cannot be represented is omitted,
+                // never guessed: the host then derives it from the vertex
+                // signature and counts that path.
+                if !mesh {
+                    match graphics.guest_input_layout() {
+                        Ok(Some(layout)) => layout.append_to(&mut state),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            pipeline = ?this,
+                            %error,
+                            "guest vertex layout omitted; the host will fall back to the shader signature"
+                        ),
+                    }
+                }
+                Some(state)
+            }
             Err(error) => {
                 crate::native_metal::pso::note_refused(
                     crate::native_metal::pso::attempt_kind_of_names(&all),

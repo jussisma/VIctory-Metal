@@ -578,6 +578,373 @@ impl GuestRenderState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Guest input layout (ADR-061)
+// ---------------------------------------------------------------------------
+
+/// Vertex-buffer slots a D3D12 list tracks.
+pub const VERTEX_SLOTS: usize = 32;
+/// First Metal attribute index the converter assigns to a layout element.
+pub const FIRST_VERTEX_ATTRIBUTE: u8 = 11;
+/// Largest Metal attribute index the descriptor holds.
+pub const MAX_VERTEX_ATTRIBUTE_INDEX: u8 = 30;
+
+/// Magic that starts the vertex-layout chunk appended to a pipeline state.
+pub const VMVD_MAGIC: [u8; 4] = *b"VMVD";
+/// Chunk version this guest writes.
+pub const VMVD_VERSION: u8 = 2;
+const VMVD_HEADER_LEN: usize = 6;
+const VMVD_ATTRIBUTE_LEN: usize = 11;
+const VMVD_SLOT_TRAILER_LEN: usize = 1;
+const VMVD_SLOT_LEN: usize = 10;
+
+/// Why a guest input layout could not be built or encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestLayoutError {
+    /// The input layout has no elements or more than the attribute limit.
+    TooManyElements(usize),
+    /// An element's Metal index is outside `0..=30`.
+    AttributeIndexOutOfRange { element: usize, index: u8 },
+    /// An element names a DXGI format the host's vertex formats do not cover.
+    UnsupportedFormat { element: usize, format: u32 },
+    /// An element's format code is outside the VMVD set.
+    UnknownFormatCode(u8),
+    /// Two elements claim the same Metal attribute index.
+    DuplicateIndex(u8),
+    /// An element names a vertex slot outside `0..32`.
+    InvalidSlot(u8),
+    /// A known stride is zero.
+    ZeroStride(u8),
+    /// A per-instance slot has a zero step rate.
+    ZeroStepRate(u8),
+    /// Elements of one slot disagree on per-vertex/per-instance or step rate.
+    MixedSlotClass(u8),
+}
+
+impl fmt::Display for GuestLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyElements(count) => {
+                write!(f, "the guest input layout declares {count} elements")
+            }
+            Self::AttributeIndexOutOfRange { element, index } => write!(
+                f,
+                "guest input element {element} needs Metal attribute index {index}, above {MAX_VERTEX_ATTRIBUTE_INDEX}"
+            ),
+            Self::UnsupportedFormat { element, format } => {
+                write!(
+                    f,
+                    "guest input element {element} has unmappable DXGI format {format}"
+                )
+            }
+            Self::UnknownFormatCode(code) => {
+                write!(f, "guest input format code {code} is outside the VMVD set")
+            }
+            Self::DuplicateIndex(index) => {
+                write!(
+                    f,
+                    "two guest input elements claim Metal attribute index {index}"
+                )
+            }
+            Self::InvalidSlot(slot) => {
+                write!(f, "guest input slot {slot} exceeds the vertex slot limit")
+            }
+            Self::ZeroStride(slot) => write!(f, "guest input slot {slot} has a zero stride"),
+            Self::ZeroStepRate(slot) => {
+                write!(
+                    f,
+                    "guest input slot {slot} is per-instance with a zero step rate"
+                )
+            }
+            Self::MixedSlotClass(slot) => {
+                write!(
+                    f,
+                    "guest input slot {slot} mixes per-vertex and per-instance elements"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestLayoutError {}
+
+/// One guest input element in D3D12 declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestInputElement {
+    /// Metal attribute index (`11 + element order`).
+    pub index: u8,
+    /// VMVD format code.
+    pub format: u8,
+    /// Resolved `AlignedByteOffset`.
+    pub offset: u32,
+    /// D3D12 `InputSlot`.
+    pub slot: u8,
+    /// D3D12 `InputSlotClass == PER_INSTANCE_DATA`.
+    pub per_instance: bool,
+    /// D3D12 `InstanceDataStepRate`.
+    pub step_rate: u32,
+}
+
+/// One guest vertex-buffer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestInputSlot {
+    /// D3D12 `InputSlot`.
+    pub slot: u8,
+    /// The most recent `IASetVertexBuffers` stride, or `None` when unknown.
+    pub stride: Option<u32>,
+    /// D3D12 `InputSlotClass == PER_INSTANCE_DATA`.
+    pub per_instance: bool,
+    /// D3D12 `InstanceDataStepRate` (1 for per-vertex).
+    pub step_rate: u32,
+}
+
+/// The guest's `D3D12_INPUT_LAYOUT_DESC` in VMVD v2 wire form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestInputLayout {
+    elements: Vec<GuestInputElement>,
+    slots: Vec<GuestInputSlot>,
+}
+
+impl GuestInputLayout {
+    /// Builds a layout from elements in declaration order and the most recent
+    /// per-slot strides. Element order is preserved: the converter numbers
+    /// attributes from [`FIRST_VERTEX_ATTRIBUTE`] in that order.
+    pub fn from_elements(
+        elements: Vec<GuestInputElement>,
+        strides: &[Option<u32>; VERTEX_SLOTS],
+    ) -> Result<Self, GuestLayoutError> {
+        if elements.is_empty() || elements.len() > usize::from(MAX_VERTEX_ATTRIBUTE_INDEX) + 1 {
+            return Err(GuestLayoutError::TooManyElements(elements.len()));
+        }
+        let mut seen = [false; MAX_VERTEX_ATTRIBUTE_INDEX as usize + 1];
+        let mut slots: Vec<GuestInputSlot> = Vec::new();
+        for (order, element) in elements.iter().enumerate() {
+            if element.index > MAX_VERTEX_ATTRIBUTE_INDEX {
+                return Err(GuestLayoutError::AttributeIndexOutOfRange {
+                    element: order,
+                    index: element.index,
+                });
+            }
+            if seen[usize::from(element.index)] {
+                return Err(GuestLayoutError::DuplicateIndex(element.index));
+            }
+            seen[usize::from(element.index)] = true;
+            if element.format == 0 || element.format > 48 {
+                return Err(GuestLayoutError::UnknownFormatCode(element.format));
+            }
+            let slot = usize::from(element.slot);
+            if slot >= VERTEX_SLOTS {
+                return Err(GuestLayoutError::InvalidSlot(element.slot));
+            }
+            match slots.iter_mut().find(|slot| slot.slot == element.slot) {
+                Some(existing) => {
+                    if existing.per_instance != element.per_instance
+                        || (element.per_instance && existing.step_rate != element.step_rate)
+                    {
+                        return Err(GuestLayoutError::MixedSlotClass(element.slot));
+                    }
+                }
+                None => {
+                    let stride = strides[slot];
+                    if stride == Some(0) {
+                        return Err(GuestLayoutError::ZeroStride(element.slot));
+                    }
+                    if element.per_instance && element.step_rate == 0 {
+                        return Err(GuestLayoutError::ZeroStepRate(element.slot));
+                    }
+                    slots.push(GuestInputSlot {
+                        slot: element.slot,
+                        stride,
+                        per_instance: element.per_instance,
+                        step_rate: if element.per_instance {
+                            element.step_rate
+                        } else {
+                            1
+                        },
+                    });
+                }
+            }
+        }
+        Ok(Self { elements, slots })
+    }
+
+    /// Whether the guest declared no input elements.
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    /// The declared elements, in D3D12 order.
+    pub fn elements(&self) -> &[GuestInputElement] {
+        &self.elements
+    }
+
+    /// The slots, in D3D12 `InputSlot` order.
+    pub fn slots(&self) -> &[GuestInputSlot] {
+        &self.slots
+    }
+
+    /// Encodes the VMVD v2 chunk. An unknown slot stride is encoded as zero
+    /// and counted in [`ia_stride_unknown`]; the host then derives the packed
+    /// stride for that slot only.
+    pub fn encode(&self) -> Vec<u8> {
+        if self.elements.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(
+            VMVD_HEADER_LEN
+                + VMVD_ATTRIBUTE_LEN * self.elements.len()
+                + VMVD_SLOT_TRAILER_LEN
+                + VMVD_SLOT_LEN * self.slots.len(),
+        );
+        out.extend_from_slice(&VMVD_MAGIC);
+        out.push(VMVD_VERSION);
+        out.push(u8::try_from(self.elements.len()).expect("element count is bounded"));
+        for element in &self.elements {
+            let stride = self
+                .slots
+                .iter()
+                .find(|slot| slot.slot == element.slot)
+                .and_then(|slot| slot.stride)
+                .unwrap_or(0);
+            out.push(element.index);
+            out.push(element.format);
+            out.extend_from_slice(&element.offset.to_le_bytes());
+            out.push(element.slot);
+            out.extend_from_slice(&stride.to_le_bytes());
+        }
+        let mut slots = self.slots.clone();
+        slots.sort_by_key(|slot| slot.slot);
+        out.push(u8::try_from(slots.len()).expect("slot count is bounded"));
+        let mut unknown = 0u64;
+        for slot in &slots {
+            out.push(slot.slot);
+            let stride = slot.stride.unwrap_or(0);
+            if slot.stride.is_none() {
+                unknown = unknown.saturating_add(1);
+            }
+            out.extend_from_slice(&stride.to_le_bytes());
+            out.push(u8::from(slot.per_instance));
+            let step_rate = if slot.per_instance {
+                slot.step_rate.max(1)
+            } else {
+                1
+            };
+            out.extend_from_slice(&step_rate.to_le_bytes());
+        }
+        if unknown > 0 {
+            IA_STRIDE_UNKNOWN.fetch_add(unknown, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Appends the chunk to a pipeline state blob.
+    pub fn append_to(&self, state: &mut Vec<u8>) {
+        state.extend_from_slice(&self.encode());
+    }
+}
+
+/// Maps a DXGI format number to the VMVD format code (a mirror of the host's
+/// `VertexFormat`). Vertex formats only: typeless, depth and packed formats
+/// have no Metal vertex attribute mapping here and return `None`.
+pub fn vertex_format_code(dxgi_format: u32) -> Option<u8> {
+    let (base, components) = match dxgi_format {
+        2 => (1, 4),   // R32G32B32A32_FLOAT
+        6 => (1, 3),   // R32G32B32_FLOAT
+        16 => (1, 2),  // R32G32_FLOAT
+        41 => (1, 1),  // R32_FLOAT
+        3 => (41, 4),  // R32G32B32A32_UINT
+        7 => (41, 3),  // R32G32B32_UINT
+        17 => (41, 2), // R32G32_UINT
+        42 => (41, 1), // R32_UINT
+        4 => (45, 4),  // R32G32B32A32_SINT
+        8 => (45, 3),  // R32G32B32_SINT
+        18 => (45, 2), // R32G32_SINT
+        43 => (45, 1), // R32_SINT
+        10 => (5, 4),  // R16G16B16A16_FLOAT
+        34 => (5, 2),  // R16G16_FLOAT
+        50 => (5, 1),  // R16_FLOAT
+        11 => (33, 4), // R16G16B16A16_UNORM
+        35 => (33, 2), // R16G16_UNORM
+        52 => (33, 1), // R16_UNORM
+        12 => (25, 4), // R16G16B16A16_UINT
+        36 => (25, 2), // R16G16_UINT
+        53 => (25, 1), // R16_UINT
+        13 => (37, 4), // R16G16B16A16_SNORM
+        37 => (37, 2), // R16G16_SNORM
+        54 => (37, 1), // R16_SNORM
+        14 => (29, 4), // R16G16B16A16_SINT
+        38 => (29, 2), // R16G16_SINT
+        55 => (29, 1), // R16_SINT
+        28 => (17, 4), // R8G8B8A8_UNORM
+        45 => (17, 2), // R8G8_UNORM
+        57 => (17, 1), // R8_UNORM
+        30 => (9, 4),  // R8G8B8A8_UINT
+        46 => (9, 2),  // R8G8_UINT
+        58 => (9, 1),  // R8_UINT
+        31 => (21, 4), // R8G8B8A8_SNORM
+        47 => (21, 2), // R8G8_SNORM
+        59 => (21, 1), // R8_SNORM
+        32 => (13, 4), // R8G8B8A8_SINT
+        48 => (13, 2), // R8G8_SINT
+        56 => (13, 1), // R8_SINT
+        _ => return None,
+    };
+    Some(base + components - 1)
+}
+
+/// The most recent `IASetVertexBuffers` stride per slot.
+///
+/// A title may create a PSO before it binds a vertex buffer, so these are
+/// advisory: a slot that has never been bound stays `None` and its layout
+/// encode counts it in [`ia_stride_unknown`] rather than inventing a packed
+/// stride silently.
+static LAST_VERTEX_STRIDES: std::sync::Mutex<[Option<u32>; VERTEX_SLOTS]> =
+    std::sync::Mutex::new([None; VERTEX_SLOTS]);
+
+/// Slots whose stride was unknown when a pipeline layout was encoded.
+static IA_STRIDE_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records the strides of one `IASetVertexBuffers` call; `None` clears a slot
+/// (a null view unbinds it). Out-of-range slots and zero strides are ignored,
+/// exactly as the wire refuses them.
+pub fn note_vertex_buffer_strides(start_slot: u32, strides: &[Option<u32>]) {
+    let Ok(start) = usize::try_from(start_slot) else {
+        return;
+    };
+    let mut table = LAST_VERTEX_STRIDES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for (offset, stride) in strides.iter().enumerate() {
+        let Some(slot) = start.checked_add(offset) else {
+            break;
+        };
+        let Some(entry) = table.get_mut(slot) else {
+            break;
+        };
+        *entry = stride.filter(|stride| *stride != 0);
+    }
+}
+
+/// The most recent stride per slot.
+pub fn vertex_strides() -> [Option<u32>; VERTEX_SLOTS] {
+    *LAST_VERTEX_STRIDES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// How many slots an encoded layout had to send with an unknown stride.
+pub fn ia_stride_unknown() -> u64 {
+    IA_STRIDE_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clears the stride table and the unknown-stride counter (tests).
+pub fn reset_vertex_layout_telemetry() {
+    *LAST_VERTEX_STRIDES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = [None; VERTEX_SLOTS];
+    IA_STRIDE_UNKNOWN.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,5 +1185,155 @@ mod tests {
             panic!("expected a blend-factor command");
         };
         assert_eq!(factor.value, [0.25, 0.5, 0.75, 1.0]);
+    }
+
+    fn element(index: u8, format: u8, offset: u32, slot: u8) -> GuestInputElement {
+        GuestInputElement {
+            index,
+            format,
+            offset,
+            slot,
+            per_instance: false,
+            step_rate: 0,
+        }
+    }
+
+    #[test]
+    fn household_dxgi_vertex_formats_map_to_vmvd_codes() {
+        assert_eq!(vertex_format_code(2), Some(4), "R32G32B32A32_FLOAT");
+        assert_eq!(vertex_format_code(6), Some(3), "R32G32B32_FLOAT");
+        assert_eq!(vertex_format_code(16), Some(2), "R32G32_FLOAT");
+        assert_eq!(vertex_format_code(41), Some(1), "R32_FLOAT");
+        assert_eq!(vertex_format_code(28), Some(20), "R8G8B8A8_UNORM");
+        assert_eq!(vertex_format_code(45), Some(18), "R8G8_UNORM");
+        assert_eq!(vertex_format_code(11), Some(36), "R16G16B16A16_UNORM");
+        assert_eq!(vertex_format_code(10), Some(8), "R16G16B16A16_FLOAT");
+        // Packed, depth and typeless formats have no vertex mapping.
+        for unsupported in [1, 5, 24, 26, 27, 40, 87, 115] {
+            assert_eq!(
+                vertex_format_code(unsupported),
+                None,
+                "format {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_slot_layout_encodes_element_order_slots_and_strides() {
+        let mut strides = [None; VERTEX_SLOTS];
+        strides[0] = Some(32);
+        strides[1] = Some(32);
+        let mut colour = element(12, 4, 8, 1);
+        colour.per_instance = true;
+        colour.step_rate = 2;
+        let layout = GuestInputLayout::from_elements(vec![element(11, 2, 0, 0), colour], &strides)
+            .expect("two-slot layout");
+        let chunk = layout.encode();
+        assert_eq!(&chunk[..4], &VMVD_MAGIC);
+        assert_eq!(chunk[4], VMVD_VERSION);
+        assert_eq!(chunk[5], 2, "two elements");
+        // Element order preserved: 11 then 12.
+        assert_eq!(chunk[6], 11);
+        assert_eq!(chunk[6 + VMVD_ATTRIBUTE_LEN], 12);
+        let slots_at = VMVD_HEADER_LEN + VMVD_ATTRIBUTE_LEN * 2;
+        assert_eq!(chunk[slots_at], 2, "two slots");
+        let first_slot = slots_at + VMVD_SLOT_TRAILER_LEN;
+        assert_eq!(chunk[first_slot], 0);
+        assert_eq!(
+            u32::from_le_bytes(chunk[first_slot + 1..first_slot + 5].try_into().unwrap()),
+            32
+        );
+        assert_eq!(chunk[first_slot + 5], 0, "slot 0 per-vertex");
+        let second_slot = first_slot + VMVD_SLOT_LEN;
+        assert_eq!(chunk[second_slot], 1);
+        assert_eq!(
+            u32::from_le_bytes(chunk[second_slot + 1..second_slot + 5].try_into().unwrap()),
+            32
+        );
+        assert_eq!(chunk[second_slot + 5], 1, "slot 1 per-instance");
+        assert_eq!(
+            u32::from_le_bytes(chunk[second_slot + 6..second_slot + 10].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            chunk.len(),
+            VMVD_HEADER_LEN + VMVD_ATTRIBUTE_LEN * 2 + VMVD_SLOT_TRAILER_LEN + VMVD_SLOT_LEN * 2
+        );
+    }
+
+    #[test]
+    fn an_unknown_stride_is_encoded_as_zero_and_counted() {
+        reset_vertex_layout_telemetry();
+        let strides = [None; VERTEX_SLOTS];
+        let layout = GuestInputLayout::from_elements(vec![element(11, 2, 0, 0)], &strides)
+            .expect("one element");
+        let chunk = layout.encode();
+        // Attribute stride and slot stride are both zero (unknown).
+        assert_eq!(
+            u32::from_le_bytes(chunk[6 + 7..6 + 11].try_into().unwrap()),
+            0
+        );
+        let slots_at = VMVD_HEADER_LEN + VMVD_ATTRIBUTE_LEN;
+        assert_eq!(
+            u32::from_le_bytes(chunk[slots_at + 2..slots_at + 6].try_into().unwrap()),
+            0
+        );
+        assert_eq!(ia_stride_unknown(), 1);
+        reset_vertex_layout_telemetry();
+        assert_eq!(ia_stride_unknown(), 0);
+    }
+
+    #[test]
+    fn recorded_strides_feed_the_next_layout() {
+        reset_vertex_layout_telemetry();
+        note_vertex_buffer_strides(0, &[Some(32), Some(48)]);
+        let strides = vertex_strides();
+        assert_eq!(strides[0], Some(32));
+        assert_eq!(strides[1], Some(48));
+        note_vertex_buffer_strides(1, &[Some(0), None]);
+        let strides = vertex_strides();
+        assert_eq!(strides[1], None, "a zero stride is not adopted");
+        assert_eq!(strides[0], Some(32));
+        reset_vertex_layout_telemetry();
+        assert_eq!(vertex_strides()[0], None);
+    }
+
+    #[test]
+    fn guest_layout_refuses_bad_slots_classes_and_formats() {
+        let known = [Some(32); VERTEX_SLOTS];
+        let mut per_instance = element(11, 2, 0, 0);
+        per_instance.per_instance = true;
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![per_instance], &known).unwrap_err(),
+            GuestLayoutError::ZeroStepRate(0)
+        );
+        let mut mixed = element(12, 2, 8, 0);
+        mixed.per_instance = true;
+        mixed.step_rate = 1;
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![element(11, 2, 0, 0), mixed], &known).unwrap_err(),
+            GuestLayoutError::MixedSlotClass(0)
+        );
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![element(31, 2, 0, 0)], &known).unwrap_err(),
+            GuestLayoutError::AttributeIndexOutOfRange {
+                element: 0,
+                index: 31
+            }
+        );
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![element(11, 2, 0, 32)], &known).unwrap_err(),
+            GuestLayoutError::InvalidSlot(32)
+        );
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![element(11, 0, 0, 0)], &known).unwrap_err(),
+            GuestLayoutError::UnknownFormatCode(0)
+        );
+        let mut zero = [None; VERTEX_SLOTS];
+        zero[0] = Some(0);
+        assert_eq!(
+            GuestInputLayout::from_elements(vec![element(11, 2, 0, 0)], &zero).unwrap_err(),
+            GuestLayoutError::ZeroStride(0)
+        );
     }
 }

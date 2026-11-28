@@ -246,7 +246,7 @@ use crate::macos::registry::{
     FunctionRole, PipelineStage as RegistryPipelineStage, PipelineState, StageLibrary, TextureDesc,
     TextureDimension, TextureFormat, TextureUsage,
 };
-use crate::macos::vertex_layout::VertexLayout;
+use crate::macos::vertex_layout::{VertexLayout, VertexStepFunction};
 use crate::root_arguments::{RootParameterPlan, decode_root_plan};
 use crate::transport::{GuestTransport, MetalError};
 use crate::wire::{
@@ -1196,6 +1196,17 @@ pub struct SessionStats {
     pub host_pipeline_translations_refused: u64,
     /// Stages answered from the host pool's content-hashed disk cache.
     pub host_pipeline_cache_hits: u64,
+    /// Graphics pipelines whose descriptor came from the guest's `VMVD` v2
+    /// layout.
+    pub vertex_layout_guest: u64,
+    /// Graphics pipelines that fell back to the vertex stage's `ISG1`
+    /// signature because no guest layout was carried.
+    pub vertex_layout_signature: u64,
+    /// Guest slots whose runtime stride was unknown at PSO time; the host
+    /// derived the packed stride for those slots only.
+    pub vertex_layout_ia_stride_unknown: u64,
+    /// `guest`, `signature` or `none`: the source of the last descriptor.
+    pub vertex_layout_source: &'static str,
     /// Last bounded host-translation refusal reason.
     pub host_translation_reason: Option<String>,
     /// Kind 8 texture registrations refused during the session.
@@ -1328,6 +1339,14 @@ pub struct IpcHost<E: BatchExecutor> {
     host_pipeline_translations_refused: u64,
     /// Stages answered by the host pool's content-hashed disk cache.
     host_pipeline_cache_hits: u64,
+    /// Graphics pipelines whose descriptor came from the guest's layout.
+    vertex_layout_guest: u64,
+    /// Graphics pipelines whose descriptor came from the `ISG1` signature.
+    vertex_layout_signature: u64,
+    /// Guest slots whose runtime stride was unknown, per registration.
+    vertex_layout_ia_stride_unknown: u64,
+    /// The source of the last registered descriptor.
+    vertex_layout_source: &'static str,
     /// Last bounded host-translation refusal reason.
     host_translation_reason: Option<String>,
     /// Kind 8 texture registrations refused during this session.
@@ -1407,6 +1426,10 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_ok: 0,
             host_pipeline_translations_refused: 0,
             host_pipeline_cache_hits: 0,
+            vertex_layout_guest: 0,
+            vertex_layout_signature: 0,
+            vertex_layout_ia_stride_unknown: 0,
+            vertex_layout_source: "none",
             host_translation_reason: None,
             texture_registration_refusals: 0,
             last_texture_refusal_reason: None,
@@ -1514,6 +1537,10 @@ impl<E: BatchExecutor> IpcHost<E> {
             host_pipeline_translations_ok: self.host_pipeline_translations_ok,
             host_pipeline_translations_refused: self.host_pipeline_translations_refused,
             host_pipeline_cache_hits: self.host_pipeline_cache_hits,
+            vertex_layout_guest: self.vertex_layout_guest,
+            vertex_layout_signature: self.vertex_layout_signature,
+            vertex_layout_ia_stride_unknown: self.vertex_layout_ia_stride_unknown,
+            vertex_layout_source: self.vertex_layout_source,
             host_translation_reason: self.host_translation_reason.clone(),
             texture_registration_refusals: self.texture_registration_refusals,
             texture_registration_reason: self.last_texture_refusal_reason.clone(),
@@ -3003,10 +3030,10 @@ impl<E: BatchExecutor> IpcHost<E> {
         };
 
         // A graphics vertex function with `[[attribute(n)]]` inputs needs a
-        // Metal vertex descriptor that the guest's state blob does not carry.
-        // The vertex stage's own DXIL container is the only signature source;
-        // a layout is appended after the state so the BatchExecutor trait and
-        // every older guest frame keep their exact back-compatible shape.
+        // Metal vertex descriptor. ADR-061 prefers the layout the guest built
+        // from its own `D3D12_INPUT_LAYOUT_DESC` (slots, offsets, strides and
+        // step rates); only a frame without one falls back to the vertex
+        // stage's DXIL `ISG1` signature, and both paths are counted.
         let mut state = request.state.clone();
         if request.kind == PIPELINE_KIND_GRAPHICS {
             let Some(vertex_index) = request
@@ -3016,14 +3043,55 @@ impl<E: BatchExecutor> IpcHost<E> {
             else {
                 return self.reject_host_translation("a graphics pipeline needs a vertex stage");
             };
-            match VertexLayout::from_dxil_container(&dxil[vertex_index]) {
-                Ok(layout) if !layout.is_empty() => layout.append_to(&mut state),
-                Ok(_) => {}
-                Err(error) => {
-                    return self.reject_host_translation(format!(
-                        "the vertex input signature cannot become a Metal vertex layout: {error}"
-                    ));
+            match trailing_vertex_layout_offset(&state) {
+                Some(at) => {
+                    // Decode here as well as in the executor: a malformed
+                    // guest layout must be a named refusal, and the decode
+                    // stats are the only place a per-slot stride fallback is
+                    // visible to telemetry.
+                    match VertexLayout::decode_with_stats(&state[at..]) {
+                        Ok((layout, stats)) => {
+                            // The registry's descriptor apply is per-vertex
+                            // only (its file is outside this task's scope).
+                            // Refuse a per-instance slot by name instead of
+                            // silently stepping it per vertex.
+                            if let Some(slot) = layout
+                                .slots()
+                                .iter()
+                                .find(|slot| slot.step_function == VertexStepFunction::PerInstance)
+                            {
+                                return self.reject_host_translation(format!(
+                                    "vertex buffer {} is per-instance; this host's descriptor apply is per-vertex only",
+                                    slot.buffer_index
+                                ));
+                            }
+                            self.vertex_layout_guest = self.vertex_layout_guest.saturating_add(1);
+                            self.vertex_layout_ia_stride_unknown = self
+                                .vertex_layout_ia_stride_unknown
+                                .saturating_add(u64::from(stats.unknown_stride_slots));
+                            self.vertex_layout_source = "guest";
+                        }
+                        Err(error) => {
+                            return self.reject_host_translation(format!(
+                                "the guest vertex layout cannot become a Metal vertex layout: {error}"
+                            ));
+                        }
+                    }
                 }
+                None => match VertexLayout::from_dxil_container(&dxil[vertex_index]) {
+                    Ok(layout) if !layout.is_empty() => {
+                        layout.append_to(&mut state);
+                        self.vertex_layout_signature =
+                            self.vertex_layout_signature.saturating_add(1);
+                        self.vertex_layout_source = "signature";
+                    }
+                    Ok(_) => self.vertex_layout_source = "none",
+                    Err(error) => {
+                        return self.reject_host_translation(format!(
+                            "the vertex input signature cannot become a Metal vertex layout: {error}"
+                        ));
+                    }
+                },
             }
         }
 
@@ -3116,6 +3184,57 @@ fn pipeline_reply_rejected(reason: &str) -> Vec<u8> {
     reply.extend_from_slice(&u16::try_from(len).expect("reason is bounded").to_le_bytes());
     reply.extend_from_slice(&bytes[..len]);
     reply
+}
+
+/// Offset of the trailing `VMVD` chunk a guest appended to a pipeline state
+/// blob, if one is there.
+///
+/// The chunk is the last section and its length follows from its header, so a
+/// stray `VMVD` inside an entry-point name never matches. A malformed chunk
+/// with a plausible header still matches and is refused by the caller's
+/// decode rather than silently replaced.
+fn trailing_vertex_layout_offset(state: &[u8]) -> Option<usize> {
+    use crate::macos::vertex_layout::{
+        MAX_VERTEX_ATTRIBUTES, VERTEX_ATTRIBUTE_LEN, VERTEX_LAYOUT_HEADER_LEN, VERTEX_LAYOUT_MAGIC,
+        VERTEX_LAYOUT_V2_TRAILER_LEN, VERTEX_LAYOUT_VERSION, VERTEX_LAYOUT_VERSION_1,
+        VERTEX_SLOT_LEN,
+    };
+    if state.len() < VERTEX_LAYOUT_HEADER_LEN {
+        return None;
+    }
+    let max_chunk = VERTEX_LAYOUT_HEADER_LEN
+        + VERTEX_ATTRIBUTE_LEN * MAX_VERTEX_ATTRIBUTES
+        + VERTEX_LAYOUT_V2_TRAILER_LEN
+        + VERTEX_SLOT_LEN * MAX_VERTEX_ATTRIBUTES;
+    let start = state.len().saturating_sub(max_chunk);
+    for at in (start..=state.len() - VERTEX_LAYOUT_HEADER_LEN).rev() {
+        if state.get(at..at + 4) != Some(&VERTEX_LAYOUT_MAGIC[..]) {
+            continue;
+        }
+        let count = usize::from(state[at + 5]);
+        if count == 0 || count > MAX_VERTEX_ATTRIBUTES {
+            continue;
+        }
+        let attributes_end = at + VERTEX_LAYOUT_HEADER_LEN + VERTEX_ATTRIBUTE_LEN * count;
+        let expected = match state[at + 4] {
+            VERTEX_LAYOUT_VERSION_1 => attributes_end,
+            VERTEX_LAYOUT_VERSION => {
+                let Some(&slot_count) = state.get(attributes_end) else {
+                    continue;
+                };
+                let slot_count = usize::from(slot_count);
+                if slot_count == 0 || slot_count > MAX_VERTEX_ATTRIBUTES {
+                    continue;
+                }
+                attributes_end + VERTEX_LAYOUT_V2_TRAILER_LEN + VERTEX_SLOT_LEN * slot_count
+            }
+            _ => continue,
+        };
+        if expected == state.len() {
+            return Some(at);
+        }
+    }
+    None
 }
 
 /// The converter's own stage code for a wire stage code.
@@ -4509,6 +4628,52 @@ mod tests {
     const ALLOCATION_ID: u64 = 1;
     const BYTES: usize = 65_536;
     const PIPELINE_ID: u64 = 7;
+
+    #[test]
+    fn a_guest_vertex_layout_is_found_only_at_the_trailing_section() {
+        use crate::macos::vertex_layout::{
+            VERTEX_ATTRIBUTE_LEN, VERTEX_LAYOUT_HEADER_LEN, VERTEX_LAYOUT_MAGIC,
+            VERTEX_LAYOUT_VERSION_1, VertexAttribute, VertexFormat,
+        };
+        let float3 = VertexFormat::with_components(VertexFormat::FLOAT, 3).unwrap();
+        let layout = VertexLayout::from_attributes(vec![VertexAttribute {
+            index: 11,
+            format: float3,
+            offset: 0,
+            buffer_index: 0,
+            stride: 12,
+        }])
+        .unwrap();
+        let prefix = b"VPS1\x00\x01\x07\x00\x00\x00\x00\x00\x00".to_vec();
+
+        let mut state = prefix.clone();
+        layout.append_to(&mut state);
+        assert_eq!(trailing_vertex_layout_offset(&state), Some(prefix.len()));
+        // No chunk at all.
+        assert_eq!(trailing_vertex_layout_offset(&prefix), None);
+
+        // A version 1 chunk is still recognised at the same position.
+        let mut v1 = prefix.clone();
+        v1.extend_from_slice(&VERTEX_LAYOUT_MAGIC);
+        v1.push(VERTEX_LAYOUT_VERSION_1);
+        v1.push(1);
+        v1.push(11);
+        v1.push(float3.code());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.push(0);
+        v1.extend_from_slice(&12u32.to_le_bytes());
+        assert_eq!(
+            v1.len(),
+            prefix.len() + VERTEX_LAYOUT_HEADER_LEN + VERTEX_ATTRIBUTE_LEN
+        );
+        assert_eq!(trailing_vertex_layout_offset(&v1), Some(prefix.len()));
+
+        // A stray magic whose header does not span to the end is not a chunk.
+        let mut stray = prefix;
+        stray.extend_from_slice(&VERTEX_LAYOUT_MAGIC);
+        stray.extend_from_slice(&[2, 3, 0, 0]);
+        assert_eq!(trailing_vertex_layout_offset(&stray), None);
+    }
 
     #[derive(Default)]
     struct StubState {
