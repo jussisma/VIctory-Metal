@@ -735,67 +735,155 @@ fn active_descriptor_heaps(this: This) -> Option<victory_metal::wire_v3::Descrip
     metal.as_ref()?.producer().descriptor_heaps().copied()
 }
 
-/// One descriptor read from an active heap: this backend's live-slot record
-/// when present, otherwise the raw RDNA 2 descriptor the title wrote.
+/// Classifies one descriptor from its raw RDNA 2 bytes (ADR-064).
 #[cfg(windows)]
-fn heap_descriptor_slot(
+fn raw_descriptor_slot(
     samplers: bool,
-    stride: u32,
-    handle: u64,
+    words: &[u32; 8],
 ) -> crate::native_metal::bindings::DescriptorSlot {
-    let words = (stride as usize / 4).clamp(1, 8);
-    let mut raw = [0u32; 8];
-    // SAFETY: the heap enumerator proved `handle` is a whole-stride descriptor
-    // inside an active heap, whose memory lives while the list records; the
-    // slice never reads past that descriptor.
-    raw[..words].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(handle as *const u32, words)
-    });
-    if raw[0] == crate::descriptor::VIEW_TAG {
-        // Our own record: the registry knows the exact CBV/SRV/UAV/sampler.
-        return descriptor_slot(handle);
-    }
     if samplers {
-        crate::native_metal::bindings::rdna2_sampler_descriptor_slot(
-            &[raw[0], raw[1], raw[2], raw[3]],
-        )
+        crate::native_metal::bindings::rdna2_sampler_descriptor_slot(&[
+            words[0], words[1], words[2], words[3],
+        ])
     } else {
-        crate::native_metal::bindings::rdna2_view_descriptor_slot(&raw)
+        crate::native_metal::bindings::rdna2_view_descriptor_slot(words)
     }
 }
 
+/// The honest bounds of one slot read: `(samplers, stride)` for a heap the
+/// list bound, `None` for a lookup in the heaps the process tracks.
+#[cfg(windows)]
+type BoundHeap = Option<(bool, u32)>;
+
+/// Reads the raw RDNA 2 bytes of one descriptor of a bound heap.
+///
+/// The heap enumerator proved `handle` is a whole-stride descriptor inside
+/// the heap, whose memory lives while the list records, so the read never
+/// passes the descriptor.
+#[cfg(windows)]
+fn bound_heap_words(stride: u32, handle: u64) -> [u32; 8] {
+    let words = (stride as usize / 4).clamp(1, 8);
+    let mut raw = [0u32; 8];
+    // SAFETY: see the function comment.
+    raw[..words]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(handle as *const u32, words) });
+    raw
+}
+
+/// One descriptor slot in the ADR-064 follow-up's order: this backend's
+/// live-slot record, then the raw RDNA 2 descriptor the title wrote in the
+/// heap that holds it, then empty.
+///
+/// `bound` names the heap the list itself bound, when it bound one; without
+/// it the handle is looked up in the shader-visible heaps this process
+/// tracks, so a table bound on a list that never recorded
+/// `SetDescriptorHeaps` still resolves its console bytes instead of reading
+/// `Empty`.
+#[cfg(windows)]
+fn read_descriptor_slot(
+    bound: BoundHeap,
+    handle: u64,
+) -> crate::native_metal::bindings::ResolvedSlot {
+    use crate::native_metal::bindings;
+    bindings::resolve_descriptor_slot(
+        handle,
+        |slot| crate::descriptor::tagged(slot).then(|| descriptor_slot(slot)),
+        |slot| match bound {
+            Some((samplers, stride)) => {
+                Some(raw_descriptor_slot(samplers, &bound_heap_words(stride, slot)))
+            }
+            None => crate::descriptor::tracked_descriptor(slot)
+                .map(|(samplers, words)| raw_descriptor_slot(samplers, &words)),
+        },
+    )
+}
+
 /// Enumerates one root descriptor table: from the active heaps when the list
-/// bound any, through the live-slot registry otherwise (ADR-064).
+/// bound any, then from the heaps this process tracks, through the live-slot
+/// registry as the last resort (ADR-064).
+///
+/// `stage` only names the caller in the first-slot census.
 #[cfg(windows)]
 fn enumerate_table_run(
     this: This,
     handle: u64,
+    stage: &'static str,
 ) -> Result<
     crate::native_metal::bindings::TypedDescriptorTableRun,
     crate::native_metal::bindings::TableRunError,
 > {
     use crate::native_metal::bindings::{self, TableRunError};
-    match active_descriptor_heaps(this) {
-        None => bindings::enumerate_descriptor_table_typed(handle, descriptor_slot),
+
+    // The heap this list bound, when it bound one. A base outside those heaps
+    // stays a named refusal (ADR-064): the title named heaps, and this handle
+    // is not among them.
+    let mut bound: BoundHeap = None;
+    let mut samplers = false;
+    let heap = match active_descriptor_heaps(this) {
         Some(heaps) => {
-            let Some((heap, samplers)) = bindings::heap_for_handle(&heaps, handle) else {
+            let Some((heap, is_samplers)) = bindings::heap_for_handle(&heaps, handle) else {
                 crate::native_metal::telemetry::note_named_refusal(
                     "a descriptor table base is outside the active descriptor heaps",
                 );
                 return Err(TableRunError::OutsideHeap { handle });
             };
-            bindings::enumerate_descriptor_table_in_heap(
-                handle,
-                &heap,
-                samplers,
-                // The root signature's table size is not tracked on this path;
-                // the run then covers the rest of the heap, never stopping at
-                // the first empty descriptor.
-                None,
-                |descriptor| heap_descriptor_slot(samplers, heap.stride, descriptor),
-            )
+            bound = Some((is_samplers, heap.stride));
+            samplers = is_samplers;
+            Some(heap)
         }
-    }
+        // No heap on the list: the descriptor may still sit in a
+        // shader-visible heap this process tracks (the title's own bytes,
+        // the ADR-064 follow-up), so classify from its geometry before falling
+        // back to the live-slot registry. Its slots are read through
+        // `descriptor::tracked_descriptor`, which finds the live heap per
+        // slot instead of trusting a snapshot.
+        None => crate::descriptor::tracked_heap(handle).map(|tracked| {
+            samplers = tracked.samplers;
+            victory_metal::wire_v3::DescriptorHeapRefV3 {
+                // Only the geometry is read here; the wire identity belongs
+                // to the `SetDescriptorHeaps` command this list never
+                // recorded.
+                allocation_id: tracked.start,
+                generation: 1,
+                offset: 0,
+                gpu_base: tracked.start,
+                stride: tracked.stride,
+                count: tracked.count,
+                active: true,
+            }
+        }),
+    };
+    let Some(heap) = heap else {
+        // No heap names this handle: the live-slot registry is the last
+        // resort, exactly as before ADR-064.
+        let mut first = true;
+        return bindings::enumerate_descriptor_table_typed(handle, |slot| {
+            let resolved = read_descriptor_slot(None, slot);
+            if first {
+                first = false;
+                table_slot_census::note(stage, resolved.source, resolved.slot);
+            }
+            resolved.slot
+        });
+    };
+    let mut first = true;
+    bindings::enumerate_descriptor_table_in_heap(
+        handle,
+        &heap,
+        samplers,
+        // The root signature's table size is not tracked on this path; the
+        // run then covers the rest of the heap, never stopping at the first
+        // empty descriptor.
+        None,
+        |slot| {
+            let resolved = read_descriptor_slot(bound, slot);
+            if first {
+                first = false;
+                table_slot_census::note(stage, resolved.source, resolved.slot);
+            }
+            resolved.slot
+        },
+    )
 }
 
 /// Records the title's `SetDescriptorHeaps` on the native producer (ADR-064).
@@ -986,6 +1074,97 @@ mod placed_census {
         for count in &COUNTS {
             count.store(0, Relaxed);
         }
+    }
+}
+
+/// The ADR-064 follow-up's first-slot census: which source named the base
+/// slot of each descriptor table a list enumerated, and what that slot was.
+///
+/// A boot that refused 4,135 compute tables as empty needs one bounded line
+/// that says whether their bytes were ever classified: `registry` means this
+/// backend's own record named the slot, `heap_bytes` means the title's raw
+/// RDNA 2 descriptor did, `untracked` means neither — and only then is
+/// `empty` a statement about the table rather than about the lookup. Counters
+/// are two fixed sets (one per stage), printed at the first table and at each
+/// power of two after it.
+#[cfg(any(windows, test))]
+mod table_slot_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use crate::native_metal::bindings::{DescriptorSlot, SlotSource};
+
+    /// The live-slot registry named the first slot.
+    pub(super) const REGISTRY: usize = 0;
+    /// The slot's raw RDNA 2 bytes in a heap named it.
+    pub(super) const HEAP_BYTES: usize = 1;
+    /// No record and no tracked heap covered the handle.
+    pub(super) const UNTRACKED: usize = 2;
+    /// The first slot is genuinely empty (zero bytes, or no live record).
+    pub(super) const EMPTY: usize = 3;
+    /// The first slot carries bits this backend cannot name.
+    pub(super) const UNRESOLVABLE: usize = 4;
+    /// A buffer entry began the table.
+    pub(super) const BUFFERS: usize = 5;
+    /// A texture address began the table.
+    pub(super) const TEXTURES: usize = 6;
+    /// A sampler handle began the table.
+    pub(super) const SAMPLERS: usize = 7;
+    const FIELDS: usize = 8;
+
+    static COMPUTE: [AtomicU64; FIELDS] = [const { AtomicU64::new(0) }; FIELDS];
+    static GRAPHICS: [AtomicU64; FIELDS] = [const { AtomicU64::new(0) }; FIELDS];
+    static TABLES: AtomicU64 = AtomicU64::new(0);
+
+    /// Counts one table's first slot and logs the census when due.
+    pub(super) fn note(stage: &'static str, source: SlotSource, slot: DescriptorSlot) {
+        let counts = if stage == "compute" {
+            &COMPUTE
+        } else {
+            &GRAPHICS
+        };
+        let field = match source {
+            SlotSource::Registry => REGISTRY,
+            SlotSource::HeapBytes => HEAP_BYTES,
+            SlotSource::Untracked => UNTRACKED,
+        };
+        counts[field].fetch_add(1, Relaxed);
+        let outcome = match slot {
+            DescriptorSlot::Empty => Some(EMPTY),
+            DescriptorSlot::Unresolvable(_) => Some(UNRESOLVABLE),
+            DescriptorSlot::Live(..) => Some(BUFFERS),
+            DescriptorSlot::Texture(..) => Some(TEXTURES),
+            DescriptorSlot::Sampler(_) => Some(SAMPLERS),
+        };
+        if let Some(outcome) = outcome {
+            counts[outcome].fetch_add(1, Relaxed);
+        }
+        let tables = TABLES.fetch_add(1, Relaxed) + 1;
+        if tables.is_power_of_two() {
+            tracing::info!(
+                compute = %summary(&COMPUTE),
+                graphics = %summary(&GRAPHICS),
+                "descriptor table first-slot census"
+            );
+        }
+    }
+
+    fn summary(counts: &[AtomicU64; FIELDS]) -> String {
+        let [registry, heap_bytes, untracked, empty, unresolvable, buffers, textures, samplers] =
+            std::array::from_fn(|i| counts[i].load(Relaxed));
+        format!(
+            "registry={registry} heap_bytes={heap_bytes} untracked={untracked} empty={empty} \
+             unresolvable={unresolvable} buffers={buffers} textures={textures} samplers={samplers}"
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn counts(stage: &'static str) -> [u64; FIELDS] {
+        let counts = if stage == "compute" {
+            &COMPUTE
+        } else {
+            &GRAPHICS
+        };
+        std::array::from_fn(|i| counts[i].load(Relaxed))
     }
 }
 
@@ -1344,7 +1523,7 @@ fn bind_graphics_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match enumerate_table_run(this, handle) {
+    let run = match enumerate_table_run(this, handle, "graphics") {
         Ok(run) => run,
         Err(error) => {
             crate::native_metal::telemetry::note_graphics_root_argument_dropped();
@@ -1459,7 +1638,7 @@ fn bind_compute_descriptor_table(this: This, slot: u32, handle: u64) {
         );
         return;
     };
-    let run = match enumerate_table_run(this, handle) {
+    let run = match enumerate_table_run(this, handle, "compute") {
         Ok(run) => run,
         Err(error) => {
             tracing::warn!(%error, "a compute descriptor table could not be enumerated");
@@ -5967,5 +6146,54 @@ mod tests {
 
         state::reset_vertex_layout_telemetry();
         assert_eq!(state::vertex_strides(), [None; state::VERTEX_SLOTS]);
+    }
+
+    /// ADR-064 follow-up: the first-slot census counts the source that named a
+    /// table's base slot and the kind it named, per stage, so a boot can tell a
+    /// compute table that was classified from one nobody could look at.
+    #[test]
+    fn first_slot_census_counts_source_and_kind_per_stage() {
+        use crate::native_metal::bindings::{DescriptorSlot, SlotSource};
+        use victory_metal::wire_v3::DescriptorKind;
+
+        let before = table_slot_census::counts("compute");
+        table_slot_census::note(
+            "compute",
+            SlotSource::HeapBytes,
+            DescriptorSlot::Texture(DescriptorKind::Srv, 0x1000),
+        );
+        table_slot_census::note("compute", SlotSource::Untracked, DescriptorSlot::Empty);
+        table_slot_census::note(
+            "compute",
+            SlotSource::Registry,
+            DescriptorSlot::Live(
+                DescriptorKind::Cbv,
+                crate::native_metal::bindings::GuestBinding {
+                    address: 0x2000,
+                    len: 16,
+                },
+            ),
+        );
+        table_slot_census::note(
+            "compute",
+            SlotSource::HeapBytes,
+            DescriptorSlot::Unresolvable("a raw RDNA 2 buffer descriptor is empty"),
+        );
+        let after = table_slot_census::counts("compute");
+        let delta = std::array::from_fn::<u64, 8, _>(|i| after[i] - before[i]);
+        assert_eq!(
+            delta,
+            [
+                1, // registry
+                2, // heap_bytes
+                1, // untracked
+                1, // empty
+                1, // unresolvable
+                1, // buffers (registry, CBV)
+                1, // textures (heap bytes)
+                0, // samplers
+            ],
+            "each source, refusal and kind is counted under its own name"
+        );
     }
 }

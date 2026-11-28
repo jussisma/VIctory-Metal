@@ -271,6 +271,75 @@ pub enum DescriptorSlot {
     Unresolvable(&'static str),
 }
 
+/// Where a descriptor slot's meaning came from (the ADR-064 follow-up).
+///
+/// The live-slot registry knows a descriptor this backend wrote (a
+/// [`crate::descriptor::VIEW_TAG`] record names the exact CBV/SRV/UAV or
+/// sampler). A descriptor the title wrote or copied itself as console bytes
+/// has no such record: only its raw RDNA 2 bits in the heap it lives in name
+/// it. The registry is tried first, then the heap's bytes, then the slot
+/// reads as empty. Naming the source is what a boot log needs to tell a
+/// genuinely empty table from one whose bytes were never consulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotSource {
+    /// The live-slot registry record named the slot.
+    Registry,
+    /// A descriptor in a heap (active, or one this process tracks) named the
+    /// slot through its raw RDNA 2 bits.
+    HeapBytes,
+    /// Neither source holds the slot: no registry record, and no heap this
+    /// process tracks covers the handle.
+    Untracked,
+}
+
+/// One descriptor slot and the source that named it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedSlot {
+    /// The slot the winning source names (never invented: an empty or
+    /// unresolvable slot is reported as such).
+    pub slot: DescriptorSlot,
+    /// Which source named it.
+    pub source: SlotSource,
+}
+
+/// Resolves one descriptor slot in the ADR-064 follow-up's order: the
+/// live-slot registry record, then the raw bytes of the descriptor in the
+/// heap that holds it, then empty.
+///
+/// `registry` returns `Some` only for a slot this backend recorded (a live
+/// record: a stale tag is still a record and is not re-read as console
+/// bytes, whose twenty trailing bytes would be another descriptor's).
+/// `heap` returns `Some` for a handle that lies inside a heap the caller can
+/// read, classified from its own bits. A slot neither source names is
+/// [`DescriptorSlot::Empty`] with [`SlotSource::Untracked`]: a genuinely
+/// empty slot stays empty, and a named refusal is never replaced by one.
+pub fn resolve_descriptor_slot<R, H>(
+    handle: u64,
+    mut registry: R,
+    mut heap: H,
+) -> ResolvedSlot
+where
+    R: FnMut(u64) -> Option<DescriptorSlot>,
+    H: FnMut(u64) -> Option<DescriptorSlot>,
+{
+    if let Some(slot) = registry(handle) {
+        return ResolvedSlot {
+            slot,
+            source: SlotSource::Registry,
+        };
+    }
+    match heap(handle) {
+        Some(slot) => ResolvedSlot {
+            slot,
+            source: SlotSource::HeapBytes,
+        },
+        None => ResolvedSlot {
+            slot: DescriptorSlot::Empty,
+            source: SlotSource::Untracked,
+        },
+    }
+}
+
 /// Why a descriptor-table run could not be enumerated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TableRunError {
@@ -873,14 +942,30 @@ where
                 break;
             }
             DescriptorSlot::Unresolvable(why) => {
-                if !known_size {
-                    boundary = TableRunBoundary::Empty;
-                    break;
+                // The first slot is the entry a table must carry: a slot this
+                // backend cannot name there is a named refusal, never the
+                // `Empty` a boot would read as "the table is genuinely empty"
+                // (the ADR-064 follow-up). Past the first slot an unknown-size
+                // run ends at the slot, because the table's real size is not
+                // known and a slot beyond it may be leftover heap.
+                if index == 0 {
+                    return Err(TableRunError::UnsupportedAt { index, why });
                 }
-                return Err(TableRunError::UnsupportedAt { index, why });
+                boundary = TableRunBoundary::Empty;
+                break;
             }
         };
         if samplers != (kind == DescriptorKind::Sampler) {
+            if index == 0 {
+                return Err(TableRunError::UnsupportedAt {
+                    index,
+                    why: if samplers {
+                        "a sampler heap holds a view descriptor"
+                    } else {
+                        "a view heap holds a sampler descriptor"
+                    },
+                });
+            }
             if !known_size {
                 boundary = TableRunBoundary::KindChange { kind };
                 break;
@@ -3180,6 +3265,185 @@ mod tests {
                 )
             }),
             Err(TableRunError::OverCap { count: 33 })
+        );
+    }
+
+    /// ADR-064 follow-up: a descriptor slot resolves through the live-slot
+    /// registry first, then the raw bytes of the heap that holds it, and only
+    /// then reads as empty. The source is named so a boot can tell a table whose
+    /// bytes were classified from one nobody ever looked at.
+    #[test]
+    fn first_slot_resolution_tries_registry_then_heap_then_empty() {
+        let recorded = DescriptorSlot::Live(
+            DescriptorKind::Cbv,
+            GuestBinding {
+                address: 0x10_0000,
+                len: 16,
+            },
+        );
+        let from_registry = resolve_descriptor_slot(
+            0x1000,
+            |_| Some(recorded),
+            |_| Some(DescriptorSlot::Texture(DescriptorKind::Srv, 0x20_0000)),
+        );
+        assert_eq!(from_registry.source, SlotSource::Registry);
+        assert_eq!(from_registry.slot, recorded);
+
+        let from_heap = resolve_descriptor_slot(
+            0x1000,
+            |_| None,
+            |_| Some(DescriptorSlot::Texture(DescriptorKind::Srv, 0x20_0000)),
+        );
+        assert_eq!(from_heap.source, SlotSource::HeapBytes);
+        assert_eq!(
+            from_heap.slot,
+            DescriptorSlot::Texture(DescriptorKind::Srv, 0x20_0000)
+        );
+
+        // No record and no heap covers the handle: the slot is empty, and the
+        // census says nobody resolved it instead of claiming a heap did.
+        let untracked = resolve_descriptor_slot(0x1000, |_| None, |_| None);
+        assert_eq!(untracked.source, SlotSource::Untracked);
+        assert_eq!(untracked.slot, DescriptorSlot::Empty);
+    }
+
+    /// ADR-064 follow-up: a compute table over descriptors the title wrote
+    /// itself (no live-slot registry record) enumerates from the heap's raw
+    /// RDNA 2 bits with the right entry kinds. This is the path the title's compute
+    /// tables take: they are packed by its own code, not through this
+    /// backend's view creators.
+    #[test]
+    fn title_written_view_and_sampler_descriptors_enumerate_by_kind() {
+        // One view heap: a 2D image then a raw buffer V#.
+        let texture_address: u64 = 0x12_3456_7800;
+        let buffer_address: u64 = 0x2000_0000;
+        let mut views = vec![0u32; 4 * RDNA2_VIEW_DESCRIPTOR_WORDS];
+        views[..8].copy_from_slice(&rdna2_image_words(texture_address, 9, 256, 128, 1, 1));
+        views[8..12].copy_from_slice(&rdna2_buffer_words(buffer_address, 16, 64));
+        let view_heap = DescriptorHeapRefV3 {
+            allocation_id: 11,
+            generation: 1,
+            offset: 0,
+            gpu_base: views.as_ptr() as u64,
+            stride: 32,
+            count: 4,
+            active: true,
+        };
+        // One sampler heap with a raw S#.
+        let mut samplers = [0u32; RDNA2_SAMPLER_DESCRIPTOR_WORDS];
+        samplers[2] = 1 << 20 | 1 << 22;
+        let sampler_heap = DescriptorHeapRefV3 {
+            allocation_id: 12,
+            generation: 1,
+            offset: 0,
+            gpu_base: samplers.as_ptr() as u64,
+            stride: 16,
+            count: 1,
+            active: true,
+        };
+
+        // The registry has no record for either heap: the title wrote the
+        // bytes, so only the RDNA 2 bits can name them.
+        let registry = |_: u64| None;
+        let view_words = |handle: u64| -> Option<DescriptorSlot> {
+            let index = ((handle - view_heap.gpu_base) / 32) as usize;
+            if index >= view_heap.count as usize {
+                return None;
+            }
+            let mut words = [0u32; 8];
+            words.copy_from_slice(&views[index * 8..index * 8 + 8]);
+            Some(rdna2_view_descriptor_slot(&words))
+        };
+        let mut first = true;
+        let run = enumerate_descriptor_table_in_heap(
+            view_heap.gpu_base,
+            &view_heap,
+            false,
+            None,
+            |handle| {
+                let resolved = resolve_descriptor_slot(handle, registry, view_words);
+                if first {
+                    first = false;
+                    assert_eq!(resolved.source, SlotSource::HeapBytes);
+                }
+                resolved.slot
+            },
+        )
+        .expect("title-written view descriptors enumerate");
+        assert_eq!(run.kind, DescriptorKind::Srv);
+        assert_eq!(
+            run.entries,
+            vec![
+                DescriptorEntry::Texture(texture_address),
+                DescriptorEntry::Buffer(GuestBinding {
+                    address: buffer_address,
+                    len: 16 * 64,
+                }),
+            ]
+        );
+
+        let sampler_words = |_: u64| {
+            Some(rdna2_sampler_descriptor_slot(
+                &[samplers[0], samplers[1], samplers[2], samplers[3]],
+            ))
+        };
+        let run = enumerate_descriptor_table_in_heap(
+            sampler_heap.gpu_base,
+            &sampler_heap,
+            true,
+            None,
+            |handle| resolve_descriptor_slot(handle, registry, sampler_words).slot,
+        )
+        .expect("a title-written sampler descriptor enumerates");
+        assert_eq!(run.kind, DescriptorKind::Sampler);
+        match run.entries.as_slice() {
+            [DescriptorEntry::Sampler(handle)] => assert_ne!(*handle, 0),
+            other => panic!("expected one sampler entry, got {other:?}"),
+        }
+    }
+
+    /// ADR-064 follow-up: a genuinely empty first slot stays `Empty`, while a
+    /// slot that carries bits this backend cannot name is a named refusal at
+    /// index 0 even when the table size is unknown. Neither is a silent empty.
+    #[test]
+    fn an_empty_first_slot_stays_empty_and_an_unresolvable_one_is_named() {
+        let heap = DescriptorHeapRefV3 {
+            allocation_id: 13,
+            generation: 1,
+            offset: 0,
+            gpu_base: 0x8000,
+            stride: 32,
+            count: 8,
+            active: true,
+        };
+        // Genuinely empty: no registry record, all-zero bytes.
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x8000, &heap, false, None, |_| {
+                DescriptorSlot::Empty
+            }),
+            Err(TableRunError::Empty)
+        );
+        // Unresolvable at the base: refused by name, with its reason, not
+        // reported as an empty table.
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x8000, &heap, false, None, |_| {
+                DescriptorSlot::Unresolvable("a raw RDNA 2 buffer descriptor is empty")
+            }),
+            Err(TableRunError::UnsupportedAt {
+                index: 0,
+                why: "a raw RDNA 2 buffer descriptor is empty"
+            })
+        );
+        // A view descriptor bound in a sampler heap is named for its slot
+        // too, instead of degrading to `Empty` because the run never started.
+        assert_eq!(
+            enumerate_descriptor_table_in_heap(0x8000, &heap, true, None, |_| {
+                DescriptorSlot::Texture(DescriptorKind::Srv, 0x40_0000)
+            }),
+            Err(TableRunError::UnsupportedAt {
+                index: 0,
+                why: "a sampler heap holds a view descriptor"
+            })
         );
     }
 

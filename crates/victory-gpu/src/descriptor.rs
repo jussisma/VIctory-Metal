@@ -214,6 +214,83 @@ fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
     found
 }
 
+/// A shader-visible heap this process still tracks, as a descriptor-slot
+/// reader needs it (an ADR-064 follow-up).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrackedHeap {
+    /// Whether the heap holds sampler descriptors (16 bytes) rather than
+    /// views (32 bytes).
+    pub(crate) samplers: bool,
+    /// Bytes between consecutive descriptors.
+    pub(crate) stride: u32,
+    /// Descriptors the heap was created with.
+    pub(crate) count: u32,
+    /// The first descriptor.
+    pub(crate) start: u64,
+}
+
+/// The shader-visible heap that owns `handle`, if this process still tracks
+/// one exactly.
+///
+/// Descriptor handles carry no heap identity, so a handle is in a heap when
+/// it lies in `[start, start + stride * count)` at a whole stride. `None`
+/// means no tracked heap covers it: the caller must not read the memory.
+#[cfg(windows)]
+pub(crate) fn tracked_heap(handle: u64) -> Option<TrackedHeap> {
+    if handle == 0 {
+        return None;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let at = heap_at(&heaps, handle)?;
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which removes
+    // their registration under the write lock we share here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let stride = heap.descriptor_stride()?;
+    if heap.index(handle).is_none() {
+        return None;
+    }
+    Some(TrackedHeap {
+        samplers: heap.samplers(),
+        stride,
+        count: heap.descriptor_count(),
+        start: heap.start,
+    })
+}
+
+/// The raw descriptor bytes at `handle` in a tracked shader-visible heap and
+/// whether that heap holds samplers.
+///
+/// This is the console-bytes read an ADR-064 follow-up added for a table bound on a list
+/// that never recorded `SetDescriptorHeaps`: the descriptor sits in a heap
+/// the process still tracks, so its own RDNA 2 bits name it. `None` when no
+/// tracked heap covers `handle`, so a caller never reads past a heap's
+/// memory.
+#[cfg(windows)]
+pub(crate) fn tracked_descriptor(handle: u64) -> Option<(bool, [u32; 8])> {
+    if handle == 0 {
+        return None;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let at = heap_at(&heaps, handle)?;
+    // SAFETY: as in `tracked_heap`.
+    let heap = unsafe { &*(at as *const Heap) };
+    Some((heap.samplers(), heap.read_descriptor(handle)?))
+}
+
+/// Whether the slot at `handle` carries this backend's live-slot record.
+///
+/// A tagged slot is the registry's to name, even when its record has gone
+/// stale: the twenty bytes after the three-word record are not another
+/// descriptor, so classifying them as console bytes would name a resource
+/// nobody bound.
+#[cfg(windows)]
+pub(crate) fn tagged(handle: u64) -> bool {
+    // SAFETY: the title passes a descriptor handle it owns, as `view`
+    // already reads from it.
+    handle != 0 && unsafe { (handle as *const u32).read_unaligned() } == VIEW_TAG
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
