@@ -172,23 +172,52 @@ impl CounterSnapshot {
 /// the cap are counted in [`DescriptorTableRefusalCensus::omitted`].
 pub const MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS: usize = 16;
 
-/// One bounded key of the descriptor-table refusal census.
+/// One bounded key of the descriptor-table census.
 ///
-/// It names only counts and fixed plan-kind words: no shader bytes, resource
-/// contents, register values or title identifiers appear here.
+/// It names only counts and fixed plan-kind/outcome words: no shader bytes,
+/// resource contents, register values or title identifiers appear here. The
+/// reflected/stage/map fields are what makes the cause of a miss visible in a
+/// single boot: the translated root signature never declares a descriptor
+/// table (tables are lowered to directly indexed heaps), so `map_tables` and
+/// `reflected_tables` both reading 0 identifies the plan-less heap-lowered
+/// class without a second run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DescriptorTableRefusalKey {
     /// Host pipeline id the refused table was selected with.
     pub pipeline_id: u64,
     /// Wire `DescriptorTableV3.set` the submission carried.
     pub wire_set: u16,
-    /// Descriptor-table parameters the selected pipeline declares.
+    /// Descriptor-table parameters the selected pipeline declares (the larger
+    /// of its authoritative map and its widest stage; the pre-existing field).
     pub declared_tables: u16,
+    /// Descriptor-table parameters converter reflection reports, summed over
+    /// every stage layout of the selected pipeline.
+    pub reflected_tables: u16,
+    /// Bit mask of the selected pipeline's stage layouts: bit 0 vertex,
+    /// bit 1 fragment, bit 2 mesh, bit 3 object, bit 4 compute.
+    pub stage_mask: u8,
+    /// Descriptor tables the authoritative translated root-parameter map
+    /// declares (`0` when the pipeline was registered without one).
+    pub map_tables: u16,
     /// Whether the submission carried a root-argument plan at all.
     pub had_plan: bool,
     /// The plan's kind for this set (`none` without an entry).
     pub plan_kind: &'static str,
+    /// Fixed outcome word: [`OUTCOME_REFUSED`], [`OUTCOME_STALE`] or
+    /// [`OUTCOME_INERT`].
+    pub outcome: &'static str,
 }
+
+/// Outcome word: the table was refused and the batch aborted.
+pub const OUTCOME_REFUSED: &str = "refused";
+
+/// Outcome word: a plan named a table the bound pipeline does not declare.
+pub const OUTCOME_STALE: &str = "stale";
+
+/// Outcome word: a plan-less set on a zero-table signature was accepted as
+/// inert because the bound pipeline cannot address a table at any root
+/// parameter.
+pub const OUTCOME_INERT: &str = "inert";
 
 /// One counted key of the descriptor-table refusal census.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,11 +228,12 @@ pub struct DescriptorTableRefusalCount {
     pub count: u64,
 }
 
-/// Bounded per-process descriptor-table refusal census.
+/// Bounded per-process descriptor-table census.
 ///
 /// It is the one host-side answer to "which descriptor-table set did not
-/// resolve, and did the guest send a plan for it?". Reading it never arms the
-/// draw tracer.
+/// resolve, did the guest send a plan for it, and what does the selected
+/// pipeline's translated/reflected signature declare?". Reading it never arms
+/// the draw tracer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DescriptorTableRefusalCensus {
     /// Distinct keys retained (`<= MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`).
@@ -235,7 +265,8 @@ impl DescriptorTableRefusalCensus {
     ///
     /// Field names, in emitted order: `distinct_keys`, `omitted`, `keys`;
     /// each key carries `pipeline_id`, `wire_set`, `declared_tables`,
-    /// `had_plan`, `plan_kind` and `count`.
+    /// `reflected_tables`, `stage_mask`, `map_tables`, `had_plan`,
+    /// `plan_kind`, `outcome` and `count`.
     pub fn json_value(&self) -> String {
         let keys = self
             .entries
@@ -243,12 +274,18 @@ impl DescriptorTableRefusalCensus {
             .map(|entry| {
                 format!(
                     "{{\"pipeline_id\": {}, \"wire_set\": {}, \"declared_tables\": {}, \
-                     \"had_plan\": {}, \"plan_kind\": \"{}\", \"count\": {}}}",
+                     \"reflected_tables\": {}, \"stage_mask\": {}, \"map_tables\": {}, \
+                     \"had_plan\": {}, \"plan_kind\": \"{}\", \"outcome\": \"{}\", \
+                     \"count\": {}}}",
                     entry.key.pipeline_id,
                     entry.key.wire_set,
                     entry.key.declared_tables,
+                    entry.key.reflected_tables,
+                    entry.key.stage_mask,
+                    entry.key.map_tables,
                     entry.key.had_plan,
                     entry.key.plan_kind,
+                    entry.key.outcome,
                     entry.count
                 )
             })
@@ -273,11 +310,13 @@ fn descriptor_table_refusals() -> &'static Mutex<DescriptorTableRefusalLog> {
     DESCRIPTOR_TABLE_REFUSALS.get_or_init(|| Mutex::new(DescriptorTableRefusalLog::default()))
 }
 
-/// Counts one descriptor-table refusal under its bounded key.
+/// Counts one descriptor-table census event under its bounded key.
 ///
-/// Only a refusal calls this, so the hot encode path allocates nothing. The
-/// map is capped at [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`]; keys past the cap
-/// only bump `omitted`.
+/// Refusals, stale-set refusals and accepted inert sets all land here so a
+/// single boot can attribute every class; `key.outcome` says which. The hot
+/// encode path allocates nothing on an existing key. The map is capped at
+/// [`MAX_DESCRIPTOR_TABLE_REFUSAL_KEYS`]; keys past the cap only bump
+/// `omitted`.
 pub fn note_descriptor_table_refusal(key: DescriptorTableRefusalKey) {
     let mut log = descriptor_table_refusals()
         .lock()
@@ -909,8 +948,12 @@ mod tests {
             pipeline_id: 7,
             wire_set: set,
             declared_tables: 2,
+            reflected_tables: 2,
+            stage_mask: 0b10,
+            map_tables: 2,
             had_plan: false,
             plan_kind: "none",
+            outcome: OUTCOME_REFUSED,
         }
     }
 
@@ -930,6 +973,10 @@ mod tests {
         let json = census.json_value();
         assert!(json.contains("\"distinct_keys\": 2"));
         assert!(json.contains("\"plan_kind\": \"none\""));
+        assert!(json.contains("\"outcome\": \"refused\""));
+        assert!(json.contains("\"reflected_tables\": 2"));
+        assert!(json.contains("\"map_tables\": 2"));
+        assert!(json.contains("\"stage_mask\": 2"));
         reset_descriptor_table_refusal_census();
     }
 
