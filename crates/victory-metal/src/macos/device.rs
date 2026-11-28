@@ -3867,6 +3867,17 @@ enum PreparedRenderOp {
         instance_count: usize,
         base_instance: usize,
     },
+    /// An Xbox rect-list draw (ADR-065): three vertices per rect, expanded to
+    /// two triangles on the CPU. `slot` is the vertex buffer the guest bound
+    /// the positions in; `stride` is that buffer's stride.
+    DrawRectList {
+        vertex_buffer: objc::Id,
+        offset: usize,
+        stride: u32,
+        slot: usize,
+        vertex_start: usize,
+        vertex_count: usize,
+    },
     DrawIndexed {
         primitive: PrimitiveType,
         index_count: usize,
@@ -3985,6 +3996,7 @@ fn draw_op_count(ops: &[PreparedRenderOp]) -> u32 {
             matches!(
                 op,
                 PreparedRenderOp::Draw { .. }
+                    | PreparedRenderOp::DrawRectList { .. }
                     | PreparedRenderOp::DrawIndexed { .. }
                     | PreparedRenderOp::DispatchMesh { .. }
                     | PreparedRenderOp::DrawIndirect { .. }
@@ -3993,6 +4005,76 @@ fn draw_op_count(ops: &[PreparedRenderOp]) -> u32 {
             )
         })
         .count() as u32
+}
+
+/// Counts rect-list draws the host could not expand (ADR-065).
+///
+/// A rect list is never *silently* redrawn as triangles: every case below is
+/// counted and logged at powers of two, so a title that hits it leaves a
+/// bounded trace instead of a wrong draw nobody can see.
+mod rect_list_census {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The draw had no vertex buffer bound at slot 0.
+    pub(super) const UNBOUND_POSITION: usize = 0;
+    /// The draw was instanced, which the expansion path does not encode.
+    pub(super) const INSTANCED: usize = 1;
+    /// The draw was indexed; the expansion path takes vertex data only.
+    pub(super) const INDEXED: usize = 2;
+    /// The draw was GPU-driven (`ExecuteIndirect*`).
+    pub(super) const INDIRECT: usize = 3;
+
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    pub(super) fn note(outcome: usize) {
+        let count = COUNTS[outcome].fetch_add(1, Relaxed) + 1;
+        if count.is_power_of_two() {
+            tracing::warn!(
+                rect_list_unbound_position = COUNTS[UNBOUND_POSITION].load(Relaxed),
+                rect_list_instanced = COUNTS[INSTANCED].load(Relaxed),
+                rect_list_indexed = COUNTS[INDEXED].load(Relaxed),
+                rect_list_indirect = COUNTS[INDIRECT].load(Relaxed),
+                "rect-list draws the host could not expand"
+            );
+        }
+    }
+}
+
+/// Encodes one draw op, expanding a rect list into two triangles (ADR-065).
+fn push_draw_ops(
+    ops: &mut Vec<PreparedRenderOp>,
+    topology: PrimitiveType,
+    rect_list: bool,
+    position: Option<(objc::Id, usize, u32)>,
+    vertex_start: usize,
+    vertex_count: usize,
+    instance_count: usize,
+    base_instance: usize,
+) {
+    if !rect_list {
+        ops.push(PreparedRenderOp::Draw {
+            primitive: topology,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        });
+        return;
+    }
+    match position {
+        Some((vertex_buffer, offset, stride)) if instance_count == 1 && base_instance == 0 => {
+            ops.push(PreparedRenderOp::DrawRectList {
+                vertex_buffer,
+                offset,
+                stride,
+                slot: 0,
+                vertex_start,
+                vertex_count,
+            });
+        }
+        Some(_) => rect_list_census::note(rect_list_census::INSTANCED),
+        None => rect_list_census::note(rect_list_census::UNBOUND_POSITION),
+    }
 }
 
 fn to_usize(value: u64) -> Result<usize, MetalError> {
@@ -7362,6 +7444,11 @@ fn build_render_ops(
     let mut current_pipeline_id: u64 = 0;
     let mut index_binding: Option<(objc::Id, usize, IndexType, u64)> = None;
     let mut topology = PrimitiveType::Triangle;
+    // ADR-065: an Xbox rect-list draw is expanded on the host, never silently
+    // drawn as triangles. `rect_position` is the binding a rect-list draw
+    // samples its three corners from: buffer, byte offset and stride.
+    let mut rect_list = false;
+    let mut rect_position: Option<(objc::Id, usize, u32)> = None;
     // ADR-053: the viewport/scissor a traced draw ran with.
     let mut viewport_rect: Option<[u32; 4]> = None;
     let mut scissor_rect: Option<[u32; 4]> = None;
@@ -7610,7 +7697,16 @@ fn build_render_ops(
                 ops.push(PreparedRenderOp::Scissor(validated));
             }
             CommandV3::SetPrimitiveTopology(wire_topology) => {
-                topology = map_topology(*wire_topology);
+                match *wire_topology {
+                    // ADR-065: rect lists are encoded by their own expansion
+                    // path; the triangle state stays only for the ops that
+                    // never execute under a rect-list topology.
+                    PrimitiveTopology::RectList => rect_list = true,
+                    other => {
+                        rect_list = false;
+                        topology = map_topology(other);
+                    }
+                }
             }
             CommandV3::SetVertexBuffers(set) => {
                 if set.buffers.is_empty() || set.buffers.len() > crate::wire_v3::MAX_VERTEX_BUFFERS
@@ -7646,6 +7742,12 @@ fn build_render_ops(
                         Ok((raw, byte_offset, slot))
                     })
                     .collect::<Result<Vec<_>, PrepareAbort>>()?;
+                // ADR-065: a rect-list draw reads its corners from slot 0.
+                if set.start_slot == 0 {
+                    rect_position = bindings
+                        .first()
+                        .map(|(raw, byte_offset, _)| (*raw, *byte_offset, set.buffers[0].stride));
+                }
                 ops.push(PreparedRenderOp::VertexBuffers(bindings));
             }
             CommandV3::SetIndexBuffer(binding) => {
@@ -7943,13 +8045,16 @@ fn build_render_ops(
                     abi_bindings,
                     trace_target,
                 );
-                ops.push(PreparedRenderOp::Draw {
-                    primitive: topology,
-                    vertex_start: draw.start_vertex as usize,
-                    vertex_count: draw.vertex_count as usize,
-                    instance_count: draw.instance_count as usize,
-                    base_instance: draw.start_instance as usize,
-                });
+                push_draw_ops(
+                    &mut ops,
+                    topology,
+                    rect_list,
+                    rect_position,
+                    draw.start_vertex as usize,
+                    draw.vertex_count as usize,
+                    draw.instance_count as usize,
+                    draw.start_instance as usize,
+                );
             }
             CommandV3::DrawInstanced(draw) => {
                 if !current_pipeline || mesh_pipeline.is_some() {
@@ -7987,15 +8092,21 @@ fn build_render_ops(
                     abi_bindings,
                     trace_target,
                 );
-                ops.push(PreparedRenderOp::Draw {
-                    primitive: topology,
-                    vertex_start: draw.start_vertex as usize,
-                    vertex_count: draw.vertex_count_per_instance as usize,
-                    instance_count: draw.instance_count as usize,
-                    base_instance: draw.start_instance as usize,
-                });
+                push_draw_ops(
+                    &mut ops,
+                    topology,
+                    rect_list,
+                    rect_position,
+                    draw.start_vertex as usize,
+                    draw.vertex_count_per_instance as usize,
+                    draw.instance_count as usize,
+                    draw.start_instance as usize,
+                );
             }
             CommandV3::DrawIndexed(draw) => {
+                if rect_list {
+                    rect_list_census::note(rect_list_census::INDEXED);
+                }
                 let (buffer, offset, index_type, index_count) =
                     prepare_indexed_draw(&index_binding, draw.index_count, draw.start_index)?;
                 if !current_pipeline || mesh_pipeline.is_some() {
@@ -8044,6 +8155,9 @@ fn build_render_ops(
                 });
             }
             CommandV3::DrawIndexedInstanced(draw) => {
+                if rect_list {
+                    rect_list_census::note(rect_list_census::INDEXED);
+                }
                 let (buffer, offset, index_type, index_count) = prepare_indexed_draw(
                     &index_binding,
                     draw.index_count_per_instance,
@@ -8095,6 +8209,9 @@ fn build_render_ops(
                 });
             }
             CommandV3::ExecuteIndirectDraw(draw) => {
+                if rect_list {
+                    rect_list_census::note(rect_list_census::INDIRECT);
+                }
                 if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
@@ -8137,6 +8254,9 @@ fn build_render_ops(
                 });
             }
             CommandV3::ExecuteIndirectDrawIndexed(draw) => {
+                if rect_list {
+                    rect_list_census::note(rect_list_census::INDIRECT);
+                }
                 if !current_pipeline || mesh_pipeline.is_some() {
                     return Err(MetalError::InvalidArg(
                         "draw requires a selected graphics pipeline in its render pass",
@@ -9902,6 +10022,31 @@ impl DirectMetalTransport {
                                     *base_instance,
                                 )?;
                             }
+                            PreparedRenderOp::DrawRectList {
+                                vertex_buffer,
+                                offset,
+                                stride,
+                                slot,
+                                vertex_start,
+                                vertex_count,
+                            } => {
+                                // SAFETY: the buffer is registry-held for the
+                                // synchronous submit and its readable range was
+                                // validated when it was bound.
+                                let outcome = unsafe {
+                                    encoder.draw_rect_list_buffer(
+                                        *vertex_buffer,
+                                        *offset,
+                                        usize::try_from(*stride).unwrap_or(0),
+                                        *slot,
+                                        *vertex_start,
+                                        *vertex_count,
+                                    )?
+                                };
+                                // A refusal is counted under its own name inside
+                                // the encoder and encodes no GPU work.
+                                let _ = outcome;
+                            }
                             PreparedRenderOp::DrawIndexed {
                                 primitive,
                                 index_count,
@@ -10326,6 +10471,12 @@ fn encode_indirect_render_segment(
                         *base_instance,
                     );
                 }
+            }
+            PreparedRenderOp::DrawRectList { .. } => {
+                // ADR-065: the expansion path lives on the render encoder used
+                // by `encode_v3_segments`; a GPU-driven segment never carries a
+                // rect list today. Count it rather than draw the wrong shape.
+                rect_list_census::note(rect_list_census::INDIRECT);
             }
             PreparedRenderOp::DrawIndexed {
                 primitive,
