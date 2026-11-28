@@ -1684,3 +1684,97 @@ host, so the new MSC fallback records a named one-line reason instead of panicki
   census that needs bounding.
 - **Probe cost** is ≈1.39 ms on each sampled frame; acceptable at `probe_every=30` but
   it should be measured against a real frame budget once draws exist.
+
+## 14. Cycle 14 — the Rosetta stone: console shaders translated to real DXIL, six Metal PSOs created on M4 Max
+
+Cycle 13 ended with a proven smoking gun: the six refused pipelines were refused because the
+legacy converter was handed a console container whose `DXIL` part is a 4-byte placeholder beside
+the console ISA chunk, and it died with `SIGSEGV` on every one. `victory_shader::emit::translate`
+already emits a complete, valid DXIL container from the console ISA, and `victory_gpu::pipeline::
+Shader::translated` already cached it — but the native Metal pipeline path never called it.
+Cycle 14 wired that translation (and its root signature) into `VICTORY_BACKEND=metal`. Base
+`cd2a2d0e`; ADRs 048–050.
+
+### 14.1 Decisions
+
+- **ADR-048** — on the native backend, `victory-gpu` translates each console stage with
+  `Shader::translated()` (and `translate_linked(ms, ps)` when a mesh pair's outputs exceed
+  `METAL_MESH_OUTPUT_BYTES`) **before** uploading anything over VP3. A container that already
+  carries a real DXIL module (declared bitcode ≥ 512 bytes and inside the part) is passed through
+  unchanged, so the D3DMetal reference path keeps byte parity. A stub with no translation is a
+  named refusal; a 4-byte stub never reaches `victory-irconverter` again. The translated root
+  signature has one canonical description in `victory-shader::emit`, used by both paths: the
+  D3DMetal reference serializes it with `D3D12SerializeVersionedRootSignature`, and the Metal path
+  serializes it purely (`to_versioned_blob`, byte-identical to four `dxc`-produced `RTS0` parts)
+  and sends it as the VP3 witness, dropping it and retrying once if the converter refuses it.
+- **ADR-049** — the descriptor-heap census holds no growable state (fixed `[Option<BoundHeap>; 64]`
+  plus fixed last-set array), reports `heaps_bound` as distinct identities and
+  `heaps_bind_calls` as the saturating slot total, folds every `frame_probe` field into
+  `telemetry.json` (13 keys in both the sampled and the not-sampled shape), and defaults
+  `probe_every` to 60.
+- **ADR-050** — Boot #21 showed the translation works and moved the blocker to three named host
+  gaps, each fixed in Wave 14B: a host-translated graphics PSO needs an `MTLVertexDescriptor`
+  derived from the translated `ISG1` signature (carried as a `VMVD` chunk in the pipeline state
+  blob; Apple's converter assigns attribute `11 + ISG1 element index`, measured, with
+  `SV_VertexID`/`SV_InstanceID` skipped but still advancing the index); the host root-layout
+  parser must accept every legal converter reflection (`Sampler` tables, 24-byte extents, empty
+  `TopLevelArgumentBuffer`) and name the failing entry/field; and a host-refused submission is a
+  spent reply that must never be re-sent at an already-consumed sequence.
+
+### 14.2 Boots (windowed, frame probe on)
+
+| | #20 (Cycle 13) | #21 | **#22 (final)** |
+|---|---|---|---|
+| D3DMetal fallback / loaded / host D3D12 | 0/0/no/0 | 0/0/no/0 | **0/0/no/0** |
+| host-translated stages | 0 | 2 | **11** |
+| host pipeline translations ok / refused | 0/6 | 1/2 | **6/0** |
+| Metal PSOs created | 0 | 1 | **6** |
+| `pipeline_stages_translated_locally` / passed through | — | — | **11 / 0** |
+| submissions / refused submissions | 4199/0 | 4/2 | **5083/52** |
+| frames presented (window) | 4198 | 1 | **5082** |
+| buffers registered / PSOs in guest census | 3338 / 0 | 2 / 1 | **3371 / 6** |
+| heaps bound / distinct / bind calls | 41k (cumulative) | — | **2 / 2 / 50,596** |
+| draws / dispatches executed | 0 | 0 | **0 (no counter exists)** |
+| `non_black_pixels` / `unique_luma_buckets` | 0/1 | 0/1 | **0/1** |
+| `uniform_color`, `nonzero_bytes` | transparent_black, 0 | transparent_black, 0 | **transparent_black, 0** |
+| `fallback_clear` | 0 | 0 | **0** |
+| probe samples / cost | 140 / 1.39 ms | 1 / 1.21 ms | **85 / 1.35 ms at every 60** |
+| host p50/p95/p99 ms, FPS | .011/.027/.039, 72.7k | .007/2.227, 895 | **.011/.025/.037, 73.1k** |
+| orphan processes after the boot | 0 | 0 | **0** |
+
+Boot #21 is the milestone that matters: the converter no longer crashes, and the host reports
+real translated stages. Boot #22 is the quantitative one: **six content-hashed Metal pipelines
+were created from real title shaders with zero D3DMetal, zero host D3D12 device and zero
+translation refusals**, 5,083 submissions and 5,082 presented frames, and the heap census that
+used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
+
+### 14.3 What is still not true
+
+- **No draw is proven executed, and no non-black frame is claimed.** The probe honestly samples
+  the real back buffer 85 times and finds `transparent_black` every time; there is no host counter
+  for draws/dispatches yet, so "draws executed" cannot be stated either way. 52 submissions are
+  refused with `UnknownHandle` (first-frame lists naming a pipeline handle that is not registered
+  yet); after that the session stays healthy instead of desynchronising.
+- **The translated root-argument binding is only half wired.** The guest now records each root
+  argument's translated space in a versioned `VRAB` plan (same slot in two spaces stays distinct,
+  inexpressible arguments are named refusals), but the host still resolves a title slot as the
+  translated parameter index; it does not match `(space, register, kind)` against the pipeline
+  ABI, and no `USER_DATA_SPACE` block is bound to a Metal buffer index. A translated pipeline
+  whose parameter order differs from the title's therefore binds the wrong parameter.
+- **A linked mesh/pixel pair sends no root-signature witness** (its signature is the pruned one);
+  that is deliberate but leaves its bindings on the converter's own derivation.
+- The title still ends by launcher timeout (`exit 10`) after the measured window, as in every
+  previous cycle; the guest's own frame measurement remains unavailable.
+
+### 14.4 Counts at the integration head
+
+- `victory-gpu` **397 passed / 0 failed / 1 ignored** (`--test-threads=1`); `victory-shader`
+  **260 / 0 / 2**; Wine `victory-hle` **81 / 0 / 0**; `victory` bin **1 / 0 / 0**.
+- `victory-metal` **368 passed / 3 failed / 9 ignored**: the three failures are the known
+  nested-`gpu-lock` artifact (`binary_archive` self-acquires `/tmp/victory-gpu.lock` while the
+  harness holds it); the same three pass unlocked (**3 passed**), so no code failure.
+- Win64 `diag` build, three Windows all-targets checks, x86_64 `victory-irconverter` build and
+  the ARM64 host build all exit 0; `git diff --check` clean.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.824 / p95 0.891 / p99 1.010 ms, 1,199.5 FPS,
+  checksum unchanged.
+- Worker `target/` directories pruned after each wave; 115 GB free; zero orphaned processes.
