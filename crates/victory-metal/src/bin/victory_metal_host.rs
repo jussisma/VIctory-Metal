@@ -557,6 +557,10 @@ struct Stats {
     memory_space_bytes: u64,
     /// ADR-051: root arguments refused by the (space, register, kind) resolver.
     abi_refusals: u64,
+    /// ADR-057: plan-less descriptor-table sets accepted inertly (heap-lowered).
+    descriptor_table_inert: u64,
+    /// ADR-057: descriptor-table sets naming a table the bound pipeline lacks.
+    descriptor_table_stale: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -601,6 +605,8 @@ impl Default for Stats {
             memory_space_bound: 0,
             memory_space_bytes: 0,
             abi_refusals: 0,
+            descriptor_table_inert: 0,
+            descriptor_table_stale: 0,
         }
     }
 }
@@ -878,6 +884,10 @@ impl BatchExecutor for DaemonExecutor {
             stats.memory_space_bound = memory_bound;
             stats.memory_space_bytes = memory_bytes;
             stats.abi_refusals = self.transport.abi_refusal_count();
+            stats.descriptor_table_inert =
+                self.transport.descriptor_table_inert_acceptance_count();
+            stats.descriptor_table_stale =
+                self.transport.descriptor_table_stale_refusal_count();
             if matches!(&result, Ok(reply) if reply.status == ReplyStatus::UnknownHandle) {
                 let site = victory_metal::macos::device::last_unknown_site().to_string();
                 stats.unknown_handle_id = victory_metal::macos::device::last_unknown_id();
@@ -1431,6 +1441,11 @@ fn write_telemetry(
             "  \"memory_space_declared_stages\": {memory_space_declared_stages},\n",
             "  \"memory_space_ranges\": {memory_space_ranges},\n",
             "  \"memory_space_heap_pairs\": {memory_space_heap_pairs},\n",
+            "  \"memory_space_gate_checks\": {memory_space_gate_checks},\n",
+            "  \"memory_space_requests\": {memory_space_requests},\n",
+            "  \"memory_space_no_map\": {memory_space_no_map},\n",
+            "  \"descriptor_table_inert_acceptances\": {descriptor_table_inert},\n",
+            "  \"descriptor_table_stale_refusals\": {descriptor_table_stale},\n",
             "  \"abi_refusals\": {abi_refusals},\n",
             "  \"descriptor_table_refusal_census\": {descriptor_table_census},\n",
             "  \"present_trace\": {present_trace},\n",
@@ -1505,6 +1520,11 @@ fn write_telemetry(
         memory_space_declared_stages = memory_space.declared_stages,
         memory_space_ranges = memory_space.ranges,
         memory_space_heap_pairs = memory_space.heap_pairs,
+        memory_space_gate_checks = memory_space.gate_checks,
+        memory_space_requests = memory_space.requests,
+        memory_space_no_map = memory_space.no_map,
+        descriptor_table_inert = stats.descriptor_table_inert,
+        descriptor_table_stale = stats.descriptor_table_stale,
         abi_refusals = stats.abi_refusals,
         descriptor_table_census = descriptor_table_census,
         present_trace = present_trace,
@@ -1809,6 +1829,8 @@ impl Clone for Stats {
             unknown_handle_id: self.unknown_handle_id,
             memory_space_bound: self.memory_space_bound,
             memory_space_bytes: self.memory_space_bytes,
+            descriptor_table_inert: self.descriptor_table_inert,
+            descriptor_table_stale: self.descriptor_table_stale,
             abi_refusals: self.abi_refusals,
         }
     }
