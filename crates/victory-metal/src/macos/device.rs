@@ -3124,7 +3124,11 @@ impl PipelineAbi {
                     ordinal += 1;
                 }
             }
-            return None;
+            // The authoritative map may not describe this table (a signature
+            // family whose table the converter reflects differently, or a map
+            // that parsed but declared no table at this ordinal). The stage
+            // layouts are the same fallback the legacy constructors use, so a
+            // valid gate/title pipeline is never dropped for a partial map.
         }
         let mut tables: Vec<RootParameterSlot> = Vec::new();
         for layout in self.layouts() {
@@ -3735,11 +3739,15 @@ enum PendingAbiBinding {
     /// Inline root constants for one declared root parameter.
     Constants {
         slot: RootParameterSlot,
+        /// Wire root-parameter index the command named.
+        wire_slot: usize,
         bytes: Vec<u8>,
     },
     /// One root CBV/SRV/UAV device address and the resource it names.
     RootView {
         slot: RootParameterSlot,
+        /// Wire root-parameter index the command named.
+        wire_slot: usize,
         address: u64,
         resource: objc::Id,
         usage: usize,
@@ -3747,6 +3755,8 @@ enum PendingAbiBinding {
     /// One converted descriptor array in GPU-visible shared memory.
     Table {
         slot: RootParameterSlot,
+        /// Wire descriptor-set index the command named.
+        wire_slot: usize,
         buffer: ObjcObject,
         address: u64,
         length: u64,
@@ -4018,6 +4028,7 @@ fn build_descriptor_table(
     let table_binding = builder.binding(address)?;
     Ok(PendingAbiBinding::Table {
         slot,
+        wire_slot: usize::from(table.set),
         buffer,
         address,
         length: table_binding.length,
@@ -4034,6 +4045,15 @@ impl PendingAbiBinding {
             Self::Constants { slot, .. }
             | Self::RootView { slot, .. }
             | Self::Table { slot, .. } => *slot,
+        }
+    }
+
+    /// The wire slot the command named (root-parameter or descriptor-set index).
+    fn wire_slot(&self) -> usize {
+        match self {
+            Self::Constants { wire_slot, .. }
+            | Self::RootView { wire_slot, .. }
+            | Self::Table { wire_slot, .. } => *wire_slot,
         }
     }
 }
@@ -4056,6 +4076,45 @@ const MEMORY_SPACE_DEFAULT_BUDGET: usize = 1 << 20;
 /// and inline root constants. Stage layouts without any encoded parameter are
 /// skipped, so a fragment stage that does not read the root signature keeps its
 /// own `buffer(2)` untouched.
+/// The layout index a pending wire argument names in one stage layout.
+///
+/// The resolver is `(space, register, kind)`. The wire also carries the flat
+/// index the title named, which is exactly the converter's parameter index on
+/// the legacy registration path (a gate pipeline registered from supplied
+/// reflection has no versioned signature map). When the triple is not declared
+/// — or a table's reflected triple is `u32::MAX` — the wire index is the
+/// deterministic identity, never a silent drop.
+fn abi_parameter_index(
+    layout: &RootSignatureLayout,
+    binding: &PendingAbiBinding,
+) -> Option<usize> {
+    let slot = binding.slot();
+    if let Ok(Some(index)) = layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
+        return Some(index);
+    }
+    let index = binding.wire_slot();
+    let parameter = layout.parameters().get(index)?;
+    if abi_kinds_compatible(parameter.kind(), slot.kind()) {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+/// Whether a wire argument kind can address a reflected parameter kind.
+///
+/// A table is a table; converter reflection cannot distinguish its range kinds
+/// (`Table` is stored as `Unspecified`), so those match any table.
+fn abi_kinds_compatible(declared: RootParameterKind, named: RootParameterKind) -> bool {
+    match (declared, named) {
+        (
+            RootParameterKind::DescriptorTable(_),
+            RootParameterKind::DescriptorTable(_),
+        ) => true,
+        (left, right) => left == right,
+    }
+}
+
 fn flush_abi(
     transport: &DirectMetalTransport,
     stages: &[(ShaderStage, RootSignatureLayout)],
@@ -4081,16 +4140,9 @@ fn flush_abi(
         let slot = binding.slot();
         let mut declared = false;
         for (_stage, layout) in stages {
-            match layout.parameter_by(slot.space(), slot.register(), slot.kind()) {
-                Ok(Some(_)) => {
-                    declared = true;
-                    break;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    transport.count_abi_refusal();
-                    return Err(error.into());
-                }
+            if abi_parameter_index(layout, binding).is_some() {
+                declared = true;
+                break;
             }
         }
         if !declared {
@@ -4108,9 +4160,7 @@ fn flush_abi(
         let mut bound = vec![false; layout.parameters().len()];
         for binding in &pending.bindings {
             let slot = binding.slot();
-            if let Ok(Some(index)) =
-                layout.parameter_by(slot.space(), slot.register(), slot.kind())
-            {
+            if let Some(index) = abi_parameter_index(layout, binding) {
                 bound[index] = true;
             }
         }
@@ -4146,8 +4196,7 @@ fn flush_abi(
         let mut stage_bytes: Option<(usize, Vec<u8>)> = None;
         for binding in &pending.bindings {
             let slot = binding.slot();
-            let Some(index) = layout.parameter_by(slot.space(), slot.register(), slot.kind())?
-            else {
+            let Some(index) = abi_parameter_index(layout, binding) else {
                 // The parameter belongs to another stage (root signatures are
                 // per-stage visible); it is not this stage's argument buffer.
                 continue;
@@ -4799,6 +4848,7 @@ fn prepare_compute_segment(
                     }
                     pending.bindings.push(PendingAbiBinding::Constants {
                         slot,
+                        wire_slot: usize::from(constants.slot),
                         bytes: constants.bytes.clone(),
                     });
                 } else {
@@ -4818,7 +4868,16 @@ fn prepare_compute_segment(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter_for_table(usize::from(table.set)) else {
+                    // The wire set index is the flattened parameter index on
+                    // this path; a signature that also declares non-table
+                    // parameters first may instead send the table's ordinal.
+                    // Try the index, then the ordinal, and only then refuse.
+                    let set = usize::from(table.set);
+                    let Some(slot) = active
+                        .root_parameter(set)
+                        .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
+                        .or_else(|| active.root_parameter_for_table(set))
+                    else {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
                             "descriptor table names no declared root parameter",
@@ -4891,6 +4950,7 @@ fn prepare_compute_segment(
                         ))?;
                     pending.bindings.push(PendingAbiBinding::RootView {
                         slot,
+                        wire_slot: usize::from(view.slot),
                         address,
                         resource: buffer,
                         usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
@@ -5689,6 +5749,7 @@ fn build_render_ops(
                     }
                     pending.bindings.push(PendingAbiBinding::Constants {
                         slot,
+                        wire_slot: usize::from(constants.slot),
                         bytes: constants.bytes.clone(),
                     });
                 } else {
@@ -5708,7 +5769,16 @@ fn build_render_ops(
                     .into());
                 }
                 if let Some(active) = abi.as_ref() {
-                    let Some(slot) = active.root_parameter_for_table(usize::from(table.set)) else {
+                    // The wire set index is the flattened parameter index on
+                    // this path; a signature that also declares non-table
+                    // parameters first may instead send the table's ordinal.
+                    // Try the index, then the ordinal, and only then refuse.
+                    let set = usize::from(table.set);
+                    let Some(slot) = active
+                        .root_parameter(set)
+                        .filter(|slot| matches!(slot.kind(), RootParameterKind::DescriptorTable(_)))
+                        .or_else(|| active.root_parameter_for_table(set))
+                    else {
                         transport.count_abi_refusal();
                         return Err(MetalError::InvalidArg(
                             "descriptor table names no declared root parameter",
@@ -5781,6 +5851,7 @@ fn build_render_ops(
                         ))?;
                     pending.bindings.push(PendingAbiBinding::RootView {
                         slot,
+                        wire_slot: usize::from(view.slot),
                         address,
                         resource: buffer,
                         usage: MTL_RESOURCE_USAGE_READ | MTL_RESOURCE_USAGE_WRITE,
