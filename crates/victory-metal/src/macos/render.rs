@@ -36,8 +36,7 @@ use crate::wire_v3::{
 };
 
 /// `MTLPixelFormatRGBA8Unorm`.
-const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;
-/// `MTLPixelFormatBGRA8Unorm`.
+const MTL_PIXEL_FORMAT_RGBA8_UNORM: usize = 70;/// `MTLPixelFormatBGRA8Unorm`.
 const MTL_PIXEL_FORMAT_BGRA8_UNORM: usize = 80;
 /// `MTLPixelFormatDepth32Float`.
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: usize = 252;
@@ -139,6 +138,9 @@ pub enum PixelFormat {
     Depth32Float,
     /// `MTLPixelFormatDepth32Float_Stencil8`, a depth/stencil attachment.
     Depth32FloatStencil8,
+    /// `MTLPixelFormatDepth16Unorm`, a 16-bit depth attachment (a title's
+    /// `R16_TYPELESS` resource that declares the depth-stencil flag).
+    Depth16Unorm,
 }
 
 impl PixelFormat {
@@ -149,7 +151,10 @@ impl PixelFormat {
 
     /// Whether this format can back a depth attachment.
     pub const fn is_depth(self) -> bool {
-        matches!(self, Self::Depth32Float | Self::Depth32FloatStencil8)
+        matches!(
+            self,
+            Self::Depth32Float | Self::Depth32FloatStencil8 | Self::Depth16Unorm
+        )
     }
 
     /// Whether this format carries a stencil plane.
@@ -163,6 +168,7 @@ impl PixelFormat {
             Self::Bgra8Unorm | Self::Rgba8Unorm => 4,
             Self::Depth32Float => 4,
             Self::Depth32FloatStencil8 => 8,
+            Self::Depth16Unorm => 2,
         }
     }
 
@@ -172,6 +178,7 @@ impl PixelFormat {
             Self::Rgba8Unorm => MTL_PIXEL_FORMAT_RGBA8_UNORM,
             Self::Depth32Float => MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
             Self::Depth32FloatStencil8 => MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8,
+            Self::Depth16Unorm => 250,
         }
     }
 
@@ -181,6 +188,7 @@ impl PixelFormat {
             MTL_PIXEL_FORMAT_RGBA8_UNORM => Some(Self::Rgba8Unorm),
             MTL_PIXEL_FORMAT_DEPTH32_FLOAT => Some(Self::Depth32Float),
             MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8 => Some(Self::Depth32FloatStencil8),
+            250 => Some(Self::Depth16Unorm),
             _ => None,
         }
     }

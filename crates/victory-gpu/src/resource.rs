@@ -2705,7 +2705,35 @@ fn texture_registration_codes(
     };
     let format = wire_format_code(desc.format)
         .ok_or("texture registration: format has no host code")?;
+    // A typeless colour-family resource the title declares as depth (the
+    // `ALLOW_DEPTH_STENCIL` bit) must be registered with its concrete depth
+    // format: the host correctly refuses a colour format as a depth attachment.
+    let format = if usage == 2 {
+        depth_wire_code(desc.format).unwrap_or(format)
+    } else {
+        format
+    };
     Ok((dimension, format, usage))
+}
+
+/// The concrete depth wire code a typeless DXGI format resolves to.
+///
+/// A `*_TYPELESS` declaration is ambiguous by design; the resource's
+/// `ALLOW_DEPTH_STENCIL` flag disambiguates it. Only the DXGI values whose
+/// depth counterpart exists in the host table are listed.
+#[cfg(any(windows, test))]
+fn depth_wire_code(dxgi: u32) -> Option<u8> {
+    Some(match dxgi {
+        // R16_TYPELESS -> D16_UNORM.
+        53 => 54,
+        // R32_TYPELESS -> D32_FLOAT.
+        39 => 7,
+        // R24G8_TYPELESS -> D24_UNORM_S8_UINT.
+        44 => 41,
+        // R32G8X24_TYPELESS -> D32_FLOAT_S8X24_UINT.
+        22 => 8,
+        _ => return None,
+    })
 }
 
 /// The host registration of one buffer, made at creation (kind 2).
@@ -3786,6 +3814,24 @@ mod tests {
         assert_eq!(texture_registration_codes(&desc, 3), Ok((1, 10, 3)));
         let signed = ResourceDesc { format: 43, ..desc };
         assert_eq!(texture_registration_codes(&signed, 3), Ok((1, 11, 3)));
+    }
+
+    /// A typeless `R16_TYPELESS` resource the title declares as depth must be
+    /// registered with its concrete depth format: the host refuses a colour
+    /// format as a depth attachment (Boot #24's 300 refusals).
+    #[test]
+    fn a_typeless_depth_target_registers_with_its_concrete_depth_format() {
+        let desc = ResourceDesc {
+            flags: 0x2,
+            ..texture(512, 512, 53, 1)
+        };
+        assert_eq!(native_texture_registration(&desc), Some(Ok((1, 54, 2))));
+        let r32 = ResourceDesc { format: 39, ..desc };
+        assert_eq!(native_texture_registration(&r32), Some(Ok((1, 7, 2))));
+        // A colour resource keeps its colour code even with a depth-shaped
+        // name: only the ALLOW_DEPTH_STENCIL flag selects the depth format.
+        let colour = ResourceDesc { flags: 0x1, ..desc };
+        assert_eq!(native_texture_registration(&colour), Some(Ok((1, 4, 1))));
     }
 
     /// Boot #11's failing at-address target: a 33x33x33 `R16G16B16A16_FLOAT`

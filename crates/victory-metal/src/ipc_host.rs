@@ -3553,7 +3553,7 @@ fn decode_texture_request(payload: &[u8]) -> Option<TextureRequest> {
     let generation = read_u32(payload, 8);
     let dimension = texture_dimension_from_code(payload[12])?;
     let format = texture_format_from_code(payload[13])?;
-    let usage = texture_usage_for_format(payload[14], format)?;
+    let usage = texture_usage_for_format(payload[14], format, payload[12])?;
     let sample_count = u32::from(payload[15]);
     let width = read_u32(payload, 16);
     let height = read_u32(payload, 20);
@@ -3748,10 +3748,21 @@ fn texture_usage_from_code(code: u8) -> Option<TextureUsage> {
 /// (colour attachment), so the host adds the shader-write bit those formats
 /// need for a compute write and keeps the render-target bit for an RTV. A
 /// sampled or depth use is left exactly as sent.
-fn texture_usage_for_format(code: u8, format: TextureFormat) -> Option<TextureUsage> {
+fn texture_usage_for_format(code: u8, format: TextureFormat, dimension: u8) -> Option<TextureUsage> {
     let usage = texture_usage_from_code(code)?;
     if (!usage.render_target && !usage.shader_write) || format.is_depth_stencil() {
         return Some(usage);
+    }
+    // A 3D texture is never a colour or depth attachment here (Metal cannot
+    // bound one), so an integer storage volume keeps its shader-write bits
+    // without falsely claiming render-target use.
+    if dimension == 5 {
+        return Some(TextureUsage {
+            shader_read: true,
+            shader_write: usage.shader_write,
+            render_target: false,
+            depth_stencil: false,
+        });
     }
     // ADR-033: an integer storage target (R8/R16/R32 UINT or SINT, including the
     // title's 640x360 R8_UINT pass) is readable, writable and attachable. The
@@ -6424,6 +6435,25 @@ mod tests {
         assert!(request.desc.usage.shader_write);
         assert!(request.desc.usage.render_target);
         assert!(request.desc.validate().is_ok());
+    }
+
+    /// A 3D integer storage target keeps its shader-write bit but must not
+    /// claim render-target use: Metal cannot bind a 3D colour/depth
+    /// attachment, and the host's descriptor validation refuses that claim
+    /// (Boot #24's 8x8x40 UAV volumes).
+    #[test]
+    fn a_3d_storage_usage_does_not_claim_a_render_target() {
+        let mut payload = texture_registration_payload(10);
+        payload[12] = 5; // D3
+        payload[14] = 3; // storage
+        payload[16..20].copy_from_slice(&8u32.to_le_bytes());
+        payload[20..24].copy_from_slice(&8u32.to_le_bytes());
+        payload[24..28].copy_from_slice(&40u32.to_le_bytes());
+        let request =
+            decode_texture_request(&payload).expect("an 8x8x40 R32_UINT storage volume decodes");
+        assert!(request.desc.usage.shader_write);
+        assert!(!request.desc.usage.render_target);
+        assert!(request.desc.validate().is_ok(), "the volume descriptor is accepted");
     }
 
     /// ADR-033: every canonical table row is decodable by its kind 8 wire code,
