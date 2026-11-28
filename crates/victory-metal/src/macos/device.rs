@@ -4021,6 +4021,8 @@ struct PreparedRenderPass {
     ops: Vec<PreparedRenderOp>,
     /// ADR-053: first colour attachment, for the opt-in offscreen-RT sample.
     trace_target: Option<crate::macos::trace::TraceTarget>,
+    /// ADR-068: clear state of that attachment in this sub-pass.
+    trace_clear: Option<crate::macos::trace::TraceClear>,
     /// ADR-053: draw-family ops this sub-pass encodes.
     draws: u32,
 }
@@ -7783,6 +7785,7 @@ fn prepare_render_segment(
             draws: draw_op_count(&ops),
             ops,
             trace_target,
+            trace_clear: trace_clear_for(&descriptor_colors),
         });
         cursor = *clear_at;
         previous_clears = clears;
@@ -7818,11 +7821,20 @@ fn prepare_render_segment(
         draws: draw_op_count(&final_ops),
         ops: final_ops,
         trace_target,
+        trace_clear: trace_clear_for(&final_colors),
     });
     for _ in &passes {
         transport.encode_counters.bump_render_pass();
     }
     Ok((passes, width, height))
+}
+/// ADR-068: clear state of the attachment the tracer samples (first colour
+/// attachment), or `None` when the pass has no colour attachment.
+fn trace_clear_for(colors: &[RawColorAttachment]) -> Option<crate::macos::trace::TraceClear> {
+    colors.first().map(|attachment| crate::macos::trace::TraceClear {
+        is_clear: matches!(attachment.load, LoadAction::Clear),
+        color: attachment.clear_color,
+    })
 }
 /// Records one clear at its command index, merging adjacent clears.
 fn push_clear_group(groups: &mut Vec<(usize, Vec<ClearSpec>)>, index: usize, spec: ClearSpec) {
@@ -10222,14 +10234,13 @@ impl DirectMetalTransport {
             let first = prepared.iter().find_map(|segment| match segment {
                 PreparedSegment::Render { passes, .. } => passes
                     .iter()
-                    .find(|pass| pass.draws > 0)
-                    .and_then(|pass| pass.trace_target),
+                    .find(|pass| pass.draws > 0 && pass.trace_target.is_some()),
                 _ => None,
             });
             match (first, state.trace.as_mut()) {
-                (Some(target), Some(trace)) => {
-                    if trace.next_pass() {
-                        Some(target)
+                (Some(pass), Some(trace)) => {
+                    if trace.next_pass_with_clear(pass.trace_clear) {
+                        pass.trace_target
                     } else {
                         None
                     }

@@ -859,6 +859,21 @@ struct SampleContext {
     pass: u32,
     draws: u32,
     target: Option<TraceTarget>,
+    clear: Option<TraceClear>,
+}
+
+/// ADR-068: the clear state of the colour attachment a sampled pass renders to.
+///
+/// A pass either clears its first colour attachment at pass start or loads the
+/// previous contents. A sub-pass that follows an explicit
+/// `ClearRenderTargetView` is a clear too, so the sampled bytes can be
+/// attributed to "after the clear" or "after the draws".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TraceClear {
+    /// The pass begins with a clear of the traced attachment.
+    pub is_clear: bool,
+    /// Colour that clear writes.
+    pub color: [f64; 4],
 }
 
 /// Process-wide tracer state read by the host for telemetry and by the GPU
@@ -1615,6 +1630,15 @@ impl TraceState {
     /// a clear-only pass must never be mistaken for drawn, non-zero output.
     /// At most [`MAX_TRACED_PASSES`] passes are sampled.
     pub fn next_pass(&mut self) -> bool {
+        self.next_pass_with_clear(None)
+    }
+
+    /// [`Self::next_pass`] carrying the sampled attachment's clear state.
+    ///
+    /// ADR-068: the clear state is what separates "the shader drew zeros" from
+    /// "the shader drew non-zero pixels that the pass load/clear never
+    /// preserved".
+    pub fn next_pass_with_clear(&mut self, clear: Option<TraceClear>) -> bool {
         self.passes = self.passes.saturating_add(1);
         if self.pending_draws == 0 {
             return false;
@@ -1630,6 +1654,7 @@ impl TraceState {
                 pass: self.passes,
                 draws: self.last_pass_draws,
                 target: self.last_target,
+                clear,
             };
             with_log(|log| {
                 log.passes_sampled = log.passes_sampled.saturating_add(1);
