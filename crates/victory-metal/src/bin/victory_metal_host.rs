@@ -1344,7 +1344,8 @@ fn draw_trace_json_for(report: &victory_metal::macos::trace::TraceReport) -> Str
             "\"traced_passes\": {}, ",
             "\"last_offscreen_nonzero_bytes\": {}, ",
             "\"last_offscreen_distinct_values\": {}, ",
-            "\"failure\": {}",
+            "\"failure\": {}, ",
+            "\"rt_evidence\": {}",
             "}}"
         ),
         report.enabled,
@@ -1352,7 +1353,8 @@ fn draw_trace_json_for(report: &victory_metal::macos::trace::TraceReport) -> Str
         report.traced_passes,
         report.last_offscreen_nonzero_bytes,
         report.last_offscreen_distinct_values,
-        failure
+        failure,
+        report.rt_evidence().json_value()
     )
 }
 
@@ -1934,20 +1936,28 @@ mod frame_probe_json_tests {
         let bytes = json.as_bytes();
         let mut keys = Vec::new();
         let mut index = 0;
+        // ADR-068: `rt_evidence` is a nested object. Only the outer key set is
+        // asserted here; the nested members are covered by the trace unit tests.
+        let mut depth = 0usize;
         while index < bytes.len() {
-            if bytes[index] == b'"' {
-                let start = index + 1;
-                let mut end = start;
-                while end < bytes.len() && bytes[end] != b'"' {
-                    end += 1;
-                }
-                if end < bytes.len() {
-                    if json[end + 1..].trim_start().starts_with(':') {
-                        keys.push(json[start..end].to_string());
+            match bytes[index] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                b'"' => {
+                    let start = index + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += 1;
                     }
-                    index = end + 1;
-                    continue;
+                    if end < bytes.len() {
+                        if depth <= 1 && json[end + 1..].trim_start().starts_with(':') {
+                            keys.push(json[start..end].to_string());
+                        }
+                        index = end + 1;
+                        continue;
+                    }
                 }
+                _ => {}
             }
             index += 1;
         }
@@ -2061,33 +2071,42 @@ mod draw_trace_json_tests {
     use victory_metal::macos::trace::TraceReport;
 
     /// Every key `draw_trace` must carry, in the emitted order.
-    const DRAW_TRACE_KEYS: [&str; 6] = [
+    const DRAW_TRACE_KEYS: [&str; 7] = [
         "enabled",
         "traced_work",
         "traced_passes",
         "last_offscreen_nonzero_bytes",
         "last_offscreen_distinct_values",
         "failure",
+        "rt_evidence",
     ];
 
     fn object_keys(json: &str) -> Vec<String> {
         let bytes = json.as_bytes();
         let mut keys = Vec::new();
         let mut index = 0;
+        // ADR-068: `rt_evidence` is a nested object. Only the outer key set is
+        // asserted here; the nested members are covered by the trace unit tests.
+        let mut depth = 0usize;
         while index < bytes.len() {
-            if bytes[index] == b'"' {
-                let start = index + 1;
-                let mut end = start;
-                while end < bytes.len() && bytes[end] != b'"' {
-                    end += 1;
-                }
-                if end < bytes.len() {
-                    if json[end + 1..].trim_start().starts_with(':') {
-                        keys.push(json[start..end].to_string());
+            match bytes[index] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                b'"' => {
+                    let start = index + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += 1;
                     }
-                    index = end + 1;
-                    continue;
+                    if end < bytes.len() {
+                        if depth <= 1 && json[end + 1..].trim_start().starts_with(':') {
+                            keys.push(json[start..end].to_string());
+                        }
+                        index = end + 1;
+                        continue;
+                    }
                 }
+                _ => {}
             }
             index += 1;
         }
@@ -2382,20 +2401,28 @@ mod state_trace_json_tests {
         let bytes = json.as_bytes();
         let mut keys = Vec::new();
         let mut index = 0;
+        // ADR-068: `rt_evidence` is a nested object. Only the outer key set is
+        // asserted here; the nested members are covered by the trace unit tests.
+        let mut depth = 0usize;
         while index < bytes.len() {
-            if bytes[index] == b'"' {
-                let start = index + 1;
-                let mut end = start;
-                while end < bytes.len() && bytes[end] != b'"' {
-                    end += 1;
-                }
-                if end < bytes.len() {
-                    if json[end + 1..].trim_start().starts_with(':') {
-                        keys.push(json[start..end].to_string());
+            match bytes[index] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                b'"' => {
+                    let start = index + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += 1;
                     }
-                    index = end + 1;
-                    continue;
+                    if end < bytes.len() {
+                        if depth <= 1 && json[end + 1..].trim_start().starts_with(':') {
+                            keys.push(json[start..end].to_string());
+                        }
+                        index = end + 1;
+                        continue;
+                    }
                 }
+                _ => {}
             }
             index += 1;
         }
