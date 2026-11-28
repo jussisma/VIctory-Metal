@@ -1778,3 +1778,95 @@ used to show ~41k now shows 2 distinct heaps with 50,596 bind calls.
 - Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.824 / p95 0.891 / p99 1.010 ms, 1,199.5 FPS,
   checksum unchanged.
 - Worker `target/` directories pruned after each wave; 115 GB free; zero orphaned processes.
+
+## 15. Cycle 15 — host VRAB binding, exact encode accounting, and the texture-registration gate
+
+### 15.1 What changed
+
+- **ADR-051, host `VRAB v2` bridge.** Every wire root argument now resolves by
+  `(space, register, kind)` against the converter-reflected layout, with the wire index as the
+  legacy identity for a reflection table whose `Slot`/`Space` is `u32::MAX` (converter reflection
+  reports every table that way, so a triple-only lookup binds the first table twice).
+  `USER_DATA_SPACE`, `ROOT_CBV_SPACE` and `SAMPLER_SPACE` bind through the argument buffer; every
+  declared `MEMORY_SPACE` parameter that receives no title data gets a bounded zero-filled shared
+  buffer (1 MiB per-submission budget). A pipeline whose translated root signature cannot be parsed
+  keeps the title-index path and records the fallback instead of losing the PSO. New counters:
+  `memory_space_bound`, `memory_space_bytes`, `abi_refusals`.
+- **ADR-052, refusal attribution and a registration invariant.** The host names the refused handle
+  class (`buffer`, `texture`, `pipeline:{graphics,mesh,compute}`, `sampler`, `surface`) and, for an
+  attachment, the exact allocation id (`unknown_handle_site`/`unknown_handle_id` in
+  `telemetry.json`). The guest records each refusal's sequence, list identity and first work opcode
+  (capped at 32 entries). Pipeline registration is synchronous in this code, so the "52 races" are
+  not a pipeline ordering defect; the epoch barrier landed as a bounded (250 ms) invariant guard,
+  and a failed registration poisons its content key so it is refused locally instead of re-sent.
+- **ADR-053, exact encode accounting and an opt-in X-ray.** `draws_encoded`,
+  `draw_indexed_encoded`, `dispatches_encoded`, `mesh_dispatches_encoded`, `indirect_encoded`,
+  `render_passes_encoded` and `clear_ops_encoded` are in `telemetry.json`.
+  `VICTORY_METAL_DRAW_TRACE=1` logs at most ten encoded draws/dispatches (kind, pipeline, counts,
+  viewport, scissor, argument-buffer shape, attachment offscreen-vs-swapchain with size and format)
+  and samples at most ten draw-bearing passes with a bounded 64x64-grid non-zero summary, folded
+  into a `draw_trace` telemetry object. Off by default and inert when unset.
+- **Texture registration diagnosis and fixes.** A texture-registration refusal now carries the host
+  reason on both sides (backward-compatible extended reply; a classic host still answers one byte).
+  A typeless resource the title declares `ALLOW_DEPTH_STENCIL` registers with its concrete depth
+  format (`R16_TYPELESS` -> `D16_UNORM`, `R32_TYPELESS` -> `D32_FLOAT`), a 3D integer storage volume
+  no longer claims render-target use, and `Depth16Unorm` is a supported depth attachment.
+  Creation-time target texture refusals fell from **358 to 0**.
+- **xmem backing.** Sub-page `XMemVirtualAlloc` commits are now share-backed with exact bounds, and
+  memory the title allocates with its own `VirtualAlloc` is refused under its own named reason
+  instead of "no shared xmem range".
+
+### 15.2 Windowed boots (probe on; draw trace on from #23)
+
+| | #22 (cycle 14) | #23 | #24 | #25 | #26 |
+|---|---|---|---|---|---|
+| host submissions / refused | 5135 / 52 | 4244 / 53 | 4253 / 55 | 4269 / 52 | 4287 / 52 |
+| frames | 5083 | 4191 | 4198 | 4217 | 4235 |
+| Metal PSOs / translation refusals | 6 / 0 | 6 / 0 | 6 / 0 | 6 / 0 | 6 / 0 |
+| draws / indexed / dispatches | no counter | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| render passes encoded | no counter | 54 | 56 | 53 | 53 |
+| texture-registration refusals | no counter | not reported | **358** | **0** | **0** |
+| refusal class / attachment | bare status | `texture` | `texture` | `texture` | `texture`, id `0xe2a6a0000` |
+| swapchain `non_black_pixels` / buckets | 0 / 1 | 0 / 1 | 0 / 1 | 0 / 1 | 0 / 1 |
+| `uniform_color` | transparent_black | same | same | same | same |
+| host p50 / p95 ms | .011 / .025 | .012 / .028 | .012 / .034 | .012 / .030 | .012 / .026 |
+| D3DMetal fallback / host D3D12 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+### 15.3 What the boots proved
+
+- Every one of the 53 early refusals is a `BeginRenderPass` (guest opcode 16, index 0, class
+  `binding`): the host cannot resolve a render-pass attachment texture. They are texture-attachment
+  refusals, not pipeline-registration races.
+- Boot #24 named the two descriptor refusals behind 358 creation-time refusals: 3D integer storage
+  volumes sent as attachments, and typeless `R16`/`R32` targets sent as colour while declared depth.
+- Boot #25 proved the creation-time path is fixed (358 -> 0 refusals) yet 52 passes still refuse.
+  Boot #26 named the attachment: allocation `0xe2a6a0000`, which is neither the installed present
+  surface (`0x127330000`) nor one of the registered creation-time targets.
+- The Synthetic pre-boot gate passes again at the final head (PASS, exit 0, checksum unchanged)
+  after the ABI resolution was corrected to keep the wire index for a table whose reflected triple
+  is unknown. No title boot ran after those last fixes.
+
+### 15.4 What is still not true
+
+- **No draw is proven executed and no non-black pixel is claimed.** The counters are exact and say
+  `draws_encoded=0` in every boot; the swapchain probe finds `transparent_black` every sample.
+- **The root-argument bridge is wired but unproven on a title.** GPU proofs show a translated
+  VS+PS drawing exact pixels from `USER_DATA_SPACE` + `ROOT_CBV_SPACE` and a translated CS reading
+  `MEMORY_SPACE`, but no title pass reached a draw.
+- **`0xe2a6a0000` is the next gate.** Cycle 16 must trace where that attachment is created (the
+  creation path does not register it, and it is not the present surface).
+- **`MEMORY_SPACE` holds zeros.** The page-table/view-address contents need the guest's VA map; no
+  data is faked.
+- **A guest range spanning several share files still refuses** (`not one contiguous shared
+  allocation`): Wire v3 maps one allocation id to one file.
+
+### 15.5 Counts at the integration head
+
+- `victory-metal` **393 passed / 0 failed / 10 ignored** (lib, no outer GPU lock); `victory-gpu`
+  **412 / 0 / 1**; `victory-shader` **260 / 0 / 2** plus **3 / 0 / 1**; Wine `victory-hle`
+  **195 / 0 / 1**; `victory` bin (native aarch64) **16 / 0 / 0**, **2 / 0 / 0**, **1 / 0 / 0**.
+- Win64 `diag` build, three Windows all-targets checks, x86_64 `victory-irconverter` build and the
+  ARM64 host build all exit 0; `git diff --check` clean.
+- Pre-boot gate `--runs 1` **PASS exit 0**: p50 0.837 / p95 0.922 / p99 0.958 ms, 1,191 FPS,
+  checksum unchanged.
+- Worker `target/` directories pruned after every wave; **118 GB free**; zero orphaned processes.
